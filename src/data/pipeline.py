@@ -1,0 +1,138 @@
+"""ETL Pipeline — 整合 抓取 → 清洗 → 寫入資料庫 流程。"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date
+
+import pandas as pd
+from sqlalchemy import select, func
+from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+
+from src.data.database import get_session, init_db
+from src.data.fetcher import FinMindFetcher
+from src.data.schema import DailyPrice, InstitutionalInvestor, MarginTrading
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _get_last_date(model, stock_id: str) -> str | None:
+    """查詢某股票在指定表中的最後一筆日期，用於增量更新。"""
+    with get_session() as session:
+        result = session.execute(
+            select(func.max(model.date)).where(model.stock_id == stock_id)
+        ).scalar()
+        if result:
+            return result.isoformat()
+    return None
+
+
+def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size: int = 80) -> int:
+    """將 DataFrame 分批寫入指定表（衝突時略過）。
+
+    SQLite 有 SQL 變數上限，必須分批 INSERT。
+    """
+    if df.empty:
+        return 0
+
+    records = df.to_dict("records")
+    with get_session() as session:
+        for i in range(0, len(records), batch_size):
+            batch = records[i : i + batch_size]
+            stmt = sqlite_upsert(model).values(batch)
+            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_keys)
+            session.execute(stmt)
+        session.commit()
+    return len(records)
+
+
+def _upsert_daily_price(df: pd.DataFrame) -> int:
+    """將日K線 DataFrame 寫入 daily_price 表（衝突時略過）。"""
+    return _upsert_batch(DailyPrice, df, ["stock_id", "date"])
+
+
+def _upsert_institutional(df: pd.DataFrame) -> int:
+    """將三大法人 DataFrame 寫入 institutional_investor 表。"""
+    return _upsert_batch(InstitutionalInvestor, df, ["stock_id", "date", "name"])
+
+
+def _upsert_margin(df: pd.DataFrame) -> int:
+    """將融資融券 DataFrame 寫入 margin_trading 表。"""
+    return _upsert_batch(MarginTrading, df, ["stock_id", "date"])
+
+
+def sync_stock(
+    stock_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    fetcher: FinMindFetcher | None = None,
+) -> dict[str, int]:
+    """同步單一股票的所有資料（日K + 三大法人 + 融資融券）。
+
+    支援增量更新：若 DB 已有資料，自動從最後一筆日期開始抓取。
+
+    Returns:
+        dict: 各資料表新增筆數，例如 {"daily_price": 100, "institutional": 300, "margin": 100}
+    """
+    if fetcher is None:
+        fetcher = FinMindFetcher()
+
+    default_start = start_date or settings.fetcher.default_start_date
+    if end_date is None:
+        end_date = date.today().isoformat()
+
+    result = {}
+
+    # --- 日K線 ---
+    last = _get_last_date(DailyPrice, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步日K線: %s ~ %s", stock_id, s, end_date)
+    df_price = fetcher.fetch_daily_price(stock_id, s, end_date)
+    result["daily_price"] = _upsert_daily_price(df_price)
+
+    # --- 三大法人 ---
+    last = _get_last_date(InstitutionalInvestor, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步三大法人: %s ~ %s", stock_id, s, end_date)
+    df_inst = fetcher.fetch_institutional(stock_id, s, end_date)
+    result["institutional"] = _upsert_institutional(df_inst)
+
+    # --- 融資融券 ---
+    last = _get_last_date(MarginTrading, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步融資融券: %s ~ %s", stock_id, s, end_date)
+    df_margin = fetcher.fetch_margin_trading(stock_id, s, end_date)
+    result["margin"] = _upsert_margin(df_margin)
+
+    return result
+
+
+def sync_watchlist(
+    watchlist: list[str] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, dict[str, int]]:
+    """批次同步關注清單中所有股票的資料。"""
+    if watchlist is None:
+        watchlist = settings.fetcher.watchlist
+
+    init_db()
+    fetcher = FinMindFetcher()
+
+    all_results = {}
+    for stock_id in watchlist:
+        logger.info("=" * 50)
+        logger.info("開始同步: %s", stock_id)
+        try:
+            all_results[stock_id] = sync_stock(
+                stock_id, start_date, end_date, fetcher
+            )
+            logger.info(
+                "[%s] 完成 — %s", stock_id, all_results[stock_id]
+            )
+        except Exception:
+            logger.exception("[%s] 同步失敗", stock_id)
+            all_results[stock_id] = {"error": True}
+
+    return all_results

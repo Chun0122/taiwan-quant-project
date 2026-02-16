@@ -1,0 +1,25 @@
+# Data fetching
+requests>=2.31.0
+FinMind>=1.6.0
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Configuration
+pyyaml>=6.0.1
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Technical indicators (P1)
+# pandas_ta>=0.3.14
+
+# Backtesting (P2)
+# vectorbt>=0.26.0
+
+# Visualization (P3)
+# plotly>=5.18.0
+# streamlit>=1.29.0
