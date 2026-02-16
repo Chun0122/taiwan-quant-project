@@ -54,6 +54,7 @@ class BacktestResultData:
     max_drawdown: float          # %
     win_rate: float | None       # %
     total_trades: int
+    benchmark_return: float | None = None  # 同期 buy & hold 報酬率 (%)
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
 
@@ -160,6 +161,9 @@ class BacktestEngine:
             equity_curve, trades, data.index[0], data.index[-1]
         )
 
+        # 計算同期 buy & hold 基準報酬
+        benchmark_return = self._compute_benchmark(data)
+
         return BacktestResultData(
             stock_id=self.strategy.stock_id,
             strategy_name=self.strategy.name,
@@ -173,9 +177,18 @@ class BacktestEngine:
             max_drawdown=metrics["max_drawdown"],
             win_rate=metrics["win_rate"],
             total_trades=len(trades),
+            benchmark_return=benchmark_return,
             trades=trades,
             equity_curve=equity_curve,
         )
+
+    def _compute_benchmark(self, data: pd.DataFrame) -> float | None:
+        """計算同期 buy & hold 報酬率（不含交易成本，純價差）。"""
+        if data.empty or len(data) < 2:
+            return None
+        first_close = data.iloc[0]["close"]
+        last_close = data.iloc[-1]["close"]
+        return round((last_close / first_close - 1) * 100, 2)
 
     def _compute_metrics(
         self,

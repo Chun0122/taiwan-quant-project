@@ -4,6 +4,9 @@
 - TaiwanStockPrice:                            日K線
 - TaiwanStockInstitutionalInvestorsBuySell:    三大法人買賣超
 - TaiwanStockMarginPurchaseShortSale:          融資融券
+- TaiwanStockMonthRevenue:                     月營收
+- TaiwanStockDividend:                         股利
+- TaiwanStockTotalReturnIndex:                 加權指數
 """
 
 from __future__ import annotations
@@ -38,6 +41,18 @@ class DataFetcher(ABC):
 
     @abstractmethod
     def fetch_margin_trading(
+        self, stock_id: str, start: str, end: str
+    ) -> pd.DataFrame:
+        ...
+
+    @abstractmethod
+    def fetch_monthly_revenue(
+        self, stock_id: str, start: str, end: str
+    ) -> pd.DataFrame:
+        ...
+
+    @abstractmethod
+    def fetch_dividend(
         self, stock_id: str, start: str, end: str
     ) -> pd.DataFrame:
         ...
@@ -177,6 +192,110 @@ class FinMindFetcher(DataFetcher):
             "margin_buy", "margin_sell", "margin_balance",
             "short_sell", "short_buy", "short_balance",
         ]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    def fetch_monthly_revenue(
+        self, stock_id: str, start: str, end: str | None = None
+    ) -> pd.DataFrame:
+        """抓取月營收資料。
+
+        回傳欄位: date, stock_id, revenue, revenue_month, revenue_year,
+                  mom_growth, yoy_growth
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockMonthRevenue", stock_id, start, end)
+        if df.empty:
+            return df
+
+        keep = ["date", "stock_id", "revenue", "revenue_month", "revenue_year"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+
+        # 計算月增率 (MoM) 和年增率 (YoY)
+        df = df.sort_values("date").reset_index(drop=True)
+        df["mom_growth"] = df["revenue"].pct_change() * 100
+
+        # 年增率：與 12 個月前比較
+        if len(df) > 12:
+            df["yoy_growth"] = (
+                df["revenue"] / df["revenue"].shift(12) - 1
+            ) * 100
+        else:
+            df["yoy_growth"] = None
+
+        return df
+
+    def fetch_dividend(
+        self, stock_id: str, start: str, end: str | None = None
+    ) -> pd.DataFrame:
+        """抓取股利資料。
+
+        回傳欄位: date, stock_id, year, cash_dividend, stock_dividend,
+                  cash_payment_date, announcement_date
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockDividend", stock_id, start, end)
+        if df.empty:
+            return df
+
+        rename_map = {
+            "CashEarningsDistribution": "cash_dividend",
+            "StockEarningsDistribution": "stock_dividend",
+            "CashDividendPaymentDate": "cash_payment_date",
+            "AnnouncementDate": "announcement_date",
+        }
+        df = df.rename(columns=rename_map)
+
+        keep = [
+            "date", "stock_id", "year",
+            "cash_dividend", "stock_dividend",
+            "cash_payment_date", "announcement_date",
+        ]
+        df = df[[c for c in keep if c in df.columns]]
+
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        for col in ("cash_payment_date", "announcement_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+        df["cash_dividend"] = df.get("cash_dividend", pd.Series(dtype=float)).fillna(0.0)
+        df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
+        return df
+
+    def fetch_taiex_index(
+        self, start: str, end: str | None = None
+    ) -> pd.DataFrame:
+        """抓取加權指數日資料（用於 benchmark）。
+
+        使用 TAIEX 作為 stock_id，存入 DailyPrice 表複用基礎設施。
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockTotalReturnIndex", "TAIEX", start, end)
+        if df.empty:
+            return df
+
+        # 將指數值作為 close，其他欄位補齊
+        if "price" in df.columns:
+            df = df.rename(columns={"price": "close"})
+
+        df["stock_id"] = "TAIEX"
+        for col in ("open", "high", "low"):
+            if col not in df.columns:
+                df[col] = df["close"]
+        for col in ("volume", "turnover"):
+            if col not in df.columns:
+                df[col] = 0
+        if "spread" not in df.columns:
+            df["spread"] = 0.0
+
+        keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df

@@ -12,8 +12,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from src.data.database import get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
-    DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator,
-    BacktestResult, Trade,
+    DailyPrice, InstitutionalInvestor, MarginTrading, MonthlyRevenue, Dividend,
+    TechnicalIndicator, BacktestResult, Trade,
 )
 from src.config import settings
 
@@ -65,6 +65,16 @@ def _upsert_margin(df: pd.DataFrame) -> int:
     return _upsert_batch(MarginTrading, df, ["stock_id", "date"])
 
 
+def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
+    """將月營收 DataFrame 寫入 monthly_revenue 表。"""
+    return _upsert_batch(MonthlyRevenue, df, ["stock_id", "date"])
+
+
+def _upsert_dividend(df: pd.DataFrame) -> int:
+    """將股利 DataFrame 寫入 dividend 表。"""
+    return _upsert_batch(Dividend, df, ["stock_id", "date"])
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,
@@ -108,6 +118,20 @@ def sync_stock(
     df_margin = fetcher.fetch_margin_trading(stock_id, s, end_date)
     result["margin"] = _upsert_margin(df_margin)
 
+    # --- 月營收 ---
+    last = _get_last_date(MonthlyRevenue, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步月營收: %s ~ %s", stock_id, s, end_date)
+    df_rev = fetcher.fetch_monthly_revenue(stock_id, s, end_date)
+    result["revenue"] = _upsert_monthly_revenue(df_rev)
+
+    # --- 股利 ---
+    last = _get_last_date(Dividend, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步股利: %s ~ %s", stock_id, s, end_date)
+    df_div = fetcher.fetch_dividend(stock_id, s, end_date)
+    result["dividend"] = _upsert_dividend(df_div)
+
     return result
 
 
@@ -139,6 +163,31 @@ def sync_watchlist(
             all_results[stock_id] = {"error": True}
 
     return all_results
+
+
+def sync_taiex_index(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    fetcher: FinMindFetcher | None = None,
+) -> int:
+    """同步加權指數資料（用於 benchmark）。"""
+    init_db()
+
+    if fetcher is None:
+        fetcher = FinMindFetcher()
+
+    default_start = start_date or settings.fetcher.default_start_date
+    if end_date is None:
+        end_date = date.today().isoformat()
+
+    last = _get_last_date(DailyPrice, "TAIEX")
+    s = last if last and last > default_start else default_start
+
+    logger.info("[TAIEX] 同步加權指數: %s ~ %s", s, end_date)
+    df = fetcher.fetch_taiex_index(s, end_date)
+    count = _upsert_daily_price(df)
+    logger.info("[TAIEX] 完成 — %d 筆", count)
+    return count
 
 
 # ------------------------------------------------------------------ #
@@ -202,6 +251,7 @@ def save_backtest_result(result_data) -> int:
             max_drawdown=result_data.max_drawdown,
             win_rate=result_data.win_rate,
             total_trades=result_data.total_trades,
+            benchmark_return=getattr(result_data, "benchmark_return", None),
         )
         session.add(bt)
         session.flush()  # 取得 id

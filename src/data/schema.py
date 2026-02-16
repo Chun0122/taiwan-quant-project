@@ -1,9 +1,11 @@
 """SQLAlchemy ORM 資料表定義。
 
-六張核心表：
+八張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
+- MonthlyRevenue:          月營收
+- Dividend:                股利資料
 - TechnicalIndicator:      技術指標（EAV 長表）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
@@ -82,6 +84,48 @@ class MarginTrading(Base):
         return f"<Margin {self.stock_id} {self.date} 融資餘額={self.margin_balance}>"
 
 
+class MonthlyRevenue(Base):
+    """月營收資料。"""
+
+    __tablename__ = "monthly_revenue"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", name="uq_monthly_revenue"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    revenue: Mapped[int] = mapped_column(BigInteger, nullable=False)  # 營收金額
+    revenue_month: Mapped[int] = mapped_column(Integer, nullable=False)  # 月份
+    revenue_year: Mapped[int] = mapped_column(Integer, nullable=False)  # 年度
+    mom_growth: Mapped[float | None] = mapped_column(Float, nullable=True)  # 月增率 (%)
+    yoy_growth: Mapped[float | None] = mapped_column(Float, nullable=True)  # 年增率 (%)
+
+    def __repr__(self) -> str:
+        return f"<MonthlyRevenue {self.stock_id} {self.date} revenue={self.revenue:,}>"
+
+
+class Dividend(Base):
+    """股利資料。"""
+
+    __tablename__ = "dividend"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", name="uq_dividend"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)  # 除權息基準日
+    year: Mapped[str] = mapped_column(String(10), nullable=False)  # 股利所屬年度
+    cash_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 現金股利
+    stock_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 股票股利
+    cash_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 現金發放日
+    announcement_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 公告日
+
+    def __repr__(self) -> str:
+        return f"<Dividend {self.stock_id} {self.date} cash={self.cash_dividend}>"
+
+
 class TechnicalIndicator(Base):
     """技術指標（EAV 長表）。
 
@@ -122,6 +166,7 @@ class BacktestResult(Base):
     max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)      # 最大回撤 (%)
     win_rate: Mapped[float] = mapped_column(Float, nullable=True)           # 勝率 (%)
     total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    benchmark_return: Mapped[float | None] = mapped_column(Float, nullable=True)  # 基準報酬率 (%)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

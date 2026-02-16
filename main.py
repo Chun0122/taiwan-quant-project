@@ -19,6 +19,12 @@ Usage:
     # 啟動視覺化儀表板
     python main.py dashboard
 
+    # 參數優化
+    python main.py optimize --stock 2330 --strategy sma_cross
+
+    # 設定排程
+    python main.py schedule --mode windows
+
     # 查詢已入庫的資料概況
     python main.py status
 """
@@ -42,7 +48,12 @@ def setup_logging() -> None:
 
 def cmd_sync(args: argparse.Namespace) -> None:
     """執行資料同步。"""
-    from src.data.pipeline import sync_watchlist
+    from src.data.pipeline import sync_watchlist, sync_taiex_index
+
+    # 同步 TAIEX 指數
+    if args.taiex:
+        taiex_count = sync_taiex_index(start_date=args.start, end_date=args.end)
+        print(f"\n  TAIEX 加權指數: {taiex_count} 筆")
 
     stocks = args.stocks if args.stocks else None
     results = sync_watchlist(
@@ -56,11 +67,14 @@ def cmd_sync(args: argparse.Namespace) -> None:
         if "error" in counts:
             print(f"  {stock_id}: 失敗")
         else:
-            print(
-                f"  {stock_id}: 日K={counts['daily_price']} 筆, "
-                f"法人={counts['institutional']} 筆, "
-                f"融資融券={counts['margin']} 筆"
-            )
+            parts = [
+                f"日K={counts['daily_price']}",
+                f"法人={counts['institutional']}",
+                f"融資融券={counts['margin']}",
+                f"營收={counts.get('revenue', 0)}",
+                f"股利={counts.get('dividend', 0)}",
+            ]
+            print(f"  {stock_id}: {', '.join(parts)}")
 
 
 def cmd_compute(args: argparse.Namespace) -> None:
@@ -116,6 +130,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print(f"  初始資金:     {result.initial_capital:>14,.0f}")
     print(f"  最終資金:     {result.final_capital:>14,.2f}")
     print(f"  總報酬率:     {result.total_return:>13.2f}%")
+    if result.benchmark_return is not None:
+        print(f"  基準報酬率:   {result.benchmark_return:>13.2f}%  (Buy & Hold)")
+        alpha = result.total_return - result.benchmark_return
+        print(f"  超額報酬:     {alpha:>13.2f}%")
     print(f"  年化報酬率:   {result.annual_return:>13.2f}%")
     print(f"  Sharpe Ratio: {result.sharpe_ratio or 'N/A':>13}")
     print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
@@ -135,13 +153,50 @@ def cmd_dashboard() -> None:
     subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)], cwd=str(PROJECT_ROOT))
 
 
+def cmd_optimize(args: argparse.Namespace) -> None:
+    """執行參數優化（Grid Search）。"""
+    from datetime import date
+
+    from src.data.database import init_db
+    from src.optimization.grid_search import GridSearchOptimizer
+
+    init_db()
+
+    start = args.start or settings.fetcher.default_start_date
+    end = args.end or date.today().isoformat()
+
+    optimizer = GridSearchOptimizer(
+        strategy_name=args.strategy,
+        stock_id=args.stock,
+        start_date=start,
+        end_date=end,
+    )
+
+    results = optimizer.run()
+    optimizer.print_top_n(results, n=args.top_n)
+
+    if args.export:
+        optimizer.export_to_csv(results, args.export)
+
+
+def cmd_schedule(args: argparse.Namespace) -> None:
+    """設定排程任務。"""
+    if args.mode == "simple":
+        from src.scheduler.simple_scheduler import run_scheduler
+        run_scheduler()
+    elif args.mode == "windows":
+        from src.scheduler.windows_task import generate_scripts
+        generate_scripts()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """顯示資料庫概況。"""
     from sqlalchemy import func, select
 
     from src.data.database import get_session, init_db
     from src.data.schema import (
-        DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator,
+        DailyPrice, InstitutionalInvestor, MarginTrading,
+        MonthlyRevenue, Dividend, TechnicalIndicator,
         BacktestResult,
     )
 
@@ -152,6 +207,8 @@ def cmd_status(args: argparse.Namespace) -> None:
             (DailyPrice, "日K線"),
             (InstitutionalInvestor, "三大法人"),
             (MarginTrading, "融資融券"),
+            (MonthlyRevenue, "月營收"),
+            (Dividend, "股利"),
             (TechnicalIndicator, "技術指標"),
         ]:
             total = session.execute(
@@ -208,6 +265,7 @@ def main() -> None:
     sp_sync.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_sync.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
     sp_sync.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+    sp_sync.add_argument("--taiex", action="store_true", help="同步加權指數")
 
     # compute 子命令
     sp_compute = subparsers.add_parser("compute", help="計算技術指標")
@@ -223,6 +281,22 @@ def main() -> None:
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
 
+    # optimize 子命令
+    sp_opt = subparsers.add_parser("optimize", help="參數優化（Grid Search）")
+    sp_opt.add_argument("--stock", required=True, help="股票代號")
+    sp_opt.add_argument("--strategy", required=True, help="策略名稱")
+    sp_opt.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
+    sp_opt.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+    sp_opt.add_argument("--top-n", type=int, default=10, help="顯示前 N 名結果 (預設 10)")
+    sp_opt.add_argument("--export", default=None, help="匯出 CSV 路徑")
+
+    # schedule 子命令
+    sp_sched = subparsers.add_parser("schedule", help="設定自動排程")
+    sp_sched.add_argument(
+        "--mode", choices=["simple", "windows"], default="windows",
+        help="排程模式: simple=前景執行, windows=產生 Task Scheduler 腳本",
+    )
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -236,6 +310,10 @@ def main() -> None:
         cmd_backtest(args)
     elif args.command == "dashboard":
         cmd_dashboard()
+    elif args.command == "optimize":
+        cmd_optimize(args)
+    elif args.command == "schedule":
+        cmd_schedule(args)
     elif args.command == "status":
         cmd_status(args)
     else:

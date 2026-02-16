@@ -53,9 +53,17 @@ taiwan-quant-project/
 │   ├── strategy/
 │   │   ├── base.py          # 策略抽象基類
 │   │   ├── sma_cross.py     # SMA 均線交叉策略
-│   │   └── rsi_threshold.py # RSI 超買超賣策略
+│   │   ├── rsi_threshold.py # RSI 超買超賣策略
+│   │   ├── bb_breakout.py   # 布林通道突破策略
+│   │   ├── macd_cross.py    # MACD 交叉策略
+│   │   └── buy_hold.py      # 買入持有基準策略
 │   ├── backtest/
 │   │   └── engine.py        # 回測引擎 + 績效計算
+│   ├── optimization/
+│   │   └── grid_search.py   # Grid Search 參數優化
+│   ├── scheduler/
+│   │   ├── simple_scheduler.py  # 前景排程器
+│   │   └── windows_task.py      # Windows Task Scheduler 產生器
 │   └── visualization/
 │       ├── app.py            # Streamlit 儀表板入口
 │       ├── data_loader.py    # 資料查詢模組
@@ -122,14 +130,21 @@ python main.py sync --start 2023-01-01 --end 2024-12-31
 
 # 組合使用
 python main.py sync --stocks 2330 --start 2024-01-01
+
+# 同時同步加權指數（用於 benchmark）
+python main.py sync --taiex
 ```
 
-每檔股票會同步三種資料：
+每檔股票會同步五種資料：
 | 資料類型 | FinMind Dataset | DB 資料表 |
 |----------|----------------|-----------|
 | 日K線（OHLCV） | TaiwanStockPrice | `daily_price` |
 | 三大法人買賣超 | TaiwanStockInstitutionalInvestorsBuySell | `institutional_investor` |
 | 融資融券 | TaiwanStockMarginPurchaseShortSale | `margin_trading` |
+| 月營收 | TaiwanStockMonthRevenue | `monthly_revenue` |
+| 股利 | TaiwanStockDividend | `dividend` |
+
+加上 `--taiex` 可同步加權指數（存入 daily_price，stock_id=TAIEX）。
 
 ### 4.2 計算技術指標 (`compute`)
 
@@ -162,6 +177,15 @@ python main.py backtest --stock 2330 --strategy sma_cross
 # RSI 超買超賣策略 (預設 30/70)
 python main.py backtest --stock 2330 --strategy rsi_threshold
 
+# 布林通道突破策略
+python main.py backtest --stock 2330 --strategy bb_breakout
+
+# MACD 交叉策略
+python main.py backtest --stock 2330 --strategy macd_cross
+
+# 買入持有基準策略
+python main.py backtest --stock 2330 --strategy buy_and_hold
+
 # 指定回測期間
 python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --end 2025-12-31
 ```
@@ -171,6 +195,11 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 |----------|------|----------|----------|
 | `sma_cross` | SMA 均線交叉 | 快線上穿慢線（黃金交叉） | 快線下穿慢線（死亡交叉） |
 | `rsi_threshold` | RSI 超買超賣 | RSI 突破超賣線(30) | RSI 跌破超買線(70) |
+| `bb_breakout` | 布林通道突破 | 價格從下軌反彈 | 價格從上軌回落 |
+| `macd_cross` | MACD 交叉 | MACD 上穿 Signal | MACD 下穿 Signal |
+| `buy_and_hold` | 買入持有 | 第一天買入 | 最後一天賣出 |
+
+回測結果會自動顯示同期 Buy & Hold 基準報酬率與超額報酬。
 
 交易成本設定（符合台股實際費率）：
 - 手續費: 0.1425%（買賣各收一次）
@@ -189,7 +218,48 @@ python main.py dashboard
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片 + 權益曲線/回撤圖 + 交易明細 + 回測比較表
 
-### 4.5 查看資料庫概況 (`status`)
+### 4.5 參數優化 (`optimize`)
+
+使用 Grid Search 窮舉參數組合，找出最佳策略參數。
+
+```bash
+# 優化 SMA 交叉策略的快慢線天數
+python main.py optimize --stock 2330 --strategy sma_cross
+
+# 顯示前 5 名
+python main.py optimize --stock 2330 --strategy sma_cross --top-n 5
+
+# 匯出結果到 CSV
+python main.py optimize --stock 2330 --strategy rsi_threshold --export results.csv
+
+# 指定回測期間
+python main.py optimize --stock 2330 --strategy macd_cross --start 2023-01-01
+```
+
+支援的策略與預設參數網格：
+| 策略 | 參數 | 搜尋範圍 |
+|------|------|----------|
+| `sma_cross` | fast, slow | fast=[5,10,15,20,25,30], slow=[20,30,40,50,60] |
+| `rsi_threshold` | oversold, overbought | oversold=[20,25,30,35,40], overbought=[60,65,70,75,80] |
+| `bb_breakout` | period, std_dev | period=[10,15,20,25,30], std_dev=[1,2,3] |
+| `macd_cross` | fast, slow, signal | fast=[8,12,16], slow=[20,26,32], signal=[7,9,11] |
+
+### 4.6 自動排程 (`schedule`)
+
+設定每日自動同步資料與計算指標。
+
+```bash
+# 產生 Windows Task Scheduler 腳本（建議）
+python main.py schedule --mode windows
+
+# 前景執行排程器（測試用，每日 23:00 自動同步）
+python main.py schedule --mode simple
+```
+
+Windows 模式會在 `scripts/` 目錄產生 `daily_sync.bat` 和 `task_schedule.xml`，
+按照輸出的說明匯入 Windows 工作排程器即可。
+
+### 4.7 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -207,7 +277,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。六張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。八張核心表：
 
 ### daily_price（日K線）
 
@@ -253,6 +323,34 @@ python main.py status
 
 唯一鍵：`(stock_id, date)`
 
+### monthly_revenue（月營收）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 資料日期 |
+| revenue | BigInteger | 營收金額 |
+| revenue_month | Integer | 月份 |
+| revenue_year | Integer | 年度 |
+| mom_growth | Float | 月增率 (%) |
+| yoy_growth | Float | 年增率 (%) |
+
+唯一鍵：`(stock_id, date)`
+
+### dividend（股利）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 除權息基準日 |
+| year | String | 股利所屬年度 |
+| cash_dividend | Float | 現金股利 |
+| stock_dividend | Float | 股票股利 |
+| cash_payment_date | Date | 現金發放日 |
+| announcement_date | Date | 公告日 |
+
+唯一鍵：`(stock_id, date)`
+
 ### technical_indicator（技術指標 — EAV 長表）
 
 | 欄位 | 型別 | 說明 |
@@ -280,6 +378,7 @@ python main.py status
 | max_drawdown | Float | 最大回撤 (%) |
 | win_rate | Float | 勝率 (%) |
 | total_trades | Integer | 交易次數 |
+| benchmark_return | Float | 基準報酬率 (%) |
 | created_at | DateTime | 建立時間 |
 
 ### trade（交易明細）

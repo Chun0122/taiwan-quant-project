@@ -32,5 +32,9 @@ Desktop.ini
 # Secrets — token 在 settings.yaml 中，不上傳
 config/settings.yaml
 
+# Generated scripts & logs
+scripts/
+logs/
+
 # Claude Code
 .claude/
