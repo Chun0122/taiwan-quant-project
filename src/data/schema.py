@@ -1,15 +1,17 @@
 """SQLAlchemy ORM 資料表定義。
 
-四張核心表：
+六張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
 - TechnicalIndicator:      技術指標（EAV 長表）
+- BacktestResult:          回測結果摘要
+- Trade:                   交易明細
 """
 
-from datetime import date
+from datetime import date, datetime
 
-from sqlalchemy import Date, Float, Integer, String, BigInteger, UniqueConstraint
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, BigInteger, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.data.database import Base
@@ -100,3 +102,46 @@ class TechnicalIndicator(Base):
 
     def __repr__(self) -> str:
         return f"<Indicator {self.stock_id} {self.date} {self.name}={self.value}>"
+
+
+class BacktestResult(Base):
+    """回測結果摘要。"""
+
+    __tablename__ = "backtest_result"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    final_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    total_return: Mapped[float] = mapped_column(Float, nullable=False)      # 總報酬率 (%)
+    annual_return: Mapped[float] = mapped_column(Float, nullable=False)     # 年化報酬率 (%)
+    sharpe_ratio: Mapped[float] = mapped_column(Float, nullable=True)       # Sharpe Ratio
+    max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)      # 最大回撤 (%)
+    win_rate: Mapped[float] = mapped_column(Float, nullable=True)           # 勝率 (%)
+    total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<Backtest {self.stock_id} {self.strategy_name} return={self.total_return:.2f}%>"
+
+
+class Trade(Base):
+    """交易明細。"""
+
+    __tablename__ = "trade"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backtest_id: Mapped[int] = mapped_column(Integer, ForeignKey("backtest_result.id"), nullable=False, index=True)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    exit_date: Mapped[date] = mapped_column(Date, nullable=True)
+    exit_price: Mapped[float] = mapped_column(Float, nullable=True)
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)            # 股數
+    pnl: Mapped[float] = mapped_column(Float, nullable=True)               # 損益金額
+    return_pct: Mapped[float] = mapped_column(Float, nullable=True)        # 報酬率 (%)
+
+    def __repr__(self) -> str:
+        return f"<Trade {self.entry_date}~{self.exit_date} pnl={self.pnl}>"

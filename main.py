@@ -13,6 +13,9 @@ Usage:
     # 計算技術指標
     python main.py compute
 
+    # 執行回測
+    python main.py backtest --stock 2330 --strategy sma_cross
+
     # 查詢已入庫的資料概況
     python main.py status
 """
@@ -74,6 +77,50 @@ def cmd_compute(args: argparse.Namespace) -> None:
             print(f"  {stock_id}: {count:,} 筆指標")
 
 
+def cmd_backtest(args: argparse.Namespace) -> None:
+    """執行回測。"""
+    from datetime import date
+
+    from src.data.database import init_db
+    from src.data.pipeline import save_backtest_result
+    from src.strategy import STRATEGY_REGISTRY
+    from src.backtest.engine import BacktestEngine
+
+    if args.strategy not in STRATEGY_REGISTRY:
+        print(f"未知策略: {args.strategy}")
+        print(f"可用策略: {', '.join(STRATEGY_REGISTRY.keys())}")
+        sys.exit(1)
+
+    init_db()
+
+    start = args.start or settings.fetcher.default_start_date
+    end = args.end or date.today().isoformat()
+
+    strategy_cls = STRATEGY_REGISTRY[args.strategy]
+    strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end)
+
+    engine = BacktestEngine(strategy)
+    result = engine.run()
+
+    # 存入 DB
+    bt_id = save_backtest_result(result)
+
+    # 印出摘要
+    print("\n" + "=" * 60)
+    print(f"回測結果 — {result.strategy_name} | {result.stock_id}")
+    print("=" * 60)
+    print(f"  期間:         {result.start_date} ~ {result.end_date}")
+    print(f"  初始資金:     {result.initial_capital:>14,.0f}")
+    print(f"  最終資金:     {result.final_capital:>14,.2f}")
+    print(f"  總報酬率:     {result.total_return:>13.2f}%")
+    print(f"  年化報酬率:   {result.annual_return:>13.2f}%")
+    print(f"  Sharpe Ratio: {result.sharpe_ratio or 'N/A':>13}")
+    print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
+    print(f"  勝率:         {result.win_rate or 'N/A':>13}%")
+    print(f"  交易次數:     {result.total_trades:>13}")
+    print(f"  (結果已儲存, id={bt_id})")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """顯示資料庫概況。"""
     from sqlalchemy import func, select
@@ -81,6 +128,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     from src.data.database import get_session, init_db
     from src.data.schema import (
         DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator,
+        BacktestResult,
     )
 
     init_db()
@@ -118,6 +166,22 @@ def cmd_status(args: argparse.Namespace) -> None:
             for name, cnt in indicator_counts:
                 print(f"    {name:15s} {cnt:>8,} 筆")
 
+        # 回測結果摘要
+        bt_count = session.execute(
+            select(func.count()).select_from(BacktestResult)
+        ).scalar()
+        if bt_count:
+            print(f"\n[回測紀錄] {bt_count} 筆")
+            rows = session.execute(
+                select(BacktestResult).order_by(BacktestResult.id.desc()).limit(5)
+            ).scalars().all()
+            for r in rows:
+                print(
+                    f"  #{r.id} {r.stock_id} {r.strategy_name} | "
+                    f"報酬={r.total_return:+.2f}% | MDD={r.max_drawdown:.2f}% | "
+                    f"交易={r.total_trades}次"
+                )
+
 
 def main() -> None:
     setup_logging()
@@ -135,6 +199,13 @@ def main() -> None:
     sp_compute = subparsers.add_parser("compute", help="計算技術指標")
     sp_compute.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
 
+    # backtest 子命令
+    sp_bt = subparsers.add_parser("backtest", help="執行回測")
+    sp_bt.add_argument("--stock", required=True, help="股票代號")
+    sp_bt.add_argument("--strategy", required=True, help="策略名稱 (sma_cross, rsi_threshold)")
+    sp_bt.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
+    sp_bt.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -144,6 +215,8 @@ def main() -> None:
         cmd_sync(args)
     elif args.command == "compute":
         cmd_compute(args)
+    elif args.command == "backtest":
+        cmd_backtest(args)
     elif args.command == "status":
         cmd_status(args)
     else:

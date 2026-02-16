@@ -11,7 +11,10 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.data.database import get_session, init_db
 from src.data.fetcher import FinMindFetcher
-from src.data.schema import DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator
+from src.data.schema import (
+    DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator,
+    BacktestResult, Trade,
+)
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -172,3 +175,53 @@ def sync_indicators(
             all_results[stock_id] = -1
 
     return all_results
+
+
+# ------------------------------------------------------------------ #
+#  P2: 回測結果存入 DB
+# ------------------------------------------------------------------ #
+
+def save_backtest_result(result_data) -> int:
+    """將回測結果與交易明細寫入 DB，回傳 backtest_result.id。"""
+    from src.backtest.engine import BacktestResultData
+
+    init_db()
+
+    with get_session() as session:
+        # 寫入回測摘要
+        bt = BacktestResult(
+            stock_id=result_data.stock_id,
+            strategy_name=result_data.strategy_name,
+            start_date=result_data.start_date,
+            end_date=result_data.end_date,
+            initial_capital=result_data.initial_capital,
+            final_capital=result_data.final_capital,
+            total_return=result_data.total_return,
+            annual_return=result_data.annual_return,
+            sharpe_ratio=result_data.sharpe_ratio,
+            max_drawdown=result_data.max_drawdown,
+            win_rate=result_data.win_rate,
+            total_trades=result_data.total_trades,
+        )
+        session.add(bt)
+        session.flush()  # 取得 id
+        bt_id = bt.id
+
+        # 寫入交易明細
+        for t in result_data.trades:
+            trade = Trade(
+                backtest_id=bt_id,
+                entry_date=t.entry_date,
+                entry_price=t.entry_price,
+                exit_date=t.exit_date,
+                exit_price=t.exit_price,
+                shares=t.shares,
+                pnl=t.pnl,
+                return_pct=t.return_pct,
+            )
+            session.add(trade)
+
+        session.commit()
+        logger.info("回測結果已儲存 (id=%d, %d 筆交易)", bt_id, len(result_data.trades))
+
+    return bt_id

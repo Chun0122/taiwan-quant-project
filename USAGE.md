@@ -141,7 +141,34 @@ python main.py compute --stocks 2330 2317
 | MACD | macd, macd_signal, macd_hist | 指數平滑異同移動平均線 (12,26,9) |
 | Bollinger Bands | bb_upper, bb_middle, bb_lower | 布林通道 (20日, 2倍標準差) |
 
-### 4.3 查看資料庫概況 (`status`)
+### 4.3 執行回測 (`backtest`)
+
+基於日K線與技術指標，模擬歷史交易並計算績效。
+
+```bash
+# SMA 均線交叉策略 (預設 10日 x 20日)
+python main.py backtest --stock 2330 --strategy sma_cross
+
+# RSI 超買超賣策略 (預設 30/70)
+python main.py backtest --stock 2330 --strategy rsi_threshold
+
+# 指定回測期間
+python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --end 2025-12-31
+```
+
+可用策略：
+| 策略名稱 | 說明 | 買入條件 | 賣出條件 |
+|----------|------|----------|----------|
+| `sma_cross` | SMA 均線交叉 | 快線上穿慢線（黃金交叉） | 快線下穿慢線（死亡交叉） |
+| `rsi_threshold` | RSI 超買超賣 | RSI 突破超賣線(30) | RSI 跌破超買線(70) |
+
+交易成本設定（符合台股實際費率）：
+- 手續費: 0.1425%（買賣各收一次）
+- 交易稅: 0.3%（僅賣出時收取）
+- 滑價: 0.05%
+- 初始資金: 1,000,000 元
+
+### 4.4 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -159,7 +186,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。四張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。六張核心表：
 
 ### daily_price（日K線）
 
@@ -215,6 +242,37 @@ python main.py status
 | value | Float | 指標值 |
 
 唯一鍵：`(stock_id, date, name)`
+
+### backtest_result（回測結果）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| strategy_name | String | 策略名稱 |
+| start_date | Date | 回測起始日 |
+| end_date | Date | 回測結束日 |
+| initial_capital | Float | 初始資金 |
+| final_capital | Float | 最終資金 |
+| total_return | Float | 總報酬率 (%) |
+| annual_return | Float | 年化報酬率 (%) |
+| sharpe_ratio | Float | Sharpe Ratio |
+| max_drawdown | Float | 最大回撤 (%) |
+| win_rate | Float | 勝率 (%) |
+| total_trades | Integer | 交易次數 |
+| created_at | DateTime | 建立時間 |
+
+### trade（交易明細）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| backtest_id | Integer | 關聯的回測結果 ID (FK) |
+| entry_date | Date | 進場日期 |
+| entry_price | Float | 進場價格 |
+| exit_date | Date | 出場日期 |
+| exit_price | Float | 出場價格 |
+| shares | Integer | 股數 |
+| pnl | Float | 損益金額 |
+| return_pct | Float | 報酬率 (%) |
 
 ---
 
