@@ -16,6 +16,9 @@ Usage:
     # 執行回測
     python main.py backtest --stock 2330 --strategy sma_cross
 
+    # 啟動視覺化儀表板
+    python main.py dashboard
+
     # 查詢已入庫的資料概況
     python main.py status
 """
@@ -121,6 +124,17 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print(f"  (結果已儲存, id={bt_id})")
 
 
+def cmd_dashboard() -> None:
+    """啟動 Streamlit 儀表板。"""
+    import subprocess
+
+    from src.config import PROJECT_ROOT
+
+    app_path = PROJECT_ROOT / "src" / "visualization" / "app.py"
+    print(f"啟動儀表板: http://localhost:8501")
+    subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)], cwd=str(PROJECT_ROOT))
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """顯示資料庫概況。"""
     from sqlalchemy import func, select
@@ -206,6 +220,9 @@ def main() -> None:
     sp_bt.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
     sp_bt.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
 
+    # dashboard 子命令
+    subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -217,6 +234,8 @@ def main() -> None:
         cmd_compute(args)
     elif args.command == "backtest":
         cmd_backtest(args)
+    elif args.command == "dashboard":
+        cmd_dashboard()
     elif args.command == "status":
         cmd_status(args)
     else:

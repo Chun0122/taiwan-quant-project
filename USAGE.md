@@ -50,9 +50,19 @@ taiwan-quant-project/
 │   │   └── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   ├── features/
 │   │   └── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
-│   ├── strategy/            # 交易策略（P2 待開發）
-│   ├── backtest/            # 回測引擎（P2 待開發）
-│   └── visualization/       # 視覺化（P3 待開發）
+│   ├── strategy/
+│   │   ├── base.py          # 策略抽象基類
+│   │   ├── sma_cross.py     # SMA 均線交叉策略
+│   │   └── rsi_threshold.py # RSI 超買超賣策略
+│   ├── backtest/
+│   │   └── engine.py        # 回測引擎 + 績效計算
+│   └── visualization/
+│       ├── app.py            # Streamlit 儀表板入口
+│       ├── data_loader.py    # 資料查詢模組
+│       ├── charts.py         # Plotly 圖表元件
+│       └── pages/            # 頁面模組
+│           ├── stock_analysis.py    # 個股分析頁
+│           └── backtest_review.py   # 回測結果頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -168,7 +178,18 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 - 滑價: 0.05%
 - 初始資金: 1,000,000 元
 
-### 4.4 查看資料庫概況 (`status`)
+### 4.4 啟動視覺化儀表板 (`dashboard`)
+
+```bash
+python main.py dashboard
+```
+
+瀏覽器會自動開啟 `http://localhost:8501`，包含兩個頁面：
+
+- **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
+- **回測結果**: 績效摘要卡片 + 權益曲線/回撤圖 + 交易明細 + 回測比較表
+
+### 4.5 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
