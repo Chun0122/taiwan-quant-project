@@ -10,6 +10,9 @@ Usage:
     # 指定日期範圍
     python main.py sync --start 2023-01-01 --end 2024-12-31
 
+    # 計算技術指標
+    python main.py compute
+
     # 查詢已入庫的資料概況
     python main.py status
 """
@@ -54,12 +57,31 @@ def cmd_sync(args: argparse.Namespace) -> None:
             )
 
 
+def cmd_compute(args: argparse.Namespace) -> None:
+    """計算技術指標。"""
+    from src.data.pipeline import sync_indicators
+
+    stocks = args.stocks if args.stocks else None
+    results = sync_indicators(watchlist=stocks)
+
+    print("\n" + "=" * 60)
+    print("指標計算結果摘要")
+    print("=" * 60)
+    for stock_id, count in results.items():
+        if count < 0:
+            print(f"  {stock_id}: 失敗")
+        else:
+            print(f"  {stock_id}: {count:,} 筆指標")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """顯示資料庫概況。"""
     from sqlalchemy import func, select
 
     from src.data.database import get_session, init_db
-    from src.data.schema import DailyPrice, InstitutionalInvestor, MarginTrading
+    from src.data.schema import (
+        DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator,
+    )
 
     init_db()
 
@@ -68,6 +90,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             (DailyPrice, "日K線"),
             (InstitutionalInvestor, "三大法人"),
             (MarginTrading, "融資融券"),
+            (TechnicalIndicator, "技術指標"),
         ]:
             total = session.execute(
                 select(func.count()).select_from(model)
@@ -84,6 +107,17 @@ def cmd_status(args: argparse.Namespace) -> None:
 
             print(f"[{label}] {total:,} 筆 | {stocks} 檔股票 | {min_date} ~ {max_date}")
 
+        # 額外顯示各指標名稱的筆數
+        indicator_counts = session.execute(
+            select(TechnicalIndicator.name, func.count())
+            .group_by(TechnicalIndicator.name)
+            .order_by(TechnicalIndicator.name)
+        ).all()
+        if indicator_counts:
+            print("\n  指標明細:")
+            for name, cnt in indicator_counts:
+                print(f"    {name:15s} {cnt:>8,} 筆")
+
 
 def main() -> None:
     setup_logging()
@@ -97,6 +131,10 @@ def main() -> None:
     sp_sync.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
     sp_sync.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
 
+    # compute 子命令
+    sp_compute = subparsers.add_parser("compute", help="計算技術指標")
+    sp_compute.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -104,6 +142,8 @@ def main() -> None:
 
     if args.command == "sync":
         cmd_sync(args)
+    elif args.command == "compute":
+        cmd_compute(args)
     elif args.command == "status":
         cmd_status(args)
     else:

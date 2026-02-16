@@ -48,7 +48,8 @@ taiwan-quant-project/
 │   │   ├── schema.py        # ORM 資料表定義
 │   │   ├── fetcher.py       # FinMind API 資料抓取
 │   │   └── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
-│   ├── features/            # 技術指標（P1 待開發）
+│   ├── features/
+│   │   └── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
 │   ├── strategy/            # 交易策略（P2 待開發）
 │   ├── backtest/            # 回測引擎（P2 待開發）
 │   └── visualization/       # 視覺化（P3 待開發）
@@ -120,7 +121,27 @@ python main.py sync --stocks 2330 --start 2024-01-01
 | 三大法人買賣超 | TaiwanStockInstitutionalInvestorsBuySell | `institutional_investor` |
 | 融資融券 | TaiwanStockMarginPurchaseShortSale | `margin_trading` |
 
-### 4.2 查看資料庫概況 (`status`)
+### 4.2 計算技術指標 (`compute`)
+
+基於已入庫的日K線資料，計算技術指標並寫入 `technical_indicator` 表。
+
+```bash
+# 計算 watchlist 中所有股票的指標
+python main.py compute
+
+# 只計算指定股票
+python main.py compute --stocks 2330 2317
+```
+
+目前支援的指標：
+| 指標 | name 欄位值 | 說明 |
+|------|-------------|------|
+| SMA | sma_5, sma_10, sma_20, sma_60 | 簡單移動平均線 |
+| RSI | rsi_14 | 相對強弱指標 (14日) |
+| MACD | macd, macd_signal, macd_hist | 指數平滑異同移動平均線 (12,26,9) |
+| Bollinger Bands | bb_upper, bb_middle, bb_lower | 布林通道 (20日, 2倍標準差) |
+
+### 4.3 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -138,7 +159,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。三張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。四張核心表：
 
 ### daily_price（日K線）
 
@@ -183,6 +204,17 @@ python main.py status
 | short_balance | BigInteger | 融券餘額 |
 
 唯一鍵：`(stock_id, date)`
+
+### technical_indicator（技術指標 — EAV 長表）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 交易日 |
+| name | String | 指標名稱（如 sma_20, rsi_14, macd） |
+| value | Float | 指標值 |
+
+唯一鍵：`(stock_id, date, name)`
 
 ---
 

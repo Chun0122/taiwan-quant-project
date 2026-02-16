@@ -11,7 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.data.database import get_session, init_db
 from src.data.fetcher import FinMindFetcher
-from src.data.schema import DailyPrice, InstitutionalInvestor, MarginTrading
+from src.data.schema import DailyPrice, InstitutionalInvestor, MarginTrading, TechnicalIndicator
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -134,5 +134,41 @@ def sync_watchlist(
         except Exception:
             logger.exception("[%s] 同步失敗", stock_id)
             all_results[stock_id] = {"error": True}
+
+    return all_results
+
+
+# ------------------------------------------------------------------ #
+#  P1: 技術指標計算
+# ------------------------------------------------------------------ #
+
+def _upsert_indicators(df: pd.DataFrame) -> int:
+    """將技術指標 DataFrame 寫入 technical_indicator 表。"""
+    return _upsert_batch(TechnicalIndicator, df, ["stock_id", "date", "name"])
+
+
+def sync_indicators(
+    watchlist: list[str] | None = None,
+) -> dict[str, int]:
+    """計算關注清單中所有股票的技術指標並寫入 DB。"""
+    from src.features.indicators import compute_indicators
+
+    if watchlist is None:
+        watchlist = settings.fetcher.watchlist
+
+    init_db()
+
+    all_results = {}
+    for stock_id in watchlist:
+        logger.info("=" * 50)
+        logger.info("計算指標: %s", stock_id)
+        try:
+            df = compute_indicators(stock_id)
+            count = _upsert_indicators(df)
+            all_results[stock_id] = count
+            logger.info("[%s] 完成 — %d 筆指標", stock_id, count)
+        except Exception:
+            logger.exception("[%s] 指標計算失敗", stock_id)
+            all_results[stock_id] = -1
 
     return all_results

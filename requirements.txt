@@ -15,7 +15,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
 # Technical indicators (P1)
-# pandas_ta>=0.3.14
+ta>=0.11.0
 
 # Backtesting (P2)
 # vectorbt>=0.26.0

@@ -1,9 +1,10 @@
 """SQLAlchemy ORM 資料表定義。
 
-三張核心表：
+四張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
+- TechnicalIndicator:      技術指標（EAV 長表）
 """
 
 from datetime import date
@@ -77,3 +78,25 @@ class MarginTrading(Base):
 
     def __repr__(self) -> str:
         return f"<Margin {self.stock_id} {self.date} 融資餘額={self.margin_balance}>"
+
+
+class TechnicalIndicator(Base):
+    """技術指標（EAV 長表）。
+
+    每一列代表某股票某日某指標的值，例如：
+    (2330, 2024-01-02, "sma_20", 580.5)
+    """
+
+    __tablename__ = "technical_indicator"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", "name", name="uq_technical_indicator"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(30), nullable=False, index=True)  # e.g. sma_5, rsi_14
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<Indicator {self.stock_id} {self.date} {self.name}={self.value}>"
