@@ -44,6 +44,7 @@ if exist venv\\Scripts\\activate.bat (
 
 "{python_exe}" "{main_script}" sync >> "{log_dir}\\sync.log" 2>&1
 "{python_exe}" "{main_script}" compute >> "{log_dir}\\compute.log" 2>&1
+"{python_exe}" "{main_script}" scan --notify >> "{log_dir}\\scan.log" 2>&1
 
 echo [%date% %time%] Daily sync completed.
 """

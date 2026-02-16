@@ -21,3 +21,10 @@ fetcher:
 # 日誌等級
 logging:
   level: "INFO"
+
+# Discord Webhook 通知設定
+# 在 Discord 頻道設定 → 整合 → Webhook → 建立 Webhook，複製 URL
+discord:
+  webhook_url: ""              # 填入你的 Discord Webhook URL
+  username: "台股量化系統"       # Webhook 顯示名稱
+  enabled: true                # 設為 false 可暫時停用通知

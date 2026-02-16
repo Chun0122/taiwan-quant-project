@@ -56,7 +56,13 @@ taiwan-quant-project/
 │   │   ├── rsi_threshold.py # RSI 超買超賣策略
 │   │   ├── bb_breakout.py   # 布林通道突破策略
 │   │   ├── macd_cross.py    # MACD 交叉策略
-│   │   └── buy_hold.py      # 買入持有基準策略
+│   │   ├── buy_hold.py      # 買入持有基準策略
+│   │   └── multi_factor.py  # 多因子組合策略
+│   ├── screener/
+│   │   ├── factors.py       # 因子定義（8 個因子）
+│   │   └── engine.py        # 多因子篩選引擎
+│   ├── notification/
+│   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
 │   │   └── engine.py        # 回測引擎 + 績效計算
 │   ├── optimization/
@@ -70,7 +76,8 @@ taiwan-quant-project/
 │       ├── charts.py         # Plotly 圖表元件
 │       └── pages/            # 頁面模組
 │           ├── stock_analysis.py    # 個股分析頁
-│           └── backtest_review.py   # 回測結果頁
+│           ├── backtest_review.py   # 回測結果頁
+│           └── screener_results.py  # 選股篩選頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -198,6 +205,9 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 | `bb_breakout` | 布林通道突破 | 價格從下軌反彈 | 價格從上軌回落 |
 | `macd_cross` | MACD 交叉 | MACD 上穿 Signal | MACD 下穿 Signal |
 | `buy_and_hold` | 買入持有 | 第一天買入 | 最後一天賣出 |
+| `multi_factor` | 多因子組合 | 加權分數 > 0.3 | 加權分數 < -0.3 |
+
+多因子策略綜合 RSI、MACD、法人動向、營收成長四大因子，加權計算後產生訊號。
 
 回測結果會自動顯示同期 Buy & Hold 基準報酬率與超額報酬。
 
@@ -213,12 +223,73 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含兩個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含三個頁面：
 
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片 + 權益曲線/回撤圖 + 交易明細 + 回測比較表
+- **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 
-### 4.5 參數優化 (`optimize`)
+### 4.5 多因子選股篩選 (`scan`)
+
+掃描 watchlist 中所有股票，計算多因子分數並排名。
+
+```bash
+# 使用全部因子掃描（預設）
+python main.py scan
+
+# 匯出結果到 CSV
+python main.py scan --export scan_results.csv
+
+# 掃描後發送 Discord 通知
+python main.py scan --notify
+
+# 指定篩選條件（只看 RSI 超賣 + 外資買超）
+python main.py scan --conditions rsi_oversold foreign_net_buy
+
+# 指定股票範圍
+python main.py scan --stocks 2330 2317 2454
+
+# 調整回溯天數
+python main.py scan --lookback 10
+```
+
+可用因子：
+| 因子名稱 | 類別 | 說明 |
+|----------|------|------|
+| `rsi_oversold` | 技術面 | RSI < 30（超賣） |
+| `macd_golden_cross` | 技術面 | MACD 上穿 Signal 線 |
+| `price_above_sma` | 技術面 | 收盤價 > SMA20 |
+| `foreign_net_buy` | 籌碼面 | 外資買超 |
+| `institutional_consecutive_buy` | 籌碼面 | 法人連續買超 3 天 |
+| `short_squeeze_ratio` | 籌碼面 | 券資比 > 20% |
+| `revenue_yoy_growth` | 基本面 | 月營收 YoY > 20% |
+| `revenue_consecutive_growth` | 基本面 | 連續營收月增 3 月 |
+
+### 4.6 Discord Webhook 通知 (`notify`)
+
+發送訊息到 Discord 頻道。需先在 `config/settings.yaml` 設定 Discord Webhook URL。
+
+```bash
+# 發送測試訊息
+python main.py notify --message "測試通知"
+```
+
+**設定步驟：**
+
+1. 開啟 Discord，進入要接收通知的頻道
+2. 頻道設定 → 整合 → Webhook → 建立 Webhook
+3. 複製 Webhook URL
+4. 在 `config/settings.yaml` 新增：
+
+```yaml
+discord:
+  webhook_url: "https://discord.com/api/webhooks/你的webhook"
+  username: "台股量化系統"
+  enabled: true
+```
+
+### 4.7 參數優化 (`optimize`)
+
 
 使用 Grid Search 窮舉參數組合，找出最佳策略參數。
 
@@ -244,9 +315,9 @@ python main.py optimize --stock 2330 --strategy macd_cross --start 2023-01-01
 | `bb_breakout` | period, std_dev | period=[10,15,20,25,30], std_dev=[1,2,3] |
 | `macd_cross` | fast, slow, signal | fast=[8,12,16], slow=[20,26,32], signal=[7,9,11] |
 
-### 4.6 自動排程 (`schedule`)
+### 4.8 自動排程 (`schedule`)
 
-設定每日自動同步資料與計算指標。
+設定每日自動同步資料、計算指標、執行篩選並發送 Discord 通知。
 
 ```bash
 # 產生 Windows Task Scheduler 腳本（建議）
@@ -259,7 +330,7 @@ python main.py schedule --mode simple
 Windows 模式會在 `scripts/` 目錄產生 `daily_sync.bat` 和 `task_schedule.xml`，
 按照輸出的說明匯入 Windows 工作排程器即可。
 
-### 4.7 查看資料庫概況 (`status`)
+### 4.9 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status

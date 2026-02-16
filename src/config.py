@@ -27,11 +27,18 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+class DiscordWebhookConfig(BaseModel):
+    webhook_url: str = ""
+    username: str = "台股量化系統"
+    enabled: bool = True
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
     fetcher: FetcherConfig = FetcherConfig()
     logging: LoggingConfig = LoggingConfig()
+    discord: DiscordWebhookConfig = DiscordWebhookConfig()
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:

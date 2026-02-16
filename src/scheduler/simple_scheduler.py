@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def daily_sync_job() -> None:
-    """每日同步與計算任務。"""
+    """每日同步、計算、篩選、通知任務。"""
     logger.info("=" * 60)
     logger.info("開始每日自動同步")
     logger.info("=" * 60)
@@ -25,6 +25,27 @@ def daily_sync_job() -> None:
         logger.info("每日同步完成")
     except Exception:
         logger.exception("每日同步失敗")
+        return
+
+    # 同步完成後執行篩選 + 通知
+    try:
+        from src.screener.engine import MultiFactorScreener
+        from src.notification.line_notify import send_scan_results
+        from src.config import settings
+
+        logger.info("開始每日自動篩選")
+        screener = MultiFactorScreener()
+        results = screener.scan()
+
+        if not results.empty:
+            logger.info("篩選完成，找到 %d 檔符合條件", len(results))
+            if settings.discord.webhook_url and settings.discord.enabled:
+                send_scan_results(results)
+                logger.info("Discord 通知已發送")
+        else:
+            logger.info("篩選完成，無符合條件的股票")
+    except Exception:
+        logger.exception("每日篩選/通知失敗")
 
 
 def run_scheduler() -> None:

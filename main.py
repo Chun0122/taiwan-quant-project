@@ -16,6 +16,9 @@ Usage:
     # 執行回測
     python main.py backtest --stock 2330 --strategy sma_cross
 
+    # 多因子策略回測
+    python main.py backtest --stock 2330 --strategy multi_factor
+
     # 啟動視覺化儀表板
     python main.py dashboard
 
@@ -27,6 +30,14 @@ Usage:
 
     # 查詢已入庫的資料概況
     python main.py status
+
+    # 多因子選股篩選
+    python main.py scan
+    python main.py scan --export scan_results.csv
+    python main.py scan --notify
+
+    # Discord 通知
+    python main.py notify --message "測試訊息"
 """
 
 from __future__ import annotations
@@ -254,6 +265,65 @@ def cmd_status(args: argparse.Namespace) -> None:
                 )
 
 
+def cmd_scan(args: argparse.Namespace) -> None:
+    """執行多因子選股篩選。"""
+    from src.data.database import init_db
+    from src.screener.engine import MultiFactorScreener
+
+    init_db()
+
+    stocks = args.stocks if args.stocks else None
+    screener = MultiFactorScreener(watchlist=stocks, lookback_days=args.lookback)
+
+    print("正在掃描股票...")
+    if args.conditions:
+        results = screener.scan_with_conditions(args.conditions, require_all=True)
+    else:
+        results = screener.scan()
+
+    if results.empty:
+        print("無符合條件的股票")
+        return
+
+    # 顯示結果
+    print(f"\n{'=' * 70}")
+    print(f"篩選結果 — 共 {len(results)} 檔")
+    print(f"{'=' * 70}")
+
+    display_cols = ["stock_id", "close", "factor_score"]
+    optional = ["rsi_14", "foreign_net", "yoy_growth"]
+    for col in optional:
+        if col in results.columns:
+            display_cols.append(col)
+
+    print(results[[c for c in display_cols if c in results.columns]].to_string(index=False))
+
+    # 匯出 CSV
+    if args.export:
+        results.to_csv(args.export, index=False)
+        print(f"\n結果已匯出至: {args.export}")
+
+    # 發送 Discord 通知
+    if args.notify:
+        from src.notification.line_notify import send_scan_results
+        ok = send_scan_results(results)
+        if ok:
+            print("Discord 通知已發送")
+        else:
+            print("Discord 通知發送失敗（請確認 webhook_url 設定）")
+
+
+def cmd_notify(args: argparse.Namespace) -> None:
+    """發送 Discord Webhook 測試訊息。"""
+    from src.notification.line_notify import send_message
+
+    ok = send_message(args.message)
+    if ok:
+        print("Discord 通知發送成功")
+    else:
+        print("Discord 通知發送失敗（請確認 config/settings.yaml 的 discord.webhook_url 設定）")
+
+
 def main() -> None:
     setup_logging()
 
@@ -297,6 +367,18 @@ def main() -> None:
         help="排程模式: simple=前景執行, windows=產生 Task Scheduler 腳本",
     )
 
+    # scan 子命令
+    sp_scan = subparsers.add_parser("scan", help="多因子選股篩選")
+    sp_scan.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_scan.add_argument("--conditions", nargs="+", help="篩選條件（因子名稱）")
+    sp_scan.add_argument("--lookback", type=int, default=5, help="回溯天數 (預設 5)")
+    sp_scan.add_argument("--export", default=None, help="匯出 CSV 路徑")
+    sp_scan.add_argument("--notify", action="store_true", help="將結果發送 Discord 通知")
+
+    # notify 子命令
+    sp_notify = subparsers.add_parser("notify", help="發送 Discord Webhook 訊息")
+    sp_notify.add_argument("--message", required=True, help="訊息內容")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -314,6 +396,10 @@ def main() -> None:
         cmd_optimize(args)
     elif args.command == "schedule":
         cmd_schedule(args)
+    elif args.command == "scan":
+        cmd_scan(args)
+    elif args.command == "notify":
+        cmd_notify(args)
     elif args.command == "status":
         cmd_status(args)
     else:
