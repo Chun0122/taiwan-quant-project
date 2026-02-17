@@ -198,3 +198,73 @@ def format_industry_report(
             messages.append(stock_msg)
 
     return messages
+
+
+def format_discovery_report(result, top_n: int = 20) -> list[str]:
+    """將全市場掃描結果格式化為 Discord 訊息。
+
+    Args:
+        result: DiscoveryResult 實例
+        top_n: 顯示前 N 名
+
+    Returns:
+        訊息列表（可能多條，因 2000 字元上限）
+    """
+    if result.rankings is None or result.rankings.empty:
+        return ["**🔍 全市場選股掃描：**無符合條件的股票"]
+
+    messages = []
+    header = [
+        "**🔍 全市場選股掃描**",
+        f"掃描時間：{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+        f"掃描範圍：{result.total_stocks} 支 → 粗篩 {result.after_coarse} 支 → Top {min(top_n, len(result.rankings))}",
+        "",
+    ]
+
+    display = result.rankings.head(top_n)
+    lines = list(header)
+    lines.append("```")
+    lines.append(
+        f"{'#':>2} {'代號':>6} {'名稱':<6}  {'收盤':>7}  {'綜合':>5}  "
+        f"{'技術':>5}  {'籌碼':>5}  {'產業':<8}"
+    )
+    lines.append("─" * 58)
+
+    current_msg_lines = list(lines)
+
+    for _, row in display.iterrows():
+        name = str(row.get("stock_name", ""))[:6]
+        industry = str(row.get("industry_category", ""))[:8]
+        line = (
+            f"{int(row['rank']):>2} {row['stock_id']:>6} {name:<6}  "
+            f"{row['close']:>7.1f}  {row['composite_score']:>5.3f}  "
+            f"{row['technical_score']:>5.3f}  {row['chip_score']:>5.3f}  "
+            f"{industry:<8}"
+        )
+
+        test_msg = "\n".join(current_msg_lines + [line, "```"])
+        if len(test_msg) > 1900:
+            current_msg_lines.append("```")
+            messages.append("\n".join(current_msg_lines))
+            current_msg_lines = ["```", line]
+        else:
+            current_msg_lines.append(line)
+
+    current_msg_lines.append("```")
+
+    # 產業分布摘要
+    if result.sector_summary is not None and not result.sector_summary.empty:
+        sector_lines = ["\n**產業分布：**"]
+        for _, sr in result.sector_summary.head(5).iterrows():
+            sector_lines.append(f"  {sr['industry']}: {sr['count']} 支 (均分 {sr['avg_score']:.3f})")
+        sector_text = "\n".join(sector_lines)
+
+        test = "\n".join(current_msg_lines) + sector_text
+        if len(test) <= 1950:
+            current_msg_lines.append(sector_text)
+        else:
+            messages.append("\n".join(current_msg_lines))
+            current_msg_lines = [sector_text]
+
+    messages.append("\n".join(current_msg_lines))
+    return messages

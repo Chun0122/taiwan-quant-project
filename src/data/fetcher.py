@@ -103,6 +103,34 @@ class FinMindFetcher(DataFetcher):
         time.sleep(0.5)
         return df
 
+    def _request_by_date(self, dataset: str, start: str, end: str) -> pd.DataFrame:
+        """按日期查全市場（不指定 data_id），回傳所有股票的資料。"""
+        params = {
+            "dataset": dataset,
+            "start_date": start,
+            "end_date": end,
+        }
+        if self.api_token:
+            params["token"] = self.api_token
+
+        logger.info("抓取全市場 %s | %s ~ %s", dataset, start, end)
+
+        resp = self._session.get(self.api_url, params=params, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get("msg") != "success":
+            raise RuntimeError(
+                f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})"
+            )
+
+        df = pd.DataFrame(payload.get("data", []))
+        if df.empty:
+            logger.warning("無資料: 全市場 %s %s~%s", dataset, start, end)
+
+        time.sleep(1)
+        return df
+
     # ------------------------------------------------------------------ #
     #  公開介面
     # ------------------------------------------------------------------ #
@@ -265,6 +293,56 @@ class FinMindFetcher(DataFetcher):
                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
         df["cash_dividend"] = df.get("cash_dividend", pd.Series(dtype=float)).fillna(0.0)
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
+        return df
+
+    def fetch_all_daily_price(
+        self, start: str, end: str | None = None
+    ) -> pd.DataFrame:
+        """抓取全市場日K線（不指定 stock_id，按日期查詢）。
+
+        回傳欄位同 fetch_daily_price: date, stock_id, open, high, low, close, volume, turnover, spread
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request_by_date("TaiwanStockPrice", start, end)
+        if df.empty:
+            return df
+
+        df = df.rename(columns={
+            "Trading_Volume": "volume",
+            "Trading_money": "turnover",
+            "max": "high",
+            "min": "low",
+        })
+        keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    def fetch_all_institutional(
+        self, start: str, end: str | None = None
+    ) -> pd.DataFrame:
+        """抓取全市場三大法人買賣超（不指定 stock_id，按日期查詢）。
+
+        回傳欄位同 fetch_institutional: date, stock_id, name, buy, sell, net
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request_by_date(
+            "TaiwanStockInstitutionalInvestorsBuySell", start, end
+        )
+        if df.empty:
+            return df
+
+        df = df.rename(columns={"name": "name", "buy": "buy", "sell": "sell"})
+        if "net" not in df.columns:
+            df["net"] = df["buy"] - df["sell"]
+
+        keep = ["date", "stock_id", "name", "buy", "sell", "net"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
     def fetch_stock_info(self) -> pd.DataFrame:

@@ -64,6 +64,8 @@ taiwan-quant-project/
 │   ├── screener/
 │   │   ├── factors.py       # 因子定義（8 個因子）
 │   │   └── engine.py        # 多因子篩選引擎
+│   ├── discovery/
+│   │   └── scanner.py       # 全市場選股掃描器（四階段漏斗）
 │   ├── report/
 │   │   ├── engine.py        # 每日選股報告引擎（四維度評分）
 │   │   └── formatter.py     # Discord 訊息格式化
@@ -593,7 +595,68 @@ python main.py industry --notify
 - **法人動能**：各產業內股票的三大法人淨買超合計
 - **價格動能**：各產業內股票的平均漲跌幅
 
-### 4.13 資料庫遷移 (`migrate`)
+### 4.13 全市場選股掃描 (`discover`)
+
+從全台灣 ~2000 支股票中自動篩選出值得關注的標的。透過 FinMind 的「按日期查全市場」API，僅需 2-3 次 API 呼叫即可取得全市場資料，不需逐一抓取。
+
+**漏斗架構：**
+```
+全市場 ~2000 支 → 粗篩 ~150 支 → 細評排名 → Top N 推薦
+```
+
+```bash
+# 預設掃描（同步資料 + 篩選 Top 20）
+python main.py discover
+
+# 顯示前 30 名
+python main.py discover --top 30
+
+# 調整股價範圍
+python main.py discover --min-price 50 --max-price 500
+
+# 調整最低成交量
+python main.py discover --min-volume 1000000
+
+# 跳過資料同步（使用 DB 已有資料）
+python main.py discover --skip-sync
+
+# 匯出 CSV
+python main.py discover --export picks.csv
+
+# 發送 Discord 通知
+python main.py discover --notify
+
+# 組合使用
+python main.py discover --top 30 --min-price 50 --export picks.csv --notify
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--top N` | 顯示前 N 名（預設 20） |
+| `--min-price N` | 最低股價門檻（預設 10） |
+| `--max-price N` | 最高股價門檻（預設 2000） |
+| `--min-volume N` | 最低成交量/股（預設 500000） |
+| `--skip-sync` | 跳過全市場資料同步，直接用 DB 既有資料 |
+| `--export PATH` | 匯出 CSV |
+| `--notify` | 發送 Discord 通知 |
+
+**篩選流程說明：**
+
+| 階段 | 動作 | 說明 |
+|------|------|------|
+| Stage 1 | 資料載入 | 從 DB 讀取最近 N 天全市場日K + 三大法人 |
+| Stage 2 | 粗篩 | 股價範圍、成交量門檻、法人買賣超、短期動能加權排名，取前 150 名 |
+| Stage 3 | 細評 | 三維度評分：技術面(35%) + 籌碼面(45%) + 基本面(20%) |
+| Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
+
+粗篩分數權重：成交量 30% + 法人淨買超 40% + 短期動能 30%
+
+細評三維度：
+- **技術面 (35%)**：SMA 趨勢、短期動能、價格位置、成交量趨勢（直接從 OHLCV 計算，不依賴 EAV 指標表）
+- **籌碼面 (45%)**：外資淨買超、投信淨買超、三大法人合計淨買超
+- **基本面 (20%)**：固定 0.5（批量掃描無法取得即時營收資料）
+
+### 4.14 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -608,7 +671,7 @@ python main.py migrate
 
 已存在的欄位會自動跳過，可重複執行。
 
-### 4.11 查看資料庫概況 (`status`)
+### 4.15 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status

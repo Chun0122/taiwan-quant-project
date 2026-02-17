@@ -65,6 +65,12 @@ Usage:
     python main.py industry --refresh --top-sectors 5
     python main.py industry --notify
 
+    # 全市場選股掃描
+    python main.py discover
+    python main.py discover --top 30 --min-price 50
+    python main.py discover --skip-sync --top 10
+    python main.py discover --export picks.csv --notify
+
     # DB 遷移
     python main.py migrate
 """
@@ -699,6 +705,78 @@ def cmd_industry(args: argparse.Namespace) -> None:
         print("\nDiscord 通知已發送")
 
 
+def cmd_discover(args: argparse.Namespace) -> None:
+    """執行全市場選股掃描。"""
+    from src.data.database import init_db
+    from src.data.pipeline import sync_market_data, sync_stock_info
+    from src.discovery.scanner import MarketScanner
+
+    init_db()
+
+    # 同步全市場資料（除非 --skip-sync）
+    if not args.skip_sync:
+        print("正在同步全市場資料...")
+        sync_stock_info(force_refresh=False)
+        counts = sync_market_data(days=10)
+        print(f"  日K線: {counts['daily_price']:,} 筆 | 法人: {counts['institutional']:,} 筆")
+
+    # 執行掃描
+    print("正在掃描全市場...")
+    scanner = MarketScanner(
+        min_price=args.min_price,
+        max_price=args.max_price,
+        min_volume=args.min_volume,
+        top_n_results=args.top,
+    )
+    result = scanner.run()
+
+    if result.rankings.empty:
+        print("無符合條件的股票")
+        return
+
+    # 顯示結果
+    display = result.rankings.head(args.top)
+    print(f"\n{'=' * 80}")
+    print(f"全市場選股掃描 — 掃描 {result.total_stocks} 支 → 粗篩 {result.after_coarse} 支 → Top {len(display)}")
+    print(f"{'=' * 80}")
+    print(
+        f"{'#':>3}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  {'綜合':>6}  "
+        f"{'技術':>6}  {'籌碼':>6}  {'基本':>6}  {'產業':<10}"
+    )
+    print(f"{'─' * 80}")
+
+    for _, row in display.iterrows():
+        name = str(row.get("stock_name", ""))[:8]
+        industry = str(row.get("industry_category", ""))[:10]
+        print(
+            f"{int(row['rank']):>3}  {row['stock_id']:>6} {name:<8}  "
+            f"{row['close']:>8.1f}  {row['composite_score']:>6.3f}  "
+            f"{row['technical_score']:>6.3f}  {row['chip_score']:>6.3f}  "
+            f"{row['fundamental_score']:>6.3f}  {industry:<10}"
+        )
+
+    # 產業分布
+    if result.sector_summary is not None and not result.sector_summary.empty:
+        print(f"\n{'─' * 40}")
+        print("產業分布")
+        for _, sr in result.sector_summary.head(8).iterrows():
+            print(f"  {sr['industry']:<14} {int(sr['count']):>3} 支  (均分 {sr['avg_score']:.3f})")
+
+    # 匯出 CSV
+    if args.export:
+        result.rankings.to_csv(args.export, index=False)
+        print(f"\n結果已匯出至: {args.export}")
+
+    # Discord 通知
+    if args.notify:
+        from src.notification.line_notify import send_message
+        from src.report.formatter import format_discovery_report
+        msgs = format_discovery_report(result, top_n=args.top)
+        for msg in msgs:
+            send_message(msg)
+        print("Discord 通知已發送")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -831,6 +909,16 @@ def main() -> None:
     sp_ind.add_argument("--momentum", type=int, default=60, help="價格動能回溯天數 (預設 60)")
     sp_ind.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
+    # discover 子命令
+    sp_disc = subparsers.add_parser("discover", help="全市場選股掃描")
+    sp_disc.add_argument("--top", type=int, default=20, help="顯示前 N 名 (預設 20)")
+    sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")
+    sp_disc.add_argument("--max-price", type=float, default=2000, help="最高股價 (預設 2000)")
+    sp_disc.add_argument("--min-volume", type=int, default=500_000, help="最低成交量 (預設 500000)")
+    sp_disc.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
+    sp_disc.add_argument("--export", default=None, help="匯出 CSV 路徑")
+    sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -865,6 +953,8 @@ def main() -> None:
         cmd_strategy_rank(args)
     elif args.command == "industry":
         cmd_industry(args)
+    elif args.command == "discover":
+        cmd_discover(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     else:

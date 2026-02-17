@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 from sqlalchemy import select, func
@@ -235,6 +235,48 @@ def sync_taiex_index(
     count = _upsert_daily_price(df)
     logger.info("[TAIEX] 完成 — %d 筆", count)
     return count
+
+
+def sync_market_data(
+    days: int = 10,
+    fetcher: FinMindFetcher | None = None,
+) -> dict[str, int]:
+    """同步全市場資料（日K + 三大法人），用於 discover 掃描。
+
+    透過 FinMind 的「按日期查全市場」API，2 次呼叫即可取得所有股票資料。
+
+    Args:
+        days: 抓取最近 N 天的資料
+        fetcher: 可注入 fetcher 實例
+
+    Returns:
+        dict: {"daily_price": N, "institutional": M}
+    """
+    init_db()
+
+    if fetcher is None:
+        fetcher = FinMindFetcher()
+
+    end = date.today()
+    start = end - timedelta(days=days)
+    start_str = start.isoformat()
+    end_str = end.isoformat()
+
+    result = {}
+
+    # --- 全市場日K線 ---
+    logger.info("[全市場] 同步日K線: %s ~ %s", start_str, end_str)
+    df_price = fetcher.fetch_all_daily_price(start_str, end_str)
+    result["daily_price"] = _upsert_daily_price(df_price)
+    logger.info("[全市場] 日K線完成 — %d 筆", result["daily_price"])
+
+    # --- 全市場三大法人 ---
+    logger.info("[全市場] 同步三大法人: %s ~ %s", start_str, end_str)
+    df_inst = fetcher.fetch_all_institutional(start_str, end_str)
+    result["institutional"] = _upsert_institutional(df_inst)
+    logger.info("[全市場] 三大法人完成 — %d 筆", result["institutional"])
+
+    return result
 
 
 # ------------------------------------------------------------------ #
