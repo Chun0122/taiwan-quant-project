@@ -47,6 +47,29 @@ def daily_sync_job() -> None:
     except Exception:
         logger.exception("每日篩選/通知失敗")
 
+    # 每日選股報告
+    try:
+        from src.report.engine import DailyReportEngine
+        from src.report.formatter import format_daily_report
+        from src.notification.line_notify import send_message
+        from src.config import settings
+
+        logger.info("開始生成每日選股報告")
+        engine = DailyReportEngine(ml_enabled=False)
+        report_df = engine.run()
+
+        if not report_df.empty:
+            logger.info("每日報告完成，共 %d 檔", len(report_df))
+            if settings.discord.webhook_url and settings.discord.enabled:
+                msgs = format_daily_report(report_df, top_n=10)
+                for msg in msgs:
+                    send_message(msg)
+                logger.info("每日報告 Discord 通知已發送")
+        else:
+            logger.info("每日報告：無資料")
+    except Exception:
+        logger.exception("每日報告生成/通知失敗")
+
 
 def run_scheduler() -> None:
     """啟動排程器（阻塞式，每日 23:00 執行）。"""

@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-八張核心表：
+九張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -9,6 +9,7 @@
 - TechnicalIndicator:      技術指標（EAV 長表）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
+- StockInfo:               股票基本資料（產業分類）
 """
 
 from datetime import date, datetime
@@ -226,6 +227,23 @@ class PortfolioBacktestResult(Base):
 
     def __repr__(self) -> str:
         return f"<PortfolioBacktest {self.stock_ids} {self.strategy_name} return={self.total_return:.2f}%>"
+
+
+class StockInfo(Base):
+    """股票基本資料（產業分類）。"""
+
+    __tablename__ = "stock_info"
+    __table_args__ = (UniqueConstraint("stock_id", name="uq_stock_info"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[str] = mapped_column(String(50), nullable=True)
+    industry_category: Mapped[str] = mapped_column(String(50), nullable=True, index=True)
+    listing_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<StockInfo {self.stock_id} {self.stock_name} [{self.industry_category}]>"
 
 
 class PortfolioTrade(Base):

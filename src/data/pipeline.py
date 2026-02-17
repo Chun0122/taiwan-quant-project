@@ -14,7 +14,7 @@ from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
     DailyPrice, InstitutionalInvestor, MarginTrading, MonthlyRevenue, Dividend,
     TechnicalIndicator, BacktestResult, Trade,
-    PortfolioBacktestResult, PortfolioTrade,
+    PortfolioBacktestResult, PortfolioTrade, StockInfo,
 )
 from src.config import settings
 
@@ -164,6 +164,52 @@ def sync_watchlist(
             all_results[stock_id] = {"error": True}
 
     return all_results
+
+
+def sync_stock_info(force_refresh: bool = False) -> int:
+    """同步全市場股票基本資料（產業分類）到 stock_info 表。
+
+    Args:
+        force_refresh: True 時強制重新抓取，否則 DB 已有資料就跳過
+
+    Returns:
+        新增/更新的筆數
+    """
+    init_db()
+
+    if not force_refresh:
+        with get_session() as session:
+            count = session.execute(
+                select(func.count()).select_from(StockInfo)
+            ).scalar()
+            if count and count > 0:
+                logger.info("[StockInfo] DB 已有 %d 筆，跳過同步（使用 force_refresh=True 強制更新）", count)
+                return 0
+
+    fetcher = FinMindFetcher()
+    df = fetcher.fetch_stock_info()
+    if df.empty:
+        logger.warning("[StockInfo] 未取得任何資料")
+        return 0
+
+    records = df.to_dict("records")
+    with get_session() as session:
+        for i in range(0, len(records), 80):
+            batch = records[i : i + 80]
+            stmt = sqlite_upsert(StockInfo).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["stock_id"],
+                set_={
+                    "stock_name": stmt.excluded.stock_name,
+                    "industry_category": stmt.excluded.industry_category,
+                    "listing_type": stmt.excluded.listing_type,
+                },
+            )
+            session.execute(stmt)
+        session.commit()
+
+    logger.info("[StockInfo] 已同步 %d 筆股票基本資料", len(records))
+    return len(records)
 
 
 def sync_taiex_index(

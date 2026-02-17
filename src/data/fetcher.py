@@ -267,6 +267,48 @@ class FinMindFetcher(DataFetcher):
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
         return df
 
+    def fetch_stock_info(self) -> pd.DataFrame:
+        """抓取全市場股票基本資料（產業分類）。
+
+        使用 TaiwanStockInfo dataset，不需 stock_id/日期，一次回傳全市場。
+
+        回傳欄位: stock_id, stock_name, industry_category, listing_type
+        """
+        params = {"dataset": "TaiwanStockInfo"}
+        if self.api_token:
+            params["token"] = self.api_token
+
+        logger.info("抓取 TaiwanStockInfo（全市場股票基本資料）")
+
+        resp = self._session.get(self.api_url, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get("msg") != "success":
+            raise RuntimeError(
+                f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})"
+            )
+
+        df = pd.DataFrame(payload.get("data", []))
+        if df.empty:
+            logger.warning("無資料: TaiwanStockInfo")
+            return df
+
+        time.sleep(0.5)
+
+        rename_map = {
+            "stock_id": "stock_id",
+            "stock_name": "stock_name",
+            "industry_category": "industry_category",
+            "type": "listing_type",
+        }
+        df = df.rename(columns=rename_map)
+
+        keep = ["stock_id", "stock_name", "industry_category", "listing_type"]
+        df = df[[c for c in keep if c in df.columns]]
+
+        return df
+
     def fetch_taiex_index(
         self, start: str, end: str | None = None
     ) -> pd.DataFrame:

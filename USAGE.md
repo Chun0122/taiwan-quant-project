@@ -45,7 +45,7 @@ taiwan-quant-project/
 │   ├── config.py            # 設定管理模組
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義（含投資組合表）
+│   │   ├── schema.py        # ORM 資料表定義（含投資組合表 + StockInfo）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   │   └── migrate.py       # SQLite Schema 遷移
@@ -64,6 +64,13 @@ taiwan-quant-project/
 │   ├── screener/
 │   │   ├── factors.py       # 因子定義（8 個因子）
 │   │   └── engine.py        # 多因子篩選引擎
+│   ├── report/
+│   │   ├── engine.py        # 每日選股報告引擎（四維度評分）
+│   │   └── formatter.py     # Discord 訊息格式化
+│   ├── strategy_rank/
+│   │   └── engine.py        # 策略回測排名引擎
+│   ├── industry/
+│   │   └── analyzer.py      # 產業輪動分析引擎
 │   ├── notification/
 │   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
@@ -73,18 +80,19 @@ taiwan-quant-project/
 │   ├── optimization/
 │   │   └── grid_search.py   # Grid Search 參數優化
 │   ├── scheduler/
-│   │   ├── simple_scheduler.py  # 前景排程器
+│   │   ├── simple_scheduler.py  # 前景排程器（含每日報告）
 │   │   └── windows_task.py      # Windows Task Scheduler 產生器
 │   └── visualization/
 │       ├── app.py            # Streamlit 儀表板入口
 │       ├── data_loader.py    # 資料查詢模組
 │       ├── charts.py         # Plotly 圖表元件
 │       └── pages/            # 頁面模組
-│           ├── stock_analysis.py    # 個股分析頁
-│           ├── backtest_review.py   # 回測結果頁
-│           ├── screener_results.py  # 選股篩選頁
-│           ├── portfolio_review.py  # 投資組合頁
-│           └── ml_analysis.py       # ML 策略分析頁
+│           ├── stock_analysis.py      # 個股分析頁
+│           ├── backtest_review.py     # 回測結果頁
+│           ├── screener_results.py    # 選股篩選頁
+│           ├── portfolio_review.py    # 投資組合頁
+│           ├── ml_analysis.py         # ML 策略分析頁
+│           └── industry_rotation.py   # 產業輪動分析頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -311,13 +319,14 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含五個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含六個頁面：
 
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
 - **投資組合**: 組合回測績效 + 個股配置圓餅圖 + 個股報酬柱狀圖 + 交易明細
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 - **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
+- **產業輪動**: 產業綜合排名 + 泡泡圖（法人 vs 動能）+ 法人淨買超長條圖 + 精選個股
 
 ### 4.5 多因子選股篩選 (`scan`)
 
@@ -461,7 +470,130 @@ python main.py walk-forward --stock 2330 --strategy ml_xgboost --stop-loss 5 --t
 
 Walk-Forward 也支援所有風險管理參數（`--stop-loss`、`--take-profit`、`--trailing-stop`、`--sizing`、`--fraction`）。
 
-### 4.10 資料庫遷移 (`migrate`)
+### 4.10 每日選股報告 (`report`)
+
+四維度（技術面/籌碼面/基本面/ML）綜合評分，自動排名最值得關注的股票。
+
+```bash
+# 預設前 10 名
+python main.py report
+
+# 顯示前 20 名
+python main.py report --top 20
+
+# 跳過 ML 評分（速度更快）
+python main.py report --no-ml
+
+# 指定股票範圍
+python main.py report --stocks 2330 2317 2454
+
+# 發送 Discord 通知
+python main.py report --notify
+
+# 匯出 CSV
+python main.py report --export daily_report.csv
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--top N` | 顯示前 N 名（預設 10） |
+| `--no-ml` | 跳過 ML 評分，加快速度 |
+| `--stocks SID ...` | 指定股票代號 |
+| `--export PATH` | 匯出 CSV |
+| `--notify` | 發送 Discord 通知 |
+
+四維度評分說明：
+
+| 維度 | 權重 | 評分依據 |
+|------|------|----------|
+| 技術面 | 30% | RSI 位置、MACD 多空、SMA20 多空 |
+| 籌碼面 | 30% | 外資買超比例、法人合計買超比例、融資變化 |
+| 基本面 | 20% | 營收 YoY 成長率、MoM 成長加分 |
+| ML 預測 | 20% | Random Forest predict_proba 信心指標 |
+
+### 4.11 策略回測排名 (`strategy-rank`)
+
+批次回測 watchlist × 策略的所有組合，找出最佳股票-策略配對。
+
+```bash
+# 預設 watchlist × 6 個快速策略
+python main.py strategy-rank
+
+# 按 Sharpe Ratio 排名（預設）
+python main.py strategy-rank --metric sharpe
+
+# 按勝率排名
+python main.py strategy-rank --metric win_rate
+
+# 指定策略
+python main.py strategy-rank --strategies sma_cross rsi_threshold macd_cross
+
+# 指定股票
+python main.py strategy-rank --stocks 2330 2317 2454
+
+# 指定回測期間
+python main.py strategy-rank --start 2023-01-01
+
+# 設定最少交易次數門檻
+python main.py strategy-rank --min-trades 5
+
+# 匯出 + Discord 通知
+python main.py strategy-rank --export rank.csv --notify
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--metric NAME` | 排名指標：`sharpe`（預設）/ `total_return` / `win_rate` / `annual_return` |
+| `--strategies NAME ...` | 指定策略名稱（預設 6 個快速策略） |
+| `--stocks SID ...` | 指定股票代號 |
+| `--start DATE` | 回測起始日期 |
+| `--end DATE` | 回測結束日期 |
+| `--min-trades N` | 最少交易次數（預設 3） |
+| `--export PATH` | 匯出 CSV |
+| `--notify` | 發送 Discord 通知 |
+
+### 4.12 產業輪動分析 (`industry`)
+
+分析各產業的法人資金動能與價格動能，找出當前熱門產業及精選個股。
+
+```bash
+# 預設分析
+python main.py industry
+
+# 強制重新抓取產業分類資料
+python main.py industry --refresh
+
+# 顯示前 5 名產業
+python main.py industry --top-sectors 5
+
+# 每產業選前 10 支股票
+python main.py industry --top 10
+
+# 調整法人回溯天數
+python main.py industry --lookback 30
+
+# 調整價格動能回溯天數
+python main.py industry --momentum 90
+
+# 發送 Discord 通知
+python main.py industry --notify
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--refresh` | 強制重新抓取 StockInfo 產業分類 |
+| `--top-sectors N` | 顯示前 N 名產業（預設 5） |
+| `--top N` | 每產業精選 N 支股票（預設 5） |
+| `--lookback N` | 法人資金流回溯天數（預設 20） |
+| `--momentum N` | 價格動能回溯天數（預設 60） |
+| `--stocks SID ...` | 指定股票範圍 |
+| `--notify` | 發送 Discord 通知 |
+
+產業排名綜合兩個維度（各占 50%）：
+- **法人動能**：各產業內股票的三大法人淨買超合計
+- **價格動能**：各產業內股票的平均漲跌幅
+
+### 4.13 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -494,7 +626,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。八張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。九張核心表：
 
 ### daily_price（日K線）
 
@@ -655,6 +787,18 @@ python main.py status
 | pnl | Float | 損益金額 |
 | return_pct | Float | 報酬率 (%) |
 | exit_reason | String | 出場原因 |
+
+### stock_info（股票基本資料，P8 新增）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| stock_name | String | 股票名稱 |
+| industry_category | String | 產業分類 |
+| listing_type | String | 上市/上櫃 |
+| updated_at | DateTime | 更新時間 |
+
+唯一鍵：`(stock_id)`
 
 ---
 

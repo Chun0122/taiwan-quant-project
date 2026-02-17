@@ -9,7 +9,7 @@ from src.data.database import get_session, init_db
 from src.data.schema import (
     BacktestResult, DailyPrice, InstitutionalInvestor,
     MarginTrading, TechnicalIndicator, Trade,
-    PortfolioBacktestResult, PortfolioTrade,
+    PortfolioBacktestResult, PortfolioTrade, StockInfo,
 )
 
 init_db()
@@ -241,6 +241,27 @@ def load_portfolio_by_id(portfolio_id: int) -> dict | None:
         "cvar_95": getattr(r, "cvar_95", None),
         "profit_factor": getattr(r, "profit_factor", None),
         "allocation_method": getattr(r, "allocation_method", None),
+    }
+
+
+def load_stock_info_map() -> dict[str, dict]:
+    """載入全部股票基本資料。
+
+    Returns:
+        {stock_id: {"stock_name": ..., "industry_category": ..., "listing_type": ...}}
+    """
+    with get_session() as session:
+        rows = session.execute(
+            select(StockInfo).order_by(StockInfo.stock_id)
+        ).scalars().all()
+
+    return {
+        r.stock_id: {
+            "stock_name": r.stock_name,
+            "industry_category": r.industry_category,
+            "listing_type": r.listing_type,
+        }
+        for r in rows
     }
 
 

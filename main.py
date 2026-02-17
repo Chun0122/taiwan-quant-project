@@ -52,6 +52,19 @@ Usage:
     python main.py walk-forward --stock 2330 --strategy ml_random_forest
     python main.py walk-forward --stock 2330 --strategy ml_xgboost --train-window 504 --test-window 126
 
+    # 每日選股報告
+    python main.py report --top 10
+    python main.py report --no-ml --notify
+    python main.py report --export daily_report.csv
+
+    # 策略回測排名
+    python main.py strategy-rank --metric sharpe
+    python main.py strategy-rank --strategies sma_cross rsi_threshold --stocks 2330 2317
+
+    # 產業輪動分析
+    python main.py industry --refresh --top-sectors 5
+    python main.py industry --notify
+
     # DB 遷移
     python main.py migrate
 """
@@ -61,6 +74,8 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+
+import pandas as pd
 
 from src.config import settings
 
@@ -517,6 +532,173 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
             )
 
 
+def cmd_report(args: argparse.Namespace) -> None:
+    """執行每日選股報告。"""
+    from src.data.database import init_db
+    from src.report.engine import DailyReportEngine
+
+    init_db()
+
+    stocks = args.stocks if args.stocks else None
+    engine = DailyReportEngine(
+        watchlist=stocks,
+        lookback_days=5,
+        ml_enabled=not args.no_ml,
+    )
+
+    print("正在計算四維度評分...")
+    df = engine.run()
+
+    if df.empty:
+        print("無資料可生成報告")
+        return
+
+    # 顯示結果
+    display = df.head(args.top)
+    print(f"\n{'=' * 75}")
+    print(f"每日選股報告 — 前 {min(args.top, len(df))} 名（共 {len(df)} 檔）")
+    print(f"{'=' * 75}")
+    print(f"{'#':>3}  {'代號':>6}  {'收盤':>8}  {'綜合':>6}  {'技術':>6}  {'籌碼':>6}  "
+          f"{'基本':>6}  {'ML':>6}  {'RSI':>5}  {'外資':>10}  {'YoY':>7}")
+    print(f"{'─' * 75}")
+
+    for _, row in display.iterrows():
+        rsi = f"{row['rsi']:.0f}" if pd.notna(row.get('rsi')) else "N/A"
+        foreign = f"{row['foreign_net']:>10,.0f}" if pd.notna(row.get('foreign_net')) else "       N/A"
+        yoy = f"{row['yoy_growth']:.1f}%" if pd.notna(row.get('yoy_growth')) else "   N/A"
+        print(
+            f"{int(row['rank']):>3}  {row['stock_id']:>6}  {row['close']:>8.1f}  "
+            f"{row['composite_score']:>6.3f}  {row['technical_score']:>6.3f}  "
+            f"{row['chip_score']:>6.3f}  {row['fundamental_score']:>6.3f}  "
+            f"{row['ml_score']:>6.3f}  {rsi:>5}  {foreign}  {yoy:>7}"
+        )
+
+    if args.export:
+        df.to_csv(args.export, index=False)
+        print(f"\n結果已匯出至: {args.export}")
+
+    if args.notify:
+        from src.notification.line_notify import send_message
+        from src.report.formatter import format_daily_report
+        msgs = format_daily_report(df, top_n=args.top)
+        for msg in msgs:
+            send_message(msg)
+        print("Discord 通知已發送")
+
+
+def cmd_strategy_rank(args: argparse.Namespace) -> None:
+    """執行策略回測排名。"""
+    from src.data.database import init_db
+    from src.strategy_rank.engine import StrategyRankEngine
+
+    init_db()
+
+    stocks = args.stocks if args.stocks else None
+    strategies = args.strategies if args.strategies else None
+
+    engine = StrategyRankEngine(
+        watchlist=stocks,
+        strategy_names=strategies,
+        metric=args.metric,
+        start_date=args.start,
+        end_date=args.end,
+        min_trades=args.min_trades,
+    )
+
+    print("正在執行批次回測...")
+    df = engine.run()
+    engine.print_summary(df, top_n=20)
+
+    if args.export and not df.empty:
+        df.to_csv(args.export, index=False)
+        print(f"\n結果已匯出至: {args.export}")
+
+    if args.notify and not df.empty:
+        from src.notification.line_notify import send_message
+        from src.report.formatter import format_strategy_rank
+        msg = format_strategy_rank(df, metric=args.metric)
+        send_message(msg)
+        print("Discord 通知已發送")
+
+
+def cmd_industry(args: argparse.Namespace) -> None:
+    """執行產業輪動分析。"""
+    from src.data.database import init_db
+    from src.data.pipeline import sync_stock_info
+    from src.industry.analyzer import IndustryRotationAnalyzer
+
+    init_db()
+
+    # 同步 StockInfo
+    if args.refresh:
+        print("正在同步股票基本資料...")
+        count = sync_stock_info(force_refresh=True)
+        print(f"已同步 {count} 筆")
+    else:
+        sync_stock_info(force_refresh=False)
+
+    stocks = args.stocks if args.stocks else None
+    analyzer = IndustryRotationAnalyzer(
+        watchlist=stocks,
+        lookback_days=args.lookback,
+        momentum_days=args.momentum,
+    )
+
+    print("正在分析產業輪動...")
+    sector_df = analyzer.rank_sectors()
+
+    if sector_df.empty:
+        print("無法計算產業排名（資料不足）")
+        return
+
+    # 顯示產業排名
+    display = sector_df.head(args.top_sectors)
+    print(f"\n{'=' * 70}")
+    print(f"產業輪動分析 — 前 {min(args.top_sectors, len(sector_df))} 名產業")
+    print(f"{'=' * 70}")
+    print(f"{'#':>3}  {'產業':<14}  {'綜合':>6}  {'法人':>6}  {'動能':>6}  {'淨買超':>14}  {'漲幅':>8}")
+    print(f"{'─' * 70}")
+
+    for _, row in display.iterrows():
+        total_net = row.get('total_net', 0)
+        avg_ret = row.get('avg_return_pct', 0)
+        print(
+            f"{int(row['rank']):>3}  {str(row['industry']):<14}  "
+            f"{row['sector_score']:>6.3f}  "
+            f"{row['institutional_score']:>6.3f}  "
+            f"{row['momentum_score']:>6.3f}  "
+            f"{total_net:>14,.0f}  {avg_ret:>7.2f}%"
+        )
+
+    # 精選個股
+    top_stocks = analyzer.top_stocks_from_hot_sectors(
+        sector_df, top_sectors=args.top_sectors, top_n=args.top
+    )
+    if not top_stocks.empty:
+        print(f"\n{'─' * 70}")
+        print("熱門產業精選個股")
+        print(f"{'─' * 70}")
+        for ind in top_stocks["industry"].unique():
+            sector_stocks = top_stocks[top_stocks["industry"] == ind]
+            print(f"\n  [{ind}]")
+            for _, sr in sector_stocks.iterrows():
+                name = sr.get('stock_name', '')
+                foreign = sr.get('foreign_net_sum', 0)
+                print(
+                    f"    {sr['stock_id']} {name:<8}  "
+                    f"收盤={sr['close']:>8.1f}  "
+                    f"外資淨買超={foreign:>12,.0f}"
+                )
+
+    if args.notify:
+        from src.notification.line_notify import send_message
+        from src.report.formatter import format_industry_report
+        msgs = format_industry_report(sector_df, top_stocks, top_n=args.top_sectors)
+        for msg in msgs:
+            send_message(msg)
+        print("\nDiscord 通知已發送")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -619,6 +801,36 @@ def main() -> None:
                         help="部位大小計算方式")
     sp_wf.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例")
 
+    # report 子命令
+    sp_report = subparsers.add_parser("report", help="每日選股報告")
+    sp_report.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_report.add_argument("--top", type=int, default=10, help="顯示前 N 名 (預設 10)")
+    sp_report.add_argument("--no-ml", action="store_true", help="跳過 ML 評分（較快）")
+    sp_report.add_argument("--export", default=None, help="匯出 CSV 路徑")
+    sp_report.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+
+    # strategy-rank 子命令
+    sp_sr = subparsers.add_parser("strategy-rank", help="策略回測排名")
+    sp_sr.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_sr.add_argument("--strategies", nargs="+", help="策略名稱（預設 6 個快速策略）")
+    sp_sr.add_argument("--metric", default="sharpe",
+                       help="排名指標 (sharpe/total_return/win_rate/annual_return)")
+    sp_sr.add_argument("--start", default=None, help="回測起始日期 (YYYY-MM-DD)")
+    sp_sr.add_argument("--end", default=None, help="回測結束日期 (YYYY-MM-DD)")
+    sp_sr.add_argument("--min-trades", type=int, default=3, help="最少交易次數 (預設 3)")
+    sp_sr.add_argument("--export", default=None, help="匯出 CSV 路徑")
+    sp_sr.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+
+    # industry 子命令
+    sp_ind = subparsers.add_parser("industry", help="產業輪動分析")
+    sp_ind.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_ind.add_argument("--refresh", action="store_true", help="強制重新抓取 StockInfo")
+    sp_ind.add_argument("--top-sectors", type=int, default=5, help="顯示前 N 名產業 (預設 5)")
+    sp_ind.add_argument("--top", type=int, default=5, help="每產業顯示前 N 支股票 (預設 5)")
+    sp_ind.add_argument("--lookback", type=int, default=20, help="法人流量回溯天數 (預設 20)")
+    sp_ind.add_argument("--momentum", type=int, default=60, help="價格動能回溯天數 (預設 60)")
+    sp_ind.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -647,6 +859,12 @@ def main() -> None:
         cmd_status(args)
     elif args.command == "walk-forward":
         cmd_walk_forward(args)
+    elif args.command == "report":
+        cmd_report(args)
+    elif args.command == "strategy-rank":
+        cmd_strategy_rank(args)
+    elif args.command == "industry":
+        cmd_industry(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     else:
