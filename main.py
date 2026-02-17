@@ -16,6 +16,15 @@ Usage:
     # 執行回測
     python main.py backtest --stock 2330 --strategy sma_cross
 
+    # 加停損停利
+    python main.py backtest --stock 2330 --strategy sma_cross --stop-loss 5 --take-profit 15
+
+    # 固定比例部位
+    python main.py backtest --stock 2330 --strategy rsi_threshold --sizing fixed_fraction --fraction 0.3
+
+    # 投資組合回測
+    python main.py backtest --stocks 2330 2317 2454 --strategy sma_cross --stop-loss 5
+
     # 多因子策略回測
     python main.py backtest --stock 2330 --strategy multi_factor
 
@@ -38,6 +47,9 @@ Usage:
 
     # Discord 通知
     python main.py notify --message "測試訊息"
+
+    # DB 遷移
+    python main.py migrate
 """
 
 from __future__ import annotations
@@ -105,12 +117,25 @@ def cmd_compute(args: argparse.Namespace) -> None:
             print(f"  {stock_id}: {count:,} 筆指標")
 
 
+def _build_risk_config(args: argparse.Namespace):
+    """從 CLI 參數建立 RiskConfig。"""
+    from src.backtest.engine import RiskConfig
+
+    return RiskConfig(
+        stop_loss_pct=args.stop_loss,
+        take_profit_pct=args.take_profit,
+        trailing_stop_pct=args.trailing_stop,
+        position_sizing=args.sizing,
+        fixed_fraction=args.fraction,
+    )
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
-    """執行回測。"""
+    """執行回測（單股或投資組合）。"""
     from datetime import date
 
     from src.data.database import init_db
-    from src.data.pipeline import save_backtest_result
+    from src.data.pipeline import save_backtest_result, save_portfolio_result
     from src.strategy import STRATEGY_REGISTRY
     from src.backtest.engine import BacktestEngine
 
@@ -124,10 +149,67 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     start = args.start or settings.fetcher.default_start_date
     end = args.end or date.today().isoformat()
 
+    risk_config = _build_risk_config(args)
     strategy_cls = STRATEGY_REGISTRY[args.strategy]
+
+    # --- 投資組合回測 ---
+    if args.stocks:
+        from src.backtest.portfolio import PortfolioBacktestEngine, PortfolioConfig
+
+        strategies = [
+            strategy_cls(stock_id=sid, start_date=start, end_date=end)
+            for sid in args.stocks
+        ]
+
+        portfolio_config = PortfolioConfig(allocation_method=args.allocation)
+
+        engine = PortfolioBacktestEngine(
+            strategies=strategies,
+            risk_config=risk_config,
+            portfolio_config=portfolio_config,
+        )
+        result = engine.run()
+
+        # 存入 DB
+        bt_id = save_portfolio_result(result)
+
+        # 印出摘要
+        print("\n" + "=" * 60)
+        print(f"投資組合回測結果 — {result.strategy_name}")
+        print(f"  股票: {', '.join(result.stock_ids)}")
+        print("=" * 60)
+        print(f"  期間:         {result.start_date} ~ {result.end_date}")
+        print(f"  配置方式:     {result.allocation_method}")
+        print(f"  初始資金:     {result.initial_capital:>14,.0f}")
+        print(f"  最終資金:     {result.final_capital:>14,.2f}")
+        print(f"  總報酬率:     {result.total_return:>13.2f}%")
+        print(f"  年化報酬率:   {result.annual_return:>13.2f}%")
+        print(f"  Sharpe Ratio: {result.sharpe_ratio or 'N/A':>13}")
+        print(f"  Sortino Ratio:{result.sortino_ratio or 'N/A':>13}")
+        print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
+        print(f"  Calmar Ratio: {result.calmar_ratio or 'N/A':>13}")
+        print(f"  勝率:         {result.win_rate or 'N/A':>13}%")
+        print(f"  交易次數:     {result.total_trades:>13}")
+        print(f"  VaR (95%):    {result.var_95 or 'N/A':>13}")
+        print(f"  CVaR (95%):   {result.cvar_95 or 'N/A':>13}")
+        print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
+
+        if result.per_stock_returns:
+            print("\n  個股報酬貢獻:")
+            for sid, ret in result.per_stock_returns.items():
+                print(f"    {sid}: {ret:+.2f}%")
+
+        print(f"  (結果已儲存, portfolio_id={bt_id})")
+        return
+
+    # --- 單股回測 ---
+    if not args.stock:
+        print("請指定 --stock 或 --stocks")
+        sys.exit(1)
+
     strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end)
 
-    engine = BacktestEngine(strategy)
+    engine = BacktestEngine(strategy, risk_config=risk_config)
     result = engine.run()
 
     # 存入 DB
@@ -147,9 +229,14 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         print(f"  超額報酬:     {alpha:>13.2f}%")
     print(f"  年化報酬率:   {result.annual_return:>13.2f}%")
     print(f"  Sharpe Ratio: {result.sharpe_ratio or 'N/A':>13}")
+    print(f"  Sortino Ratio:{result.sortino_ratio or 'N/A':>13}")
     print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
+    print(f"  Calmar Ratio: {result.calmar_ratio or 'N/A':>13}")
     print(f"  勝率:         {result.win_rate or 'N/A':>13}%")
     print(f"  交易次數:     {result.total_trades:>13}")
+    print(f"  VaR (95%):    {result.var_95 or 'N/A':>13}")
+    print(f"  CVaR (95%):   {result.cvar_95 or 'N/A':>13}")
+    print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
     print(f"  (結果已儲存, id={bt_id})")
 
 
@@ -208,7 +295,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     from src.data.schema import (
         DailyPrice, InstitutionalInvestor, MarginTrading,
         MonthlyRevenue, Dividend, TechnicalIndicator,
-        BacktestResult,
+        BacktestResult, PortfolioBacktestResult,
     )
 
     init_db()
@@ -260,6 +347,22 @@ def cmd_status(args: argparse.Namespace) -> None:
             for r in rows:
                 print(
                     f"  #{r.id} {r.stock_id} {r.strategy_name} | "
+                    f"報酬={r.total_return:+.2f}% | MDD={r.max_drawdown:.2f}% | "
+                    f"交易={r.total_trades}次"
+                )
+
+        # 投資組合回測摘要
+        pbt_count = session.execute(
+            select(func.count()).select_from(PortfolioBacktestResult)
+        ).scalar()
+        if pbt_count:
+            print(f"\n[投資組合回測] {pbt_count} 筆")
+            rows = session.execute(
+                select(PortfolioBacktestResult).order_by(PortfolioBacktestResult.id.desc()).limit(5)
+            ).scalars().all()
+            for r in rows:
+                print(
+                    f"  #{r.id} [{r.stock_ids}] {r.strategy_name} | "
                     f"報酬={r.total_return:+.2f}% | MDD={r.max_drawdown:.2f}% | "
                     f"交易={r.total_trades}次"
                 )
@@ -324,6 +427,19 @@ def cmd_notify(args: argparse.Namespace) -> None:
         print("Discord 通知發送失敗（請確認 config/settings.yaml 的 discord.webhook_url 設定）")
 
 
+def cmd_migrate(args: argparse.Namespace) -> None:
+    """執行 DB schema 遷移。"""
+    from src.data.migrate import run_migrations
+
+    added = run_migrations()
+    if added:
+        print(f"遷移完成，新增 {len(added)} 個欄位:")
+        for col in added:
+            print(f"  + {col}")
+    else:
+        print("資料庫已是最新，無需遷移")
+
+
 def main() -> None:
     setup_logging()
 
@@ -343,10 +459,22 @@ def main() -> None:
 
     # backtest 子命令
     sp_bt = subparsers.add_parser("backtest", help="執行回測")
-    sp_bt.add_argument("--stock", required=True, help="股票代號")
-    sp_bt.add_argument("--strategy", required=True, help="策略名稱 (sma_cross, rsi_threshold)")
+    sp_bt.add_argument("--stock", default=None, help="股票代號（單股回測）")
+    sp_bt.add_argument("--stocks", nargs="+", default=None, help="多支股票代號（投資組合回測）")
+    sp_bt.add_argument("--strategy", required=True, help="策略名稱 (sma_cross, rsi_threshold, ...)")
     sp_bt.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
     sp_bt.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+    # 風險管理參數
+    sp_bt.add_argument("--stop-loss", type=float, default=None, help="停損百分比 (例: 5.0 = -5%%)")
+    sp_bt.add_argument("--take-profit", type=float, default=None, help="停利百分比 (例: 15.0 = +15%%)")
+    sp_bt.add_argument("--trailing-stop", type=float, default=None, help="移動停損百分比 (例: 8.0)")
+    sp_bt.add_argument("--sizing", default="all_in",
+                        choices=["all_in", "fixed_fraction", "kelly", "atr"],
+                        help="部位大小計算方式")
+    sp_bt.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例 (0.0~1.0)")
+    sp_bt.add_argument("--allocation", default="equal_weight",
+                        choices=["equal_weight", "custom"],
+                        help="投資組合配置方式")
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
@@ -382,6 +510,9 @@ def main() -> None:
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
+    # migrate 子命令
+    subparsers.add_parser("migrate", help="執行資料庫 schema 遷移")
+
     args = parser.parse_args()
 
     if args.command == "sync":
@@ -402,6 +533,8 @@ def main() -> None:
         cmd_notify(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "migrate":
+        cmd_migrate(args)
     else:
         parser.print_help()
         sys.exit(1)

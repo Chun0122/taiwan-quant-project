@@ -11,6 +11,12 @@ from src.visualization.data_loader import (
 from src.visualization.charts import plot_equity_curve
 
 
+def _fmt(val, suffix="", default="N/A"):
+    if val is None:
+        return default
+    return f"{val}{suffix}"
+
+
 def render() -> None:
     st.title("🔄 回測結果")
 
@@ -51,13 +57,23 @@ def render() -> None:
     st.subheader(f"#{bt['id']} {bt['stock_id']} — {bt['strategy_name']}")
     st.caption(f"{bt['start_date']} ~ {bt['end_date']}")
 
+    # 第一排：核心指標
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("總報酬", f"{bt['total_return']:+.2f}%")
     c2.metric("年化報酬", f"{bt['annual_return']:+.2f}%")
-    c3.metric("Sharpe", f"{bt['sharpe_ratio']}" if bt["sharpe_ratio"] else "N/A")
+    c3.metric("Sharpe", _fmt(bt['sharpe_ratio']))
     c4.metric("最大回撤", f"{bt['max_drawdown']:.2f}%")
-    c5.metric("勝率", f"{bt['win_rate']}%" if bt["win_rate"] is not None else "N/A")
+    c5.metric("勝率", _fmt(bt['win_rate'], "%"))
 
+    # 第二排：進階指標
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Sortino", _fmt(bt.get('sortino_ratio')))
+    a2.metric("Calmar", _fmt(bt.get('calmar_ratio')))
+    a3.metric("VaR(95%)", _fmt(bt.get('var_95'), "%"))
+    a4.metric("CVaR(95%)", _fmt(bt.get('cvar_95'), "%"))
+    a5.metric("Profit Factor", _fmt(bt.get('profit_factor')))
+
+    # 第三排：資金
     m1, m2, m3 = st.columns(3)
     m1.metric("初始資金", f"{bt['initial_capital']:,.0f}")
     m2.metric("最終資金", f"{bt['final_capital']:,.2f}")
@@ -77,9 +93,27 @@ def render() -> None:
     if not trades.empty:
         st.subheader("交易明細")
         trade_display = trades.copy()
-        trade_display.columns = [
-            "進場日", "進場價", "出場日", "出場價", "股數", "損益", "報酬%",
-        ]
+
+        # 判斷是否有 exit_reason 欄位
+        has_exit_reason = "exit_reason" in trade_display.columns and trade_display["exit_reason"].notna().any()
+
+        if has_exit_reason:
+            trade_display = trade_display[[
+                "entry_date", "entry_price", "exit_date", "exit_price",
+                "shares", "pnl", "return_pct", "exit_reason",
+            ]]
+            trade_display.columns = [
+                "進場日", "進場價", "出場日", "出場價", "股數", "損益", "報酬%", "出場原因",
+            ]
+        else:
+            trade_display = trade_display[[
+                "entry_date", "entry_price", "exit_date", "exit_price",
+                "shares", "pnl", "return_pct",
+            ]]
+            trade_display.columns = [
+                "進場日", "進場價", "出場日", "出場價", "股數", "損益", "報酬%",
+            ]
+
         # 損益顏色標記
         st.dataframe(
             trade_display.style.map(

@@ -250,3 +250,97 @@ def plot_equity_curve(
     fig.update_yaxes(title_text="回撤 %", row=2, col=1)
 
     return fig
+
+
+# ------------------------------------------------------------------ #
+#  投資組合圖表
+# ------------------------------------------------------------------ #
+
+def plot_portfolio_equity(equity_curve: list[float], dates: list, initial_capital: float = 1_000_000) -> go.Figure:
+    """投資組合權益曲線。"""
+    eq_arr = np.array(equity_curve)
+    peak = np.maximum.accumulate(eq_arr)
+    drawdown = (peak - eq_arr) / peak * 100
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.7, 0.3], vertical_spacing=0.05,
+        subplot_titles=("組合權益曲線", "回撤 (%)"),
+    )
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=equity_curve, name="權益",
+        line=dict(color="#2196F3", width=2),
+        fill="tozeroy", fillcolor="rgba(33,150,243,0.1)",
+    ), row=1, col=1)
+
+    fig.add_hline(
+        y=initial_capital, line_dash="dash", line_color="gray",
+        annotation_text="初始資金", row=1, col=1,
+    )
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=-drawdown, name="回撤",
+        line=dict(color="#EF5350", width=1.5),
+        fill="tozeroy", fillcolor="rgba(239,83,80,0.15)",
+    ), row=2, col=1)
+
+    fig.update_layout(
+        height=500,
+        margin=dict(l=60, r=20, t=40, b=40),
+        showlegend=False,
+    )
+    fig.update_yaxes(title_text="資金", row=1, col=1)
+    fig.update_yaxes(title_text="回撤 %", row=2, col=1)
+
+    return fig
+
+
+def plot_allocation_pie(stock_ids: list[str], weights: dict[str, float] | None = None) -> go.Figure:
+    """投資組合配置圓餅圖。"""
+    if weights:
+        labels = list(weights.keys())
+        values = list(weights.values())
+    else:
+        # equal weight
+        n = len(stock_ids)
+        labels = stock_ids
+        values = [1.0 / n] * n
+
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        textinfo="label+percent",
+        hole=0.3,
+    )])
+
+    fig.update_layout(
+        title="資金配置比例",
+        height=350,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    return fig
+
+
+def plot_per_stock_returns(per_stock_returns: dict[str, float]) -> go.Figure:
+    """個股報酬柱狀圖。"""
+    stocks = list(per_stock_returns.keys())
+    returns = list(per_stock_returns.values())
+
+    colors = ["#26A69A" if r >= 0 else "#EF5350" for r in returns]
+
+    fig = go.Figure(data=[go.Bar(
+        x=stocks,
+        y=returns,
+        marker_color=colors,
+        text=[f"{r:+.2f}%" for r in returns],
+        textposition="outside",
+    )])
+
+    fig.update_layout(
+        title="個股報酬貢獻",
+        yaxis_title="報酬率 (%)",
+        height=350,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
+    return fig

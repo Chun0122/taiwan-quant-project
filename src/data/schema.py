@@ -13,7 +13,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, BigInteger, UniqueConstraint
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, BigInteger, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.data.database import Base
@@ -167,6 +167,11 @@ class BacktestResult(Base):
     win_rate: Mapped[float] = mapped_column(Float, nullable=True)           # 勝率 (%)
     total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
     benchmark_return: Mapped[float | None] = mapped_column(Float, nullable=True)  # 基準報酬率 (%)
+    sortino_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calmar_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    var_95: Mapped[float | None] = mapped_column(Float, nullable=True)           # VaR (95%)
+    cvar_95: Mapped[float | None] = mapped_column(Float, nullable=True)          # CVaR (95%)
+    profit_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
@@ -187,6 +192,60 @@ class Trade(Base):
     shares: Mapped[int] = mapped_column(Integer, nullable=False)            # 股數
     pnl: Mapped[float] = mapped_column(Float, nullable=True)               # 損益金額
     return_pct: Mapped[float] = mapped_column(Float, nullable=True)        # 報酬率 (%)
+    exit_reason: Mapped[str | None] = mapped_column(String(20), nullable=True)  # signal/stop_loss/take_profit/trailing_stop/force_close
 
     def __repr__(self) -> str:
         return f"<Trade {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
+
+
+class PortfolioBacktestResult(Base):
+    """投資組合回測結果摘要。"""
+
+    __tablename__ = "portfolio_backtest_result"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    stock_ids: Mapped[str] = mapped_column(Text, nullable=False)             # 逗號分隔
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    final_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    total_return: Mapped[float] = mapped_column(Float, nullable=False)
+    annual_return: Mapped[float] = mapped_column(Float, nullable=False)
+    sharpe_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    sortino_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calmar_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    var_95: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cvar_95: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    allocation_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<PortfolioBacktest {self.stock_ids} {self.strategy_name} return={self.total_return:.2f}%>"
+
+
+class PortfolioTrade(Base):
+    """投資組合交易明細。"""
+
+    __tablename__ = "portfolio_trade"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_backtest_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("portfolio_backtest_result.id"), nullable=False, index=True
+    )
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<PortfolioTrade {self.stock_id} {self.entry_date}~{self.exit_date} pnl={self.pnl}>"

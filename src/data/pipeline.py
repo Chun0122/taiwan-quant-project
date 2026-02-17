@@ -14,6 +14,7 @@ from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
     DailyPrice, InstitutionalInvestor, MarginTrading, MonthlyRevenue, Dividend,
     TechnicalIndicator, BacktestResult, Trade,
+    PortfolioBacktestResult, PortfolioTrade,
 )
 from src.config import settings
 
@@ -232,8 +233,6 @@ def sync_indicators(
 
 def save_backtest_result(result_data) -> int:
     """將回測結果與交易明細寫入 DB，回傳 backtest_result.id。"""
-    from src.backtest.engine import BacktestResultData
-
     init_db()
 
     with get_session() as session:
@@ -252,6 +251,11 @@ def save_backtest_result(result_data) -> int:
             win_rate=result_data.win_rate,
             total_trades=result_data.total_trades,
             benchmark_return=getattr(result_data, "benchmark_return", None),
+            sortino_ratio=getattr(result_data, "sortino_ratio", None),
+            calmar_ratio=getattr(result_data, "calmar_ratio", None),
+            var_95=getattr(result_data, "var_95", None),
+            cvar_95=getattr(result_data, "cvar_95", None),
+            profit_factor=getattr(result_data, "profit_factor", None),
         )
         session.add(bt)
         session.flush()  # 取得 id
@@ -268,6 +272,7 @@ def save_backtest_result(result_data) -> int:
                 shares=t.shares,
                 pnl=t.pnl,
                 return_pct=t.return_pct,
+                exit_reason=getattr(t, "exit_reason", None),
             )
             session.add(trade)
 
@@ -275,3 +280,53 @@ def save_backtest_result(result_data) -> int:
         logger.info("回測結果已儲存 (id=%d, %d 筆交易)", bt_id, len(result_data.trades))
 
     return bt_id
+
+
+def save_portfolio_result(result_data) -> int:
+    """將投資組合回測結果與交易明細寫入 DB，回傳 portfolio_backtest_result.id。"""
+    init_db()
+
+    with get_session() as session:
+        pbt = PortfolioBacktestResult(
+            strategy_name=result_data.strategy_name,
+            stock_ids=",".join(result_data.stock_ids),
+            start_date=result_data.start_date,
+            end_date=result_data.end_date,
+            initial_capital=result_data.initial_capital,
+            final_capital=result_data.final_capital,
+            total_return=result_data.total_return,
+            annual_return=result_data.annual_return,
+            sharpe_ratio=result_data.sharpe_ratio,
+            max_drawdown=result_data.max_drawdown,
+            win_rate=result_data.win_rate,
+            total_trades=result_data.total_trades,
+            sortino_ratio=getattr(result_data, "sortino_ratio", None),
+            calmar_ratio=getattr(result_data, "calmar_ratio", None),
+            var_95=getattr(result_data, "var_95", None),
+            cvar_95=getattr(result_data, "cvar_95", None),
+            profit_factor=getattr(result_data, "profit_factor", None),
+            allocation_method=getattr(result_data, "allocation_method", None),
+        )
+        session.add(pbt)
+        session.flush()
+        pbt_id = pbt.id
+
+        for t in result_data.trades:
+            trade = PortfolioTrade(
+                portfolio_backtest_id=pbt_id,
+                stock_id=t.stock_id,
+                entry_date=t.entry_date,
+                entry_price=t.entry_price,
+                exit_date=t.exit_date,
+                exit_price=t.exit_price,
+                shares=t.shares,
+                pnl=t.pnl,
+                return_pct=t.return_pct,
+                exit_reason=getattr(t, "exit_reason", None),
+            )
+            session.add(trade)
+
+        session.commit()
+        logger.info("投資組合回測結果已儲存 (id=%d, %d 筆交易)", pbt_id, len(result_data.trades))
+
+    return pbt_id

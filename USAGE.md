@@ -45,9 +45,10 @@ taiwan-quant-project/
 │   ├── config.py            # 設定管理模組
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義
+│   │   ├── schema.py        # ORM 資料表定義（含投資組合表）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
-│   │   └── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
+│   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
+│   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
 │   │   └── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
 │   ├── strategy/
@@ -64,7 +65,8 @@ taiwan-quant-project/
 │   ├── notification/
 │   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
-│   │   └── engine.py        # 回測引擎 + 績效計算
+│   │   ├── engine.py        # 回測引擎 + 風險管理 + 績效計算
+│   │   └── portfolio.py     # 投資組合回測引擎
 │   ├── optimization/
 │   │   └── grid_search.py   # Grid Search 參數優化
 │   ├── scheduler/
@@ -217,16 +219,86 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 - 滑價: 0.05%
 - 初始資金: 1,000,000 元
 
+#### 風險管理參數
+
+回測支援停損、停利、移動停損與部位大小計算：
+
+```bash
+# 停損停利
+python main.py backtest --stock 2330 --strategy sma_cross --stop-loss 5 --take-profit 15
+
+# 移動停損（從最高點回落 8% 出場）
+python main.py backtest --stock 2330 --strategy sma_cross --trailing-stop 8
+
+# 固定比例部位（每次只投入 30% 資金）
+python main.py backtest --stock 2330 --strategy rsi_threshold --sizing fixed_fraction --fraction 0.3
+
+# Kelly Criterion 部位計算（根據歷史勝率自動調整）
+python main.py backtest --stock 2330 --strategy sma_cross --sizing kelly
+
+# ATR 部位計算（根據波動度控制風險）
+python main.py backtest --stock 2330 --strategy sma_cross --sizing atr
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--stop-loss N` | 停損百分比，例 5.0 = 虧損 5% 時出場 |
+| `--take-profit N` | 停利百分比，例 15.0 = 獲利 15% 時出場 |
+| `--trailing-stop N` | 移動停損百分比，從持倉最高點回落 N% 時出場 |
+| `--sizing MODE` | 部位大小計算：`all_in`（預設）/ `fixed_fraction` / `kelly` / `atr` |
+| `--fraction N` | `fixed_fraction` 模式的資金比例（0.0~1.0） |
+
+部位計算模式說明：
+| 模式 | 說明 |
+|------|------|
+| `all_in` | 全部資金買入（預設，向後相容） |
+| `fixed_fraction` | 以 `fraction` 比例的資金買入 |
+| `kelly` | Kelly Criterion：根據歷史勝率與賠率計算最佳部位（預設 half-Kelly） |
+| `atr` | ATR 部位：根據 ATR(14) 波動度計算股數上限，控制單筆風險 |
+
+#### 投資組合回測
+
+多股票同時回測，共用資金池：
+
+```bash
+# 等權配置
+python main.py backtest --stocks 2330 2317 2454 --strategy sma_cross
+
+# 加停損
+python main.py backtest --stocks 2330 2317 --strategy multi_factor --stop-loss 5
+
+# 等權 + 固定比例部位
+python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-loss 5 --take-profit 15
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--stocks SID1 SID2 ...` | 多支股票代號（與 `--stock` 互斥） |
+| `--allocation METHOD` | 配置方式：`equal_weight`（預設）/ `custom` |
+
+#### 績效指標
+
+除了基本指標（總報酬、年化報酬、Sharpe、最大回撤、勝率），P6 新增五項進階指標：
+
+| 指標 | 說明 |
+|------|------|
+| Sortino Ratio | 僅考慮下行風險的風險調整報酬（越高越好） |
+| Calmar Ratio | 年化報酬 / 最大回撤（越高越好） |
+| VaR (95%) | 95% 信心水準下的每日最大損失 |
+| CVaR (95%) | 超過 VaR 的平均損失（尾端風險） |
+| Profit Factor | 總獲利 / 總虧損（> 1 表示獲利） |
+
 ### 4.4 啟動視覺化儀表板 (`dashboard`)
 
 ```bash
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含三個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含四個頁面：
 
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
-- **回測結果**: 績效摘要卡片 + 權益曲線/回撤圖 + 交易明細 + 回測比較表
+- **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
+- **投資組合**: 組合回測績效 + 個股配置圓餅圖 + 個股報酬柱狀圖 + 交易明細
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 
 ### 4.5 多因子選股篩選 (`scan`)
@@ -330,7 +402,22 @@ python main.py schedule --mode simple
 Windows 模式會在 `scripts/` 目錄產生 `daily_sync.bat` 和 `task_schedule.xml`，
 按照輸出的說明匯入 Windows 工作排程器即可。
 
-### 4.9 查看資料庫概況 (`status`)
+### 4.10 資料庫遷移 (`migrate`)
+
+若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
+
+```bash
+python main.py migrate
+```
+
+此命令會：
+- 為 `backtest_result` 表新增 `sortino_ratio`、`calmar_ratio`、`var_95`、`cvar_95`、`profit_factor` 欄位
+- 為 `trade` 表新增 `exit_reason` 欄位
+- 建立 `portfolio_backtest_result` 和 `portfolio_trade` 新表
+
+已存在的欄位會自動跳過，可重複執行。
+
+### 4.11 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -450,6 +537,11 @@ python main.py status
 | win_rate | Float | 勝率 (%) |
 | total_trades | Integer | 交易次數 |
 | benchmark_return | Float | 基準報酬率 (%) |
+| sortino_ratio | Float | Sortino Ratio（P6 新增） |
+| calmar_ratio | Float | Calmar Ratio（P6 新增） |
+| var_95 | Float | VaR 95%（P6 新增） |
+| cvar_95 | Float | CVaR 95%（P6 新增） |
+| profit_factor | Float | Profit Factor（P6 新增） |
 | created_at | DateTime | 建立時間 |
 
 ### trade（交易明細）
@@ -464,6 +556,46 @@ python main.py status
 | shares | Integer | 股數 |
 | pnl | Float | 損益金額 |
 | return_pct | Float | 報酬率 (%) |
+| exit_reason | String | 出場原因: signal/stop_loss/take_profit/trailing_stop/force_close（P6 新增） |
+
+### portfolio_backtest_result（投資組合回測結果，P6 新增）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| strategy_name | String | 策略名稱 |
+| stock_ids | Text | 股票代號（逗號分隔） |
+| start_date | Date | 回測起始日 |
+| end_date | Date | 回測結束日 |
+| initial_capital | Float | 初始資金 |
+| final_capital | Float | 最終資金 |
+| total_return | Float | 總報酬率 (%) |
+| annual_return | Float | 年化報酬率 (%) |
+| sharpe_ratio | Float | Sharpe Ratio |
+| max_drawdown | Float | 最大回撤 (%) |
+| win_rate | Float | 勝率 (%) |
+| total_trades | Integer | 交易次數 |
+| sortino_ratio | Float | Sortino Ratio |
+| calmar_ratio | Float | Calmar Ratio |
+| var_95 | Float | VaR 95% |
+| cvar_95 | Float | CVaR 95% |
+| profit_factor | Float | Profit Factor |
+| allocation_method | String | 配置方式（equal_weight/custom） |
+| created_at | DateTime | 建立時間 |
+
+### portfolio_trade（投資組合交易明細，P6 新增）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| portfolio_backtest_id | Integer | 關聯的組合回測 ID (FK) |
+| stock_id | String | 股票代號 |
+| entry_date | Date | 進場日期 |
+| entry_price | Float | 進場價格 |
+| exit_date | Date | 出場日期 |
+| exit_price | Float | 出場價格 |
+| shares | Integer | 股數 |
+| pnl | Float | 損益金額 |
+| return_pct | Float | 報酬率 (%) |
+| exit_reason | String | 出場原因 |
 
 ---
 
