@@ -240,42 +240,132 @@ def sync_taiex_index(
 def sync_market_data(
     days: int = 10,
     fetcher: FinMindFetcher | None = None,
+    max_stocks: int = 200,
 ) -> dict[str, int]:
     """同步全市場資料（日K + 三大法人），用於 discover 掃描。
 
-    透過 FinMind 的「按日期查全市場」API，2 次呼叫即可取得所有股票資料。
+    資料來源優先順序：
+    1. TWSE/TPEX 官方開放資料（免費，4 次 API 取得全市場）
+    2. FinMind 批次 API（需付費帳號）
+    3. FinMind 逐股抓取（免費帳號備案，較慢）
 
     Args:
         days: 抓取最近 N 天的資料
-        fetcher: 可注入 fetcher 實例
+        fetcher: 可注入 FinMind fetcher 實例（用於備案策略）
+        max_stocks: 備案策略最多抓取的股票數
 
     Returns:
         dict: {"daily_price": N, "institutional": M}
     """
-    init_db()
+    from src.data.twse_fetcher import (
+        fetch_market_daily_prices,
+        fetch_market_institutional,
+    )
 
+    init_db()
+    result = {"daily_price": 0, "institutional": 0}
+
+    # --- 策略 1：TWSE/TPEX 官方資料（免費、快速） ---
+    end = date.today()
+
+    # 從今天往前找，跳過週末，直到抓到 days 個有資料的交易日
+    # （假日時 API 回傳空資料，自動往前找）
+    d = end
+    success_count = 0
+    max_attempts = days + 20  # 預留假日空間
+    attempts = 0
+
+    logger.info("[全市場] 使用 TWSE/TPEX 官方資料，目標 %d 個交易日", days)
+
+    while success_count < days and attempts < max_attempts:
+        attempts += 1
+        if d.weekday() >= 5:  # 跳過週末
+            d -= timedelta(days=1)
+            continue
+
+        logger.info("[全市場] 抓取 %s ...", d.isoformat())
+
+        df_price = fetch_market_daily_prices(d)
+        if not df_price.empty:
+            success_count += 1
+            result["daily_price"] += _upsert_daily_price(df_price)
+
+            df_inst = fetch_market_institutional(d)
+            if not df_inst.empty:
+                result["institutional"] += _upsert_institutional(df_inst)
+        else:
+            logger.info("[全市場] %s 無資料（假日），跳過", d.isoformat())
+
+        d -= timedelta(days=1)
+
+    if success_count > 0:
+        logger.info(
+            "[全市場] TWSE/TPEX 同步完成 — %d 個交易日, 日K %d 筆, 法人 %d 筆",
+            success_count, result["daily_price"], result["institutional"],
+        )
+        return result
+
+    # --- 策略 2：FinMind 批次 API（付費帳號） ---
     if fetcher is None:
         fetcher = FinMindFetcher()
 
-    end = date.today()
     start = end - timedelta(days=days)
     start_str = start.isoformat()
     end_str = end.isoformat()
 
-    result = {}
-
-    # --- 全市場日K線 ---
-    logger.info("[全市場] 同步日K線: %s ~ %s", start_str, end_str)
+    logger.info("[全市場] TWSE/TPEX 失敗，嘗試 FinMind 批次 API: %s ~ %s", start_str, end_str)
     df_price = fetcher.fetch_all_daily_price(start_str, end_str)
-    result["daily_price"] = _upsert_daily_price(df_price)
-    logger.info("[全市場] 日K線完成 — %d 筆", result["daily_price"])
 
-    # --- 全市場三大法人 ---
-    logger.info("[全市場] 同步三大法人: %s ~ %s", start_str, end_str)
-    df_inst = fetcher.fetch_all_institutional(start_str, end_str)
-    result["institutional"] = _upsert_institutional(df_inst)
-    logger.info("[全市場] 三大法人完成 — %d 筆", result["institutional"])
+    if not df_price.empty:
+        result["daily_price"] = _upsert_daily_price(df_price)
+        df_inst = fetcher.fetch_all_institutional(start_str, end_str)
+        result["institutional"] = _upsert_institutional(df_inst)
+        logger.info(
+            "[全市場] FinMind 批次完成 — 日K %d 筆, 法人 %d 筆",
+            result["daily_price"], result["institutional"],
+        )
+        return result
 
+    # --- 策略 3：FinMind 逐股抓取（免費帳號備案） ---
+    logger.info("[全市場] 所有批次來源不可用，改用 FinMind 逐股抓取（上限 %d 支）", max_stocks)
+
+    with get_session() as session:
+        rows = session.execute(
+            select(StockInfo.stock_id)
+            .where(StockInfo.listing_type.in_(["twse", "tpex"]))
+        ).scalars().all()
+
+    if not rows:
+        sync_stock_info(force_refresh=True)
+        with get_session() as session:
+            rows = session.execute(
+                select(StockInfo.stock_id)
+                .where(StockInfo.listing_type.in_(["twse", "tpex"]))
+            ).scalars().all()
+
+    stock_ids = [sid for sid in rows if sid.isdigit() and len(sid) == 4]
+    stock_ids = stock_ids[:max_stocks]
+    total = len(stock_ids)
+    logger.info("[全市場] 逐股抓取 %d 支", total)
+
+    start_str = (end - timedelta(days=days)).isoformat()
+    end_str = end.isoformat()
+
+    for i, sid in enumerate(stock_ids, 1):
+        try:
+            if i % 20 == 0 or i == total:
+                logger.info("[全市場] 進度: %d/%d", i, total)
+            df_p = fetcher.fetch_daily_price(sid, start_str, end_str)
+            result["daily_price"] += _upsert_daily_price(df_p)
+            df_i = fetcher.fetch_institutional(sid, start_str, end_str)
+            result["institutional"] += _upsert_institutional(df_i)
+        except Exception:
+            logger.warning("[%s] 抓取失敗，跳過", sid)
+
+    logger.info(
+        "[全市場] 逐股抓取完成 — 日K %d 筆, 法人 %d 筆",
+        result["daily_price"], result["institutional"],
+    )
     return result
 
 

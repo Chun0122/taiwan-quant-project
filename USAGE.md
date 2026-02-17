@@ -47,6 +47,7 @@ taiwan-quant-project/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
 │   │   ├── schema.py        # ORM 資料表定義（含投資組合表 + StockInfo）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
+│   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
@@ -597,12 +598,17 @@ python main.py industry --notify
 
 ### 4.13 全市場選股掃描 (`discover`)
 
-從全台灣 ~2000 支股票中自動篩選出值得關注的標的。透過 FinMind 的「按日期查全市場」API，僅需 2-3 次 API 呼叫即可取得全市場資料，不需逐一抓取。
+從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。使用 TWSE/TPEX 官方開放資料（免費、無需 Token），僅需 4 次 API 呼叫即可取得全市場日行情 + 三大法人資料。
 
 **漏斗架構：**
 ```
-全市場 ~2000 支 → 粗篩 ~150 支 → 細評排名 → Top N 推薦
+全市場 ~6000 支 → 粗篩 ~150 支 → 細評排名 → Top N 推薦
 ```
+
+**資料來源優先順序：**
+1. TWSE/TPEX 官方開放資料（免費，4 次 API 呼叫取得全市場）
+2. FinMind 批次 API（需付費帳號）
+3. FinMind 逐股抓取（免費帳號備案，較慢）
 
 ```bash
 # 預設掃描（同步資料 + 篩選 Top 20）
@@ -636,6 +642,7 @@ python main.py discover --top 30 --min-price 50 --export picks.csv --notify
 | `--min-price N` | 最低股價門檻（預設 10） |
 | `--max-price N` | 最高股價門檻（預設 2000） |
 | `--min-volume N` | 最低成交量/股（預設 500000） |
+| `--sync-days N` | 同步最近幾個交易日（預設 3） |
 | `--skip-sync` | 跳過全市場資料同步，直接用 DB 既有資料 |
 | `--export PATH` | 匯出 CSV |
 | `--notify` | 發送 Discord 通知 |

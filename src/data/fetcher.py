@@ -104,7 +104,11 @@ class FinMindFetcher(DataFetcher):
         return df
 
     def _request_by_date(self, dataset: str, start: str, end: str) -> pd.DataFrame:
-        """按日期查全市場（不指定 data_id），回傳所有股票的資料。"""
+        """按日期查全市場（不指定 data_id），回傳所有股票的資料。
+
+        注意：此功能需要 FinMind 付費帳號。免費帳號會回傳 400 錯誤，
+        此時回傳空 DataFrame，由上層改用逐股抓取的備案策略。
+        """
         params = {
             "dataset": dataset,
             "start_date": start,
@@ -116,6 +120,14 @@ class FinMindFetcher(DataFetcher):
         logger.info("抓取全市場 %s | %s ~ %s", dataset, start, end)
 
         resp = self._session.get(self.api_url, params=params, timeout=60)
+
+        if resp.status_code == 400:
+            payload = resp.json()
+            logger.warning(
+                "全市場批次查詢不可用（需付費帳號）: %s", payload.get("msg", "")
+            )
+            return pd.DataFrame()
+
         resp.raise_for_status()
         payload = resp.json()
 

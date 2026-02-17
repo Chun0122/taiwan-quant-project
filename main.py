@@ -715,9 +715,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
     # 同步全市場資料（除非 --skip-sync）
     if not args.skip_sync:
-        print("正在同步全市場資料...")
+        print("正在同步股票基本資料...")
         sync_stock_info(force_refresh=False)
-        counts = sync_market_data(days=10)
+        print("正在同步全市場資料（TWSE/TPEX 官方資料）...")
+        counts = sync_market_data(days=args.sync_days, max_stocks=args.max_stocks)
         print(f"  日K線: {counts['daily_price']:,} 筆 | 法人: {counts['institutional']:,} 筆")
 
     # 執行掃描
@@ -915,6 +916,8 @@ def main() -> None:
     sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")
     sp_disc.add_argument("--max-price", type=float, default=2000, help="最高股價 (預設 2000)")
     sp_disc.add_argument("--min-volume", type=int, default=500_000, help="最低成交量 (預設 500000)")
+    sp_disc.add_argument("--sync-days", type=int, default=3, help="同步最近幾個交易日 (預設 3)")
+    sp_disc.add_argument("--max-stocks", type=int, default=200, help="備案逐股抓取上限 (預設 200)")
     sp_disc.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
     sp_disc.add_argument("--export", default=None, help="匯出 CSV 路徑")
     sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
