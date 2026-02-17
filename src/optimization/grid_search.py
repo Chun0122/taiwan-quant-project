@@ -33,6 +33,24 @@ DEFAULT_PARAM_GRIDS: dict[str, dict[str, list]] = {
         "slow": [20, 26, 32],
         "signal": [7, 9, 11],
     },
+    "ml_random_forest": {
+        "lookback": [10, 20, 30],
+        "forward_days": [3, 5, 10],
+        "threshold": [0.55, 0.6, 0.65],
+        "train_ratio": [0.6, 0.7, 0.8],
+    },
+    "ml_xgboost": {
+        "lookback": [10, 20, 30],
+        "forward_days": [3, 5, 10],
+        "threshold": [0.55, 0.6, 0.65],
+        "train_ratio": [0.6, 0.7, 0.8],
+    },
+    "ml_logistic": {
+        "lookback": [10, 20, 30],
+        "forward_days": [3, 5, 10],
+        "threshold": [0.55, 0.6, 0.65],
+        "train_ratio": [0.6, 0.7, 0.8],
+    },
 }
 
 

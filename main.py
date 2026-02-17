@@ -48,6 +48,10 @@ Usage:
     # Discord 通知
     python main.py notify --message "測試訊息"
 
+    # Walk-Forward 驗證（ML 策略防過擬合）
+    python main.py walk-forward --stock 2330 --strategy ml_random_forest
+    python main.py walk-forward --stock 2330 --strategy ml_xgboost --train-window 504 --test-window 126
+
     # DB 遷移
     python main.py migrate
 """
@@ -427,6 +431,92 @@ def cmd_notify(args: argparse.Namespace) -> None:
         print("Discord 通知發送失敗（請確認 config/settings.yaml 的 discord.webhook_url 設定）")
 
 
+def cmd_walk_forward(args: argparse.Namespace) -> None:
+    """執行 Walk-Forward 滾動驗證。"""
+    from datetime import date
+
+    from src.data.database import init_db
+    from src.strategy import STRATEGY_REGISTRY
+    from src.backtest.walk_forward import WalkForwardEngine
+
+    if args.strategy not in STRATEGY_REGISTRY:
+        print(f"未知策略: {args.strategy}")
+        print(f"可用策略: {', '.join(STRATEGY_REGISTRY.keys())}")
+        sys.exit(1)
+
+    init_db()
+
+    start = args.start or settings.fetcher.default_start_date
+    end = args.end or date.today().isoformat()
+    strategy_cls = STRATEGY_REGISTRY[args.strategy]
+
+    # 收集策略參數
+    strategy_params: dict = {}
+    if args.lookback:
+        strategy_params["lookback"] = args.lookback
+    if args.forward_days:
+        strategy_params["forward_days"] = args.forward_days
+    if args.threshold:
+        strategy_params["threshold"] = args.threshold
+    if args.train_ratio:
+        strategy_params["train_ratio"] = args.train_ratio
+
+    # 對 ML 策略，從策略名自動設定 model_type
+    if args.strategy.startswith("ml_"):
+        model_type = args.strategy.replace("ml_", "")
+        strategy_params.setdefault("model_type", model_type)
+
+    risk_config = _build_risk_config(args)
+
+    print(f"Walk-Forward 驗證: {args.strategy} | {args.stock}")
+    print(f"  期間: {start} ~ {end}")
+    print(f"  訓練窗口: {args.train_window} 日 | 測試窗口: {args.test_window} 日 | 步進: {args.step_size} 日")
+    if strategy_params:
+        print(f"  策略參數: {strategy_params}")
+
+    try:
+        engine = WalkForwardEngine(
+            strategy_cls=strategy_cls,
+            stock_id=args.stock,
+            start_date=start,
+            end_date=end,
+            train_window=args.train_window,
+            test_window=args.test_window,
+            step_size=args.step_size,
+            risk_config=risk_config,
+            strategy_params=strategy_params,
+        )
+        result = engine.run()
+    except ValueError as e:
+        print(f"\n錯誤: {e}")
+        sys.exit(1)
+
+    # 印出結果
+    print("\n" + "=" * 60)
+    print(f"Walk-Forward 驗證結果 — {result.strategy_name} | {result.stock_id}")
+    print("=" * 60)
+    print(f"  期間:         {result.start_date} ~ {result.end_date}")
+    print(f"  Fold 數:      {result.total_folds}")
+    print(f"  總報酬率:     {result.total_return:>13.2f}%")
+    print(f"  年化報酬率:   {result.annual_return:>13.2f}%")
+    print(f"  Sharpe Ratio: {result.sharpe_ratio or 'N/A':>13}")
+    print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
+    print(f"  勝率:         {result.win_rate or 'N/A':>13}%")
+    print(f"  交易次數:     {result.total_trades:>13}")
+    print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
+
+    # 各 Fold 摘要
+    if result.folds:
+        print(f"\n{'─' * 60}")
+        print(f"  {'Fold':>4}  {'訓練期':^23}  {'測試期':^23}  {'報酬':>7}  {'交易':>4}")
+        print(f"{'─' * 60}")
+        for f in result.folds:
+            print(
+                f"  {f.fold_idx:>4}  {f.train_start}~{f.train_end}  "
+                f"{f.test_start}~{f.test_end}  {f.total_return:>6.2f}%  {f.trades:>4}"
+            )
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -507,6 +597,28 @@ def main() -> None:
     sp_notify = subparsers.add_parser("notify", help="發送 Discord Webhook 訊息")
     sp_notify.add_argument("--message", required=True, help="訊息內容")
 
+    # walk-forward 子命令
+    sp_wf = subparsers.add_parser("walk-forward", help="Walk-Forward 滾動驗證")
+    sp_wf.add_argument("--stock", required=True, help="股票代號")
+    sp_wf.add_argument("--strategy", required=True, help="策略名稱 (ml_random_forest, ml_xgboost, ...)")
+    sp_wf.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
+    sp_wf.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+    sp_wf.add_argument("--train-window", type=int, default=252, help="訓練窗口天數 (預設 252)")
+    sp_wf.add_argument("--test-window", type=int, default=63, help="測試窗口天數 (預設 63)")
+    sp_wf.add_argument("--step-size", type=int, default=63, help="步進大小 (預設 63)")
+    sp_wf.add_argument("--lookback", type=int, default=None, help="ML 回溯天數")
+    sp_wf.add_argument("--forward-days", type=int, default=None, help="ML 預測天數")
+    sp_wf.add_argument("--threshold", type=float, default=None, help="ML 訊號門檻")
+    sp_wf.add_argument("--train-ratio", type=float, default=None, help="ML 訓練比例")
+    # 風險管理參數（複用）
+    sp_wf.add_argument("--stop-loss", type=float, default=None, help="停損百分比")
+    sp_wf.add_argument("--take-profit", type=float, default=None, help="停利百分比")
+    sp_wf.add_argument("--trailing-stop", type=float, default=None, help="移動停損百分比")
+    sp_wf.add_argument("--sizing", default="all_in",
+                        choices=["all_in", "fixed_fraction", "kelly", "atr"],
+                        help="部位大小計算方式")
+    sp_wf.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -533,6 +645,8 @@ def main() -> None:
         cmd_notify(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "walk-forward":
+        cmd_walk_forward(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     else:

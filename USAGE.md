@@ -50,7 +50,8 @@ taiwan-quant-project/
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
-│   │   └── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
+│   │   ├── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
+│   │   └── ml_features.py  # ML 特徵工程
 │   ├── strategy/
 │   │   ├── base.py          # 策略抽象基類
 │   │   ├── sma_cross.py     # SMA 均線交叉策略
@@ -58,7 +59,8 @@ taiwan-quant-project/
 │   │   ├── bb_breakout.py   # 布林通道突破策略
 │   │   ├── macd_cross.py    # MACD 交叉策略
 │   │   ├── buy_hold.py      # 買入持有基準策略
-│   │   └── multi_factor.py  # 多因子組合策略
+│   │   ├── multi_factor.py  # 多因子組合策略
+│   │   └── ml_strategy.py   # ML 機器學習策略（RF/XGBoost/Logistic）
 │   ├── screener/
 │   │   ├── factors.py       # 因子定義（8 個因子）
 │   │   └── engine.py        # 多因子篩選引擎
@@ -66,7 +68,8 @@ taiwan-quant-project/
 │   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
 │   │   ├── engine.py        # 回測引擎 + 風險管理 + 績效計算
-│   │   └── portfolio.py     # 投資組合回測引擎
+│   │   ├── portfolio.py     # 投資組合回測引擎
+│   │   └── walk_forward.py  # Walk-Forward 滾動驗證引擎
 │   ├── optimization/
 │   │   └── grid_search.py   # Grid Search 參數優化
 │   ├── scheduler/
@@ -79,7 +82,9 @@ taiwan-quant-project/
 │       └── pages/            # 頁面模組
 │           ├── stock_analysis.py    # 個股分析頁
 │           ├── backtest_review.py   # 回測結果頁
-│           └── screener_results.py  # 選股篩選頁
+│           ├── screener_results.py  # 選股篩選頁
+│           ├── portfolio_review.py  # 投資組合頁
+│           └── ml_analysis.py       # ML 策略分析頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -208,8 +213,20 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 | `macd_cross` | MACD 交叉 | MACD 上穿 Signal | MACD 下穿 Signal |
 | `buy_and_hold` | 買入持有 | 第一天買入 | 最後一天賣出 |
 | `multi_factor` | 多因子組合 | 加權分數 > 0.3 | 加權分數 < -0.3 |
+| `ml_random_forest` | ML Random Forest | P(上漲) > threshold | P(上漲) < 1-threshold |
+| `ml_xgboost` | ML XGBoost | P(上漲) > threshold | P(上漲) < 1-threshold |
+| `ml_logistic` | ML Logistic Regression | P(上漲) > threshold | P(上漲) < 1-threshold |
 
 多因子策略綜合 RSI、MACD、法人動向、營收成長四大因子，加權計算後產生訊號。
+
+ML 策略使用機器學習模型預測未來 N 天漲跌，自動建構 15+ 技術特徵（動量、均線比率、波動率、成交量比率、布林位置等），依訓練比例分割歷史資料進行訓練與測試。XGBoost 未安裝時自動 fallback 到 Random Forest。
+
+```bash
+# ML 策略回測
+python main.py backtest --stock 2330 --strategy ml_random_forest
+python main.py backtest --stock 2330 --strategy ml_xgboost
+python main.py backtest --stock 2330 --strategy ml_logistic
+```
 
 回測結果會自動顯示同期 Buy & Hold 基準報酬率與超額報酬。
 
@@ -294,12 +311,13 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含四個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含五個頁面：
 
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
 - **投資組合**: 組合回測績效 + 個股配置圓餅圖 + 個股報酬柱狀圖 + 交易明細
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
+- **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
 
 ### 4.5 多因子選股篩選 (`scan`)
 
@@ -386,6 +404,9 @@ python main.py optimize --stock 2330 --strategy macd_cross --start 2023-01-01
 | `rsi_threshold` | oversold, overbought | oversold=[20,25,30,35,40], overbought=[60,65,70,75,80] |
 | `bb_breakout` | period, std_dev | period=[10,15,20,25,30], std_dev=[1,2,3] |
 | `macd_cross` | fast, slow, signal | fast=[8,12,16], slow=[20,26,32], signal=[7,9,11] |
+| `ml_random_forest` | lookback, forward_days, threshold, train_ratio | lookback=[10,20,30], forward_days=[3,5,10], threshold=[0.55,0.6,0.65], train_ratio=[0.6,0.7,0.8] |
+| `ml_xgboost` | lookback, forward_days, threshold, train_ratio | 同上 |
+| `ml_logistic` | lookback, forward_days, threshold, train_ratio | 同上 |
 
 ### 4.8 自動排程 (`schedule`)
 
@@ -401,6 +422,44 @@ python main.py schedule --mode simple
 
 Windows 模式會在 `scripts/` 目錄產生 `daily_sync.bat` 和 `task_schedule.xml`，
 按照輸出的說明匯入 Windows 工作排程器即可。
+
+### 4.9 Walk-Forward 滾動驗證 (`walk-forward`)
+
+對 ML 策略進行滾動窗口訓練/測試驗證，避免過擬合。將歷史資料分成多個滾動窗口，每次用 train_window 訓練、test_window 測試，依序往前推移。
+
+```
+|--- train_1 ---|-- test_1 --|
+     |--- train_2 ---|-- test_2 --|
+          |--- train_3 ---|-- test_3 --|
+```
+
+```bash
+# 基本用法（預設 252 日訓練 / 63 日測試 / 63 日步進）
+python main.py walk-forward --stock 2330 --strategy ml_random_forest
+
+# 自訂窗口大小
+python main.py walk-forward --stock 2330 --strategy ml_xgboost --train-window 504 --test-window 126 --step-size 63
+
+# 調整 ML 參數
+python main.py walk-forward --stock 2330 --strategy ml_random_forest --lookback 30 --forward-days 10 --threshold 0.55
+
+# 搭配風險管理
+python main.py walk-forward --stock 2330 --strategy ml_xgboost --stop-loss 5 --take-profit 15
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--stock SID` | 股票代號 |
+| `--strategy NAME` | 策略名稱（可用任何已註冊策略，特別適合 ML 策略） |
+| `--train-window N` | 訓練窗口天數（預設 252，約 1 年） |
+| `--test-window N` | 測試窗口天數（預設 63，約 1 季） |
+| `--step-size N` | 每次前進天數（預設 63） |
+| `--lookback N` | ML 回溯天數（覆蓋策略預設值） |
+| `--forward-days N` | ML 預測天數（覆蓋策略預設值） |
+| `--threshold N` | ML 訊號門檻（覆蓋策略預設值） |
+| `--train-ratio N` | ML 訓練比例（覆蓋策略預設值） |
+
+Walk-Forward 也支援所有風險管理參數（`--stop-loss`、`--take-profit`、`--trailing-stop`、`--sizing`、`--fraction`）。
 
 ### 4.10 資料庫遷移 (`migrate`)
 

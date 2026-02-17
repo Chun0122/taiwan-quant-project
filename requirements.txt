@@ -26,3 +26,7 @@ streamlit>=1.29.0
 
 # Scheduling (P4)
 schedule>=1.2.0
+
+# Machine Learning (P7)
+scikit-learn>=1.3.0
+xgboost>=2.0.0  # 可選，未安裝時 fallback 到 Random Forest
