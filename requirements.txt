@@ -15,7 +15,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
 # Technical indicators (P1)
-ta>=0.11.0
+# ta 由 FinMind 自動安裝（~=0.5.25）
 
 # Backtesting (P2)
 # vectorbt>=0.26.0
