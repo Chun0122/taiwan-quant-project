@@ -237,6 +237,8 @@ class MarketScanner:
         )
         # 排除指數類（如 TAIEX）
         mask = mask & (~latest["stock_id"].str.contains(r"[A-Za-z]", na=False))
+        # 排除 ETF（代號 00 開頭，如 0050、00878、009xx）
+        mask = mask & (~latest["stock_id"].str.startswith("00"))
         filtered = latest[mask].copy()
 
         if filtered.empty:
