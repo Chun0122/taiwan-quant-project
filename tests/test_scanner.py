@@ -181,3 +181,62 @@ class TestComputeSectorSummary:
     def test_empty_rankings(self, scanner):
         result = scanner._compute_sector_summary(pd.DataFrame())
         assert result.empty
+
+
+# ─── _compute_fundamental_scores ─────────────────────────
+
+
+class TestComputeFundamentalScores:
+    def test_with_revenue_data(self, scanner):
+        """YoY 25% → score ≈ 0.5, YoY 50% → 1.0"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [25.0, 50.0],
+                "mom_growth": [0.0, -5.0],
+            }
+        )
+        result = scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert len(result) == 2
+        # YoY 25% / 50 = 0.5, MoM 0 → no bonus → 0.5
+        score_1000 = result.loc[result["stock_id"] == "1000", "fundamental_score"].iloc[0]
+        assert score_1000 == pytest.approx(0.5)
+        # YoY 50% / 50 = 1.0, MoM < 0 → no bonus → 1.0
+        score_1001 = result.loc[result["stock_id"] == "1001", "fundamental_score"].iloc[0]
+        assert score_1001 == pytest.approx(1.0)
+
+    def test_no_revenue_returns_default(self, scanner):
+        """空 DF → 全部 0.5"""
+        result = scanner._compute_fundamental_scores(
+            ["1000", "1001"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+        )
+        assert len(result) == 2
+        assert (result["fundamental_score"] == 0.5).all()
+
+    def test_high_yoy_caps_at_one(self, scanner):
+        """YoY 100% + MoM 正 → clip 在 1.0"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [100.0],
+                "mom_growth": [10.0],
+            }
+        )
+        result = scanner._compute_fundamental_scores(["1000"], df_revenue)
+        score = result.iloc[0]["fundamental_score"]
+        # 100/50=2.0 clip→1.0, +0.1 bonus → 1.1 clip→1.0
+        assert score == pytest.approx(1.0)
+
+    def test_negative_yoy_floors_at_zero(self, scanner):
+        """YoY -20% → 0.0"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [-20.0],
+                "mom_growth": [-5.0],
+            }
+        )
+        result = scanner._compute_fundamental_scores(["1000"], df_revenue)
+        score = result.iloc[0]["fundamental_score"]
+        # -20/50 = -0.4 clip→0.0, MoM < 0 → no bonus → 0.0
+        assert score == pytest.approx(0.0)

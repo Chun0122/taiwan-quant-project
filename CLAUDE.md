@@ -28,7 +28,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，90 個測試覆蓋核心模組：
+使用 pytest 測試框架，94 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -49,7 +49,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_ml_features.py` | `src/features/ml_features.py` 特徵工程 | 純函數 |
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算 | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py` | `src/data/twse_fetcher.py` 工具函數 | 純函數 |
-| `tests/test_scanner.py` | `src/discovery/scanner.py` 掃描計算 | 純函數 |
+| `tests/test_scanner.py` | `src/discovery/scanner.py` 掃描計算 + 基本面分數 | 純函數 |
 | `tests/test_fetcher.py` | `src/data/fetcher.py` API 封裝 | mock HTTP |
 | `tests/test_config.py` | `src/config.py` 設定載入 | tmp_path |
 | `tests/test_db_integration.py` | ORM + upsert + pipeline | in-memory SQLite |
@@ -105,7 +105,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/optimization/grid_search.py` | Grid Search 參數優化器 |
 | `src/screener/factors.py` | 8 個篩選因子（技術面/籌碼面/基本面） |
 | `src/screener/engine.py` | 多因子篩選引擎（watchlist 內掃描） |
-| `src/discovery/scanner.py` | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分 → Top N |
+| `src/discovery/scanner.py` | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分（技術+籌碼+基本面） → Top N |
 | `src/industry/analyzer.py` | 產業輪動分析（法人動能 + 價格動能） |
 | `src/report/engine.py` | 每日選股報告（四維度綜合評分） |
 | `src/report/formatter.py` | Discord 訊息格式化（2000 字元限制） |

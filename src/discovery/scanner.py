@@ -13,11 +13,12 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
 from src.data.database import get_session
-from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
+from src.data.schema import DailyPrice, InstitutionalInvestor, MonthlyRevenue, StockInfo
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class MarketScanner:
     def run(self) -> DiscoveryResult:
         """執行四階段漏斗掃描。"""
         # Stage 1: 載入資料
-        df_price, df_inst = self._load_market_data()
+        df_price, df_inst, df_revenue = self._load_market_data()
         if df_price.empty:
             logger.warning("無市場資料可供掃描")
             return DiscoveryResult(
@@ -89,7 +90,7 @@ class MarketScanner:
             )
 
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_revenue)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 4: 排名 + 產業標籤
@@ -108,9 +109,10 @@ class MarketScanner:
     #  Stage 1: 載入資料
     # ------------------------------------------------------------------ #
 
-    def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """從 DB 查詢最近的 daily_price + institutional 資料。"""
+    def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """從 DB 查詢最近的 daily_price + institutional + monthly_revenue 資料。"""
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        revenue_cutoff = date.today() - timedelta(days=90)
 
         with get_session() as session:
             # 日K線
@@ -157,7 +159,35 @@ class MarketScanner:
                 ],
             )
 
-        return df_price, df_inst
+            # 月營收（每支股票取最新一筆）
+            from sqlalchemy import func
+
+            subq = (
+                select(
+                    MonthlyRevenue.stock_id,
+                    func.max(MonthlyRevenue.date).label("max_date"),
+                )
+                .where(MonthlyRevenue.date >= revenue_cutoff)
+                .group_by(MonthlyRevenue.stock_id)
+                .subquery()
+            )
+            rows = session.execute(
+                select(
+                    MonthlyRevenue.stock_id,
+                    MonthlyRevenue.yoy_growth,
+                    MonthlyRevenue.mom_growth,
+                ).join(
+                    subq,
+                    (MonthlyRevenue.stock_id == subq.c.stock_id)
+                    & (MonthlyRevenue.date == subq.c.max_date),
+                )
+            ).all()
+            df_revenue = pd.DataFrame(
+                rows,
+                columns=["stock_id", "yoy_growth", "mom_growth"],
+            )
+
+        return df_price, df_inst, df_revenue
 
     # ------------------------------------------------------------------ #
     #  Stage 2: 粗篩
@@ -233,6 +263,7 @@ class MarketScanner:
         candidates: pd.DataFrame,
         df_price: pd.DataFrame,
         df_inst: pd.DataFrame,
+        df_revenue: pd.DataFrame,
     ) -> pd.DataFrame:
         """對候選股進行三維度評分：技術(35%) + 籌碼(45%) + 基本面(20%)。"""
         stock_ids = candidates["stock_id"].tolist()
@@ -243,13 +274,16 @@ class MarketScanner:
         # --- 籌碼分數 ---
         chip_scores = self._compute_chip_scores(stock_ids, df_inst)
 
-        # --- 基本面固定 0.5（批量無營收資料）---
+        # --- 基本面分數 ---
+        fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
+
         candidates = candidates.copy()
         candidates = candidates.merge(tech_scores, on="stock_id", how="left")
         candidates = candidates.merge(chip_scores, on="stock_id", how="left")
+        candidates = candidates.merge(fund_scores, on="stock_id", how="left")
         candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
         candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
-        candidates["fundamental_score"] = 0.5
+        candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
 
         # 綜合分數
         candidates["composite_score"] = (
@@ -364,6 +398,33 @@ class MarketScanner:
             results.append({"stock_id": sid, "chip_score": chip_score})
 
         return pd.DataFrame(results)
+
+    def _compute_fundamental_scores(
+        self, stock_ids: list[str], df_revenue: pd.DataFrame
+    ) -> pd.DataFrame:
+        """從月營收資料計算基本面分數（YoY 營收成長 + MoM 加分）。"""
+        if df_revenue.empty:
+            return pd.DataFrame(
+                {"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)}
+            )
+
+        rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
+        if rev.empty:
+            return pd.DataFrame(
+                {"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)}
+            )
+
+        yoy = rev["yoy_growth"].fillna(0)
+        yoy_score = np.clip(yoy / 50, 0, 1)
+        mom_bonus = (rev["mom_growth"].fillna(0) > 0).astype(float) * 0.1
+        rev["fundamental_score"] = np.clip(yoy_score + mom_bonus, 0, 1)
+
+        # 包含所有 stock_ids，無資料的用 NaN（外層 fillna 處理）
+        result = pd.DataFrame({"stock_id": stock_ids})
+        result = result.merge(
+            rev[["stock_id", "fundamental_score"]], on="stock_id", how="left"
+        )
+        return result
 
     # ------------------------------------------------------------------ #
     #  Stage 4: 排名 + 產業標籤
