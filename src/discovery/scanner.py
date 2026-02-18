@@ -178,8 +178,7 @@ class MarketScanner:
                     MonthlyRevenue.mom_growth,
                 ).join(
                     subq,
-                    (MonthlyRevenue.stock_id == subq.c.stock_id)
-                    & (MonthlyRevenue.date == subq.c.max_date),
+                    (MonthlyRevenue.stock_id == subq.c.stock_id) & (MonthlyRevenue.date == subq.c.max_date),
                 )
             ).all()
             df_revenue = pd.DataFrame(
@@ -399,20 +398,14 @@ class MarketScanner:
 
         return pd.DataFrame(results)
 
-    def _compute_fundamental_scores(
-        self, stock_ids: list[str], df_revenue: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
         """從月營收資料計算基本面分數（YoY 營收成長 + MoM 加分）。"""
         if df_revenue.empty:
-            return pd.DataFrame(
-                {"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)}
-            )
+            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
         rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
         if rev.empty:
-            return pd.DataFrame(
-                {"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)}
-            )
+            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
         yoy = rev["yoy_growth"].fillna(0)
         yoy_score = np.clip(yoy / 50, 0, 1)
@@ -421,9 +414,7 @@ class MarketScanner:
 
         # 包含所有 stock_ids，無資料的用 NaN（外層 fillna 處理）
         result = pd.DataFrame({"stock_id": stock_ids})
-        result = result.merge(
-            rev[["stock_id", "fundamental_score"]], on="stock_id", how="left"
-        )
+        result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
         return result
 
     # ------------------------------------------------------------------ #

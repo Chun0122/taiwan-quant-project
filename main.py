@@ -96,7 +96,7 @@ def setup_logging() -> None:
 
 def cmd_sync(args: argparse.Namespace) -> None:
     """執行資料同步。"""
-    from src.data.pipeline import sync_watchlist, sync_taiex_index
+    from src.data.pipeline import sync_taiex_index, sync_watchlist
 
     # 同步 TAIEX 指數
     if args.taiex:
@@ -104,9 +104,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         print(f"\n  TAIEX 加權指數: {taiex_count} 筆")
 
     stocks = args.stocks if args.stocks else None
-    results = sync_watchlist(
-        watchlist=stocks, start_date=args.start, end_date=args.end
-    )
+    results = sync_watchlist(watchlist=stocks, start_date=args.start, end_date=args.end)
 
     print("\n" + "=" * 60)
     print("同步結果摘要")
@@ -159,10 +157,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """執行回測（單股或投資組合）。"""
     from datetime import date
 
+    from src.backtest.engine import BacktestEngine
     from src.data.database import init_db
     from src.data.pipeline import save_backtest_result, save_portfolio_result
     from src.strategy import STRATEGY_REGISTRY
-    from src.backtest.engine import BacktestEngine
 
     if args.strategy not in STRATEGY_REGISTRY:
         print(f"未知策略: {args.strategy}")
@@ -181,10 +179,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     if args.stocks:
         from src.backtest.portfolio import PortfolioBacktestEngine, PortfolioConfig
 
-        strategies = [
-            strategy_cls(stock_id=sid, start_date=start, end_date=end)
-            for sid in args.stocks
-        ]
+        strategies = [strategy_cls(stock_id=sid, start_date=start, end_date=end) for sid in args.stocks]
 
         portfolio_config = PortfolioConfig(allocation_method=args.allocation)
 
@@ -272,7 +267,7 @@ def cmd_dashboard() -> None:
     from src.config import PROJECT_ROOT
 
     app_path = PROJECT_ROOT / "src" / "visualization" / "app.py"
-    print(f"啟動儀表板: http://localhost:8501")
+    print("啟動儀表板: http://localhost:8501")
     subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)], cwd=str(PROJECT_ROOT))
 
 
@@ -306,9 +301,11 @@ def cmd_schedule(args: argparse.Namespace) -> None:
     """設定排程任務。"""
     if args.mode == "simple":
         from src.scheduler.simple_scheduler import run_scheduler
+
         run_scheduler()
     elif args.mode == "windows":
         from src.scheduler.windows_task import generate_scripts
+
         generate_scripts()
 
 
@@ -318,9 +315,14 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     from src.data.database import get_session, init_db
     from src.data.schema import (
-        DailyPrice, InstitutionalInvestor, MarginTrading,
-        MonthlyRevenue, Dividend, TechnicalIndicator,
-        BacktestResult, PortfolioBacktestResult,
+        BacktestResult,
+        DailyPrice,
+        Dividend,
+        InstitutionalInvestor,
+        MarginTrading,
+        MonthlyRevenue,
+        PortfolioBacktestResult,
+        TechnicalIndicator,
     )
 
     init_db()
@@ -334,18 +336,10 @@ def cmd_status(args: argparse.Namespace) -> None:
             (Dividend, "股利"),
             (TechnicalIndicator, "技術指標"),
         ]:
-            total = session.execute(
-                select(func.count()).select_from(model)
-            ).scalar()
-            stocks = session.execute(
-                select(func.count(func.distinct(model.stock_id)))
-            ).scalar()
-            min_date = session.execute(
-                select(func.min(model.date))
-            ).scalar()
-            max_date = session.execute(
-                select(func.max(model.date))
-            ).scalar()
+            total = session.execute(select(func.count()).select_from(model)).scalar()
+            stocks = session.execute(select(func.count(func.distinct(model.stock_id)))).scalar()
+            min_date = session.execute(select(func.min(model.date))).scalar()
+            max_date = session.execute(select(func.max(model.date))).scalar()
 
             print(f"[{label}] {total:,} 筆 | {stocks} 檔股票 | {min_date} ~ {max_date}")
 
@@ -361,14 +355,10 @@ def cmd_status(args: argparse.Namespace) -> None:
                 print(f"    {name:15s} {cnt:>8,} 筆")
 
         # 回測結果摘要
-        bt_count = session.execute(
-            select(func.count()).select_from(BacktestResult)
-        ).scalar()
+        bt_count = session.execute(select(func.count()).select_from(BacktestResult)).scalar()
         if bt_count:
             print(f"\n[回測紀錄] {bt_count} 筆")
-            rows = session.execute(
-                select(BacktestResult).order_by(BacktestResult.id.desc()).limit(5)
-            ).scalars().all()
+            rows = session.execute(select(BacktestResult).order_by(BacktestResult.id.desc()).limit(5)).scalars().all()
             for r in rows:
                 print(
                     f"  #{r.id} {r.stock_id} {r.strategy_name} | "
@@ -377,14 +367,14 @@ def cmd_status(args: argparse.Namespace) -> None:
                 )
 
         # 投資組合回測摘要
-        pbt_count = session.execute(
-            select(func.count()).select_from(PortfolioBacktestResult)
-        ).scalar()
+        pbt_count = session.execute(select(func.count()).select_from(PortfolioBacktestResult)).scalar()
         if pbt_count:
             print(f"\n[投資組合回測] {pbt_count} 筆")
-            rows = session.execute(
-                select(PortfolioBacktestResult).order_by(PortfolioBacktestResult.id.desc()).limit(5)
-            ).scalars().all()
+            rows = (
+                session.execute(select(PortfolioBacktestResult).order_by(PortfolioBacktestResult.id.desc()).limit(5))
+                .scalars()
+                .all()
+            )
             for r in rows:
                 print(
                     f"  #{r.id} [{r.stock_ids}] {r.strategy_name} | "
@@ -434,6 +424,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     # 發送 Discord 通知
     if args.notify:
         from src.notification.line_notify import send_scan_results
+
         ok = send_scan_results(results)
         if ok:
             print("Discord 通知已發送")
@@ -456,9 +447,9 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
     """執行 Walk-Forward 滾動驗證。"""
     from datetime import date
 
+    from src.backtest.walk_forward import WalkForwardEngine
     from src.data.database import init_db
     from src.strategy import STRATEGY_REGISTRY
-    from src.backtest.walk_forward import WalkForwardEngine
 
     if args.strategy not in STRATEGY_REGISTRY:
         print(f"未知策略: {args.strategy}")
@@ -564,14 +555,16 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(f"\n{'=' * 75}")
     print(f"每日選股報告 — 前 {min(args.top, len(df))} 名（共 {len(df)} 檔）")
     print(f"{'=' * 75}")
-    print(f"{'#':>3}  {'代號':>6}  {'收盤':>8}  {'綜合':>6}  {'技術':>6}  {'籌碼':>6}  "
-          f"{'基本':>6}  {'ML':>6}  {'RSI':>5}  {'外資':>10}  {'YoY':>7}")
+    print(
+        f"{'#':>3}  {'代號':>6}  {'收盤':>8}  {'綜合':>6}  {'技術':>6}  {'籌碼':>6}  "
+        f"{'基本':>6}  {'ML':>6}  {'RSI':>5}  {'外資':>10}  {'YoY':>7}"
+    )
     print(f"{'─' * 75}")
 
     for _, row in display.iterrows():
-        rsi = f"{row['rsi']:.0f}" if pd.notna(row.get('rsi')) else "N/A"
-        foreign = f"{row['foreign_net']:>10,.0f}" if pd.notna(row.get('foreign_net')) else "       N/A"
-        yoy = f"{row['yoy_growth']:.1f}%" if pd.notna(row.get('yoy_growth')) else "   N/A"
+        rsi = f"{row['rsi']:.0f}" if pd.notna(row.get("rsi")) else "N/A"
+        foreign = f"{row['foreign_net']:>10,.0f}" if pd.notna(row.get("foreign_net")) else "       N/A"
+        yoy = f"{row['yoy_growth']:.1f}%" if pd.notna(row.get("yoy_growth")) else "   N/A"
         print(
             f"{int(row['rank']):>3}  {row['stock_id']:>6}  {row['close']:>8.1f}  "
             f"{row['composite_score']:>6.3f}  {row['technical_score']:>6.3f}  "
@@ -586,6 +579,7 @@ def cmd_report(args: argparse.Namespace) -> None:
     if args.notify:
         from src.notification.line_notify import send_message
         from src.report.formatter import format_daily_report
+
         msgs = format_daily_report(df, top_n=args.top)
         for msg in msgs:
             send_message(msg)
@@ -622,6 +616,7 @@ def cmd_strategy_rank(args: argparse.Namespace) -> None:
     if args.notify and not df.empty:
         from src.notification.line_notify import send_message
         from src.report.formatter import format_strategy_rank
+
         msg = format_strategy_rank(df, metric=args.metric)
         send_message(msg)
         print("Discord 通知已發送")
@@ -666,8 +661,8 @@ def cmd_industry(args: argparse.Namespace) -> None:
     print(f"{'─' * 70}")
 
     for _, row in display.iterrows():
-        total_net = row.get('total_net', 0)
-        avg_ret = row.get('avg_return_pct', 0)
+        total_net = row.get("total_net", 0)
+        avg_ret = row.get("avg_return_pct", 0)
         print(
             f"{int(row['rank']):>3}  {str(row['industry']):<14}  "
             f"{row['sector_score']:>6.3f}  "
@@ -677,9 +672,7 @@ def cmd_industry(args: argparse.Namespace) -> None:
         )
 
     # 精選個股
-    top_stocks = analyzer.top_stocks_from_hot_sectors(
-        sector_df, top_sectors=args.top_sectors, top_n=args.top
-    )
+    top_stocks = analyzer.top_stocks_from_hot_sectors(sector_df, top_sectors=args.top_sectors, top_n=args.top)
     if not top_stocks.empty:
         print(f"\n{'─' * 70}")
         print("熱門產業精選個股")
@@ -688,17 +681,14 @@ def cmd_industry(args: argparse.Namespace) -> None:
             sector_stocks = top_stocks[top_stocks["industry"] == ind]
             print(f"\n  [{ind}]")
             for _, sr in sector_stocks.iterrows():
-                name = sr.get('stock_name', '')
-                foreign = sr.get('foreign_net_sum', 0)
-                print(
-                    f"    {sr['stock_id']} {name:<8}  "
-                    f"收盤={sr['close']:>8.1f}  "
-                    f"外資淨買超={foreign:>12,.0f}"
-                )
+                name = sr.get("stock_name", "")
+                foreign = sr.get("foreign_net_sum", 0)
+                print(f"    {sr['stock_id']} {name:<8}  收盤={sr['close']:>8.1f}  外資淨買超={foreign:>12,.0f}")
 
     if args.notify:
         from src.notification.line_notify import send_message
         from src.report.formatter import format_industry_report
+
         msgs = format_industry_report(sector_df, top_stocks, top_n=args.top_sectors)
         for msg in msgs:
             send_message(msg)
@@ -772,6 +762,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
     if args.notify:
         from src.notification.line_notify import send_message
         from src.report.formatter import format_discovery_report
+
         msgs = format_discovery_report(result, top_n=args.top)
         for msg in msgs:
             send_message(msg)
@@ -819,13 +810,13 @@ def main() -> None:
     sp_bt.add_argument("--stop-loss", type=float, default=None, help="停損百分比 (例: 5.0 = -5%%)")
     sp_bt.add_argument("--take-profit", type=float, default=None, help="停利百分比 (例: 15.0 = +15%%)")
     sp_bt.add_argument("--trailing-stop", type=float, default=None, help="移動停損百分比 (例: 8.0)")
-    sp_bt.add_argument("--sizing", default="all_in",
-                        choices=["all_in", "fixed_fraction", "kelly", "atr"],
-                        help="部位大小計算方式")
+    sp_bt.add_argument(
+        "--sizing", default="all_in", choices=["all_in", "fixed_fraction", "kelly", "atr"], help="部位大小計算方式"
+    )
     sp_bt.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例 (0.0~1.0)")
-    sp_bt.add_argument("--allocation", default="equal_weight",
-                        choices=["equal_weight", "custom"],
-                        help="投資組合配置方式")
+    sp_bt.add_argument(
+        "--allocation", default="equal_weight", choices=["equal_weight", "custom"], help="投資組合配置方式"
+    )
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
@@ -842,7 +833,9 @@ def main() -> None:
     # schedule 子命令
     sp_sched = subparsers.add_parser("schedule", help="設定自動排程")
     sp_sched.add_argument(
-        "--mode", choices=["simple", "windows"], default="windows",
+        "--mode",
+        choices=["simple", "windows"],
+        default="windows",
         help="排程模式: simple=前景執行, windows=產生 Task Scheduler 腳本",
     )
 
@@ -875,9 +868,9 @@ def main() -> None:
     sp_wf.add_argument("--stop-loss", type=float, default=None, help="停損百分比")
     sp_wf.add_argument("--take-profit", type=float, default=None, help="停利百分比")
     sp_wf.add_argument("--trailing-stop", type=float, default=None, help="移動停損百分比")
-    sp_wf.add_argument("--sizing", default="all_in",
-                        choices=["all_in", "fixed_fraction", "kelly", "atr"],
-                        help="部位大小計算方式")
+    sp_wf.add_argument(
+        "--sizing", default="all_in", choices=["all_in", "fixed_fraction", "kelly", "atr"], help="部位大小計算方式"
+    )
     sp_wf.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例")
 
     # report 子命令
@@ -892,8 +885,7 @@ def main() -> None:
     sp_sr = subparsers.add_parser("strategy-rank", help="策略回測排名")
     sp_sr.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_sr.add_argument("--strategies", nargs="+", help="策略名稱（預設 6 個快速策略）")
-    sp_sr.add_argument("--metric", default="sharpe",
-                       help="排名指標 (sharpe/total_return/win_rate/annual_return)")
+    sp_sr.add_argument("--metric", default="sharpe", help="排名指標 (sharpe/total_return/win_rate/annual_return)")
     sp_sr.add_argument("--start", default=None, help="回測起始日期 (YYYY-MM-DD)")
     sp_sr.add_argument("--end", default=None, help="回測結束日期 (YYYY-MM-DD)")
     sp_sr.add_argument("--min-trades", type=int, default=3, help="最少交易次數 (預設 3)")
