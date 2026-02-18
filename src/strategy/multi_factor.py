@@ -16,10 +16,10 @@ from sqlalchemy import select
 from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
-    TechnicalIndicator,
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
+    TechnicalIndicator,
 )
 from src.strategy.base import Strategy
 
@@ -61,57 +61,62 @@ class MultiFactorStrategy(Strategy):
 
         with get_session() as session:
             # 日K線
-            prices = session.execute(
-                select(DailyPrice)
-                .where(DailyPrice.stock_id == self.stock_id)
-                .where(DailyPrice.date >= self.start_date)
-                .where(DailyPrice.date <= self.end_date)
-                .order_by(DailyPrice.date)
-            ).scalars().all()
+            prices = (
+                session.execute(
+                    select(DailyPrice)
+                    .where(DailyPrice.stock_id == self.stock_id)
+                    .where(DailyPrice.date >= self.start_date)
+                    .where(DailyPrice.date <= self.end_date)
+                    .order_by(DailyPrice.date)
+                )
+                .scalars()
+                .all()
+            )
 
         if not prices:
             logger.warning("[%s] 無日K線資料", self.stock_id)
             return pd.DataFrame()
 
-        df = pd.DataFrame([
-            {"date": r.date, "open": r.open, "high": r.high,
-             "low": r.low, "close": r.close, "volume": r.volume}
-            for r in prices
-        ]).set_index("date")
+        df = pd.DataFrame(
+            [
+                {"date": r.date, "open": r.open, "high": r.high, "low": r.low, "close": r.close, "volume": r.volume}
+                for r in prices
+            ]
+        ).set_index("date")
 
         with get_session() as session:
             # 技術指標
-            indicators = session.execute(
-                select(TechnicalIndicator)
-                .where(TechnicalIndicator.stock_id == self.stock_id)
-                .where(TechnicalIndicator.date >= self.start_date)
-                .where(TechnicalIndicator.date <= self.end_date)
-            ).scalars().all()
+            indicators = (
+                session.execute(
+                    select(TechnicalIndicator)
+                    .where(TechnicalIndicator.stock_id == self.stock_id)
+                    .where(TechnicalIndicator.date >= self.start_date)
+                    .where(TechnicalIndicator.date <= self.end_date)
+                )
+                .scalars()
+                .all()
+            )
 
             if indicators:
-                df_ind = pd.DataFrame([
-                    {"date": r.date, "name": r.name, "value": r.value}
-                    for r in indicators
-                ])
+                df_ind = pd.DataFrame([{"date": r.date, "name": r.name, "value": r.value} for r in indicators])
                 df_wide = df_ind.pivot_table(index="date", columns="name", values="value")
                 df = df.join(df_wide, how="left")
 
             # 三大法人（pivot by name → 外資/投信/自營商 net）
-            institutions = session.execute(
-                select(InstitutionalInvestor)
-                .where(InstitutionalInvestor.stock_id == self.stock_id)
-                .where(InstitutionalInvestor.date >= self.start_date)
-                .where(InstitutionalInvestor.date <= self.end_date)
-            ).scalars().all()
+            institutions = (
+                session.execute(
+                    select(InstitutionalInvestor)
+                    .where(InstitutionalInvestor.stock_id == self.stock_id)
+                    .where(InstitutionalInvestor.date >= self.start_date)
+                    .where(InstitutionalInvestor.date <= self.end_date)
+                )
+                .scalars()
+                .all()
+            )
 
             if institutions:
-                df_inst = pd.DataFrame([
-                    {"date": r.date, "name": r.name, "net": r.net}
-                    for r in institutions
-                ])
-                inst_pivot = df_inst.pivot_table(
-                    index="date", columns="name", values="net", aggfunc="sum"
-                )
+                df_inst = pd.DataFrame([{"date": r.date, "name": r.name, "net": r.net} for r in institutions])
+                inst_pivot = df_inst.pivot_table(index="date", columns="name", values="net", aggfunc="sum")
                 rename_map = {
                     "Foreign_Investor": "foreign_net",
                     "Investment_Trust": "trust_net",
@@ -127,35 +132,43 @@ class MultiFactorStrategy(Strategy):
                 df = df.join(inst_pivot, how="left")
 
             # 融資融券
-            margins = session.execute(
-                select(MarginTrading)
-                .where(MarginTrading.stock_id == self.stock_id)
-                .where(MarginTrading.date >= self.start_date)
-                .where(MarginTrading.date <= self.end_date)
-            ).scalars().all()
+            margins = (
+                session.execute(
+                    select(MarginTrading)
+                    .where(MarginTrading.stock_id == self.stock_id)
+                    .where(MarginTrading.date >= self.start_date)
+                    .where(MarginTrading.date <= self.end_date)
+                )
+                .scalars()
+                .all()
+            )
 
             if margins:
-                df_margin = pd.DataFrame([
-                    {"date": r.date, "margin_balance": r.margin_balance,
-                     "short_balance": r.short_balance}
-                    for r in margins
-                ]).set_index("date")
+                df_margin = pd.DataFrame(
+                    [
+                        {"date": r.date, "margin_balance": r.margin_balance, "short_balance": r.short_balance}
+                        for r in margins
+                    ]
+                ).set_index("date")
                 df = df.join(df_margin, how="left")
 
             # 月營收（forward fill 到每日）
-            revenues = session.execute(
-                select(MonthlyRevenue)
-                .where(MonthlyRevenue.stock_id == self.stock_id)
-                .where(MonthlyRevenue.date >= self.start_date)
-                .where(MonthlyRevenue.date <= self.end_date)
-                .order_by(MonthlyRevenue.date)
-            ).scalars().all()
+            revenues = (
+                session.execute(
+                    select(MonthlyRevenue)
+                    .where(MonthlyRevenue.stock_id == self.stock_id)
+                    .where(MonthlyRevenue.date >= self.start_date)
+                    .where(MonthlyRevenue.date <= self.end_date)
+                    .order_by(MonthlyRevenue.date)
+                )
+                .scalars()
+                .all()
+            )
 
             if revenues:
-                df_rev = pd.DataFrame([
-                    {"date": r.date, "yoy_growth": r.yoy_growth}
-                    for r in revenues
-                ]).set_index("date")
+                df_rev = pd.DataFrame([{"date": r.date, "yoy_growth": r.yoy_growth} for r in revenues]).set_index(
+                    "date"
+                )
                 df = df.join(df_rev, how="left")
                 df["yoy_growth"] = df["yoy_growth"].ffill()
 
@@ -197,8 +210,7 @@ class MultiFactorStrategy(Strategy):
         # 法人因子
         w_inst = self.weights.get("institutional", 0)
         if w_inst > 0:
-            net_cols = [c for c in ["foreign_net", "trust_net", "dealer_net"]
-                        if c in data.columns]
+            net_cols = [c for c in ["foreign_net", "trust_net", "dealer_net"] if c in data.columns]
             if net_cols:
                 total_net = data[net_cols].sum(axis=1)
                 inst_score = pd.Series(0, index=data.index)

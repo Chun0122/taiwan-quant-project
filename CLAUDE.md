@@ -133,3 +133,12 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - **日期格式**：FinMind 使用 ISO 格式（`YYYY-MM-DD`）；TWSE 使用 `YYYYMMDD`；TPEX 使用民國曆（`YYY/MM/DD`，年 = 西元年 - 1911）。
 - **回測成本**：手續費 0.1425%、交易稅 0.3%（賣出時）、滑價 0.05%。
 - **測試慣例**：純函數優先測試（零 mock）。DB 整合測試使用 in-memory SQLite + transaction rollback 隔離。HTTP 測試 mock `requests.Session.get` + `time.sleep`。新增計算邏輯時應補充對應測試。
+
+## 已確認事項（規劃時勿重複提出）
+
+以下項目已處理或為刻意設計，進行程式碼審查或規劃時應跳過：
+
+- **`config/settings.yaml` 機密管理**：已在 `.gitignore` 中排除，Git 僅追蹤 `settings.yaml.example`。Token 從未進入版本控制。
+- **TWSE/TPEX SSL `verify=False`**：已知的刻意行為，因部分 Windows 環境缺少 TWSE/TPEX 的根憑證鏈，停用驗證為目前的可接受方案。
+- **`src/notification/line_notify.py` 檔名**：歷史遺留，實際實作為 Discord Webhook。不需重新命名，import 路徑已穩定。
+- **`datetime.utcnow()` DeprecationWarning**：來自 SQLAlchemy schema 的 `default=datetime.utcnow`，為低優先級項目，不影響功能。

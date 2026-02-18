@@ -13,19 +13,23 @@ from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 
+from src.backtest.engine import BacktestEngine, RiskConfig
 from src.config import settings
 from src.data.database import get_session, init_db
 from src.data.schema import DailyPrice
 from src.strategy import STRATEGY_REGISTRY
-from src.backtest.engine import BacktestEngine, RiskConfig
 
 logger = logging.getLogger(__name__)
 
 FAST_STRATEGIES = [
-    "sma_cross", "rsi_threshold", "bb_breakout",
-    "macd_cross", "buy_and_hold", "multi_factor",
+    "sma_cross",
+    "rsi_threshold",
+    "bb_breakout",
+    "macd_cross",
+    "buy_and_hold",
+    "multi_factor",
 ]
 ML_STRATEGIES = ["ml_random_forest", "ml_xgboost", "ml_logistic"]
 
@@ -97,18 +101,23 @@ class StrategyRankEngine:
                 done += 1
                 logger.info(
                     "[%d/%d] 回測 %s × %s",
-                    done, total_combos, stock_id, strategy_name,
+                    done,
+                    total_combos,
+                    stock_id,
+                    strategy_name,
                 )
 
                 # 先檢查資料量
                 ok, reason = self._check_data_available(stock_id, strategy_name)
                 if not ok:
                     logger.info("  跳過: %s", reason)
-                    results.append(RankResult(
-                        stock_id=stock_id,
-                        strategy_name=strategy_name,
-                        error=reason,
-                    ))
+                    results.append(
+                        RankResult(
+                            stock_id=stock_id,
+                            strategy_name=strategy_name,
+                            error=reason,
+                        )
+                    )
                     continue
 
                 result = self._run_single(stock_id, strategy_name)
@@ -182,18 +191,20 @@ class StrategyRankEngine:
                 continue
             if r.total_trades < self.min_trades:
                 continue
-            records.append({
-                "stock_id": r.stock_id,
-                "strategy_name": r.strategy_name,
-                "total_return": r.total_return,
-                "annual_return": r.annual_return,
-                "sharpe_ratio": r.sharpe_ratio,
-                "max_drawdown": r.max_drawdown,
-                "win_rate": r.win_rate,
-                "total_trades": r.total_trades,
-                "sortino_ratio": r.sortino_ratio,
-                "profit_factor": r.profit_factor,
-            })
+            records.append(
+                {
+                    "stock_id": r.stock_id,
+                    "strategy_name": r.strategy_name,
+                    "total_return": r.total_return,
+                    "annual_return": r.annual_return,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "max_drawdown": r.max_drawdown,
+                    "win_rate": r.win_rate,
+                    "total_trades": r.total_trades,
+                    "sortino_ratio": r.sortino_ratio,
+                    "profit_factor": r.profit_factor,
+                }
+            )
 
         if not records:
             return pd.DataFrame()
@@ -214,9 +225,17 @@ class StrategyRankEngine:
         df["rank"] = range(1, len(df) + 1)
 
         cols = [
-            "rank", "stock_id", "strategy_name", "total_return", "annual_return",
-            "sharpe_ratio", "max_drawdown", "win_rate", "total_trades",
-            "sortino_ratio", "profit_factor",
+            "rank",
+            "stock_id",
+            "strategy_name",
+            "total_return",
+            "annual_return",
+            "sharpe_ratio",
+            "max_drawdown",
+            "win_rate",
+            "total_trades",
+            "sortino_ratio",
+            "profit_factor",
         ]
         return df[[c for c in cols if c in df.columns]]
 
@@ -230,13 +249,15 @@ class StrategyRankEngine:
         print(f"\n{'=' * 80}")
         print(f"策略回測排名 (top {min(top_n, len(df))}/{len(df)})  排序: {self.metric}")
         print(f"{'=' * 80}")
-        print(f"{'Rank':>4}  {'Stock':>6}  {'Strategy':<16}  {'Return':>8}  "
-              f"{'Annual':>8}  {'Sharpe':>7}  {'MDD':>7}  {'WinR':>6}  {'Trades':>6}")
+        print(
+            f"{'Rank':>4}  {'Stock':>6}  {'Strategy':<16}  {'Return':>8}  "
+            f"{'Annual':>8}  {'Sharpe':>7}  {'MDD':>7}  {'WinR':>6}  {'Trades':>6}"
+        )
         print(f"{'─' * 80}")
 
         for _, row in display.iterrows():
-            sharpe = f"{row['sharpe_ratio']:.2f}" if pd.notna(row.get('sharpe_ratio')) else "N/A"
-            win_r = f"{row['win_rate']:.1f}" if pd.notna(row.get('win_rate')) else "N/A"
+            sharpe = f"{row['sharpe_ratio']:.2f}" if pd.notna(row.get("sharpe_ratio")) else "N/A"
+            win_r = f"{row['win_rate']:.1f}" if pd.notna(row.get("win_rate")) else "N/A"
             print(
                 f"{int(row['rank']):>4}  {row['stock_id']:>6}  {row['strategy_name']:<16}  "
                 f"{row['total_return']:>7.2f}%  {row['annual_return']:>7.2f}%  "

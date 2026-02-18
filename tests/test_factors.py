@@ -1,21 +1,20 @@
 """測試 src/screener/factors.py 的 8 個篩選因子。"""
 
 import pandas as pd
-import pytest
 
 from src.screener.factors import (
-    rsi_oversold,
-    macd_golden_cross,
-    price_above_sma,
     foreign_net_buy,
     institutional_consecutive_buy,
-    short_squeeze_ratio,
-    revenue_yoy_growth,
+    macd_golden_cross,
+    price_above_sma,
     revenue_consecutive_growth,
+    revenue_yoy_growth,
+    rsi_oversold,
+    short_squeeze_ratio,
 )
 
-
 # ─── RSI 超賣 ─────────────────────────────────────────────
+
 
 class TestRsiOversold:
     def test_below_threshold_returns_true(self):
@@ -41,12 +40,15 @@ class TestRsiOversold:
 
 # ─── MACD 黃金交叉 ────────────────────────────────────────
 
+
 class TestMacdGoldenCross:
     def test_crossover_detected(self):
-        df = pd.DataFrame({
-            "macd":        [-1.0, 0.5, 1.0],
-            "macd_signal": [ 0.0, 0.0, 0.0],
-        })
+        df = pd.DataFrame(
+            {
+                "macd": [-1.0, 0.5, 1.0],
+                "macd_signal": [0.0, 0.0, 0.0],
+            }
+        )
         result = macd_golden_cross(df)
         # 第 0 天: prev=NaN → False
         # 第 1 天: prev_diff=-1 <= 0, diff=0.5 > 0 → True
@@ -54,10 +56,12 @@ class TestMacdGoldenCross:
         assert result.tolist() == [False, True, False]
 
     def test_no_crossover(self):
-        df = pd.DataFrame({
-            "macd":        [1.0, 2.0, 3.0],
-            "macd_signal": [0.0, 0.0, 0.0],
-        })
+        df = pd.DataFrame(
+            {
+                "macd": [1.0, 2.0, 3.0],
+                "macd_signal": [0.0, 0.0, 0.0],
+            }
+        )
         result = macd_golden_cross(df)
         assert not result.any()
 
@@ -68,6 +72,7 @@ class TestMacdGoldenCross:
 
 
 # ─── 股價站上 SMA ──────────────────────────────────────────
+
 
 class TestPriceAboveSma:
     def test_above_sma(self):
@@ -88,6 +93,7 @@ class TestPriceAboveSma:
 
 # ─── 外資買超 ──────────────────────────────────────────────
 
+
 class TestForeignNetBuy:
     def test_positive_net_buy(self):
         df = pd.DataFrame({"foreign_net": [1000, -500, 0]})
@@ -102,13 +108,16 @@ class TestForeignNetBuy:
 
 # ─── 法人連續買超 ──────────────────────────────────────────
 
+
 class TestInstitutionalConsecutiveBuy:
     def test_consecutive_3_days(self):
-        df = pd.DataFrame({
-            "foreign_net": [100, 200, 300, 400, -100],
-            "trust_net":   [  0,   0,   0,   0,    0],
-            "dealer_net":  [  0,   0,   0,   0,    0],
-        })
+        df = pd.DataFrame(
+            {
+                "foreign_net": [100, 200, 300, 400, -100],
+                "trust_net": [0, 0, 0, 0, 0],
+                "dealer_net": [0, 0, 0, 0, 0],
+            }
+        )
         result = institutional_consecutive_buy(df, days=3)
         assert result.tolist() == [False, False, True, True, False]
 
@@ -120,25 +129,30 @@ class TestInstitutionalConsecutiveBuy:
     def test_partial_columns(self):
         df = pd.DataFrame({"foreign_net": [100, 200, 300]})
         result = institutional_consecutive_buy(df, days=3)
-        assert result.iloc[-1] == True
+        assert bool(result.iloc[-1]) is True
 
 
 # ─── 券資比 ───────────────────────────────────────────────
 
+
 class TestShortSqueezeRatio:
     def test_above_threshold(self):
-        df = pd.DataFrame({
-            "short_balance":  [300, 100],
-            "margin_balance": [1000, 1000],
-        })
+        df = pd.DataFrame(
+            {
+                "short_balance": [300, 100],
+                "margin_balance": [1000, 1000],
+            }
+        )
         result = short_squeeze_ratio(df, threshold=0.2)
         assert result.tolist() == [True, False]
 
     def test_zero_margin_returns_false(self):
-        df = pd.DataFrame({
-            "short_balance":  [300],
-            "margin_balance": [0],
-        })
+        df = pd.DataFrame(
+            {
+                "short_balance": [300],
+                "margin_balance": [0],
+            }
+        )
         result = short_squeeze_ratio(df)
         # margin=0 → NaN → comparison with NaN → False
         assert result.tolist() == [False]
@@ -150,6 +164,7 @@ class TestShortSqueezeRatio:
 
 
 # ─── 營收 YoY ─────────────────────────────────────────────
+
 
 class TestRevenueYoyGrowth:
     def test_above_threshold(self):
@@ -164,6 +179,7 @@ class TestRevenueYoyGrowth:
 
 
 # ─── 連續營收成長 ──────────────────────────────────────────
+
 
 class TestRevenueConsecutiveGrowth:
     def test_3_months_growth(self):

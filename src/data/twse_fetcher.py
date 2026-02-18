@@ -14,9 +14,9 @@ import logging
 import time
 from datetime import date, timedelta
 
-import urllib3
 import pandas as pd
 import requests
+import urllib3
 
 # TWSE/TPEX 的 SSL 憑證在部分系統會驗證失敗，停用警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -61,6 +61,7 @@ def _find_last_trading_day(target: date, max_lookback: int = 7) -> date:
 # ------------------------------------------------------------------ #
 #  TWSE 上市
 # ------------------------------------------------------------------ #
+
 
 def fetch_twse_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     """抓取 TWSE 上市股票全市場日收盤行情。
@@ -123,17 +124,19 @@ def fetch_twse_daily_prices(target_date: date | None = None) -> pd.DataFrame:
         if spread_val and direction == "-":
             spread_val = -spread_val
 
-        rows.append({
-            "date": target_date,
-            "stock_id": stock_id,
-            "open": open_ or close,
-            "high": high or close,
-            "low": low or close,
-            "close": close,
-            "volume": int(volume) if volume else 0,
-            "turnover": int(turnover) if turnover else 0,
-            "spread": spread_val or 0.0,
-        })
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "open": open_ or close,
+                "high": high or close,
+                "low": low or close,
+                "close": close,
+                "volume": int(volume) if volume else 0,
+                "turnover": int(turnover) if turnover else 0,
+                "spread": spread_val or 0.0,
+            }
+        )
 
     df = pd.DataFrame(rows)
     logger.info("TWSE 日行情: %d 支股票", len(df))
@@ -191,9 +194,36 @@ def fetch_twse_institutional(target_date: date | None = None) -> pd.DataFrame:
         dealer_sell = (_parse_number(item[13]) or 0) + (_parse_number(item[16]) or 0)
         dealer_net = dealer_buy - dealer_sell
 
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Foreign_Investor", "buy": int(foreign_buy), "sell": int(foreign_sell), "net": int(foreign_net)})
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Investment_Trust", "buy": int(trust_buy), "sell": int(trust_sell), "net": int(trust_net)})
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Dealer_self", "buy": int(dealer_buy), "sell": int(dealer_sell), "net": int(dealer_net)})
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Foreign_Investor",
+                "buy": int(foreign_buy),
+                "sell": int(foreign_sell),
+                "net": int(foreign_net),
+            }
+        )
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Investment_Trust",
+                "buy": int(trust_buy),
+                "sell": int(trust_sell),
+                "net": int(trust_net),
+            }
+        )
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Dealer_self",
+                "buy": int(dealer_buy),
+                "sell": int(dealer_sell),
+                "net": int(dealer_net),
+            }
+        )
 
     df = pd.DataFrame(rows)
     logger.info("TWSE 三大法人: %d 支股票", len(df) // 3 if len(df) > 0 else 0)
@@ -204,6 +234,7 @@ def fetch_twse_institutional(target_date: date | None = None) -> pd.DataFrame:
 # ------------------------------------------------------------------ #
 #  TPEX 上櫃
 # ------------------------------------------------------------------ #
+
 
 def fetch_tpex_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     """抓取 TPEX 上櫃股票全市場日收盤行情。
@@ -262,17 +293,19 @@ def fetch_tpex_daily_prices(target_date: date | None = None) -> pd.DataFrame:
         if close is None:
             continue
 
-        rows.append({
-            "date": target_date,
-            "stock_id": stock_id,
-            "open": open_ or close,
-            "high": high or close,
-            "low": low or close,
-            "close": close,
-            "volume": int(volume) if volume else 0,
-            "turnover": int(turnover) if turnover else 0,
-            "spread": change or 0.0,
-        })
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "open": open_ or close,
+                "high": high or close,
+                "low": low or close,
+                "close": close,
+                "volume": int(volume) if volume else 0,
+                "turnover": int(turnover) if turnover else 0,
+                "spread": change or 0.0,
+            }
+        )
 
     df = pd.DataFrame(rows)
     logger.info("TPEX 日行情: %d 支股票", len(df))
@@ -340,9 +373,36 @@ def fetch_tpex_institutional(target_date: date | None = None) -> pd.DataFrame:
         dealer_sell = (_parse_number(item[15]) or 0) + (_parse_number(item[18]) or 0)
         dealer_net = dealer_buy - dealer_sell
 
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Foreign_Investor", "buy": int(foreign_buy), "sell": int(foreign_sell), "net": int(foreign_net)})
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Investment_Trust", "buy": int(trust_buy), "sell": int(trust_sell), "net": int(trust_net)})
-        rows.append({"date": target_date, "stock_id": stock_id, "name": "Dealer_self", "buy": int(dealer_buy), "sell": int(dealer_sell), "net": int(dealer_net)})
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Foreign_Investor",
+                "buy": int(foreign_buy),
+                "sell": int(foreign_sell),
+                "net": int(foreign_net),
+            }
+        )
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Investment_Trust",
+                "buy": int(trust_buy),
+                "sell": int(trust_sell),
+                "net": int(trust_net),
+            }
+        )
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "name": "Dealer_self",
+                "buy": int(dealer_buy),
+                "sell": int(dealer_sell),
+                "net": int(dealer_net),
+            }
+        )
 
     df = pd.DataFrame(rows)
     logger.info("TPEX 三大法人: %d 支股票", len(df) // 3 if len(df) > 0 else 0)
@@ -353,6 +413,7 @@ def fetch_tpex_institutional(target_date: date | None = None) -> pd.DataFrame:
 # ------------------------------------------------------------------ #
 #  整合：全市場 (TWSE + TPEX)
 # ------------------------------------------------------------------ #
+
 
 def fetch_market_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     """抓取全市場（上市 + 上櫃）日收盤行情。

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pandas as pd
 import pytest
 
 
@@ -20,6 +18,7 @@ class TestFinMindFetcher:
 
     def _make_fetcher(self):
         from src.data.fetcher import FinMindFetcher
+
         return FinMindFetcher(api_token="test_token")
 
     def test_fetch_daily_price_renames_columns(self, monkeypatch):
@@ -87,9 +86,27 @@ class TestFinMindFetcher:
         mock_resp.json.return_value = {
             "msg": "success",
             "data": [
-                {"date": "2024-01-10", "stock_id": "2330", "revenue": 200_000_000, "revenue_month": 1, "revenue_year": 2024},
-                {"date": "2024-02-10", "stock_id": "2330", "revenue": 220_000_000, "revenue_month": 2, "revenue_year": 2024},
-                {"date": "2024-03-10", "stock_id": "2330", "revenue": 250_000_000, "revenue_month": 3, "revenue_year": 2024},
+                {
+                    "date": "2024-01-10",
+                    "stock_id": "2330",
+                    "revenue": 200_000_000,
+                    "revenue_month": 1,
+                    "revenue_year": 2024,
+                },
+                {
+                    "date": "2024-02-10",
+                    "stock_id": "2330",
+                    "revenue": 220_000_000,
+                    "revenue_month": 2,
+                    "revenue_year": 2024,
+                },
+                {
+                    "date": "2024-03-10",
+                    "stock_id": "2330",
+                    "revenue": 250_000_000,
+                    "revenue_month": 3,
+                    "revenue_year": 2024,
+                },
             ],
         }
         monkeypatch.setattr(fetcher._session, "get", lambda *a, **kw: mock_resp)

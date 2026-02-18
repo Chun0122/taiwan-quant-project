@@ -14,7 +14,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, BigInteger, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.data.database import Base
@@ -24,9 +24,7 @@ class DailyPrice(Base):
     """個股日 K 線資料。"""
 
     __tablename__ = "daily_price"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", name="uq_daily_price"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_daily_price"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -47,9 +45,7 @@ class InstitutionalInvestor(Base):
     """三大法人買賣超資料。"""
 
     __tablename__ = "institutional_investor"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", "name", name="uq_institutional"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", "name", name="uq_institutional"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -67,9 +63,7 @@ class MarginTrading(Base):
     """融資融券資料。"""
 
     __tablename__ = "margin_trading"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", name="uq_margin_trading"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_margin_trading"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -89,9 +83,7 @@ class MonthlyRevenue(Base):
     """月營收資料。"""
 
     __tablename__ = "monthly_revenue"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", name="uq_monthly_revenue"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_monthly_revenue"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -110,9 +102,7 @@ class Dividend(Base):
     """股利資料。"""
 
     __tablename__ = "dividend"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", name="uq_dividend"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_dividend"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -135,9 +125,7 @@ class TechnicalIndicator(Base):
     """
 
     __tablename__ = "technical_indicator"
-    __table_args__ = (
-        UniqueConstraint("stock_id", "date", "name", name="uq_technical_indicator"),
-    )
+    __table_args__ = (UniqueConstraint("stock_id", "date", "name", name="uq_technical_indicator"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -161,17 +149,17 @@ class BacktestResult(Base):
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
     final_capital: Mapped[float] = mapped_column(Float, nullable=False)
-    total_return: Mapped[float] = mapped_column(Float, nullable=False)      # 總報酬率 (%)
-    annual_return: Mapped[float] = mapped_column(Float, nullable=False)     # 年化報酬率 (%)
-    sharpe_ratio: Mapped[float] = mapped_column(Float, nullable=True)       # Sharpe Ratio
-    max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)      # 最大回撤 (%)
-    win_rate: Mapped[float] = mapped_column(Float, nullable=True)           # 勝率 (%)
+    total_return: Mapped[float] = mapped_column(Float, nullable=False)  # 總報酬率 (%)
+    annual_return: Mapped[float] = mapped_column(Float, nullable=False)  # 年化報酬率 (%)
+    sharpe_ratio: Mapped[float] = mapped_column(Float, nullable=True)  # Sharpe Ratio
+    max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)  # 最大回撤 (%)
+    win_rate: Mapped[float] = mapped_column(Float, nullable=True)  # 勝率 (%)
     total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
     benchmark_return: Mapped[float | None] = mapped_column(Float, nullable=True)  # 基準報酬率 (%)
     sortino_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     calmar_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
-    var_95: Mapped[float | None] = mapped_column(Float, nullable=True)           # VaR (95%)
-    cvar_95: Mapped[float | None] = mapped_column(Float, nullable=True)          # CVaR (95%)
+    var_95: Mapped[float | None] = mapped_column(Float, nullable=True)  # VaR (95%)
+    cvar_95: Mapped[float | None] = mapped_column(Float, nullable=True)  # CVaR (95%)
     profit_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -190,10 +178,12 @@ class Trade(Base):
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     exit_date: Mapped[date] = mapped_column(Date, nullable=True)
     exit_price: Mapped[float] = mapped_column(Float, nullable=True)
-    shares: Mapped[int] = mapped_column(Integer, nullable=False)            # 股數
-    pnl: Mapped[float] = mapped_column(Float, nullable=True)               # 損益金額
-    return_pct: Mapped[float] = mapped_column(Float, nullable=True)        # 報酬率 (%)
-    exit_reason: Mapped[str | None] = mapped_column(String(20), nullable=True)  # signal/stop_loss/take_profit/trailing_stop/force_close
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)  # 股數
+    pnl: Mapped[float] = mapped_column(Float, nullable=True)  # 損益金額
+    return_pct: Mapped[float] = mapped_column(Float, nullable=True)  # 報酬率 (%)
+    exit_reason: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )  # signal/stop_loss/take_profit/trailing_stop/force_close
 
     def __repr__(self) -> str:
         return f"<Trade {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
@@ -206,7 +196,7 @@ class PortfolioBacktestResult(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
-    stock_ids: Mapped[str] = mapped_column(Text, nullable=False)             # 逗號分隔
+    stock_ids: Mapped[str] = mapped_column(Text, nullable=False)  # 逗號分隔
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     initial_capital: Mapped[float] = mapped_column(Float, nullable=False)

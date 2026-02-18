@@ -12,11 +12,11 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
+from sqlalchemy import select
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from ta.volatility import BollingerBands
 
-from sqlalchemy import select
 from src.data.database import get_session
 from src.data.schema import DailyPrice
 
@@ -26,20 +26,21 @@ logger = logging.getLogger(__name__)
 def _load_daily_price(stock_id: str) -> pd.DataFrame:
     """從 DB 讀取某股票的日K線，回傳按日期排序的 DataFrame。"""
     with get_session() as session:
-        rows = session.execute(
-            select(DailyPrice)
-            .where(DailyPrice.stock_id == stock_id)
-            .order_by(DailyPrice.date)
-        ).scalars().all()
+        rows = (
+            session.execute(select(DailyPrice).where(DailyPrice.stock_id == stock_id).order_by(DailyPrice.date))
+            .scalars()
+            .all()
+        )
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame([
-        {"date": r.date, "open": r.open, "high": r.high,
-         "low": r.low, "close": r.close, "volume": r.volume}
-        for r in rows
-    ])
+    df = pd.DataFrame(
+        [
+            {"date": r.date, "open": r.open, "high": r.high, "low": r.low, "close": r.close, "volume": r.volume}
+            for r in rows
+        ]
+    )
     return df
 
 

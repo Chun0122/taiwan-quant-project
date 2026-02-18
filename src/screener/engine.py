@@ -12,16 +12,16 @@ import logging
 from datetime import date, timedelta
 
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import select
 
 from src.config import settings
 from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
-    TechnicalIndicator,
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
+    TechnicalIndicator,
 )
 from src.screener.factors import FACTOR_REGISTRY
 
@@ -64,64 +64,74 @@ class MultiFactorScreener:
 
         with get_session() as session:
             # 1. 日K線
-            prices = session.execute(
-                select(DailyPrice)
-                .where(DailyPrice.stock_id == stock_id)
-                .where(DailyPrice.date >= start_date)
-                .order_by(DailyPrice.date.desc())
-                .limit(self.lookback_days)
-            ).scalars().all()
+            prices = (
+                session.execute(
+                    select(DailyPrice)
+                    .where(DailyPrice.stock_id == stock_id)
+                    .where(DailyPrice.date >= start_date)
+                    .order_by(DailyPrice.date.desc())
+                    .limit(self.lookback_days)
+                )
+                .scalars()
+                .all()
+            )
 
             if not prices:
                 return pd.DataFrame()
 
-            df = pd.DataFrame([
-                {
-                    "date": r.date,
-                    "close": r.close,
-                    "open": r.open,
-                    "high": r.high,
-                    "low": r.low,
-                    "volume": r.volume,
-                }
-                for r in prices
-            ]).set_index("date").sort_index()
+            df = (
+                pd.DataFrame(
+                    [
+                        {
+                            "date": r.date,
+                            "close": r.close,
+                            "open": r.open,
+                            "high": r.high,
+                            "low": r.low,
+                            "volume": r.volume,
+                        }
+                        for r in prices
+                    ]
+                )
+                .set_index("date")
+                .sort_index()
+            )
 
             date_range_start = df.index.min()
             date_range_end = df.index.max()
 
             # 2. 技術指標 pivot
-            indicators = session.execute(
-                select(TechnicalIndicator)
-                .where(TechnicalIndicator.stock_id == stock_id)
-                .where(TechnicalIndicator.date >= date_range_start)
-                .where(TechnicalIndicator.date <= date_range_end)
-            ).scalars().all()
+            indicators = (
+                session.execute(
+                    select(TechnicalIndicator)
+                    .where(TechnicalIndicator.stock_id == stock_id)
+                    .where(TechnicalIndicator.date >= date_range_start)
+                    .where(TechnicalIndicator.date <= date_range_end)
+                )
+                .scalars()
+                .all()
+            )
 
             if indicators:
-                df_ind = pd.DataFrame([
-                    {"date": r.date, "name": r.name, "value": r.value}
-                    for r in indicators
-                ])
+                df_ind = pd.DataFrame([{"date": r.date, "name": r.name, "value": r.value} for r in indicators])
                 df_wide = df_ind.pivot_table(index="date", columns="name", values="value")
                 df = df.join(df_wide, how="left")
 
             # 3. 三大法人 pivot by name
-            institutions = session.execute(
-                select(InstitutionalInvestor)
-                .where(InstitutionalInvestor.stock_id == stock_id)
-                .where(InstitutionalInvestor.date >= date_range_start)
-                .where(InstitutionalInvestor.date <= date_range_end)
-            ).scalars().all()
+            institutions = (
+                session.execute(
+                    select(InstitutionalInvestor)
+                    .where(InstitutionalInvestor.stock_id == stock_id)
+                    .where(InstitutionalInvestor.date >= date_range_start)
+                    .where(InstitutionalInvestor.date <= date_range_end)
+                )
+                .scalars()
+                .all()
+            )
 
             if institutions:
-                df_inst = pd.DataFrame([
-                    {"date": r.date, "name": r.name, "net": r.net}
-                    for r in institutions
-                ])
-                inst_pivot = df_inst.pivot_table(
-                    index="date", columns="name", values="net", aggfunc="sum"
-                )
+                df_inst = pd.DataFrame([{"date": r.date, "name": r.name, "net": r.net} for r in institutions])
+                inst_pivot = df_inst.pivot_table(index="date", columns="name", values="net", aggfunc="sum")
                 # 重新命名為統一欄位名
                 rename_map = {
                     "Foreign_Investor": "foreign_net",
@@ -141,31 +151,41 @@ class MultiFactorScreener:
                 df = df.join(inst_pivot, how="left")
 
             # 4. 融資融券
-            margins = session.execute(
-                select(MarginTrading)
-                .where(MarginTrading.stock_id == stock_id)
-                .where(MarginTrading.date >= date_range_start)
-                .where(MarginTrading.date <= date_range_end)
-            ).scalars().all()
+            margins = (
+                session.execute(
+                    select(MarginTrading)
+                    .where(MarginTrading.stock_id == stock_id)
+                    .where(MarginTrading.date >= date_range_start)
+                    .where(MarginTrading.date <= date_range_end)
+                )
+                .scalars()
+                .all()
+            )
 
             if margins:
-                df_margin = pd.DataFrame([
-                    {
-                        "date": r.date,
-                        "margin_balance": r.margin_balance,
-                        "short_balance": r.short_balance,
-                    }
-                    for r in margins
-                ]).set_index("date")
+                df_margin = pd.DataFrame(
+                    [
+                        {
+                            "date": r.date,
+                            "margin_balance": r.margin_balance,
+                            "short_balance": r.short_balance,
+                        }
+                        for r in margins
+                    ]
+                ).set_index("date")
                 df = df.join(df_margin, how="left")
 
             # 5. 月營收（取最近一筆）
-            latest_rev = session.execute(
-                select(MonthlyRevenue)
-                .where(MonthlyRevenue.stock_id == stock_id)
-                .order_by(MonthlyRevenue.date.desc())
-                .limit(1)
-            ).scalars().first()
+            latest_rev = (
+                session.execute(
+                    select(MonthlyRevenue)
+                    .where(MonthlyRevenue.stock_id == stock_id)
+                    .order_by(MonthlyRevenue.date.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
 
             if latest_rev:
                 df["yoy_growth"] = latest_rev.yoy_growth
@@ -242,9 +262,19 @@ class MultiFactorScreener:
 
         # 整理欄位順序
         priority_cols = [
-            "stock_id", "close", "volume", "rsi_14", "macd", "sma_20",
-            "foreign_net", "trust_net", "dealer_net",
-            "margin_balance", "short_balance", "yoy_growth", "factor_score",
+            "stock_id",
+            "close",
+            "volume",
+            "rsi_14",
+            "macd",
+            "sma_20",
+            "foreign_net",
+            "trust_net",
+            "dealer_net",
+            "margin_balance",
+            "short_balance",
+            "yoy_growth",
+            "factor_score",
         ]
         ordered = [c for c in priority_cols if c in df_result.columns]
         remaining = [c for c in df_result.columns if c not in ordered]

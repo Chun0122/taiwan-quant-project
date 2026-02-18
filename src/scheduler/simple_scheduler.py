@@ -7,7 +7,7 @@ import time
 
 import schedule
 
-from src.data.pipeline import sync_watchlist, sync_indicators, sync_taiex_index
+from src.data.pipeline import sync_indicators, sync_taiex_index, sync_watchlist
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +29,9 @@ def daily_sync_job() -> None:
 
     # 同步完成後執行篩選 + 通知
     try:
-        from src.screener.engine import MultiFactorScreener
-        from src.notification.line_notify import send_scan_results
         from src.config import settings
+        from src.notification.line_notify import send_scan_results
+        from src.screener.engine import MultiFactorScreener
 
         logger.info("開始每日自動篩選")
         screener = MultiFactorScreener()
@@ -49,10 +49,10 @@ def daily_sync_job() -> None:
 
     # 每日選股報告
     try:
+        from src.config import settings
+        from src.notification.line_notify import send_message
         from src.report.engine import DailyReportEngine
         from src.report.formatter import format_daily_report
-        from src.notification.line_notify import send_message
-        from src.config import settings
 
         logger.info("開始生成每日選股報告")
         engine = DailyReportEngine(ml_enabled=False)
@@ -72,11 +72,11 @@ def daily_sync_job() -> None:
 
     # 全市場選股掃描
     try:
+        from src.config import settings
         from src.data.pipeline import sync_market_data, sync_stock_info
         from src.discovery.scanner import MarketScanner
-        from src.report.formatter import format_discovery_report
         from src.notification.line_notify import send_message
-        from src.config import settings
+        from src.report.formatter import format_discovery_report
 
         logger.info("開始全市場選股掃描")
         sync_stock_info(force_refresh=False)

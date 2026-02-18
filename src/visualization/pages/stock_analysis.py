@@ -6,10 +6,13 @@ from datetime import date, timedelta
 
 import streamlit as st
 
-from src.visualization.data_loader import (
-    get_stock_list, load_institutional, load_margin, load_price_with_indicators,
-)
 from src.visualization.charts import plot_candlestick, plot_institutional, plot_margin
+from src.visualization.data_loader import (
+    get_stock_list,
+    load_institutional,
+    load_margin,
+    load_price_with_indicators,
+)
 
 
 def render() -> None:

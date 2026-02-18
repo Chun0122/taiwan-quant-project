@@ -51,39 +51,45 @@ class Strategy(ABC):
 
         # 載入日K線
         with get_session() as session:
-            prices = session.execute(
-                select(DailyPrice)
-                .where(DailyPrice.stock_id == self.stock_id)
-                .where(DailyPrice.date >= self.start_date)
-                .where(DailyPrice.date <= self.end_date)
-                .order_by(DailyPrice.date)
-            ).scalars().all()
+            prices = (
+                session.execute(
+                    select(DailyPrice)
+                    .where(DailyPrice.stock_id == self.stock_id)
+                    .where(DailyPrice.date >= self.start_date)
+                    .where(DailyPrice.date <= self.end_date)
+                    .order_by(DailyPrice.date)
+                )
+                .scalars()
+                .all()
+            )
 
         if not prices:
             logger.warning("[%s] 無日K線資料", self.stock_id)
             return pd.DataFrame()
 
-        df = pd.DataFrame([
-            {"date": r.date, "open": r.open, "high": r.high,
-             "low": r.low, "close": r.close, "volume": r.volume}
-            for r in prices
-        ]).set_index("date")
+        df = pd.DataFrame(
+            [
+                {"date": r.date, "open": r.open, "high": r.high, "low": r.low, "close": r.close, "volume": r.volume}
+                for r in prices
+            ]
+        ).set_index("date")
 
         # 載入技術指標並 pivot 成寬表
         with get_session() as session:
-            indicators = session.execute(
-                select(TechnicalIndicator)
-                .where(TechnicalIndicator.stock_id == self.stock_id)
-                .where(TechnicalIndicator.date >= self.start_date)
-                .where(TechnicalIndicator.date <= self.end_date)
-                .order_by(TechnicalIndicator.date)
-            ).scalars().all()
+            indicators = (
+                session.execute(
+                    select(TechnicalIndicator)
+                    .where(TechnicalIndicator.stock_id == self.stock_id)
+                    .where(TechnicalIndicator.date >= self.start_date)
+                    .where(TechnicalIndicator.date <= self.end_date)
+                    .order_by(TechnicalIndicator.date)
+                )
+                .scalars()
+                .all()
+            )
 
         if indicators:
-            df_ind = pd.DataFrame([
-                {"date": r.date, "name": r.name, "value": r.value}
-                for r in indicators
-            ])
+            df_ind = pd.DataFrame([{"date": r.date, "name": r.name, "value": r.value} for r in indicators])
             df_wide = df_ind.pivot_table(index="date", columns="name", values="value")
             df = df.join(df_wide, how="left")
 

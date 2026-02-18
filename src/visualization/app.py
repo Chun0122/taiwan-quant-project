@@ -16,19 +16,25 @@ page = st.sidebar.radio(
 
 if page == "📈 個股分析":
     from src.visualization.pages.stock_analysis import render
+
     render()
 elif page == "🔄 回測結果":
     from src.visualization.pages.backtest_review import render
+
     render()
 elif page == "📊 投資組合":
     from src.visualization.pages.portfolio_review import render
+
     render()
 elif page == "🔍 選股篩選":
     from src.visualization.pages.screener_results import render
+
     render()
 elif page == "🤖 ML 策略分析":
     from src.visualization.pages.ml_analysis import render
+
     render()
 elif page == "🏭 產業輪動":
     from src.visualization.pages.industry_rotation import render
+
     render()

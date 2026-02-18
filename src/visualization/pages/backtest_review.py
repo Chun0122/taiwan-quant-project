@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import streamlit as st
-import pandas as pd
 
-from src.visualization.data_loader import (
-    load_backtest_list, load_backtest_by_id, load_trades, load_price_with_indicators,
-)
 from src.visualization.charts import plot_equity_curve
+from src.visualization.data_loader import (
+    load_backtest_by_id,
+    load_backtest_list,
+    load_price_with_indicators,
+    load_trades,
+)
 
 
 def _fmt(val, suffix="", default="N/A"):
@@ -27,15 +29,33 @@ def render() -> None:
 
     # --- 回測比較表 ---
     st.subheader("回測紀錄總覽")
-    display_df = bt_list[[
-        "id", "stock_id", "strategy_name", "start_date", "end_date",
-        "total_return", "annual_return", "sharpe_ratio", "max_drawdown",
-        "win_rate", "total_trades",
-    ]].copy()
+    display_df = bt_list[
+        [
+            "id",
+            "stock_id",
+            "strategy_name",
+            "start_date",
+            "end_date",
+            "total_return",
+            "annual_return",
+            "sharpe_ratio",
+            "max_drawdown",
+            "win_rate",
+            "total_trades",
+        ]
+    ].copy()
     display_df.columns = [
-        "ID", "股票", "策略", "起始日", "結束日",
-        "總報酬%", "年化報酬%", "Sharpe", "MDD%",
-        "勝率%", "交易次數",
+        "ID",
+        "股票",
+        "策略",
+        "起始日",
+        "結束日",
+        "總報酬%",
+        "年化報酬%",
+        "Sharpe",
+        "MDD%",
+        "勝率%",
+        "交易次數",
     ]
     st.dataframe(display_df, width="stretch", hide_index=True)
 
@@ -61,17 +81,17 @@ def render() -> None:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("總報酬", f"{bt['total_return']:+.2f}%")
     c2.metric("年化報酬", f"{bt['annual_return']:+.2f}%")
-    c3.metric("Sharpe", _fmt(bt['sharpe_ratio']))
+    c3.metric("Sharpe", _fmt(bt["sharpe_ratio"]))
     c4.metric("最大回撤", f"{bt['max_drawdown']:.2f}%")
-    c5.metric("勝率", _fmt(bt['win_rate'], "%"))
+    c5.metric("勝率", _fmt(bt["win_rate"], "%"))
 
     # 第二排：進階指標
     a1, a2, a3, a4, a5 = st.columns(5)
-    a1.metric("Sortino", _fmt(bt.get('sortino_ratio')))
-    a2.metric("Calmar", _fmt(bt.get('calmar_ratio')))
-    a3.metric("VaR(95%)", _fmt(bt.get('var_95'), "%"))
-    a4.metric("CVaR(95%)", _fmt(bt.get('cvar_95'), "%"))
-    a5.metric("Profit Factor", _fmt(bt.get('profit_factor')))
+    a1.metric("Sortino", _fmt(bt.get("sortino_ratio")))
+    a2.metric("Calmar", _fmt(bt.get("calmar_ratio")))
+    a3.metric("VaR(95%)", _fmt(bt.get("var_95"), "%"))
+    a4.metric("CVaR(95%)", _fmt(bt.get("cvar_95"), "%"))
+    a5.metric("Profit Factor", _fmt(bt.get("profit_factor")))
 
     # 第三排：資金
     m1, m2, m3 = st.columns(3)
@@ -81,9 +101,7 @@ def render() -> None:
 
     # --- 權益曲線 ---
     trades = load_trades(selected_id)
-    prices = load_price_with_indicators(
-        bt["stock_id"], str(bt["start_date"]), str(bt["end_date"])
-    )
+    prices = load_price_with_indicators(bt["stock_id"], str(bt["start_date"]), str(bt["end_date"]))
 
     if not prices.empty:
         fig_eq = plot_equity_curve(trades, prices, bt["initial_capital"])
@@ -98,28 +116,60 @@ def render() -> None:
         has_exit_reason = "exit_reason" in trade_display.columns and trade_display["exit_reason"].notna().any()
 
         if has_exit_reason:
-            trade_display = trade_display[[
-                "entry_date", "entry_price", "exit_date", "exit_price",
-                "shares", "pnl", "return_pct", "exit_reason",
-            ]]
+            trade_display = trade_display[
+                [
+                    "entry_date",
+                    "entry_price",
+                    "exit_date",
+                    "exit_price",
+                    "shares",
+                    "pnl",
+                    "return_pct",
+                    "exit_reason",
+                ]
+            ]
             trade_display.columns = [
-                "進場日", "進場價", "出場日", "出場價", "股數", "損益", "報酬%", "出場原因",
+                "進場日",
+                "進場價",
+                "出場日",
+                "出場價",
+                "股數",
+                "損益",
+                "報酬%",
+                "出場原因",
             ]
         else:
-            trade_display = trade_display[[
-                "entry_date", "entry_price", "exit_date", "exit_price",
-                "shares", "pnl", "return_pct",
-            ]]
+            trade_display = trade_display[
+                [
+                    "entry_date",
+                    "entry_price",
+                    "exit_date",
+                    "exit_price",
+                    "shares",
+                    "pnl",
+                    "return_pct",
+                ]
+            ]
             trade_display.columns = [
-                "進場日", "進場價", "出場日", "出場價", "股數", "損益", "報酬%",
+                "進場日",
+                "進場價",
+                "出場日",
+                "出場價",
+                "股數",
+                "損益",
+                "報酬%",
             ]
 
         # 損益顏色標記
         st.dataframe(
             trade_display.style.map(
-                lambda v: "color: #EF5350" if isinstance(v, (int, float)) and v < 0
-                else "color: #26A69A" if isinstance(v, (int, float)) and v > 0
-                else "",
+                lambda v: (
+                    "color: #EF5350"
+                    if isinstance(v, (int, float)) and v < 0
+                    else "color: #26A69A"
+                    if isinstance(v, (int, float)) and v > 0
+                    else ""
+                ),
                 subset=["損益", "報酬%"],
             ),
             width="stretch",

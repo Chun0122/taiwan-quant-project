@@ -101,9 +101,9 @@ def _generate_xml(output: Path, batch_path: Path) -> None:
 def _print_instructions(batch_path: Path, xml_path: Path, log_dir: Path) -> None:
     """列印安裝說明。"""
     print(f"""
-{'=' * 65}
+{"=" * 65}
 Windows 工作排程器安裝說明
-{'=' * 65}
+{"=" * 65}
 
 【方法一：命令列匯入（建議）】
 
@@ -127,5 +127,5 @@ Windows 工作排程器安裝說明
 
 排程時間：每日 23:00
 日誌位置：{log_dir}
-{'=' * 65}
+{"=" * 65}
 """)

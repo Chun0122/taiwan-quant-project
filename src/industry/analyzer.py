@@ -11,9 +11,8 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 
 from src.config import settings
 from src.data.database import get_session, init_db
@@ -43,9 +42,7 @@ class IndustryRotationAnalyzer:
             {stock_id: industry_category}，不在表中的股票標為「未分類」
         """
         with get_session() as session:
-            rows = session.execute(
-                select(StockInfo.stock_id, StockInfo.industry_category)
-            ).all()
+            rows = session.execute(select(StockInfo.stock_id, StockInfo.industry_category)).all()
 
         db_map = {r[0]: r[1] or "未分類" for r in rows}
 
@@ -66,20 +63,21 @@ class IndustryRotationAnalyzer:
         start_date = end_date - timedelta(days=self.lookback_days * 2)
 
         with get_session() as session:
-            rows = session.execute(
-                select(InstitutionalInvestor)
-                .where(InstitutionalInvestor.stock_id.in_(self.watchlist))
-                .where(InstitutionalInvestor.date >= start_date)
-                .order_by(InstitutionalInvestor.date.desc())
-            ).scalars().all()
+            rows = (
+                session.execute(
+                    select(InstitutionalInvestor)
+                    .where(InstitutionalInvestor.stock_id.in_(self.watchlist))
+                    .where(InstitutionalInvestor.date >= start_date)
+                    .order_by(InstitutionalInvestor.date.desc())
+                )
+                .scalars()
+                .all()
+            )
 
         if not rows:
             return pd.DataFrame(columns=["industry", "total_net", "stock_count", "avg_net_per_stock"])
 
-        df = pd.DataFrame([
-            {"stock_id": r.stock_id, "date": r.date, "name": r.name, "net": r.net}
-            for r in rows
-        ])
+        df = pd.DataFrame([{"stock_id": r.stock_id, "date": r.date, "name": r.name, "net": r.net} for r in rows])
 
         # 只取最近 lookback_days 個交易日
         unique_dates = sorted(df["date"].unique(), reverse=True)
@@ -92,10 +90,14 @@ class IndustryRotationAnalyzer:
 
         # 按產業 + 股票加總
         stock_net = df.groupby(["industry", "stock_id"])["net"].sum().reset_index()
-        sector_flow = stock_net.groupby("industry").agg(
-            total_net=("net", "sum"),
-            stock_count=("stock_id", "nunique"),
-        ).reset_index()
+        sector_flow = (
+            stock_net.groupby("industry")
+            .agg(
+                total_net=("net", "sum"),
+                stock_count=("stock_id", "nunique"),
+            )
+            .reset_index()
+        )
         sector_flow["avg_net_per_stock"] = sector_flow["total_net"] / sector_flow["stock_count"]
         sector_flow = sector_flow.sort_values("total_net", ascending=False).reset_index(drop=True)
 
@@ -136,20 +138,26 @@ class IndustryRotationAnalyzer:
             last_close = grp.iloc[-1]["close"]
             if first_close > 0:
                 ret_pct = (last_close / first_close - 1) * 100
-                returns.append({
-                    "stock_id": sid,
-                    "return_pct": ret_pct,
-                    "industry": industry_map.get(sid, "未分類"),
-                })
+                returns.append(
+                    {
+                        "stock_id": sid,
+                        "return_pct": ret_pct,
+                        "industry": industry_map.get(sid, "未分類"),
+                    }
+                )
 
         if not returns:
             return pd.DataFrame(columns=["industry", "avg_return_pct", "stock_count"])
 
         df_ret = pd.DataFrame(returns)
-        sector_momentum = df_ret.groupby("industry").agg(
-            avg_return_pct=("return_pct", "mean"),
-            stock_count=("stock_id", "nunique"),
-        ).reset_index()
+        sector_momentum = (
+            df_ret.groupby("industry")
+            .agg(
+                avg_return_pct=("return_pct", "mean"),
+                stock_count=("stock_id", "nunique"),
+            )
+            .reset_index()
+        )
         sector_momentum = sector_momentum.sort_values("avg_return_pct", ascending=False).reset_index(drop=True)
 
         return sector_momentum
@@ -205,16 +213,21 @@ class IndustryRotationAnalyzer:
         merged["institutional_score"] = _minmax(merged["total_net"])
         merged["momentum_score"] = _minmax(merged["avg_return_pct"])
         merged["sector_score"] = (
-            inst_weight * merged["institutional_score"]
-            + momentum_weight * merged["momentum_score"]
+            inst_weight * merged["institutional_score"] + momentum_weight * merged["momentum_score"]
         )
 
         merged = merged.sort_values("sector_score", ascending=False).reset_index(drop=True)
         merged["rank"] = range(1, len(merged) + 1)
 
         cols = [
-            "rank", "industry", "sector_score", "institutional_score",
-            "momentum_score", "total_net", "avg_return_pct", "stock_count",
+            "rank",
+            "industry",
+            "sector_score",
+            "institutional_score",
+            "momentum_score",
+            "total_net",
+            "avg_return_pct",
+            "stock_count",
         ]
         return merged[[c for c in cols if c in merged.columns]]
 
@@ -271,8 +284,7 @@ class IndustryRotationAnalyzer:
 
             # 取得股票名稱
             info_rows = session.execute(
-                select(StockInfo.stock_id, StockInfo.stock_name)
-                .where(StockInfo.stock_id.in_(hot_stocks))
+                select(StockInfo.stock_id, StockInfo.stock_name).where(StockInfo.stock_id.in_(hot_stocks))
             ).all()
 
         # 最新收盤價（每支取第一筆 = 最新）
@@ -286,13 +298,15 @@ class IndustryRotationAnalyzer:
 
         records = []
         for sid in hot_stocks:
-            records.append({
-                "industry": industry_map[sid],
-                "stock_id": sid,
-                "stock_name": name_map.get(sid, ""),
-                "close": price_map.get(sid, 0),
-                "foreign_net_sum": inst_map.get(sid, 0),
-            })
+            records.append(
+                {
+                    "industry": industry_map[sid],
+                    "stock_id": sid,
+                    "stock_name": name_map.get(sid, ""),
+                    "close": price_map.get(sid, 0),
+                    "foreign_net_sum": inst_map.get(sid, 0),
+                }
+            )
 
         if not records:
             return pd.DataFrame()
@@ -302,9 +316,7 @@ class IndustryRotationAnalyzer:
         # 按產業內外資淨買超排序，每產業取 top_n
         result_parts = []
         for ind in hot_industries:
-            sector_stocks = df[df["industry"] == ind].sort_values(
-                "foreign_net_sum", ascending=False
-            ).head(top_n).copy()
+            sector_stocks = df[df["industry"] == ind].sort_values("foreign_net_sum", ascending=False).head(top_n).copy()
             sector_stocks["rank_in_sector"] = range(1, len(sector_stocks) + 1)
             result_parts.append(sector_stocks)
 

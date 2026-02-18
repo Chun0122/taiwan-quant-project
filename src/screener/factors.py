@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-
 # ─── 技術面因子 ──────────────────────────────────────────────
+
 
 def rsi_oversold(df: pd.DataFrame, threshold: float = 30) -> pd.Series:
     """RSI 低於門檻值（超賣區）。
@@ -52,6 +52,7 @@ def price_above_sma(df: pd.DataFrame, period: int = 20) -> pd.Series:
 
 
 # ─── 籌碼面因子 ──────────────────────────────────────────────
+
 
 def foreign_net_buy(df: pd.DataFrame, threshold: float = 0) -> pd.Series:
     """外資買超。
@@ -111,6 +112,7 @@ def short_squeeze_ratio(df: pd.DataFrame, threshold: float = 0.2) -> pd.Series:
 
 
 # ─── 基本面因子 ──────────────────────────────────────────────
+
 
 def revenue_yoy_growth(df: pd.DataFrame, threshold: float = 20) -> pd.Series:
     """月營收年增率超過門檻。

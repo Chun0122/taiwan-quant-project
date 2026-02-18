@@ -1,11 +1,9 @@
 """資料庫引擎與 Session 管理。"""
 
-from pathlib import Path
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from src.config import settings, PROJECT_ROOT
+from src.config import PROJECT_ROOT, settings
 
 
 class Base(DeclarativeBase):

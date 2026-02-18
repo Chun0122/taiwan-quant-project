@@ -1,9 +1,8 @@
 """Streamlit 產業輪動分析頁面。"""
 
-import streamlit as st
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
 
 def render():
@@ -19,6 +18,7 @@ def render():
     if st.sidebar.button("🔄 同步 StockInfo"):
         with st.spinner("正在同步股票基本資料..."):
             from src.data.pipeline import sync_stock_info
+
             count = sync_stock_info(force_refresh=True)
             st.sidebar.success(f"已同步 {count} 筆")
 
@@ -30,8 +30,8 @@ def render():
 
 
 def _run_analysis(lookback_days, momentum_days, top_sectors, top_n):
-    from src.industry.analyzer import IndustryRotationAnalyzer
     from src.data.pipeline import sync_stock_info
+    from src.industry.analyzer import IndustryRotationAnalyzer
 
     # 確保 StockInfo 存在
     sync_stock_info(force_refresh=False)
@@ -63,13 +63,15 @@ def _render_sector_overview(sector_df, top_sectors, analyzer):
     # 排名表格
     st.subheader("產業綜合排名")
     st.dataframe(
-        display.style.format({
-            "sector_score": "{:.3f}",
-            "institutional_score": "{:.3f}",
-            "momentum_score": "{:.3f}",
-            "total_net": "{:,.0f}",
-            "avg_return_pct": "{:.2f}%",
-        }),
+        display.style.format(
+            {
+                "sector_score": "{:.3f}",
+                "institutional_score": "{:.3f}",
+                "momentum_score": "{:.3f}",
+                "total_net": "{:,.0f}",
+                "avg_return_pct": "{:.2f}%",
+            }
+        ),
         use_container_width=True,
         hide_index=True,
     )
@@ -103,15 +105,14 @@ def _render_sector_overview(sector_df, top_sectors, analyzer):
         # 法人淨買超長條圖
         st.subheader("法人淨買超（按產業）")
         chart_data = sector_df.head(top_sectors).sort_values("total_net")
-        fig = go.Figure(go.Bar(
-            x=chart_data["total_net"],
-            y=chart_data["industry"],
-            orientation="h",
-            marker_color=[
-                "#2ecc71" if v > 0 else "#e74c3c"
-                for v in chart_data["total_net"]
-            ],
-        ))
+        fig = go.Figure(
+            go.Bar(
+                x=chart_data["total_net"],
+                y=chart_data["industry"],
+                orientation="h",
+                marker_color=["#2ecc71" if v > 0 else "#e74c3c" for v in chart_data["total_net"]],
+            )
+        )
         fig.update_layout(
             height=400,
             xaxis_title="淨買超金額",
@@ -123,9 +124,7 @@ def _render_sector_overview(sector_df, top_sectors, analyzer):
 def _render_top_stocks(sector_df, analyzer, top_sectors, top_n):
     """精選個股 Tab。"""
     with st.spinner("正在篩選精選個股..."):
-        top_stocks = analyzer.top_stocks_from_hot_sectors(
-            sector_df, top_sectors=top_sectors, top_n=top_n
-        )
+        top_stocks = analyzer.top_stocks_from_hot_sectors(sector_df, top_sectors=top_sectors, top_n=top_n)
 
     if top_stocks.empty:
         st.warning("無精選個股資料")
@@ -137,10 +136,12 @@ def _render_top_stocks(sector_df, analyzer, top_sectors, top_n):
             display_cols = ["stock_id", "stock_name", "close", "foreign_net_sum", "rank_in_sector"]
             available = [c for c in display_cols if c in sector_stocks.columns]
             st.dataframe(
-                sector_stocks[available].style.format({
-                    "close": "{:.1f}",
-                    "foreign_net_sum": "{:,.0f}",
-                }),
+                sector_stocks[available].style.format(
+                    {
+                        "close": "{:.1f}",
+                        "foreign_net_sum": "{:,.0f}",
+                    }
+                ),
                 use_container_width=True,
                 hide_index=True,
             )

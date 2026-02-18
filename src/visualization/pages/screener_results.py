@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import streamlit as st
-import pandas as pd
 
 from src.screener.factors import FACTOR_REGISTRY
 
@@ -105,13 +104,22 @@ def render() -> None:
 
         # 主要結果表格
         display_cols = [
-            "stock_id", "close", "volume", "factor_score",
+            "stock_id",
+            "close",
+            "volume",
+            "factor_score",
         ]
         # 加入可用的指標欄位
         optional_cols = [
-            "rsi_14", "macd", "sma_20",
-            "foreign_net", "trust_net", "dealer_net",
-            "margin_balance", "short_balance", "yoy_growth",
+            "rsi_14",
+            "macd",
+            "sma_20",
+            "foreign_net",
+            "trust_net",
+            "dealer_net",
+            "margin_balance",
+            "short_balance",
+            "yoy_growth",
         ]
         for col in optional_cols:
             if col in results.columns:
@@ -139,9 +147,7 @@ def render() -> None:
                 "stock_id": st.column_config.TextColumn("股票代號", width="small"),
                 "close": st.column_config.NumberColumn("收盤價", format="%.2f"),
                 "volume": st.column_config.NumberColumn("成交量", format="%d"),
-                "factor_score": st.column_config.ProgressColumn(
-                    "因子分數", min_value=0, max_value=1, format="%.2f"
-                ),
+                "factor_score": st.column_config.ProgressColumn("因子分數", min_value=0, max_value=1, format="%.2f"),
             },
         )
 

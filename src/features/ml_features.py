@@ -97,8 +97,14 @@ def build_ml_features(data: pd.DataFrame, lookback: int = 20, forward_days: int 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """取得特徵欄位名稱（排除 OHLCV、標籤等非特徵欄位）。"""
     exclude = {
-        "open", "high", "low", "close", "volume",
-        "future_return", "label",
-        "turnover", "spread",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "future_return",
+        "label",
+        "turnover",
+        "spread",
     }
     return [c for c in df.columns if c not in exclude]

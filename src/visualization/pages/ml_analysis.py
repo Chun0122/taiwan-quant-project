@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
 
 from src.visualization.data_loader import get_stock_list
 
@@ -47,9 +47,7 @@ def render() -> None:
     # ─── Tab 1: 模型訓練分析 ──────────────────────────────
     with tab1:
         if st.button("訓練模型", type="primary", key="ml_train_btn"):
-            _run_model_analysis(
-                stock_id, model_type, lookback, forward_days, train_ratio, threshold
-            )
+            _run_model_analysis(stock_id, model_type, lookback, forward_days, train_ratio, threshold)
 
     # ─── Tab 2: Walk-Forward 驗證 ─────────────────────────
     with tab2:
@@ -69,8 +67,14 @@ def render() -> None:
 
         if st.button("執行 Walk-Forward", type="primary", key="wf_run_btn"):
             _run_walk_forward(
-                stock_id, model_type, lookback, forward_days,
-                train_window, test_window, step_size, threshold,
+                stock_id,
+                model_type,
+                lookback,
+                forward_days,
+                train_window,
+                test_window,
+                step_size,
+                threshold,
             )
 
 
@@ -83,8 +87,8 @@ def _run_model_analysis(
     threshold: float,
 ) -> None:
     """訓練模型並顯示分析結果。"""
-    from src.strategy.ml_strategy import MLStrategy
     from src.features.ml_features import build_ml_features, get_feature_columns
+    from src.strategy.ml_strategy import MLStrategy
 
     with st.spinner("載入資料並訓練模型..."):
         strategy = MLStrategy(
@@ -117,6 +121,7 @@ def _run_model_analysis(
 
         # 標準化
         from sklearn.preprocessing import StandardScaler
+
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X[:split_idx])
         X_test = scaler.transform(X[split_idx:])
@@ -154,17 +159,25 @@ def _run_model_analysis(
         importances = None
 
     if importances is not None:
-        fi_df = pd.DataFrame({
-            "feature": feature_cols,
-            "importance": importances,
-        }).sort_values("importance", ascending=True).tail(15)
+        fi_df = (
+            pd.DataFrame(
+                {
+                    "feature": feature_cols,
+                    "importance": importances,
+                }
+            )
+            .sort_values("importance", ascending=True)
+            .tail(15)
+        )
 
-        fig = go.Figure(go.Bar(
-            x=fi_df["importance"],
-            y=fi_df["feature"],
-            orientation="h",
-            marker_color="#2196F3",
-        ))
+        fig = go.Figure(
+            go.Bar(
+                x=fi_df["importance"],
+                y=fi_df["feature"],
+                orientation="h",
+                marker_color="#2196F3",
+            )
+        )
         fig.update_layout(
             title="Top 15 特徵重要性",
             xaxis_title="重要性",
@@ -181,15 +194,19 @@ def _run_model_analysis(
     prob_up = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
 
     fig = go.Figure()
-    fig.add_trace(go.Histogram(
-        x=prob_up, nbinsx=30,
-        marker_color="#2196F3", opacity=0.7,
-        name="預測機率",
-    ))
-    fig.add_vline(x=threshold, line_dash="dash", line_color="red",
-                  annotation_text=f"買入門檻 ({threshold})")
-    fig.add_vline(x=1 - threshold, line_dash="dash", line_color="green",
-                  annotation_text=f"賣出門檻 ({1-threshold:.2f})")
+    fig.add_trace(
+        go.Histogram(
+            x=prob_up,
+            nbinsx=30,
+            marker_color="#2196F3",
+            opacity=0.7,
+            name="預測機率",
+        )
+    )
+    fig.add_vline(x=threshold, line_dash="dash", line_color="red", annotation_text=f"買入門檻 ({threshold})")
+    fig.add_vline(
+        x=1 - threshold, line_dash="dash", line_color="green", annotation_text=f"賣出門檻 ({1 - threshold:.2f})"
+    )
     fig.update_layout(
         title="上漲機率分佈",
         xaxis_title="P(上漲)",
@@ -210,8 +227,8 @@ def _run_walk_forward(
     threshold: float,
 ) -> None:
     """執行 Walk-Forward 驗證並顯示結果。"""
-    from src.strategy.ml_strategy import MLStrategy
     from src.backtest.walk_forward import WalkForwardEngine
+    from src.strategy.ml_strategy import MLStrategy
 
     with st.spinner(f"執行 Walk-Forward 驗證（窗口: {train_window}/{test_window}）..."):
         try:
@@ -252,15 +269,18 @@ def _run_walk_forward(
     if result.equity_curve:
         st.subheader("Walk-Forward 權益曲線")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            y=result.equity_curve,
-            mode="lines",
-            line=dict(color="#2196F3", width=1.5),
-            name="權益",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                y=result.equity_curve,
+                mode="lines",
+                line=dict(color="#2196F3", width=1.5),
+                name="權益",
+            )
+        )
         fig.add_hline(
             y=result.equity_curve[0],
-            line_dash="dash", line_color="gray",
+            line_dash="dash",
+            line_color="gray",
             annotation_text="初始資金",
         )
         fig.update_layout(
@@ -275,14 +295,16 @@ def _run_walk_forward(
         st.subheader("各 Fold 績效")
         fold_data = []
         for f in result.folds:
-            fold_data.append({
-                "Fold": f.fold_idx,
-                "訓練期": f"{f.train_start} ~ {f.train_end}",
-                "測試期": f"{f.test_start} ~ {f.test_end}",
-                "報酬率": f"{f.total_return:.2f}%",
-                "Sharpe": f"{f.sharpe_ratio:.4f}" if f.sharpe_ratio else "N/A",
-                "交易數": f.trades,
-            })
+            fold_data.append(
+                {
+                    "Fold": f.fold_idx,
+                    "訓練期": f"{f.train_start} ~ {f.train_end}",
+                    "測試期": f"{f.test_start} ~ {f.test_end}",
+                    "報酬率": f"{f.total_return:.2f}%",
+                    "Sharpe": f"{f.sharpe_ratio:.4f}" if f.sharpe_ratio else "N/A",
+                    "交易數": f.trades,
+                }
+            )
 
         st.dataframe(
             pd.DataFrame(fold_data),
@@ -295,11 +317,13 @@ def _run_walk_forward(
         fold_labels = [f"Fold {f.fold_idx}" for f in result.folds]
         colors = ["#26A69A" if r >= 0 else "#EF5350" for r in fold_returns]
 
-        fig = go.Figure(go.Bar(
-            x=fold_labels,
-            y=fold_returns,
-            marker_color=colors,
-        ))
+        fig = go.Figure(
+            go.Bar(
+                x=fold_labels,
+                y=fold_returns,
+                marker_color=colors,
+            )
+        )
         fig.update_layout(
             title="各 Fold 報酬率",
             yaxis_title="報酬率 (%)",

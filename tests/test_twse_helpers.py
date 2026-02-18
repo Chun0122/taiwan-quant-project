@@ -2,9 +2,7 @@
 
 from datetime import date
 
-import pytest
-
-from src.data.twse_fetcher import _parse_number, _to_roc_date, _find_last_trading_day
+from src.data.twse_fetcher import _find_last_trading_day, _parse_number, _to_roc_date
 
 
 class TestParseNumber:

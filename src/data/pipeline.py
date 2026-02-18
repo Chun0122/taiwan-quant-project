@@ -6,17 +6,25 @@ import logging
 from datetime import date, timedelta
 
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
+from src.config import settings
 from src.data.database import get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
-    DailyPrice, InstitutionalInvestor, MarginTrading, MonthlyRevenue, Dividend,
-    TechnicalIndicator, BacktestResult, Trade,
-    PortfolioBacktestResult, PortfolioTrade, StockInfo,
+    BacktestResult,
+    DailyPrice,
+    Dividend,
+    InstitutionalInvestor,
+    MarginTrading,
+    MonthlyRevenue,
+    PortfolioBacktestResult,
+    PortfolioTrade,
+    StockInfo,
+    TechnicalIndicator,
+    Trade,
 )
-from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +32,7 @@ logger = logging.getLogger(__name__)
 def _get_last_date(model, stock_id: str) -> str | None:
     """查詢某股票在指定表中的最後一筆日期，用於增量更新。"""
     with get_session() as session:
-        result = session.execute(
-            select(func.max(model.date)).where(model.stock_id == stock_id)
-        ).scalar()
+        result = session.execute(select(func.max(model.date)).where(model.stock_id == stock_id)).scalar()
         if result:
             return result.isoformat()
     return None
@@ -153,12 +159,8 @@ def sync_watchlist(
         logger.info("=" * 50)
         logger.info("開始同步: %s", stock_id)
         try:
-            all_results[stock_id] = sync_stock(
-                stock_id, start_date, end_date, fetcher
-            )
-            logger.info(
-                "[%s] 完成 — %s", stock_id, all_results[stock_id]
-            )
+            all_results[stock_id] = sync_stock(stock_id, start_date, end_date, fetcher)
+            logger.info("[%s] 完成 — %s", stock_id, all_results[stock_id])
         except Exception:
             logger.exception("[%s] 同步失敗", stock_id)
             all_results[stock_id] = {"error": True}
@@ -179,9 +181,7 @@ def sync_stock_info(force_refresh: bool = False) -> int:
 
     if not force_refresh:
         with get_session() as session:
-            count = session.execute(
-                select(func.count()).select_from(StockInfo)
-            ).scalar()
+            count = session.execute(select(func.count()).select_from(StockInfo)).scalar()
             if count and count > 0:
                 logger.info("[StockInfo] DB 已有 %d 筆，跳過同步（使用 force_refresh=True 強制更新）", count)
                 return 0
@@ -301,7 +301,9 @@ def sync_market_data(
     if success_count > 0:
         logger.info(
             "[全市場] TWSE/TPEX 同步完成 — %d 個交易日, 日K %d 筆, 法人 %d 筆",
-            success_count, result["daily_price"], result["institutional"],
+            success_count,
+            result["daily_price"],
+            result["institutional"],
         )
         return result
 
@@ -322,7 +324,8 @@ def sync_market_data(
         result["institutional"] = _upsert_institutional(df_inst)
         logger.info(
             "[全市場] FinMind 批次完成 — 日K %d 筆, 法人 %d 筆",
-            result["daily_price"], result["institutional"],
+            result["daily_price"],
+            result["institutional"],
         )
         return result
 
@@ -330,18 +333,20 @@ def sync_market_data(
     logger.info("[全市場] 所有批次來源不可用，改用 FinMind 逐股抓取（上限 %d 支）", max_stocks)
 
     with get_session() as session:
-        rows = session.execute(
-            select(StockInfo.stock_id)
-            .where(StockInfo.listing_type.in_(["twse", "tpex"]))
-        ).scalars().all()
+        rows = (
+            session.execute(select(StockInfo.stock_id).where(StockInfo.listing_type.in_(["twse", "tpex"])))
+            .scalars()
+            .all()
+        )
 
     if not rows:
         sync_stock_info(force_refresh=True)
         with get_session() as session:
-            rows = session.execute(
-                select(StockInfo.stock_id)
-                .where(StockInfo.listing_type.in_(["twse", "tpex"]))
-            ).scalars().all()
+            rows = (
+                session.execute(select(StockInfo.stock_id).where(StockInfo.listing_type.in_(["twse", "tpex"])))
+                .scalars()
+                .all()
+            )
 
     stock_ids = [sid for sid in rows if sid.isdigit() and len(sid) == 4]
     stock_ids = stock_ids[:max_stocks]
@@ -364,7 +369,8 @@ def sync_market_data(
 
     logger.info(
         "[全市場] 逐股抓取完成 — 日K %d 筆, 法人 %d 筆",
-        result["daily_price"], result["institutional"],
+        result["daily_price"],
+        result["institutional"],
     )
     return result
 
@@ -372,6 +378,7 @@ def sync_market_data(
 # ------------------------------------------------------------------ #
 #  P1: 技術指標計算
 # ------------------------------------------------------------------ #
+
 
 def _upsert_indicators(df: pd.DataFrame) -> int:
     """將技術指標 DataFrame 寫入 technical_indicator 表。"""
@@ -408,6 +415,7 @@ def sync_indicators(
 # ------------------------------------------------------------------ #
 #  P2: 回測結果存入 DB
 # ------------------------------------------------------------------ #
+
 
 def save_backtest_result(result_data) -> int:
     """將回測結果與交易明細寫入 DB，回傳 backtest_result.id。"""

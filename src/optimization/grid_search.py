@@ -8,7 +8,7 @@ from itertools import product
 
 import pandas as pd
 
-from src.backtest.engine import BacktestEngine, BacktestConfig
+from src.backtest.engine import BacktestConfig, BacktestEngine
 from src.strategy import STRATEGY_REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,9 @@ class GridSearchOptimizer:
 
         logger.info(
             "開始網格搜尋: %s | %s | %d 組參數",
-            self.strategy_name, self.stock_id, len(combinations),
+            self.strategy_name,
+            self.stock_id,
+            len(combinations),
         )
 
         results: list[OptimizationResult] = []
@@ -148,7 +150,9 @@ class GridSearchOptimizer:
 
                 logger.info(
                     "[%d/%d] %s | 報酬=%.2f%% | Sharpe=%s | MDD=%.2f%%",
-                    i, len(combinations), params,
+                    i,
+                    len(combinations),
+                    params,
                     result.total_return,
                     f"{result.sharpe_ratio:.4f}" if result.sharpe_ratio else "N/A",
                     result.max_drawdown,

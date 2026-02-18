@@ -31,8 +31,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from src.backtest.engine import BacktestConfig, BacktestEngine, RiskConfig, TradeRecord
-from src.strategy.base import Strategy
+from src.backtest.engine import BacktestConfig, RiskConfig, TradeRecord
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +168,11 @@ class WalkForwardEngine:
 
             logger.info(
                 "[Fold %d] train: %s ~ %s | test: %s ~ %s",
-                fold_idx, train_start, train_end, test_start, test_end,
+                fold_idx,
+                train_start,
+                train_end,
+                test_start,
+                test_end,
             )
 
             # 建立策略（用整個 train+test 期間的資料）
@@ -202,21 +205,21 @@ class WalkForwardEngine:
                     continue
 
                 # 模擬 test 期間交易
-                fold_result = self._simulate_fold(
-                    test_data, test_signals, capital
-                )
+                fold_result = self._simulate_fold(test_data, test_signals, capital)
 
                 capital = fold_result["final_capital"]
-                folds.append(WalkForwardFold(
-                    fold_idx=fold_idx,
-                    train_start=train_start,
-                    train_end=train_end,
-                    test_start=test_start,
-                    test_end=test_end,
-                    total_return=fold_result["total_return"],
-                    trades=len(fold_result["trades"]),
-                    sharpe_ratio=fold_result.get("sharpe_ratio"),
-                ))
+                folds.append(
+                    WalkForwardFold(
+                        fold_idx=fold_idx,
+                        train_start=train_start,
+                        train_end=train_end,
+                        test_start=test_start,
+                        test_end=test_end,
+                        total_return=fold_result["total_return"],
+                        trades=len(fold_result["trades"]),
+                        sharpe_ratio=fold_result.get("sharpe_ratio"),
+                    )
+                )
                 all_trades.extend(fold_result["trades"])
                 combined_equity.extend(fold_result["equity_curve"])
 
@@ -231,8 +234,10 @@ class WalkForwardEngine:
 
         # 計算合併績效
         metrics = self._compute_combined_metrics(
-            combined_equity, all_trades,
-            dates[0], dates[-1],
+            combined_equity,
+            all_trades,
+            dates[0],
+            dates[-1],
         )
 
         strategy_name = self.strategy_cls.__name__
@@ -310,16 +315,18 @@ class WalkForwardEngine:
                 pnl = (revenue - commission - tax) - position * entry_price
                 ret_pct = (sell_price / entry_price - 1) * 100
 
-                trades.append(TradeRecord(
-                    entry_date=entry_date,
-                    entry_price=round(entry_price, 2),
-                    exit_date=dt,
-                    exit_price=round(sell_price, 2),
-                    shares=position,
-                    pnl=round(pnl, 2),
-                    return_pct=round(ret_pct, 2),
-                    exit_reason="signal",
-                ))
+                trades.append(
+                    TradeRecord(
+                        entry_date=entry_date,
+                        entry_price=round(entry_price, 2),
+                        exit_date=dt,
+                        exit_price=round(sell_price, 2),
+                        shares=position,
+                        pnl=round(pnl, 2),
+                        return_pct=round(ret_pct, 2),
+                        exit_reason="signal",
+                    )
+                )
                 position = 0
                 entry_price = 0.0
                 entry_date = None
@@ -338,16 +345,18 @@ class WalkForwardEngine:
             pnl = (revenue - commission - tax) - position * entry_price
             ret_pct = (sell_price / entry_price - 1) * 100
 
-            trades.append(TradeRecord(
-                entry_date=entry_date,
-                entry_price=round(entry_price, 2),
-                exit_date=data.index[-1],
-                exit_price=round(sell_price, 2),
-                shares=position,
-                pnl=round(pnl, 2),
-                return_pct=round(ret_pct, 2),
-                exit_reason="force_close",
-            ))
+            trades.append(
+                TradeRecord(
+                    entry_date=entry_date,
+                    entry_price=round(entry_price, 2),
+                    exit_date=data.index[-1],
+                    exit_price=round(sell_price, 2),
+                    shares=position,
+                    pnl=round(pnl, 2),
+                    return_pct=round(ret_pct, 2),
+                    exit_reason="force_close",
+                )
+            )
             position = 0
             equity_curve[-1] = capital
 
@@ -359,9 +368,7 @@ class WalkForwardEngine:
             eq = np.array(equity_curve)
             daily_rets = np.diff(eq) / eq[:-1]
             if np.std(daily_rets) > 0:
-                sharpe = round(
-                    np.mean(daily_rets) / np.std(daily_rets) * math.sqrt(252), 4
-                )
+                sharpe = round(np.mean(daily_rets) / np.std(daily_rets) * math.sqrt(252), 4)
 
         return {
             "final_capital": capital,
@@ -396,9 +403,7 @@ class WalkForwardEngine:
             eq = np.array(equity_curve)
             daily_returns = np.diff(eq) / eq[:-1]
             if np.std(daily_returns) > 0:
-                sharpe_ratio = round(
-                    np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4
-                )
+                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
 
         max_drawdown = 0.0
         if equity_curve:

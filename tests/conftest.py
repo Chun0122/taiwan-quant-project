@@ -47,13 +47,15 @@ def sample_ohlcv() -> pd.DataFrame:
     rows = []
     for i, dt in enumerate(dates):
         close = base_price + i * 0.5
-        rows.append({
-            "date": dt.date(),
-            "open": close - 0.3,
-            "high": close + 1.0,
-            "low": close - 1.0,
-            "close": close,
-            "volume": 1_000_000 + i * 10_000,
-        })
+        rows.append(
+            {
+                "date": dt.date(),
+                "open": close - 0.3,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 1_000_000 + i * 10_000,
+            }
+        )
     df = pd.DataFrame(rows).set_index("date")
     return df

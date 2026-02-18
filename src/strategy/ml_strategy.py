@@ -56,6 +56,7 @@ class MLStrategy(Strategy):
         if self.model_type == "xgboost":
             try:
                 from xgboost import XGBClassifier
+
                 return XGBClassifier(
                     n_estimators=100,
                     max_depth=5,
@@ -67,7 +68,10 @@ class MLStrategy(Strategy):
             except ImportError:
                 logger.warning("xgboost 未安裝，fallback 到 random_forest")
                 return RandomForestClassifier(
-                    n_estimators=100, max_depth=10, random_state=42, n_jobs=-1,
+                    n_estimators=100,
+                    max_depth=10,
+                    random_state=42,
+                    n_jobs=-1,
                 )
 
         if self.model_type == "logistic":
@@ -75,7 +79,10 @@ class MLStrategy(Strategy):
 
         # random_forest（預設）
         return RandomForestClassifier(
-            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1,
+            n_estimators=100,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1,
         )
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
@@ -128,10 +135,13 @@ class MLStrategy(Strategy):
                 signals[dt] = -1
 
         train_acc = model.score(X_train, y_train)
-        test_acc = model.score(X_test, y[:split_idx + len(X_test)][-len(X_test):])
+        test_acc = model.score(X_test, y[: split_idx + len(X_test)][-len(X_test) :])
         logger.info(
             "[%s] ML 模型訓練完成: train_acc=%.2f%%, test_acc=%.2f%%, 特徵=%d",
-            self.stock_id, train_acc * 100, test_acc * 100, len(feature_cols),
+            self.stock_id,
+            train_acc * 100,
+            test_acc * 100,
+            len(feature_cols),
         )
 
         return signals

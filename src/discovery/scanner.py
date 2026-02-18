@@ -13,9 +13,8 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
-from sqlalchemy import select, func
+from sqlalchemy import select
 
 from src.data.database import get_session
 from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
@@ -26,6 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""
+
     rankings: pd.DataFrame
     total_stocks: int
     after_coarse: int
@@ -125,9 +125,18 @@ class MarketScanner:
                     DailyPrice.volume,
                 ).where(DailyPrice.date >= cutoff)
             ).all()
-            df_price = pd.DataFrame(rows, columns=[
-                "stock_id", "date", "open", "high", "low", "close", "volume",
-            ])
+            df_price = pd.DataFrame(
+                rows,
+                columns=[
+                    "stock_id",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ],
+            )
 
             # 三大法人
             rows = session.execute(
@@ -138,9 +147,15 @@ class MarketScanner:
                     InstitutionalInvestor.net,
                 ).where(InstitutionalInvestor.date >= cutoff)
             ).all()
-            df_inst = pd.DataFrame(rows, columns=[
-                "stock_id", "date", "name", "net",
-            ])
+            df_inst = pd.DataFrame(
+                rows,
+                columns=[
+                    "stock_id",
+                    "date",
+                    "name",
+                    "net",
+                ],
+            )
 
         return df_price, df_inst
 
@@ -148,9 +163,7 @@ class MarketScanner:
     #  Stage 2: 粗篩
     # ------------------------------------------------------------------ #
 
-    def _coarse_filter(
-        self, df_price: pd.DataFrame, df_inst: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """粗篩：股價/量/法人/動能加權 → 取 top N candidates。"""
         # 取每支股票最近一天的收盤價和成交量
         latest_date = df_price["date"].max()
@@ -196,9 +209,7 @@ class MarketScanner:
             prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
             prev.columns = ["stock_id", "prev_close"]
             filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = (
-                (filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]
-            ).fillna(0)
+            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
             filtered["mom_rank"] = filtered["momentum"].rank(pct=True)
         else:
             filtered["momentum"] = 0
@@ -206,9 +217,7 @@ class MarketScanner:
 
         # 粗篩綜合分 = 成交量 30% + 法人 40% + 動能 30%
         filtered["coarse_score"] = (
-            filtered["vol_rank"] * 0.30
-            + filtered["inst_rank"] * 0.40
-            + filtered["mom_rank"] * 0.30
+            filtered["vol_rank"] * 0.30 + filtered["inst_rank"] * 0.40 + filtered["mom_rank"] * 0.30
         )
 
         # 取 top N
@@ -251,9 +260,7 @@ class MarketScanner:
 
         return candidates
 
-    def _compute_technical_scores(
-        self, stock_ids: list[str], df_price: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """從原始 OHLCV 計算技術面分數（SMA、動能、價格位置）。"""
         results = []
 
@@ -311,15 +318,15 @@ class MarketScanner:
 
         return pd.DataFrame(results)
 
-    def _compute_chip_scores(
-        self, stock_ids: list[str], df_inst: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _compute_chip_scores(self, stock_ids: list[str], df_inst: pd.DataFrame) -> pd.DataFrame:
         """計算籌碼面分數（三大法人買賣超）。"""
         if df_inst.empty:
-            return pd.DataFrame({
-                "stock_id": stock_ids,
-                "chip_score": [0.5] * len(stock_ids),
-            })
+            return pd.DataFrame(
+                {
+                    "stock_id": stock_ids,
+                    "chip_score": [0.5] * len(stock_ids),
+                }
+            )
 
         results = []
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
@@ -371,8 +378,9 @@ class MarketScanner:
         stock_ids = scored["stock_id"].tolist()
         with get_session() as session:
             rows = session.execute(
-                select(StockInfo.stock_id, StockInfo.stock_name, StockInfo.industry_category)
-                .where(StockInfo.stock_id.in_(stock_ids))
+                select(StockInfo.stock_id, StockInfo.stock_name, StockInfo.industry_category).where(
+                    StockInfo.stock_id.in_(stock_ids)
+                )
             ).all()
             info_df = pd.DataFrame(rows, columns=["stock_id", "stock_name", "industry_category"])
 
@@ -387,9 +395,18 @@ class MarketScanner:
 
         # 只保留需要的欄位
         keep_cols = [
-            "rank", "stock_id", "stock_name", "close", "volume",
-            "composite_score", "technical_score", "chip_score", "fundamental_score",
-            "industry_category", "momentum", "inst_net",
+            "rank",
+            "stock_id",
+            "stock_name",
+            "close",
+            "volume",
+            "composite_score",
+            "technical_score",
+            "chip_score",
+            "fundamental_score",
+            "industry_category",
+            "momentum",
+            "inst_net",
         ]
         return scored[[c for c in keep_cols if c in scored.columns]]
 

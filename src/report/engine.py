@@ -43,9 +43,7 @@ class DailyReportEngine:
         self.lookback_days = lookback_days
         self.ml_enabled = ml_enabled
         self.start_date = start_date or settings.fetcher.default_start_date
-        self._screener = MultiFactorScreener(
-            watchlist=self.watchlist, lookback_days=lookback_days
-        )
+        self._screener = MultiFactorScreener(watchlist=self.watchlist, lookback_days=lookback_days)
         init_db()
 
     def run(self) -> pd.DataFrame:
@@ -74,19 +72,23 @@ class DailyReportEngine:
 
                 composite = self._compute_composite(tech, chip, fund, ml)
 
-                results.append({
-                    "stock_id": stock_id,
-                    "close": latest.get("close", 0),
-                    "technical_score": round(tech, 3),
-                    "chip_score": round(chip, 3),
-                    "fundamental_score": round(fund, 3),
-                    "ml_score": round(ml, 3),
-                    "composite_score": round(composite, 3),
-                    "rsi": round(latest.get("rsi_14", 50), 1) if pd.notna(latest.get("rsi_14")) else None,
-                    "macd": round(latest.get("macd", 0), 2) if pd.notna(latest.get("macd")) else None,
-                    "foreign_net": latest.get("foreign_net", 0) if pd.notna(latest.get("foreign_net")) else None,
-                    "yoy_growth": round(latest.get("yoy_growth", 0), 1) if pd.notna(latest.get("yoy_growth")) else None,
-                })
+                results.append(
+                    {
+                        "stock_id": stock_id,
+                        "close": latest.get("close", 0),
+                        "technical_score": round(tech, 3),
+                        "chip_score": round(chip, 3),
+                        "fundamental_score": round(fund, 3),
+                        "ml_score": round(ml, 3),
+                        "composite_score": round(composite, 3),
+                        "rsi": round(latest.get("rsi_14", 50), 1) if pd.notna(latest.get("rsi_14")) else None,
+                        "macd": round(latest.get("macd", 0), 2) if pd.notna(latest.get("macd")) else None,
+                        "foreign_net": latest.get("foreign_net", 0) if pd.notna(latest.get("foreign_net")) else None,
+                        "yoy_growth": round(latest.get("yoy_growth", 0), 1)
+                        if pd.notna(latest.get("yoy_growth"))
+                        else None,
+                    }
+                )
             except Exception:
                 logger.exception("[%s] 報告計算失敗", stock_id)
 
@@ -98,9 +100,18 @@ class DailyReportEngine:
         df["rank"] = range(1, len(df) + 1)
 
         cols = [
-            "rank", "stock_id", "close", "technical_score", "chip_score",
-            "fundamental_score", "ml_score", "composite_score",
-            "rsi", "macd", "foreign_net", "yoy_growth",
+            "rank",
+            "stock_id",
+            "close",
+            "technical_score",
+            "chip_score",
+            "fundamental_score",
+            "ml_score",
+            "composite_score",
+            "rsi",
+            "macd",
+            "foreign_net",
+            "yoy_growth",
         ]
         return df[[c for c in cols if c in df.columns]]
 
@@ -203,6 +214,7 @@ class DailyReportEngine:
         """
         try:
             from datetime import date
+
             from src.strategy.ml_strategy import MLStrategy
 
             end = date.today().isoformat()
@@ -219,7 +231,7 @@ class DailyReportEngine:
             signals = strategy.generate_signals(data)
 
             # 取最後一筆信號作為 ML 分數
-            if hasattr(strategy, '_last_proba') and strategy._last_proba is not None:
+            if hasattr(strategy, "_last_proba") and strategy._last_proba is not None:
                 return float(np.clip(strategy._last_proba, 0, 1))
 
             last_signal = signals.iloc[-1] if len(signals) > 0 else 0
@@ -234,9 +246,7 @@ class DailyReportEngine:
             logger.debug("[%s] ML 分數計算失敗，使用中性值", stock_id)
             return 0.5
 
-    def _compute_composite(
-        self, tech: float, chip: float, fund: float, ml: float
-    ) -> float:
+    def _compute_composite(self, tech: float, chip: float, fund: float, ml: float) -> float:
         """加權合成分數。"""
         return (
             self.weights["technical"] * tech

@@ -35,9 +35,7 @@ class BollingerBandBreakoutStrategy(Strategy):
         lower_col = "bb_lower"
 
         if upper_col not in data.columns or lower_col not in data.columns:
-            raise ValueError(
-                f"缺少指標欄位: {upper_col} 或 {lower_col}，請先執行 python main.py compute"
-            )
+            raise ValueError(f"缺少指標欄位: {upper_col} 或 {lower_col}，請先執行 python main.py compute")
 
         close = data["close"]
         upper = data[upper_col]

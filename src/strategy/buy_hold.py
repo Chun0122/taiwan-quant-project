@@ -30,7 +30,7 @@ class BuyAndHoldStrategy(Strategy):
         signals = pd.Series(0, index=data.index)
 
         if len(data) > 0:
-            signals.iloc[0] = 1    # 第一天買入
+            signals.iloc[0] = 1  # 第一天買入
             signals.iloc[-1] = -1  # 最後一天賣出
 
         return signals

@@ -1,9 +1,5 @@
 """測試 src/config.py — 設定載入。"""
 
-from pathlib import Path
-
-import pytest
-
 from src.config import Settings, load_settings
 
 
@@ -18,12 +14,7 @@ class TestLoadSettings:
     def test_valid_yaml_loads(self, tmp_path):
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(
-            "finmind:\n"
-            "  api_token: my_token\n"
-            "fetcher:\n"
-            "  watchlist:\n"
-            "    - '2330'\n"
-            "    - '2317'\n",
+            "finmind:\n  api_token: my_token\nfetcher:\n  watchlist:\n    - '2330'\n    - '2317'\n",
             encoding="utf-8",
         )
         result = load_settings(config_file)

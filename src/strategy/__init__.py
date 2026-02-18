@@ -2,13 +2,13 @@
 
 from functools import partial
 
-from src.strategy.sma_cross import SMACrossStrategy
-from src.strategy.rsi_threshold import RSIThresholdStrategy
 from src.strategy.bb_breakout import BollingerBandBreakoutStrategy
-from src.strategy.macd_cross import MACDCrossStrategy
 from src.strategy.buy_hold import BuyAndHoldStrategy
-from src.strategy.multi_factor import MultiFactorStrategy
+from src.strategy.macd_cross import MACDCrossStrategy
 from src.strategy.ml_strategy import MLStrategy
+from src.strategy.multi_factor import MultiFactorStrategy
+from src.strategy.rsi_threshold import RSIThresholdStrategy
+from src.strategy.sma_cross import SMACrossStrategy
 
 STRATEGY_REGISTRY: dict[str, type] = {
     "sma_cross": SMACrossStrategy,

@@ -34,9 +34,7 @@ class RSIThresholdStrategy(Strategy):
         rsi_col = "rsi_14"
 
         if rsi_col not in data.columns:
-            raise ValueError(
-                f"缺少指標欄位: {rsi_col}，請先執行 python main.py compute"
-            )
+            raise ValueError(f"缺少指標欄位: {rsi_col}，請先執行 python main.py compute")
 
         rsi = data[rsi_col]
         prev_rsi = rsi.shift(1)

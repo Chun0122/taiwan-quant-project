@@ -37,9 +37,7 @@ class MACDCrossStrategy(Strategy):
         signal_col = "macd_signal"
 
         if macd_col not in data.columns or signal_col not in data.columns:
-            raise ValueError(
-                f"缺少指標欄位: {macd_col} 或 {signal_col}，請先執行 python main.py compute"
-            )
+            raise ValueError(f"缺少指標欄位: {macd_col} 或 {signal_col}，請先執行 python main.py compute")
 
         macd_line = data[macd_col]
         signal_line = data[signal_col]

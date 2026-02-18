@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.features.ml_features import build_ml_features, get_feature_columns
 
@@ -12,13 +11,16 @@ def _make_ohlcv(n: int = 60) -> pd.DataFrame:
     dates = pd.bdate_range("2024-01-01", periods=n)
     np.random.seed(42)
     close = 100 + np.cumsum(np.random.randn(n) * 0.5)
-    df = pd.DataFrame({
-        "open": close - 0.2,
-        "high": close + 1.0,
-        "low": close - 1.0,
-        "close": close,
-        "volume": np.random.randint(500_000, 2_000_000, size=n),
-    }, index=dates.date)
+    df = pd.DataFrame(
+        {
+            "open": close - 0.2,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": np.random.randint(500_000, 2_000_000, size=n),
+        },
+        index=dates.date,
+    )
 
     # 加入技術指標欄位
     df["sma_5"] = df["close"].rolling(5).mean()
@@ -37,10 +39,17 @@ class TestBuildMlFeatures:
         df = _make_ohlcv(60)
         result = build_ml_features(df)
         expected_cols = [
-            "return_1d", "return_5d", "return_10d", "return_20d",
-            "volatility_10", "volatility_20",
-            "volume_ratio_5d", "volume_ratio_20d",
-            "price_position", "label", "future_return",
+            "return_1d",
+            "return_5d",
+            "return_10d",
+            "return_20d",
+            "volatility_10",
+            "volatility_20",
+            "volume_ratio_5d",
+            "volume_ratio_20d",
+            "price_position",
+            "label",
+            "future_return",
         ]
         for col in expected_cols:
             assert col in result.columns, f"Missing column: {col}"

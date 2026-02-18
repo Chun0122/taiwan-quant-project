@@ -106,8 +106,8 @@ def format_strategy_rank(df: pd.DataFrame, metric: str = "sharpe") -> str:
     ]
 
     for _, row in df.head(15).iterrows():
-        sharpe = f"{row['sharpe_ratio']:.2f}" if pd.notna(row.get('sharpe_ratio')) else "N/A"
-        win_r = f"{row['win_rate']:.1f}%" if pd.notna(row.get('win_rate')) else "N/A"
+        sharpe = f"{row['sharpe_ratio']:.2f}" if pd.notna(row.get("sharpe_ratio")) else "N/A"
+        win_r = f"{row['win_rate']:.1f}%" if pd.notna(row.get("win_rate")) else "N/A"
         line = (
             f"{int(row['rank']):>2} {row['stock_id']:>6}  "
             f"{row['strategy_name']:<14}  {row['total_return']:>7.2f}%  "
@@ -156,9 +156,9 @@ def format_industry_report(
     ]
 
     for _, row in sector_df.head(top_n).iterrows():
-        total_net = row.get('total_net', 0)
+        total_net = row.get("total_net", 0)
         net_str = f"{total_net:>12,.0f}" if total_net != 0 else "         N/A"
-        avg_ret = row.get('avg_return_pct', 0)
+        avg_ret = row.get("avg_return_pct", 0)
         ret_str = f"{avg_ret:>6.2f}%" if avg_ret != 0 else "    N/A"
         line = (
             f"{int(row['rank']):>2} {str(row['industry']):<12}  "
@@ -181,8 +181,8 @@ def format_industry_report(
             stock_lines.append(f"\n**{ind}**")
             stock_lines.append("```")
             for _, sr in sector_stocks.iterrows():
-                name = sr.get('stock_name', '')[:6]
-                foreign = sr.get('foreign_net_sum', 0)
+                name = sr.get("stock_name", "")[:6]
+                foreign = sr.get("foreign_net_sum", 0)
                 stock_lines.append(
                     f"  {sr['stock_id']} {name:<6} "
                     f"收盤={sr['close']:>8.1f}  "
@@ -224,10 +224,7 @@ def format_discovery_report(result, top_n: int = 20) -> list[str]:
     display = result.rankings.head(top_n)
     lines = list(header)
     lines.append("```")
-    lines.append(
-        f"{'#':>2} {'代號':>6} {'名稱':<6}  {'收盤':>7}  {'綜合':>5}  "
-        f"{'技術':>5}  {'籌碼':>5}  {'產業':<8}"
-    )
+    lines.append(f"{'#':>2} {'代號':>6} {'名稱':<6}  {'收盤':>7}  {'綜合':>5}  {'技術':>5}  {'籌碼':>5}  {'產業':<8}")
     lines.append("─" * 58)
 
     current_msg_lines = list(lines)

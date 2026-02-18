@@ -28,34 +28,19 @@ class DataFetcher(ABC):
     """資料抓取抽象基類 — 日後可擴充 Fugle、TWSE 等來源。"""
 
     @abstractmethod
-    def fetch_daily_price(
-        self, stock_id: str, start: str, end: str
-    ) -> pd.DataFrame:
-        ...
+    def fetch_daily_price(self, stock_id: str, start: str, end: str) -> pd.DataFrame: ...
 
     @abstractmethod
-    def fetch_institutional(
-        self, stock_id: str, start: str, end: str
-    ) -> pd.DataFrame:
-        ...
+    def fetch_institutional(self, stock_id: str, start: str, end: str) -> pd.DataFrame: ...
 
     @abstractmethod
-    def fetch_margin_trading(
-        self, stock_id: str, start: str, end: str
-    ) -> pd.DataFrame:
-        ...
+    def fetch_margin_trading(self, stock_id: str, start: str, end: str) -> pd.DataFrame: ...
 
     @abstractmethod
-    def fetch_monthly_revenue(
-        self, stock_id: str, start: str, end: str
-    ) -> pd.DataFrame:
-        ...
+    def fetch_monthly_revenue(self, stock_id: str, start: str, end: str) -> pd.DataFrame: ...
 
     @abstractmethod
-    def fetch_dividend(
-        self, stock_id: str, start: str, end: str
-    ) -> pd.DataFrame:
-        ...
+    def fetch_dividend(self, stock_id: str, start: str, end: str) -> pd.DataFrame: ...
 
 
 class FinMindFetcher(DataFetcher):
@@ -91,9 +76,7 @@ class FinMindFetcher(DataFetcher):
         payload = resp.json()
 
         if payload.get("msg") != "success":
-            raise RuntimeError(
-                f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})"
-            )
+            raise RuntimeError(f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})")
 
         df = pd.DataFrame(payload.get("data", []))
         if df.empty:
@@ -123,18 +106,14 @@ class FinMindFetcher(DataFetcher):
 
         if resp.status_code == 400:
             payload = resp.json()
-            logger.warning(
-                "全市場批次查詢不可用（需付費帳號）: %s", payload.get("msg", "")
-            )
+            logger.warning("全市場批次查詢不可用（需付費帳號）: %s", payload.get("msg", ""))
             return pd.DataFrame()
 
         resp.raise_for_status()
         payload = resp.json()
 
         if payload.get("msg") != "success":
-            raise RuntimeError(
-                f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})"
-            )
+            raise RuntimeError(f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})")
 
         df = pd.DataFrame(payload.get("data", []))
         if df.empty:
@@ -147,9 +126,7 @@ class FinMindFetcher(DataFetcher):
     #  公開介面
     # ------------------------------------------------------------------ #
 
-    def fetch_daily_price(
-        self, stock_id: str, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_daily_price(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取日K線資料。
 
         回傳欄位: date, stock_id, open, high, low, close,
@@ -162,21 +139,21 @@ class FinMindFetcher(DataFetcher):
         if df.empty:
             return df
 
-        df = df.rename(columns={
-            "Trading_Volume": "volume",
-            "Trading_money": "turnover",
-            "max": "high",
-            "min": "low",
-        })
+        df = df.rename(
+            columns={
+                "Trading_Volume": "volume",
+                "Trading_money": "turnover",
+                "max": "high",
+                "min": "low",
+            }
+        )
         # 只保留需要的欄位
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
-    def fetch_institutional(
-        self, stock_id: str, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_institutional(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取三大法人買賣超資料。
 
         回傳欄位: date, stock_id, name, buy, sell, net
@@ -184,9 +161,7 @@ class FinMindFetcher(DataFetcher):
         if end is None:
             end = date.today().isoformat()
 
-        df = self._request(
-            "TaiwanStockInstitutionalInvestorsBuySell", stock_id, start, end
-        )
+        df = self._request("TaiwanStockInstitutionalInvestorsBuySell", stock_id, start, end)
         if df.empty:
             return df
 
@@ -200,9 +175,7 @@ class FinMindFetcher(DataFetcher):
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
-    def fetch_margin_trading(
-        self, stock_id: str, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_margin_trading(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取融資融券資料。
 
         回傳欄位: date, stock_id, margin_buy, margin_sell, margin_balance,
@@ -211,9 +184,7 @@ class FinMindFetcher(DataFetcher):
         if end is None:
             end = date.today().isoformat()
 
-        df = self._request(
-            "TaiwanStockMarginPurchaseShortSale", stock_id, start, end
-        )
+        df = self._request("TaiwanStockMarginPurchaseShortSale", stock_id, start, end)
         if df.empty:
             return df
 
@@ -228,17 +199,20 @@ class FinMindFetcher(DataFetcher):
         df = df.rename(columns=rename_map)
 
         keep = [
-            "date", "stock_id",
-            "margin_buy", "margin_sell", "margin_balance",
-            "short_sell", "short_buy", "short_balance",
+            "date",
+            "stock_id",
+            "margin_buy",
+            "margin_sell",
+            "margin_balance",
+            "short_sell",
+            "short_buy",
+            "short_balance",
         ]
         df = df[[c for c in keep if c in df.columns]]
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
-    def fetch_monthly_revenue(
-        self, stock_id: str, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_monthly_revenue(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取月營收資料。
 
         回傳欄位: date, stock_id, revenue, revenue_month, revenue_year,
@@ -261,17 +235,13 @@ class FinMindFetcher(DataFetcher):
 
         # 年增率：與 12 個月前比較
         if len(df) > 12:
-            df["yoy_growth"] = (
-                df["revenue"] / df["revenue"].shift(12) - 1
-            ) * 100
+            df["yoy_growth"] = (df["revenue"] / df["revenue"].shift(12) - 1) * 100
         else:
             df["yoy_growth"] = None
 
         return df
 
-    def fetch_dividend(
-        self, stock_id: str, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_dividend(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取股利資料。
 
         回傳欄位: date, stock_id, year, cash_dividend, stock_dividend,
@@ -293,9 +263,13 @@ class FinMindFetcher(DataFetcher):
         df = df.rename(columns=rename_map)
 
         keep = [
-            "date", "stock_id", "year",
-            "cash_dividend", "stock_dividend",
-            "cash_payment_date", "announcement_date",
+            "date",
+            "stock_id",
+            "year",
+            "cash_dividend",
+            "stock_dividend",
+            "cash_payment_date",
+            "announcement_date",
         ]
         df = df[[c for c in keep if c in df.columns]]
 
@@ -307,9 +281,7 @@ class FinMindFetcher(DataFetcher):
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
         return df
 
-    def fetch_all_daily_price(
-        self, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_all_daily_price(self, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取全市場日K線（不指定 stock_id，按日期查詢）。
 
         回傳欄位同 fetch_daily_price: date, stock_id, open, high, low, close, volume, turnover, spread
@@ -321,20 +293,20 @@ class FinMindFetcher(DataFetcher):
         if df.empty:
             return df
 
-        df = df.rename(columns={
-            "Trading_Volume": "volume",
-            "Trading_money": "turnover",
-            "max": "high",
-            "min": "low",
-        })
+        df = df.rename(
+            columns={
+                "Trading_Volume": "volume",
+                "Trading_money": "turnover",
+                "max": "high",
+                "min": "low",
+            }
+        )
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
         df["date"] = pd.to_datetime(df["date"]).dt.date
         return df
 
-    def fetch_all_institutional(
-        self, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_all_institutional(self, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取全市場三大法人買賣超（不指定 stock_id，按日期查詢）。
 
         回傳欄位同 fetch_institutional: date, stock_id, name, buy, sell, net
@@ -342,9 +314,7 @@ class FinMindFetcher(DataFetcher):
         if end is None:
             end = date.today().isoformat()
 
-        df = self._request_by_date(
-            "TaiwanStockInstitutionalInvestorsBuySell", start, end
-        )
+        df = self._request_by_date("TaiwanStockInstitutionalInvestorsBuySell", start, end)
         if df.empty:
             return df
 
@@ -375,9 +345,7 @@ class FinMindFetcher(DataFetcher):
         payload = resp.json()
 
         if payload.get("msg") != "success":
-            raise RuntimeError(
-                f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})"
-            )
+            raise RuntimeError(f"FinMind API 錯誤: {payload.get('msg')} (status={payload.get('status')})")
 
         df = pd.DataFrame(payload.get("data", []))
         if df.empty:
@@ -399,9 +367,7 @@ class FinMindFetcher(DataFetcher):
 
         return df
 
-    def fetch_taiex_index(
-        self, start: str, end: str | None = None
-    ) -> pd.DataFrame:
+    def fetch_taiex_index(self, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取加權指數日資料（用於 benchmark）。
 
         使用 TAIEX 作為 stock_id，存入 DailyPrice 表複用基礎設施。

@@ -28,37 +28,44 @@ def _make_price_df(n_stocks: int = 20) -> pd.DataFrame:
         close_d1 = 50 + i * 10
         close_d2 = close_d1 + (i - n_stocks // 2)
         for d, c in [(d1, close_d1), (d2, close_d2)]:
-            rows.append({
-                "stock_id": sid,
-                "date": d,
-                "open": c - 1,
-                "high": c + 2,
-                "low": c - 2,
-                "close": c,
-                "volume": 200_000 + i * 50_000,
-            })
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": d,
+                    "open": c - 1,
+                    "high": c + 2,
+                    "low": c - 2,
+                    "close": c,
+                    "volume": 200_000 + i * 50_000,
+                }
+            )
     return pd.DataFrame(rows)
 
 
 def _make_inst_df(stock_ids: list[str], target_date: date) -> pd.DataFrame:
     rows = []
     for sid in stock_ids:
-        rows.append({
-            "stock_id": sid,
-            "date": target_date,
-            "name": "Foreign_Investor",
-            "net": int(sid) % 3 * 1000 - 500,
-        })
-        rows.append({
-            "stock_id": sid,
-            "date": target_date,
-            "name": "Investment_Trust",
-            "net": int(sid) % 5 * 200 - 200,
-        })
+        rows.append(
+            {
+                "stock_id": sid,
+                "date": target_date,
+                "name": "Foreign_Investor",
+                "net": int(sid) % 3 * 1000 - 500,
+            }
+        )
+        rows.append(
+            {
+                "stock_id": sid,
+                "date": target_date,
+                "name": "Investment_Trust",
+                "net": int(sid) % 5 * 200 - 200,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 # ─── _coarse_filter ───────────────────────────────────────
+
 
 class TestCoarseFilter:
     def test_filters_by_price_and_volume(self, scanner):
@@ -74,12 +81,19 @@ class TestCoarseFilter:
     def test_filters_out_index_stocks(self, scanner):
         df_price = _make_price_df(5)
         # Add an index-like stock with letters
-        idx_row = pd.DataFrame([{
-            "stock_id": "TAIEX",
-            "date": date(2025, 1, 3),
-            "open": 18000, "high": 18100, "low": 17900,
-            "close": 18000, "volume": 10_000_000,
-        }])
+        idx_row = pd.DataFrame(
+            [
+                {
+                    "stock_id": "TAIEX",
+                    "date": date(2025, 1, 3),
+                    "open": 18000,
+                    "high": 18100,
+                    "low": 17900,
+                    "close": 18000,
+                    "volume": 10_000_000,
+                }
+            ]
+        )
         df_price = pd.concat([df_price, idx_row], ignore_index=True)
         result = scanner._coarse_filter(df_price, pd.DataFrame())
         stock_ids = result["stock_id"].tolist() if not result.empty else []
@@ -101,6 +115,7 @@ class TestCoarseFilter:
 
 # ─── _compute_technical_scores ────────────────────────────
 
+
 class TestComputeTechnicalScores:
     def test_scores_in_valid_range(self, scanner):
         df_price = _make_price_df(5)
@@ -111,16 +126,25 @@ class TestComputeTechnicalScores:
         assert (result["technical_score"] <= 1.0).all()
 
     def test_insufficient_data_gets_default(self, scanner):
-        df_price = pd.DataFrame([{
-            "stock_id": "9999",
-            "date": date(2025, 1, 3),
-            "open": 100, "high": 101, "low": 99, "close": 100, "volume": 500_000,
-        }])
+        df_price = pd.DataFrame(
+            [
+                {
+                    "stock_id": "9999",
+                    "date": date(2025, 1, 3),
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 500_000,
+                }
+            ]
+        )
         result = scanner._compute_technical_scores(["9999"], df_price)
         assert result.iloc[0]["technical_score"] == pytest.approx(0.5)
 
 
 # ─── _compute_chip_scores ────────────────────────────────
+
 
 class TestComputeChipScores:
     def test_empty_inst_returns_default(self, scanner):
@@ -138,13 +162,16 @@ class TestComputeChipScores:
 
 # ─── _compute_sector_summary ─────────────────────────────
 
+
 class TestComputeSectorSummary:
     def test_sector_summary(self, scanner):
-        rankings = pd.DataFrame({
-            "stock_id": ["1000", "1001", "1002"],
-            "industry_category": ["半導體", "半導體", "金融"],
-            "composite_score": [0.8, 0.7, 0.6],
-        })
+        rankings = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "industry_category": ["半導體", "半導體", "金融"],
+                "composite_score": [0.8, 0.7, 0.6],
+            }
+        )
         result = scanner._compute_sector_summary(rankings)
         assert "industry" in result.columns
         assert "count" in result.columns

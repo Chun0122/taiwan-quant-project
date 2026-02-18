@@ -19,23 +19,23 @@ logger = logging.getLogger(__name__)
 class BacktestConfig:
     """回測參數（符合台股實際費用）。"""
 
-    initial_capital: float = 1_000_000      # 初始資金
-    commission_rate: float = 0.001425       # 手續費 0.1425%
-    tax_rate: float = 0.003                 # 交易稅 0.3%（賣出時）
-    slippage: float = 0.0005                # 滑價 0.05%
+    initial_capital: float = 1_000_000  # 初始資金
+    commission_rate: float = 0.001425  # 手續費 0.1425%
+    tax_rate: float = 0.003  # 交易稅 0.3%（賣出時）
+    slippage: float = 0.0005  # 滑價 0.05%
 
 
 @dataclass
 class RiskConfig:
     """風險管理參數。"""
 
-    stop_loss_pct: float | None = None        # 停損 %（例 5.0 = -5% 出場）
-    take_profit_pct: float | None = None      # 停利 %（例 15.0 = +15% 出場）
-    trailing_stop_pct: float | None = None    # 移動停損 %（從高點回落）
-    position_sizing: str = "all_in"           # "all_in"|"fixed_fraction"|"kelly"|"atr"
-    fixed_fraction: float = 1.0               # 固定比例（0.0~1.0）
-    kelly_fraction: float = 0.5               # Kelly 乘數（預設 half-Kelly）
-    atr_risk_pct: float = 1.0                 # ATR sizing: 每筆風險占資金 %
+    stop_loss_pct: float | None = None  # 停損 %（例 5.0 = -5% 出場）
+    take_profit_pct: float | None = None  # 停利 %（例 15.0 = +15% 出場）
+    trailing_stop_pct: float | None = None  # 移動停損 %（從高點回落）
+    position_sizing: str = "all_in"  # "all_in"|"fixed_fraction"|"kelly"|"atr"
+    fixed_fraction: float = 1.0  # 固定比例（0.0~1.0）
+    kelly_fraction: float = 0.5  # Kelly 乘數（預設 half-Kelly）
+    atr_risk_pct: float = 1.0  # ATR sizing: 每筆風險占資金 %
     atr_period: int = 14
     atr_multiplier: float = 2.0
 
@@ -64,17 +64,17 @@ class BacktestResultData:
     end_date: date
     initial_capital: float
     final_capital: float
-    total_return: float          # %
-    annual_return: float         # %
+    total_return: float  # %
+    annual_return: float  # %
     sharpe_ratio: float | None
-    max_drawdown: float          # %
-    win_rate: float | None       # %
+    max_drawdown: float  # %
+    win_rate: float | None  # %
     total_trades: int
     benchmark_return: float | None = None  # 同期 buy & hold 報酬率 (%)
     sortino_ratio: float | None = None
     calmar_ratio: float | None = None
-    var_95: float | None = None           # Value at Risk (95%)
-    cvar_95: float | None = None          # Conditional VaR (95%)
+    var_95: float | None = None  # Value at Risk (95%)
+    cvar_95: float | None = None  # Conditional VaR (95%)
     profit_factor: float | None = None
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
@@ -106,7 +106,7 @@ class BacktestEngine:
         signals = self.strategy.generate_signals(data)
 
         capital = self.config.initial_capital
-        position = 0        # 持有股數
+        position = 0  # 持有股數
         entry_price = 0.0
         entry_date = None
         peak_since_entry = 0.0  # 移動停損用：進場後最高價
@@ -164,16 +164,18 @@ class BacktestEngine:
                 pnl = net_revenue - position * entry_price
                 ret_pct = (sell_price / entry_price - 1) * 100
 
-                trades.append(TradeRecord(
-                    entry_date=entry_date,
-                    entry_price=round(entry_price, 2),
-                    exit_date=dt,
-                    exit_price=round(sell_price, 2),
-                    shares=position,
-                    pnl=round(pnl, 2),
-                    return_pct=round(ret_pct, 2),
-                    exit_reason=exit_reason,
-                ))
+                trades.append(
+                    TradeRecord(
+                        entry_date=entry_date,
+                        entry_price=round(entry_price, 2),
+                        exit_date=dt,
+                        exit_price=round(sell_price, 2),
+                        shares=position,
+                        pnl=round(pnl, 2),
+                        return_pct=round(ret_pct, 2),
+                        exit_reason=exit_reason,
+                    )
+                )
                 position = 0
                 entry_price = 0.0
                 entry_date = None
@@ -184,9 +186,7 @@ class BacktestEngine:
                 # --- 買入 ---
                 if signal == 1 and position == 0:
                     buy_price = data.loc[dt, "close"] * (1 + self.config.slippage)
-                    shares = self._calculate_shares(
-                        capital, buy_price, data, dt, trades
-                    )
+                    shares = self._calculate_shares(capital, buy_price, data, dt, trades)
                     if shares > 0:
                         cost = shares * buy_price + shares * buy_price * self.config.commission_rate
                         capital -= cost
@@ -207,16 +207,18 @@ class BacktestEngine:
                     pnl = net_revenue - position * entry_price
                     ret_pct = (sell_price / entry_price - 1) * 100
 
-                    trades.append(TradeRecord(
-                        entry_date=entry_date,
-                        entry_price=round(entry_price, 2),
-                        exit_date=dt,
-                        exit_price=round(sell_price, 2),
-                        shares=position,
-                        pnl=round(pnl, 2),
-                        return_pct=round(ret_pct, 2),
-                        exit_reason="signal",
-                    ))
+                    trades.append(
+                        TradeRecord(
+                            entry_date=entry_date,
+                            entry_price=round(entry_price, 2),
+                            exit_date=dt,
+                            exit_price=round(sell_price, 2),
+                            shares=position,
+                            pnl=round(pnl, 2),
+                            return_pct=round(ret_pct, 2),
+                            exit_reason="signal",
+                        )
+                    )
                     position = 0
                     entry_price = 0.0
                     entry_date = None
@@ -239,23 +241,23 @@ class BacktestEngine:
             pnl = net_revenue - position * entry_price
             ret_pct = (sell_price / entry_price - 1) * 100
 
-            trades.append(TradeRecord(
-                entry_date=entry_date,
-                entry_price=round(entry_price, 2),
-                exit_date=data.index[-1],
-                exit_price=round(sell_price, 2),
-                shares=position,
-                pnl=round(pnl, 2),
-                return_pct=round(ret_pct, 2),
-                exit_reason="force_close",
-            ))
+            trades.append(
+                TradeRecord(
+                    entry_date=entry_date,
+                    entry_price=round(entry_price, 2),
+                    exit_date=data.index[-1],
+                    exit_price=round(sell_price, 2),
+                    shares=position,
+                    pnl=round(pnl, 2),
+                    return_pct=round(ret_pct, 2),
+                    exit_reason="force_close",
+                )
+            )
             position = 0
             equity_curve[-1] = capital
 
         final_capital = capital
-        metrics = self._compute_metrics(
-            equity_curve, trades, data.index[0], data.index[-1]
-        )
+        metrics = self._compute_metrics(equity_curve, trades, data.index[0], data.index[-1])
 
         # 計算同期 buy & hold 基準報酬
         benchmark_return = self._compute_benchmark(data)
@@ -363,10 +365,10 @@ class BacktestEngine:
         if idx < period:
             return None
 
-        window = data.iloc[idx - period: idx]
+        window = data.iloc[idx - period : idx]
         high = window["high"].values
         low = window["low"].values
-        prev_close = data.iloc[idx - period - 1: idx - 1]["close"].values
+        prev_close = data.iloc[idx - period - 1 : idx - 1]["close"].values
 
         if len(prev_close) < period:
             return None
@@ -420,9 +422,7 @@ class BacktestEngine:
             eq = np.array(equity_curve)
             daily_returns = np.diff(eq) / eq[:-1]
             if np.std(daily_returns) > 0:
-                sharpe_ratio = round(
-                    np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4
-                )
+                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
 
         # 最大回撤
         max_drawdown = 0.0
@@ -455,9 +455,7 @@ class BacktestEngine:
             # Sortino Ratio: mean / downside_std × √252
             neg_returns = daily_returns[daily_returns < 0]
             if len(neg_returns) > 0 and np.std(neg_returns) > 0:
-                sortino_ratio = round(
-                    np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4
-                )
+                sortino_ratio = round(np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4)
 
             # Calmar Ratio: annual_return / max_drawdown
             if max_drawdown > 0:

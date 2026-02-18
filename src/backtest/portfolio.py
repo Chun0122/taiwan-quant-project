@@ -10,10 +10,11 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from src.strategy.base import Strategy
 from src.backtest.engine import (
-    BacktestConfig, RiskConfig, TradeRecord,
+    BacktestConfig,
+    RiskConfig,
 )
+from src.strategy.base import Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,9 @@ logger = logging.getLogger(__name__)
 class PortfolioConfig:
     """投資組合配置。"""
 
-    allocation_method: str = "equal_weight"   # "equal_weight" | "custom"
-    weights: dict[str, float] | None = None   # stock_id → 權重（custom 時使用）
-    max_position_pct: float = 0.5             # 單股最大持倉比例
+    allocation_method: str = "equal_weight"  # "equal_weight" | "custom"
+    weights: dict[str, float] | None = None  # stock_id → 權重（custom 時使用）
+    max_position_pct: float = 0.5  # 單股最大持倉比例
 
 
 @dataclass
@@ -185,17 +186,19 @@ class PortfolioBacktestEngine:
                     pnl = net_revenue - positions[sid] * entry_prices[sid]
                     ret_pct = (sell_price / entry_prices[sid] - 1) * 100
 
-                    trades.append(PortfolioTradeRecord(
-                        stock_id=sid,
-                        entry_date=entry_dates[sid],
-                        entry_price=round(entry_prices[sid], 2),
-                        exit_date=dt,
-                        exit_price=round(sell_price, 2),
-                        shares=positions[sid],
-                        pnl=round(pnl, 2),
-                        return_pct=round(ret_pct, 2),
-                        exit_reason=exit_reason,
-                    ))
+                    trades.append(
+                        PortfolioTradeRecord(
+                            stock_id=sid,
+                            entry_date=entry_dates[sid],
+                            entry_price=round(entry_prices[sid], 2),
+                            exit_date=dt,
+                            exit_price=round(sell_price, 2),
+                            shares=positions[sid],
+                            pnl=round(pnl, 2),
+                            return_pct=round(ret_pct, 2),
+                            exit_reason=exit_reason,
+                        )
+                    )
                     per_stock_pnl[sid] += pnl
                     positions[sid] = 0
                     entry_prices[sid] = 0.0
@@ -232,17 +235,19 @@ class PortfolioBacktestEngine:
                         pnl = net_revenue - positions[sid] * entry_prices[sid]
                         ret_pct = (sell_price / entry_prices[sid] - 1) * 100
 
-                        trades.append(PortfolioTradeRecord(
-                            stock_id=sid,
-                            entry_date=entry_dates[sid],
-                            entry_price=round(entry_prices[sid], 2),
-                            exit_date=dt,
-                            exit_price=round(sell_price, 2),
-                            shares=positions[sid],
-                            pnl=round(pnl, 2),
-                            return_pct=round(ret_pct, 2),
-                            exit_reason="signal",
-                        ))
+                        trades.append(
+                            PortfolioTradeRecord(
+                                stock_id=sid,
+                                entry_date=entry_dates[sid],
+                                entry_price=round(entry_prices[sid], 2),
+                                exit_date=dt,
+                                exit_price=round(sell_price, 2),
+                                shares=positions[sid],
+                                pnl=round(pnl, 2),
+                                return_pct=round(ret_pct, 2),
+                                exit_reason="signal",
+                            )
+                        )
                         per_stock_pnl[sid] += pnl
                         positions[sid] = 0
                         entry_prices[sid] = 0.0
@@ -271,17 +276,19 @@ class PortfolioBacktestEngine:
                 pnl = net_revenue - positions[sid] * entry_prices[sid]
                 ret_pct = (sell_price / entry_prices[sid] - 1) * 100
 
-                trades.append(PortfolioTradeRecord(
-                    stock_id=sid,
-                    entry_date=entry_dates[sid],
-                    entry_price=round(entry_prices[sid], 2),
-                    exit_date=data.index[-1],
-                    exit_price=round(sell_price, 2),
-                    shares=positions[sid],
-                    pnl=round(pnl, 2),
-                    return_pct=round(ret_pct, 2),
-                    exit_reason="force_close",
-                ))
+                trades.append(
+                    PortfolioTradeRecord(
+                        stock_id=sid,
+                        entry_date=entry_dates[sid],
+                        entry_price=round(entry_prices[sid], 2),
+                        exit_date=data.index[-1],
+                        exit_price=round(sell_price, 2),
+                        shares=positions[sid],
+                        pnl=round(pnl, 2),
+                        return_pct=round(ret_pct, 2),
+                        exit_reason="force_close",
+                    )
+                )
                 per_stock_pnl[sid] += pnl
                 positions[sid] = 0
 
@@ -377,15 +384,11 @@ class PortfolioBacktestEngine:
             daily_returns = np.diff(eq) / eq[:-1]
 
             if np.std(daily_returns) > 0:
-                sharpe_ratio = round(
-                    np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4
-                )
+                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
 
             neg_returns = daily_returns[daily_returns < 0]
             if len(neg_returns) > 0 and np.std(neg_returns) > 0:
-                sortino_ratio = round(
-                    np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4
-                )
+                sortino_ratio = round(np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4)
 
             if max_drawdown > 0:
                 calmar_ratio = round(annual_return / max_drawdown, 4)
