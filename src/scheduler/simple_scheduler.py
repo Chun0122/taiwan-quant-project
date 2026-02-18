@@ -70,6 +70,33 @@ def daily_sync_job() -> None:
     except Exception:
         logger.exception("每日報告生成/通知失敗")
 
+    # 全市場選股掃描
+    try:
+        from src.data.pipeline import sync_market_data, sync_stock_info
+        from src.discovery.scanner import MarketScanner
+        from src.report.formatter import format_discovery_report
+        from src.notification.line_notify import send_message
+        from src.config import settings
+
+        logger.info("開始全市場選股掃描")
+        sync_stock_info(force_refresh=False)
+        sync_market_data(days=3)
+
+        scanner = MarketScanner()
+        result = scanner.run()
+
+        if not result.rankings.empty:
+            logger.info("全市場掃描完成，共 %d 支候選", len(result.rankings))
+            if settings.discord.webhook_url and settings.discord.enabled:
+                msgs = format_discovery_report(result, top_n=20)
+                for msg in msgs:
+                    send_message(msg)
+                logger.info("全市場掃描 Discord 通知已發送")
+        else:
+            logger.info("全市場掃描：無符合條件的股票")
+    except Exception:
+        logger.exception("全市場掃描/通知失敗")
+
 
 def run_scheduler() -> None:
     """啟動排程器（阻塞式，每日 23:00 執行）。"""
