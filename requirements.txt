@@ -30,3 +30,8 @@ schedule>=1.2.0
 # Machine Learning (P7)
 scikit-learn>=1.3.0
 xgboost>=2.0.0  # 可選，未安裝時 fallback 到 Random Forest
+
+# Testing
+pytest>=7.4.0
+pytest-mock>=3.12.0
+pytest-cov>=4.1.0

@@ -26,11 +26,37 @@ python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
 ```
 
-目前無正式測試套件。變更後可用語法檢查與匯入測試驗證：
+### 測試
+
+使用 pytest 測試框架，90 個測試覆蓋核心模組：
+
 ```bash
-python -c "import ast; ast.parse(open('path/to/file.py', encoding='utf-8').read())"
-python -c "from src.module import ClassName; print('OK')"
+# 執行全部測試
+pytest -v
+
+# 執行單一測試檔
+pytest tests/test_factors.py -v
+
+# 帶覆蓋率報告
+pytest --cov=src --cov-report=term-missing
 ```
+
+測試檔案結構：
+
+| 測試檔 | 測試對象 | 類型 |
+|--------|----------|------|
+| `tests/test_factors.py` | `src/screener/factors.py` 8 個篩選因子 | 純函數 |
+| `tests/test_ml_features.py` | `src/features/ml_features.py` 特徵工程 | 純函數 |
+| `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算 | 純函數 + mock Strategy |
+| `tests/test_twse_helpers.py` | `src/data/twse_fetcher.py` 工具函數 | 純函數 |
+| `tests/test_scanner.py` | `src/discovery/scanner.py` 掃描計算 | 純函數 |
+| `tests/test_fetcher.py` | `src/data/fetcher.py` API 封裝 | mock HTTP |
+| `tests/test_config.py` | `src/config.py` 設定載入 | tmp_path |
+| `tests/test_db_integration.py` | ORM + upsert + pipeline | in-memory SQLite |
+
+共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
+
+新增或修改模組後，應確保現有測試通過（`pytest -v`），並為新的純函數/計算邏輯補充測試。
 
 ## 架構
 
@@ -41,11 +67,13 @@ FinMind API / TWSE+TPEX ──→ Pipeline (ETL) ──→ SQLite DB
 Strategy.load_data() ← 寬表（OHLCV + 指標合併）
          │
     generate_signals() → BacktestEngine.run() → BacktestResult → DB
+                                                    │
+                              DailyReportEngine / StrategyRankEngine → Discord 通知
 ```
 
 ### 核心設計模式
 
-**策略註冊機制** (`src/strategy/__init__.py`)：所有策略註冊於 `STRATEGY_REGISTRY` 字典，CLI 依名稱解析策略。新增策略方式：繼承 `Strategy`，實作 `generate_signals(data) → Series[1/-1/0]`，加入註冊表。
+**策略註冊機制** (`src/strategy/__init__.py`)：所有策略註冊於 `STRATEGY_REGISTRY` 字典，CLI 依名稱解析策略。目前 9 個策略：`sma_cross`、`rsi_threshold`、`bb_breakout`、`macd_cross`、`buy_and_hold`、`multi_factor`、`ml_random_forest`、`ml_xgboost`、`ml_logistic`。新增策略方式：繼承 `Strategy`，實作 `generate_signals(data) → Series[1/-1/0]`，加入註冊表。
 
 **EAV 指標儲存** (`src/data/schema.py:TechnicalIndicator`)：技術指標採用 Entity-Attribute-Value 模式（stock_id, date, name, value），於 `Strategy.load_data()` 時樞紐轉換為寬表。
 
@@ -63,14 +91,32 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/fetcher.py` | FinMind API 封裝（逐股 + 批次） |
 | `src/data/twse_fetcher.py` | TWSE/TPEX 官方資料（全市場、免費） |
 | `src/data/pipeline.py` | ETL 調度、寫入 DB |
-| `src/data/schema.py` | 9 張 SQLAlchemy ORM 資料表 |
+| `src/data/schema.py` | 10 張 SQLAlchemy ORM 資料表 |
+| `src/data/migrate.py` | DB schema 遷移工具 |
+| `src/config.py` | Pydantic 設定模型 + `load_settings()` |
 | `src/features/indicators.py` | SMA/RSI/MACD/BB → EAV 格式 |
 | `src/features/ml_features.py` | ML 特徵矩陣（動能、波動度、量比） |
 | `src/strategy/base.py` | 抽象 `Strategy`：`load_data()` + `generate_signals()` |
+| `src/strategy/__init__.py` | `STRATEGY_REGISTRY`（9 個策略） |
+| `src/strategy/ml_strategy.py` | ML 策略（Random Forest / XGBoost / Logistic） |
 | `src/backtest/engine.py` | 交易模擬、風險管理、部位控管 |
 | `src/backtest/portfolio.py` | 多股票組合回測 |
-| `src/discovery/scanner.py` | 四階段漏斗：~6000 → 粗篩 150 → 評分 → Top N |
+| `src/backtest/walk_forward.py` | Walk-Forward 滾動窗口驗證（防過擬合） |
+| `src/optimization/grid_search.py` | Grid Search 參數優化器 |
+| `src/screener/factors.py` | 8 個篩選因子（技術面/籌碼面/基本面） |
+| `src/screener/engine.py` | 多因子篩選引擎（watchlist 內掃描） |
+| `src/discovery/scanner.py` | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分 → Top N |
+| `src/industry/analyzer.py` | 產業輪動分析（法人動能 + 價格動能） |
+| `src/report/engine.py` | 每日選股報告（四維度綜合評分） |
 | `src/report/formatter.py` | Discord 訊息格式化（2000 字元限制） |
+| `src/strategy_rank/engine.py` | 策略排名引擎（批次回測 watchlist × strategies） |
+| `src/notification/line_notify.py` | Discord Webhook 通知（檔名為歷史遺留） |
+| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫） |
+| `src/scheduler/windows_task.py` | Windows 工作排程器整合 |
+| `src/visualization/app.py` | Streamlit 儀表板入口 |
+| `src/visualization/charts.py` | Plotly 圖表元件 |
+| `src/visualization/data_loader.py` | 儀表板資料載入 |
+| `src/visualization/pages/` | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation） |
 | `main.py` | CLI 調度器（argparse 子命令） |
 
 ### 設定
@@ -86,3 +132,4 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - **API 速率控制**：FinMind 每次請求間隔 0.5 秒，TWSE/TPEX 間隔 3 秒。
 - **日期格式**：FinMind 使用 ISO 格式（`YYYY-MM-DD`）；TWSE 使用 `YYYYMMDD`；TPEX 使用民國曆（`YYY/MM/DD`，年 = 西元年 - 1911）。
 - **回測成本**：手續費 0.1425%、交易稅 0.3%（賣出時）、滑價 0.05%。
+- **測試慣例**：純函數優先測試（零 mock）。DB 整合測試使用 in-memory SQLite + transaction rollback 隔離。HTTP 測試 mock `requests.Session.get` + `time.sleep`。新增計算邏輯時應補充對應測試。
