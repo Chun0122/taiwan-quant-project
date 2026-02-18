@@ -89,6 +89,19 @@ class MarketScanner:
                 after_coarse=0,
             )
 
+        # Stage 2.5: 補抓候選股月營收（從 FinMind 逐股取得）
+        candidate_ids = candidates["stock_id"].tolist()
+        try:
+            from src.data.pipeline import sync_revenue_for_stocks
+
+            logger.info("Stage 2.5: 補抓 %d 支候選股月營收...", len(candidate_ids))
+            rev_count = sync_revenue_for_stocks(candidate_ids)
+            logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收", rev_count)
+            # 重新載入營收資料（補抓後 DB 已更新）
+            df_revenue = self._load_revenue_data(candidate_ids)
+        except Exception:
+            logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
+
         # Stage 3: 細評
         scored = self._score_candidates(candidates, df_price, df_inst, df_revenue)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
@@ -112,7 +125,6 @@ class MarketScanner:
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """從 DB 查詢最近的 daily_price + institutional + monthly_revenue 資料。"""
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
-        revenue_cutoff = date.today() - timedelta(days=90)
 
         with get_session() as session:
             # 日K線
@@ -159,15 +171,32 @@ class MarketScanner:
                 ],
             )
 
-            # 月營收（每支股票取最新一筆）
-            from sqlalchemy import func
+        # 月營收（全部股票）
+        df_revenue = self._load_revenue_data()
+
+        return df_price, df_inst, df_revenue
+
+    def _load_revenue_data(self, stock_ids: list[str] | None = None) -> pd.DataFrame:
+        """從 DB 查詢月營收資料（每支股票取最新一筆）。
+
+        Args:
+            stock_ids: 限定查詢的股票清單，None 表示查全部
+        """
+        from sqlalchemy import func
+
+        revenue_cutoff = date.today() - timedelta(days=90)
+
+        with get_session() as session:
+            base_filter = MonthlyRevenue.date >= revenue_cutoff
+            if stock_ids:
+                base_filter = base_filter & MonthlyRevenue.stock_id.in_(stock_ids)
 
             subq = (
                 select(
                     MonthlyRevenue.stock_id,
                     func.max(MonthlyRevenue.date).label("max_date"),
                 )
-                .where(MonthlyRevenue.date >= revenue_cutoff)
+                .where(base_filter)
                 .group_by(MonthlyRevenue.stock_id)
                 .subquery()
             )
@@ -181,12 +210,11 @@ class MarketScanner:
                     (MonthlyRevenue.stock_id == subq.c.stock_id) & (MonthlyRevenue.date == subq.c.max_date),
                 )
             ).all()
-            df_revenue = pd.DataFrame(
-                rows,
-                columns=["stock_id", "yoy_growth", "mom_growth"],
-            )
 
-        return df_price, df_inst, df_revenue
+        return pd.DataFrame(
+            rows,
+            columns=["stock_id", "yoy_growth", "mom_growth"],
+        )
 
     # ------------------------------------------------------------------ #
     #  Stage 2: 粗篩

@@ -82,6 +82,41 @@ def _upsert_dividend(df: pd.DataFrame) -> int:
     return _upsert_batch(Dividend, df, ["stock_id", "date"])
 
 
+def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
+    """為指定股票補抓最新月營收（跳過 DB 已有近期資料的）。
+
+    用於 discover 全市場掃描：粗篩後候選股約 150 支，
+    在細評前自動從 FinMind 補抓月營收，讓基本面分數不再 fallback 到 0.5。
+
+    Args:
+        stock_ids: 要補抓營收的股票代號清單
+
+    Returns:
+        新增的月營收筆數
+    """
+    fetcher = FinMindFetcher()
+    total = 0
+    start = (date.today() - timedelta(days=180)).isoformat()
+    end = date.today().isoformat()
+    skipped = 0
+
+    for sid in stock_ids:
+        last = _get_last_date(MonthlyRevenue, sid)
+        # 如果 DB 已有 60 天內的資料，跳過（避免重複抓取）
+        if last and (date.today() - date.fromisoformat(last)).days < 60:
+            skipped += 1
+            continue
+        try:
+            df = fetcher.fetch_monthly_revenue(sid, last or start, end)
+            total += _upsert_monthly_revenue(df)
+        except Exception:
+            logger.warning("[%s] 月營收補抓失敗，跳過", sid)
+
+    if skipped:
+        logger.info("[營收補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+    return total
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,

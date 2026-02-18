@@ -653,8 +653,11 @@ python main.py discover --top 30 --min-price 50 --export picks.csv --notify
 |------|------|------|
 | Stage 1 | 資料載入 | 從 DB 讀取最近 N 天全市場日K + 三大法人 |
 | Stage 2 | 粗篩 | 股價範圍、成交量門檻、法人買賣超、短期動能加權排名，取前 150 名 |
+| Stage 2.5 | 營收補抓 | 從 FinMind 逐股補抓候選股月營收（需 API Token，每支 0.5 秒，約 75 秒） |
 | Stage 3 | 細評 | 三維度評分：技術面(35%) + 籌碼面(45%) + 基本面(20%) |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
+
+> **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收。若無 Token，基本面分數會 fallback 到 0.5（中性值），不影響其他維度評分。Token 設定方式見「FinMind API Token」章節。
 
 粗篩分數權重：成交量 30% + 法人淨買超 40% + 短期動能 30%
 
