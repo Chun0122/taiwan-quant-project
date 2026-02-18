@@ -142,6 +142,62 @@ class TestComputeTechnicalScores:
         result = scanner._compute_technical_scores(["9999"], df_price)
         assert result.iloc[0]["technical_score"] == pytest.approx(0.5)
 
+    def test_volatility_convergence(self, scanner):
+        """波動度收斂：價格穩定的股票應在波動收斂因子得高分。"""
+        # 建立 5 天幾乎不動的資料（低波動）
+        rows = []
+        for i, d in enumerate([date(2025, 1, j) for j in range(1, 6)]):
+            rows.append(
+                {
+                    "stock_id": "8888",
+                    "date": d,
+                    "open": 100,
+                    "high": 100.5,
+                    "low": 99.5,
+                    "close": 100 + i * 0.1,  # 極小變動
+                    "volume": 1_000_000,
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        result = scanner._compute_technical_scores(["8888"], df_price)
+        # 低波動 → 波動收斂因子接近 1.0，整體分應 > 0.5
+        assert result.iloc[0]["technical_score"] >= 0.4
+
+    def test_volume_price_divergence(self, scanner):
+        """量價背離：價漲量增 vs 價跌量增，前者分數應更高。"""
+        # 價漲量增
+        rows_up = []
+        for i, d in enumerate([date(2025, 1, j) for j in range(1, 6)]):
+            rows_up.append(
+                {
+                    "stock_id": "7777",
+                    "date": d,
+                    "open": 100 + i * 2,
+                    "high": 103 + i * 2,
+                    "low": 99 + i * 2,
+                    "close": 101 + i * 2,
+                    "volume": 500_000 + i * 100_000,
+                }
+            )
+        # 價跌量增
+        rows_down = []
+        for i, d in enumerate([date(2025, 1, j) for j in range(1, 6)]):
+            rows_down.append(
+                {
+                    "stock_id": "6666",
+                    "date": d,
+                    "open": 110 - i * 2,
+                    "high": 113 - i * 2,
+                    "low": 109 - i * 2,
+                    "close": 109 - i * 2,
+                    "volume": 500_000 + i * 100_000,
+                }
+            )
+        df_price = pd.DataFrame(rows_up + rows_down)
+        result = scanner._compute_technical_scores(["7777", "6666"], df_price)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["7777"] > scores["6666"]
+
 
 # ─── _compute_chip_scores ────────────────────────────────
 
@@ -155,7 +211,35 @@ class TestComputeChipScores:
     def test_scores_in_valid_range(self, scanner):
         sids = ["1000", "1001"]
         df_inst = _make_inst_df(sids, date(2025, 1, 3))
+        df_price = _make_price_df(5)
+        result = scanner._compute_chip_scores(sids, df_inst, df_price)
+        assert (result["chip_score"] >= 0).all()
+        assert (result["chip_score"] <= 1.0).all()
+
+    def test_consecutive_buy_days_boost(self, scanner):
+        """連續買超天數越多，分數應越高。"""
+        sids = ["1000", "1001"]
+        # 1000: 只有 1 天買超，1001: 連續 3 天買超
+        rows = []
+        for d_offset, d in enumerate([date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]):
+            # 1000: 只有最後一天淨買超 > 0
+            net_1000 = 1000 if d_offset == 2 else -500
+            rows.append({"stock_id": "1000", "date": d, "name": "Foreign_Investor", "net": net_1000})
+            # 1001: 每天都淨買超 > 0
+            rows.append({"stock_id": "1001", "date": d, "name": "Foreign_Investor", "net": 500})
+        df_inst = pd.DataFrame(rows)
+        df_price = _make_price_df(5)
+        result = scanner._compute_chip_scores(sids, df_inst, df_price)
+        scores = result.set_index("stock_id")["chip_score"]
+        # 1001 連續買超 3 天，籌碼分數應高於 1000
+        assert scores["1001"] > scores["1000"]
+
+    def test_without_price_data(self, scanner):
+        """未傳入 df_price 時應 graceful fallback（買超佔量比為 0）。"""
+        sids = ["1000", "1001"]
+        df_inst = _make_inst_df(sids, date(2025, 1, 3))
         result = scanner._compute_chip_scores(sids, df_inst)
+        assert len(result) == 2
         assert (result["chip_score"] >= 0).all()
         assert (result["chip_score"] <= 1.0).all()
 

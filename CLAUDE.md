@@ -28,7 +28,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，94 個測試覆蓋核心模組：
+使用 pytest 測試框架，98 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -43,16 +43,16 @@ pytest --cov=src --cov-report=term-missing
 
 測試檔案結構：
 
-| 測試檔 | 測試對象 | 類型 |
-|--------|----------|------|
-| `tests/test_factors.py` | `src/screener/factors.py` 8 個篩選因子 | 純函數 |
-| `tests/test_ml_features.py` | `src/features/ml_features.py` 特徵工程 | 純函數 |
-| `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算 | 純函數 + mock Strategy |
-| `tests/test_twse_helpers.py` | `src/data/twse_fetcher.py` 工具函數 | 純函數 |
-| `tests/test_scanner.py` | `src/discovery/scanner.py` 掃描計算 + 基本面分數 | 純函數 |
-| `tests/test_fetcher.py` | `src/data/fetcher.py` API 封裝 | mock HTTP |
-| `tests/test_config.py` | `src/config.py` 設定載入 | tmp_path |
-| `tests/test_db_integration.py` | ORM + upsert + pipeline | in-memory SQLite |
+| 測試檔                          | 測試對象                                         | 類型                   |
+| ------------------------------- | ------------------------------------------------ | ---------------------- |
+| `tests/test_factors.py`         | `src/screener/factors.py` 8 個篩選因子           | 純函數                 |
+| `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
+| `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算                | 純函數 + mock Strategy |
+| `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
+| `tests/test_scanner.py`         | `src/discovery/scanner.py` 掃描計算 + 籌碼/技術/基本面分數 | 純函數                 |
+| `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
+| `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
+| `tests/test_db_integration.py`  | ORM + upsert + pipeline                          | in-memory SQLite       |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -61,6 +61,7 @@ pytest --cov=src --cov-report=term-missing
 ## 架構
 
 ### 資料流程
+
 ```
 FinMind API / TWSE+TPEX ──→ Pipeline (ETL) ──→ SQLite DB
                                                     │
@@ -80,44 +81,45 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 **SQLAlchemy Session** (`src/data/database.py`)：一律使用 `with get_session() as session:` 上下文管理器。批次寫入使用 `sqlite_upsert().on_conflict_do_nothing()`。DB 操作前需呼叫 `init_db()`。
 
 **三層資料來源策略**（`src/data/pipeline.py:sync_market_data`）：
+
 1. TWSE/TPEX 官方開放資料（免費，4 次 API 呼叫取得全市場 ~6000 支股票）
 2. FinMind 批次 API（付費帳號）
 3. FinMind 逐股擷取（免費備援，速度較慢）
 
 ### 模組職責
 
-| 模組 | 角色 |
-|------|------|
-| `src/data/fetcher.py` | FinMind API 封裝（逐股 + 批次） |
-| `src/data/twse_fetcher.py` | TWSE/TPEX 官方資料（全市場、免費） |
-| `src/data/pipeline.py` | ETL 調度、寫入 DB |
-| `src/data/schema.py` | 10 張 SQLAlchemy ORM 資料表 |
-| `src/data/migrate.py` | DB schema 遷移工具 |
-| `src/config.py` | Pydantic 設定模型 + `load_settings()` |
-| `src/features/indicators.py` | SMA/RSI/MACD/BB → EAV 格式 |
-| `src/features/ml_features.py` | ML 特徵矩陣（動能、波動度、量比） |
-| `src/strategy/base.py` | 抽象 `Strategy`：`load_data()` + `generate_signals()` |
-| `src/strategy/__init__.py` | `STRATEGY_REGISTRY`（9 個策略） |
-| `src/strategy/ml_strategy.py` | ML 策略（Random Forest / XGBoost / Logistic） |
-| `src/backtest/engine.py` | 交易模擬、風險管理、部位控管 |
-| `src/backtest/portfolio.py` | 多股票組合回測 |
-| `src/backtest/walk_forward.py` | Walk-Forward 滾動窗口驗證（防過擬合） |
-| `src/optimization/grid_search.py` | Grid Search 參數優化器 |
-| `src/screener/factors.py` | 8 個篩選因子（技術面/籌碼面/基本面） |
-| `src/screener/engine.py` | 多因子篩選引擎（watchlist 內掃描） |
-| `src/discovery/scanner.py` | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分（技術+籌碼+基本面） → Top N |
-| `src/industry/analyzer.py` | 產業輪動分析（法人動能 + 價格動能） |
-| `src/report/engine.py` | 每日選股報告（四維度綜合評分） |
-| `src/report/formatter.py` | Discord 訊息格式化（2000 字元限制） |
-| `src/strategy_rank/engine.py` | 策略排名引擎（批次回測 watchlist × strategies） |
-| `src/notification/line_notify.py` | Discord Webhook 通知（檔名為歷史遺留） |
-| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫） |
-| `src/scheduler/windows_task.py` | Windows 工作排程器整合 |
-| `src/visualization/app.py` | Streamlit 儀表板入口 |
-| `src/visualization/charts.py` | Plotly 圖表元件 |
-| `src/visualization/data_loader.py` | 儀表板資料載入 |
-| `src/visualization/pages/` | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation） |
-| `main.py` | CLI 調度器（argparse 子命令） |
+| 模組                                | 角色                                                                                                              |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次）                                                                                   |
+| `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）                                                                                |
+| `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
+| `src/data/schema.py`                | 10 張 SQLAlchemy ORM 資料表                                                                                       |
+| `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
+| `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
+| `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式                                                                                        |
+| `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）                                                                                 |
+| `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()`                                                             |
+| `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
+| `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
+| `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管                                                                                      |
+| `src/backtest/portfolio.py`         | 多股票組合回測                                                                                                    |
+| `src/backtest/walk_forward.py`      | Walk-Forward 滾動窗口驗證（防過擬合）                                                                             |
+| `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
+| `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
+| `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
+| `src/discovery/scanner.py`          | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分（技術 6 因子 + 籌碼 5 因子 + 基本面） → Top N                            |
+| `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能）                                                                               |
+| `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
+| `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |
+| `src/strategy_rank/engine.py`       | 策略排名引擎（批次回測 watchlist × strategies）                                                                   |
+| `src/notification/line_notify.py`   | Discord Webhook 通知（檔名為歷史遺留）                                                                            |
+| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫）                                                                                       |
+| `src/scheduler/windows_task.py`     | Windows 工作排程器整合                                                                                            |
+| `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
+| `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
+| `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
+| `src/visualization/pages/`          | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation） |
+| `main.py`                           | CLI 調度器（argparse 子命令）                                                                                     |
 
 ### 設定
 
@@ -133,6 +135,11 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - **日期格式**：FinMind 使用 ISO 格式（`YYYY-MM-DD`）；TWSE 使用 `YYYYMMDD`；TPEX 使用民國曆（`YYY/MM/DD`，年 = 西元年 - 1911）。
 - **回測成本**：手續費 0.1425%、交易稅 0.3%（賣出時）、滑價 0.05%。
 - **測試慣例**：純函數優先測試（零 mock）。DB 整合測試使用 in-memory SQLite + transaction rollback 隔離。HTTP 測試 mock `requests.Session.get` + `time.sleep`。新增計算邏輯時應補充對應測試。
+- **文件聯動更新 (重要)**：
+  - 每當修改原始碼（如 `src/` 或 `main.py`）後，**必須自動同步更新**以下兩份檔案：
+    1. `CLAUDE.md`：若涉及架構變更、新增指令、新增測試或模組職責異動，須立即修正。
+    2. `usage.md`：若涉及用戶端指令 (CLI) 參數變動、工作流程調整或新功能上線，須同步更新使用手冊。
+  - **排除對象**：僅進行「規劃 (Planning)」或「詢問 (Ask)」而不涉及實際檔案寫入時，無需更新。
 
 ## 已確認事項（規劃時勿重複提出）
 

@@ -300,7 +300,7 @@ class MarketScanner:
         tech_scores = self._compute_technical_scores(stock_ids, df_price)
 
         # --- 籌碼分數 ---
-        chip_scores = self._compute_chip_scores(stock_ids, df_inst)
+        chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
 
         # --- 基本面分數 ---
         fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
@@ -323,7 +323,7 @@ class MarketScanner:
         return candidates
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """從原始 OHLCV 計算技術面分數（SMA、動能、價格位置）。"""
+        """從原始 OHLCV 計算技術面分數（6 因子：SMA + 動能 + 價格位置 + 量能比 + 波動收斂 + 量價背離）。"""
         results = []
 
         for sid in stock_ids:
@@ -375,13 +375,43 @@ class MarketScanner:
                     score += 0.5
                 n_factors += 1
 
+            # 5) 波動度收斂（BB 寬度縮窄）：CV 越低代表盤整越緊，突破潛力越大
+            if len(closes) >= 5:
+                recent_closes = closes[-5:]
+                mean_price = recent_closes.mean()
+                if mean_price > 0:
+                    cv = recent_closes.std(ddof=0) / mean_price
+                    # CV 越小分數越高：用 1 - 歸一化 CV（CV 通常 < 0.1，用 0.1 做上限）
+                    score += max(0.0, 1.0 - min(cv / 0.1, 1.0))
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            # 6) 量價背離偵測：價格方向 vs 成交量方向一致性
+            if len(closes) >= 3 and len(volumes) >= 3:
+                price_chg = closes[-1] - closes[-3]
+                vol_chg = float(volumes[-1]) - float(volumes[-3])
+                # 價漲量增 → 健康上漲（高分），價漲量縮 → 看空背離（低分）
+                # 價跌量增 → 看空（低分），價跌量縮 → 中性
+                if price_chg > 0 and vol_chg > 0:
+                    score += 1.0  # 價漲量增：最佳
+                elif price_chg > 0 and vol_chg <= 0:
+                    score += 0.3  # 價漲量縮：背離
+                elif price_chg <= 0 and vol_chg <= 0:
+                    score += 0.5  # 價跌量縮：中性
+                else:
+                    score += 0.2  # 價跌量增：最差
+                n_factors += 1
+
             tech_score = score / max(n_factors, 1)
             results.append({"stock_id": sid, "technical_score": tech_score})
 
         return pd.DataFrame(results)
 
-    def _compute_chip_scores(self, stock_ids: list[str], df_inst: pd.DataFrame) -> pd.DataFrame:
-        """計算籌碼面分數（三大法人買賣超，排名百分位）。"""
+    def _compute_chip_scores(
+        self, stock_ids: list[str], df_inst: pd.DataFrame, df_price: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
+        """計算籌碼面分數（5 因子：淨買超 × 3 + 連續買超天數 + 買超佔量比）。"""
         if df_inst.empty:
             return pd.DataFrame(
                 {
@@ -392,35 +422,69 @@ class MarketScanner:
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
 
-        # 計算每支股票的外資、投信、合計淨買超
+        # 計算每支股票的外資、投信、合計淨買超 + 連續買超天數 + 買超佔量比
         rows = []
         for sid in stock_ids:
             stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
             if stock_inst.empty:
-                rows.append({"stock_id": sid, "foreign_net": 0, "trust_net": 0, "total_net": 0})
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "foreign_net": 0,
+                        "trust_net": 0,
+                        "total_net": 0,
+                        "consec_buy_days": 0,
+                        "buy_vol_ratio": 0.0,
+                    }
+                )
                 continue
 
             foreign_data = stock_inst[stock_inst["name"].str.contains("外資", na=False)]
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
+            total_net = stock_inst["net"].sum()
+
+            # 連續買超天數：從最新日期往回數，三大法人合計淨買超 > 0 的連續天數
+            daily_net = stock_inst.groupby("date")["net"].sum().sort_index(ascending=False)
+            consec_days = 0
+            for net_val in daily_net.values:
+                if net_val > 0:
+                    consec_days += 1
+                else:
+                    break
+
+            # 買超佔成交量比例：合計淨買超 / 最新日成交量
+            buy_vol_ratio = 0.0
+            if df_price is not None and not df_price.empty:
+                stock_price = df_price[df_price["stock_id"] == sid]
+                if not stock_price.empty:
+                    latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
+                    if latest_vol > 0:
+                        buy_vol_ratio = total_net / latest_vol
 
             rows.append(
                 {
                     "stock_id": sid,
                     "foreign_net": foreign_data["net"].sum() if not foreign_data.empty else 0,
                     "trust_net": trust_data["net"].sum() if not trust_data.empty else 0,
-                    "total_net": stock_inst["net"].sum(),
+                    "total_net": total_net,
+                    "consec_buy_days": consec_days,
+                    "buy_vol_ratio": buy_vol_ratio,
                 }
             )
 
         df = pd.DataFrame(rows)
 
-        # 用排名百分位取代二元判斷，分數自然分散在 0~1
+        # 用排名百分位，分數自然分散在 0~1
         foreign_rank = df["foreign_net"].rank(pct=True)
         trust_rank = df["trust_net"].rank(pct=True)
         total_rank = df["total_net"].rank(pct=True)
+        consec_rank = df["consec_buy_days"].rank(pct=True)
+        buy_vol_rank = df["buy_vol_ratio"].rank(pct=True)
 
-        # 外資 40% + 投信 30% + 合計 30%
-        df["chip_score"] = foreign_rank * 0.40 + trust_rank * 0.30 + total_rank * 0.30
+        # 外資 30% + 投信 20% + 合計 20% + 連續買超 15% + 買超佔量 15%
+        df["chip_score"] = (
+            foreign_rank * 0.30 + trust_rank * 0.20 + total_rank * 0.20 + consec_rank * 0.15 + buy_vol_rank * 0.15
+        )
 
         return df[["stock_id", "chip_score"]]
 
