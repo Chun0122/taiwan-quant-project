@@ -13,7 +13,6 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
@@ -382,7 +381,7 @@ class MarketScanner:
         return pd.DataFrame(results)
 
     def _compute_chip_scores(self, stock_ids: list[str], df_inst: pd.DataFrame) -> pd.DataFrame:
-        """計算籌碼面分數（三大法人買賣超）。"""
+        """計算籌碼面分數（三大法人買賣超，排名百分位）。"""
         if df_inst.empty:
             return pd.DataFrame(
                 {
@@ -391,45 +390,42 @@ class MarketScanner:
                 }
             )
 
-        results = []
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
 
+        # 計算每支股票的外資、投信、合計淨買超
+        rows = []
         for sid in stock_ids:
             stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
             if stock_inst.empty:
-                results.append({"stock_id": sid, "chip_score": 0.5})
+                rows.append({"stock_id": sid, "foreign_net": 0, "trust_net": 0, "total_net": 0})
                 continue
 
-            score = 0.0
-            n_factors = 0
-
-            # 外資淨買超
             foreign_data = stock_inst[stock_inst["name"].str.contains("外資", na=False)]
-            if not foreign_data.empty:
-                foreign_net = foreign_data["net"].sum()
-                # 歸一化：正值加分
-                score += 1.0 if foreign_net > 0 else 0.0
-                n_factors += 1
-
-            # 投信淨買超
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
-            if not trust_data.empty:
-                trust_net = trust_data["net"].sum()
-                score += 1.0 if trust_net > 0 else 0.0
-                n_factors += 1
 
-            # 三大法人合計淨買超
-            total_net = stock_inst["net"].sum()
-            score += 1.0 if total_net > 0 else 0.0
-            n_factors += 1
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "foreign_net": foreign_data["net"].sum() if not foreign_data.empty else 0,
+                    "trust_net": trust_data["net"].sum() if not trust_data.empty else 0,
+                    "total_net": stock_inst["net"].sum(),
+                }
+            )
 
-            chip_score = score / max(n_factors, 1)
-            results.append({"stock_id": sid, "chip_score": chip_score})
+        df = pd.DataFrame(rows)
 
-        return pd.DataFrame(results)
+        # 用排名百分位取代二元判斷，分數自然分散在 0~1
+        foreign_rank = df["foreign_net"].rank(pct=True)
+        trust_rank = df["trust_net"].rank(pct=True)
+        total_rank = df["total_net"].rank(pct=True)
+
+        # 外資 40% + 投信 30% + 合計 30%
+        df["chip_score"] = foreign_rank * 0.40 + trust_rank * 0.30 + total_rank * 0.30
+
+        return df[["stock_id", "chip_score"]]
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """從月營收資料計算基本面分數（YoY 營收成長 + MoM 加分）。"""
+        """從月營收資料計算基本面分數（YoY 70% + MoM 30%，排名百分位）。"""
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
@@ -437,10 +433,12 @@ class MarketScanner:
         if rev.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
-        yoy = rev["yoy_growth"].fillna(0)
-        yoy_score = np.clip(yoy / 50, 0, 1)
-        mom_bonus = (rev["mom_growth"].fillna(0) > 0).astype(float) * 0.1
-        rev["fundamental_score"] = np.clip(yoy_score + mom_bonus, 0, 1)
+        # 用排名百分位，讓分數自然分散在 0~1
+        yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
+        mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
+
+        # YoY 權重 70% + MoM 權重 30%
+        rev["fundamental_score"] = yoy_rank * 0.70 + mom_rank * 0.30
 
         # 包含所有 stock_ids，無資料的用 NaN（外層 fillna 處理）
         result = pd.DataFrame({"stock_id": stock_ids})

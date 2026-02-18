@@ -188,22 +188,22 @@ class TestComputeSectorSummary:
 
 class TestComputeFundamentalScores:
     def test_with_revenue_data(self, scanner):
-        """YoY 25% → score ≈ 0.5, YoY 50% → 1.0"""
+        """排名百分位：YoY 較高者分數較高"""
         df_revenue = pd.DataFrame(
             {
-                "stock_id": ["1000", "1001"],
-                "yoy_growth": [25.0, 50.0],
-                "mom_growth": [0.0, -5.0],
+                "stock_id": ["1000", "1001", "1002"],
+                "yoy_growth": [10.0, 30.0, -5.0],
+                "mom_growth": [5.0, -2.0, 3.0],
             }
         )
-        result = scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
-        assert len(result) == 2
-        # YoY 25% / 50 = 0.5, MoM 0 → no bonus → 0.5
-        score_1000 = result.loc[result["stock_id"] == "1000", "fundamental_score"].iloc[0]
-        assert score_1000 == pytest.approx(0.5)
-        # YoY 50% / 50 = 1.0, MoM < 0 → no bonus → 1.0
-        score_1001 = result.loc[result["stock_id"] == "1001", "fundamental_score"].iloc[0]
-        assert score_1001 == pytest.approx(1.0)
+        result = scanner._compute_fundamental_scores(["1000", "1001", "1002"], df_revenue)
+        assert len(result) == 3
+        scores = result.set_index("stock_id")["fundamental_score"]
+        # 1001 有最高 YoY → 分數最高
+        assert scores["1001"] > scores["1002"]
+        # 所有分數都在 0~1 範圍
+        assert (result["fundamental_score"] >= 0).all()
+        assert (result["fundamental_score"] <= 1).all()
 
     def test_no_revenue_returns_default(self, scanner):
         """空 DF → 全部 0.5"""
@@ -213,30 +213,29 @@ class TestComputeFundamentalScores:
         assert len(result) == 2
         assert (result["fundamental_score"] == 0.5).all()
 
-    def test_high_yoy_caps_at_one(self, scanner):
-        """YoY 100% + MoM 正 → clip 在 1.0"""
+    def test_higher_yoy_ranks_higher(self, scanner):
+        """YoY 越高排名越前，分數越高"""
         df_revenue = pd.DataFrame(
             {
-                "stock_id": ["1000"],
-                "yoy_growth": [100.0],
-                "mom_growth": [10.0],
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [100.0, 5.0],
+                "mom_growth": [10.0, 10.0],
             }
         )
-        result = scanner._compute_fundamental_scores(["1000"], df_revenue)
-        score = result.iloc[0]["fundamental_score"]
-        # 100/50=2.0 clip→1.0, +0.1 bonus → 1.1 clip→1.0
-        assert score == pytest.approx(1.0)
+        result = scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
 
-    def test_negative_yoy_floors_at_zero(self, scanner):
-        """YoY -20% → 0.0"""
+    def test_scores_spread_across_range(self, scanner):
+        """多支股票時分數應分散，不會全部相同"""
         df_revenue = pd.DataFrame(
             {
-                "stock_id": ["1000"],
-                "yoy_growth": [-20.0],
-                "mom_growth": [-5.0],
+                "stock_id": ["1000", "1001", "1002", "1003"],
+                "yoy_growth": [-20.0, 0.0, 15.0, 50.0],
+                "mom_growth": [-5.0, 3.0, -1.0, 10.0],
             }
         )
-        result = scanner._compute_fundamental_scores(["1000"], df_revenue)
-        score = result.iloc[0]["fundamental_score"]
-        # -20/50 = -0.4 clip→0.0, MoM < 0 → no bonus → 0.0
-        assert score == pytest.approx(0.0)
+        result = scanner._compute_fundamental_scores(["1000", "1001", "1002", "1003"], df_revenue)
+        scores = result["fundamental_score"]
+        # 至少有 3 個不同的分數值（分散性）
+        assert scores.nunique() >= 3
