@@ -18,8 +18,9 @@ class BuyAndHoldStrategy(Strategy):
         stock_id: str,
         start_date: str,
         end_date: str,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
 
     @property
     def name(self) -> str:

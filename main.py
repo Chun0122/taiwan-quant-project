@@ -179,7 +179,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     if args.stocks:
         from src.backtest.portfolio import PortfolioBacktestEngine, PortfolioConfig
 
-        strategies = [strategy_cls(stock_id=sid, start_date=start, end_date=end) for sid in args.stocks]
+        adj_div = getattr(args, "adjust_dividend", False)
+        strategies = [
+            strategy_cls(stock_id=sid, start_date=start, end_date=end, adjust_dividend=adj_div) for sid in args.stocks
+        ]
 
         portfolio_config = PortfolioConfig(allocation_method=args.allocation)
 
@@ -227,7 +230,8 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         print("請指定 --stock 或 --stocks")
         sys.exit(1)
 
-    strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end)
+    adj_div = getattr(args, "adjust_dividend", False)
+    strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end, adjust_dividend=adj_div)
 
     engine = BacktestEngine(strategy, risk_config=risk_config)
     result = engine.run()
@@ -472,6 +476,11 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
         strategy_params["threshold"] = args.threshold
     if args.train_ratio:
         strategy_params["train_ratio"] = args.train_ratio
+
+    # 除權息還原
+    adj_div = getattr(args, "adjust_dividend", False)
+    if adj_div:
+        strategy_params["adjust_dividend"] = True
 
     # 對 ML 策略，從策略名自動設定 model_type
     if args.strategy.startswith("ml_"):
@@ -817,6 +826,9 @@ def main() -> None:
     sp_bt.add_argument(
         "--allocation", default="equal_weight", choices=["equal_weight", "custom"], help="投資組合配置方式"
     )
+    sp_bt.add_argument(
+        "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
+    )
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
@@ -872,6 +884,9 @@ def main() -> None:
         "--sizing", default="all_in", choices=["all_in", "fixed_fraction", "kelly", "atr"], help="部位大小計算方式"
     )
     sp_wf.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例")
+    sp_wf.add_argument(
+        "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
+    )
 
     # report 子命令
     sp_report = subparsers.add_parser("report", help="每日選股報告")

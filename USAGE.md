@@ -239,6 +239,24 @@ python main.py backtest --stock 2330 --strategy ml_xgboost
 python main.py backtest --stock 2330 --strategy ml_logistic
 ```
 
+#### 除權息還原回測
+
+啟用 `--adjust-dividend` 旗標可讓回測考慮除權息影響：
+
+```bash
+# 除權息還原回測
+python main.py backtest --stock 2330 --strategy sma_cross --adjust-dividend
+
+# 投資組合 + 除權息還原
+python main.py backtest --stocks 2330 2317 2454 --strategy multi_factor --adjust-dividend
+```
+
+啟用後系統會自動執行兩件事：
+1. **價格還原**：回溯調整除權息前的 OHLC 價格，重新計算技術指標，避免除權息日產生假訊號（如 SMA 假跌破、RSI 假超賣）
+2. **股利入帳**：持倉期間遇到除權息日，現金股利自動加入資金，股票股利自動增加持股數量
+
+> **注意**：需先透過 `python main.py sync` 同步股利資料（`dividend` 表）。預設關閉以保持向後相容性。
+
 回測結果會自動顯示同期 Buy & Hold 基準報酬率與超額報酬。
 
 交易成本設定（符合台股實際費率）：
@@ -275,6 +293,7 @@ python main.py backtest --stock 2330 --strategy sma_cross --sizing atr
 | `--trailing-stop N` | 移動停損百分比，從持倉最高點回落 N% 時出場 |
 | `--sizing MODE` | 部位大小計算：`all_in`（預設）/ `fixed_fraction` / `kelly` / `atr` |
 | `--fraction N` | `fixed_fraction` 模式的資金比例（0.0~1.0） |
+| `--adjust-dividend` | 啟用除權息還原（回溯調整價格 + 股利入帳） |
 
 部位計算模式說明：
 | 模式 | 說明 |
@@ -457,6 +476,9 @@ python main.py walk-forward --stock 2330 --strategy ml_random_forest --lookback 
 
 # 搭配風險管理
 python main.py walk-forward --stock 2330 --strategy ml_xgboost --stop-loss 5 --take-profit 15
+
+# 除權息還原
+python main.py walk-forward --stock 2330 --strategy ml_random_forest --adjust-dividend
 ```
 
 | 參數 | 說明 |
@@ -470,6 +492,7 @@ python main.py walk-forward --stock 2330 --strategy ml_xgboost --stop-loss 5 --t
 | `--forward-days N` | ML 預測天數（覆蓋策略預設值） |
 | `--threshold N` | ML 訊號門檻（覆蓋策略預設值） |
 | `--train-ratio N` | ML 訓練比例（覆蓋策略預設值） |
+| `--adjust-dividend` | 啟用除權息還原（回溯調整價格 + 股利入帳） |
 
 Walk-Forward 也支援所有風險管理參數（`--stop-loss`、`--take-profit`、`--trailing-stop`、`--sizing`、`--fraction`）。
 

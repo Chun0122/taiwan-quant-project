@@ -52,6 +52,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_scanner.py`         | `src/discovery/scanner.py` 掃描計算 + 籌碼/技術/基本面分數 | 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
+| `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
 | `tests/test_db_integration.py`  | ORM + upsert + pipeline                          | in-memory SQLite       |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
@@ -78,6 +79,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 **EAV 指標儲存** (`src/data/schema.py:TechnicalIndicator`)：技術指標採用 Entity-Attribute-Value 模式（stock_id, date, name, value），於 `Strategy.load_data()` 時樞紐轉換為寬表。
 
+**除權息還原回測** (`--adjust-dividend`)：兩層架構 — Layer 1 在 `Strategy.load_data()` 回溯調整 OHLC 價格並從調整後價格重算技術指標（避免除權息日產生假訊號），保留 `raw_*` 原始價格；Layer 2 在 `BacktestEngine.run()` 使用原始價格交易，並在除權息日將現金股利入帳、股票股利增加持股。預設關閉（`adjust_dividend=False`），透過 CLI `--adjust-dividend` 旗標啟用。
+
 **SQLAlchemy Session** (`src/data/database.py`)：一律使用 `with get_session() as session:` 上下文管理器。批次寫入使用 `sqlite_upsert().on_conflict_do_nothing()`。DB 操作前需呼叫 `init_db()`。
 
 **三層資料來源策略**（`src/data/pipeline.py:sync_market_data`）：
@@ -96,12 +99,12 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/schema.py`                | 10 張 SQLAlchemy ORM 資料表                                                                                       |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
-| `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式                                                                                        |
+| `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）                                |
 | `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）                                                                                 |
-| `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()`                                                             |
+| `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()` + 除權息調整（`_apply_dividend_adjustment`）                |
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
 | `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
-| `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管                                                                                      |
+| `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管、除權息股利入帳                                                                      |
 | `src/backtest/portfolio.py`         | 多股票組合回測                                                                                                    |
 | `src/backtest/walk_forward.py`      | Walk-Forward 滾動窗口驗證（防過擬合）                                                                             |
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |

@@ -100,3 +100,40 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
     result = pd.DataFrame(records)
     logger.info("[%s] 計算完成: %d 筆指標", stock_id, len(result))
     return result
+
+
+def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """從 DataFrame 直接計算技術指標，回傳寬表格式。
+
+    用於除權息還原後的價格序列，繞過 EAV 表直接計算。
+
+    Args:
+        df: 含 close/high/low 欄位的 DataFrame（index=日期）
+
+    Returns:
+        DataFrame with indicator columns (sma_5, sma_10, sma_20, sma_60,
+        rsi_14, macd, macd_signal, macd_hist, bb_upper, bb_middle, bb_lower)
+    """
+    close = df["close"]
+    result = pd.DataFrame(index=df.index)
+
+    # SMA
+    for period in (5, 10, 20, 60):
+        result[f"sma_{period}"] = SMAIndicator(close=close, n=period).sma_indicator()
+
+    # RSI(14)
+    result["rsi_14"] = RSIIndicator(close=close, n=14).rsi()
+
+    # MACD(12, 26, 9)
+    macd_ind = MACD(close=close, n_slow=26, n_fast=12, n_sign=9)
+    result["macd"] = macd_ind.macd()
+    result["macd_signal"] = macd_ind.macd_signal()
+    result["macd_hist"] = macd_ind.macd_diff()
+
+    # Bollinger Bands(20, 2)
+    bb = BollingerBands(close=close, n=20, ndev=2)
+    result["bb_upper"] = bb.bollinger_hband()
+    result["bb_middle"] = bb.bollinger_mavg()
+    result["bb_lower"] = bb.bollinger_lband()
+
+    return result

@@ -128,6 +128,13 @@ class PortfolioBacktestEngine:
         equity_curve: list[float] = []
         per_stock_pnl: dict[str, float] = {sid: 0.0 for sid in stock_ids}
 
+        # 除權息資料（每支股票的）
+        stock_dividends: dict[str, pd.DataFrame | None] = {}
+        for strategy in self.strategies:
+            sid = strategy.stock_id
+            if sid in stock_data:
+                stock_dividends[sid] = getattr(strategy, "_dividends", None)
+
         for dt in all_dates:
             # 每股處理
             for sid in stock_ids:
@@ -135,10 +142,27 @@ class PortfolioBacktestEngine:
                 if dt not in data.index:
                     continue
 
+                has_raw = "raw_close" in data.columns
                 close = data.loc[dt, "close"]
                 high = data.loc[dt, "high"]
                 low = data.loc[dt, "low"]
+                raw_close = data.loc[dt, "raw_close"] if has_raw else close
+                raw_high = data.loc[dt, "raw_high"] if has_raw else high
+                raw_low = data.loc[dt, "raw_low"] if has_raw else low
                 signal = stock_signals[sid].get(dt, 0)
+
+                # --- 除權息處理 ---
+                divs = stock_dividends.get(sid)
+                if divs is not None and not divs.empty and positions[sid] > 0:
+                    if dt in divs.index:
+                        cash_div = divs.loc[dt, "cash_dividend"]
+                        stock_div = divs.loc[dt, "stock_dividend"]
+                        if cash_div > 0:
+                            capital += cash_div * positions[sid]
+                        if stock_div > 0:
+                            new_shares = int(positions[sid] * stock_div / 10)
+                            if new_shares > 0:
+                                positions[sid] += new_shares
 
                 # --- 風險出場檢查 ---
                 risk_exit = False
@@ -147,36 +171,36 @@ class PortfolioBacktestEngine:
                 if positions[sid] > 0:
                     ep = entry_prices[sid]
 
-                    if high > peak_since_entry[sid]:
-                        peak_since_entry[sid] = high
+                    if raw_high > peak_since_entry[sid]:
+                        peak_since_entry[sid] = raw_high
 
                     # 停損
                     if self.risk_config.stop_loss_pct is not None:
                         stop_price = ep * (1 - self.risk_config.stop_loss_pct / 100)
-                        if low <= stop_price:
+                        if raw_low <= stop_price:
                             risk_exit = True
                             exit_reason = "stop_loss"
-                            close = min(close, stop_price)
+                            raw_close = min(raw_close, stop_price)
 
                     # 停利
                     if not risk_exit and self.risk_config.take_profit_pct is not None:
                         tp_price = ep * (1 + self.risk_config.take_profit_pct / 100)
-                        if high >= tp_price:
+                        if raw_high >= tp_price:
                             risk_exit = True
                             exit_reason = "take_profit"
-                            close = max(close, tp_price)
+                            raw_close = max(raw_close, tp_price)
 
                     # 移動停損
                     if not risk_exit and self.risk_config.trailing_stop_pct is not None:
                         trail_price = peak_since_entry[sid] * (1 - self.risk_config.trailing_stop_pct / 100)
-                        if low <= trail_price:
+                        if raw_low <= trail_price:
                             risk_exit = True
                             exit_reason = "trailing_stop"
-                            close = min(close, trail_price)
+                            raw_close = min(raw_close, trail_price)
 
                 # 執行風險出場
                 if risk_exit and positions[sid] > 0:
-                    sell_price = close * (1 - self.config.slippage)
+                    sell_price = raw_close * (1 - self.config.slippage)
                     revenue = positions[sid] * sell_price
                     commission = revenue * self.config.commission_rate
                     tax = revenue * self.config.tax_rate
@@ -208,7 +232,7 @@ class PortfolioBacktestEngine:
                 elif not risk_exit:
                     # 買入
                     if signal == 1 and positions[sid] == 0:
-                        buy_price = data.loc[dt, "close"] * (1 + self.config.slippage)
+                        buy_price = raw_close * (1 + self.config.slippage)
                         # 買入金額 = capital × weight，受 max_position_pct 限制
                         alloc_capital = capital * min(weights[sid], self.portfolio_config.max_position_pct)
                         commission = alloc_capital * self.config.commission_rate
@@ -221,11 +245,11 @@ class PortfolioBacktestEngine:
                             positions[sid] = shares
                             entry_prices[sid] = buy_price
                             entry_dates[sid] = dt
-                            peak_since_entry[sid] = high
+                            peak_since_entry[sid] = raw_high
 
                     # 賣出
                     elif signal == -1 and positions[sid] > 0:
-                        sell_price = data.loc[dt, "close"] * (1 - self.config.slippage)
+                        sell_price = raw_close * (1 - self.config.slippage)
                         revenue = positions[sid] * sell_price
                         commission = revenue * self.config.commission_rate
                         tax = revenue * self.config.tax_rate
@@ -258,14 +282,16 @@ class PortfolioBacktestEngine:
             mtm = capital
             for sid in stock_ids:
                 if positions[sid] > 0 and dt in stock_data[sid].index:
-                    mtm += positions[sid] * stock_data[sid].loc[dt, "close"]
+                    d = stock_data[sid]
+                    rc = d.loc[dt, "raw_close"] if "raw_close" in d.columns else d.loc[dt, "close"]
+                    mtm += positions[sid] * rc
             equity_curve.append(mtm)
 
         # 5. 結束時強制平倉所有持倉
         for sid in stock_ids:
             if positions[sid] > 0:
                 data = stock_data[sid]
-                last_close = data.iloc[-1]["close"]
+                last_close = data.iloc[-1]["raw_close"] if "raw_close" in data.columns else data.iloc[-1]["close"]
                 sell_price = last_close * (1 - self.config.slippage)
                 revenue = positions[sid] * sell_price
                 commission = revenue * self.config.commission_rate

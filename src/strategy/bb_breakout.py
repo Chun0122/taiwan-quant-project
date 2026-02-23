@@ -21,8 +21,9 @@ class BollingerBandBreakoutStrategy(Strategy):
         end_date: str,
         period: int = 20,
         std_dev: int = 2,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
         self.period = period
         self.std_dev = std_dev
 

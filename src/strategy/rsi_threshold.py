@@ -21,8 +21,9 @@ class RSIThresholdStrategy(Strategy):
         end_date: str,
         oversold: int = 30,
         overbought: int = 70,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
         self.oversold = oversold
         self.overbought = overbought
 

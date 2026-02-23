@@ -44,8 +44,9 @@ class MultiFactorStrategy(Strategy):
         weights: dict[str, float] | None = None,
         buy_threshold: float = 0.3,
         sell_threshold: float = -0.3,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
         self.weights = weights or DEFAULT_WEIGHTS.copy()
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
@@ -84,24 +85,36 @@ class MultiFactorStrategy(Strategy):
             ]
         ).set_index("date")
 
-        with get_session() as session:
-            # 技術指標
-            indicators = (
-                session.execute(
-                    select(TechnicalIndicator)
-                    .where(TechnicalIndicator.stock_id == self.stock_id)
-                    .where(TechnicalIndicator.date >= self.start_date)
-                    .where(TechnicalIndicator.date <= self.end_date)
+        if self.adjust_dividend:
+            # 除權息回溯調整 → 內聯計算指標
+            dividends = self._load_dividends()
+            self._dividends = dividends
+            df = self._apply_dividend_adjustment(df, dividends)
+
+            from src.features.indicators import compute_indicators_from_df
+
+            df_indicators = compute_indicators_from_df(df)
+            df = df.join(df_indicators, how="left")
+        else:
+            with get_session() as session:
+                # 技術指標
+                indicators = (
+                    session.execute(
+                        select(TechnicalIndicator)
+                        .where(TechnicalIndicator.stock_id == self.stock_id)
+                        .where(TechnicalIndicator.date >= self.start_date)
+                        .where(TechnicalIndicator.date <= self.end_date)
+                    )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
 
-            if indicators:
-                df_ind = pd.DataFrame([{"date": r.date, "name": r.name, "value": r.value} for r in indicators])
-                df_wide = df_ind.pivot_table(index="date", columns="name", values="value")
-                df = df.join(df_wide, how="left")
+                if indicators:
+                    df_ind = pd.DataFrame([{"date": r.date, "name": r.name, "value": r.value} for r in indicators])
+                    df_wide = df_ind.pivot_table(index="date", columns="name", values="value")
+                    df = df.join(df_wide, how="left")
 
+        with get_session() as session:
             # 三大法人（pivot by name → 外資/投信/自營商 net）
             institutions = (
                 session.execute(

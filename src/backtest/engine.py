@@ -113,11 +113,32 @@ class BacktestEngine:
         trades: list[TradeRecord] = []
         equity_curve: list[float] = []
 
+        # 除權息資料（若有）
+        has_raw = "raw_close" in data.columns
+        dividends = getattr(self.strategy, "_dividends", None)
+
         for dt in data.index:
             close = data.loc[dt, "close"]
             high = data.loc[dt, "high"]
             low = data.loc[dt, "low"]
+
+            # 若有除權息調整，交易使用原始價格
+            raw_close = data.loc[dt, "raw_close"] if has_raw else close
+            raw_high = data.loc[dt, "raw_high"] if has_raw else high
+            raw_low = data.loc[dt, "raw_low"] if has_raw else low
             signal = signals.get(dt, 0)
+
+            # --- 除權息處理（持倉中才處理） ---
+            if dividends is not None and not dividends.empty and position > 0:
+                if dt in dividends.index:
+                    cash_div = dividends.loc[dt, "cash_dividend"]
+                    stock_div = dividends.loc[dt, "stock_dividend"]
+                    if cash_div > 0:
+                        capital += cash_div * position
+                    if stock_div > 0:
+                        new_shares = int(position * stock_div / 10)
+                        if new_shares > 0:
+                            position += new_shares
 
             # --- 風險出場檢查（持倉中才執行） ---
             risk_exit = False
@@ -125,36 +146,36 @@ class BacktestEngine:
 
             if position > 0:
                 # 更新持倉最高價
-                if high > peak_since_entry:
-                    peak_since_entry = high
+                if raw_high > peak_since_entry:
+                    peak_since_entry = raw_high
 
                 # 1. 停損檢查
                 if self.risk_config.stop_loss_pct is not None:
                     stop_price = entry_price * (1 - self.risk_config.stop_loss_pct / 100)
-                    if low <= stop_price:
+                    if raw_low <= stop_price:
                         risk_exit = True
                         exit_reason = "stop_loss"
-                        close = min(close, stop_price)  # 以停損價出場
+                        raw_close = min(raw_close, stop_price)  # 以停損價出場
 
                 # 2. 停利檢查
                 if not risk_exit and self.risk_config.take_profit_pct is not None:
                     tp_price = entry_price * (1 + self.risk_config.take_profit_pct / 100)
-                    if high >= tp_price:
+                    if raw_high >= tp_price:
                         risk_exit = True
                         exit_reason = "take_profit"
-                        close = max(close, tp_price)  # 以停利價出場
+                        raw_close = max(raw_close, tp_price)  # 以停利價出場
 
                 # 3. 移動停損檢查
                 if not risk_exit and self.risk_config.trailing_stop_pct is not None:
                     trail_price = peak_since_entry * (1 - self.risk_config.trailing_stop_pct / 100)
-                    if low <= trail_price:
+                    if raw_low <= trail_price:
                         risk_exit = True
                         exit_reason = "trailing_stop"
-                        close = min(close, trail_price)
+                        raw_close = min(raw_close, trail_price)
 
             # --- 執行風險出場 ---
             if risk_exit and position > 0:
-                sell_price = close * (1 - self.config.slippage)
+                sell_price = raw_close * (1 - self.config.slippage)
                 revenue = position * sell_price
                 commission = revenue * self.config.commission_rate
                 tax = revenue * self.config.tax_rate
@@ -185,7 +206,7 @@ class BacktestEngine:
             elif not risk_exit:
                 # --- 買入 ---
                 if signal == 1 and position == 0:
-                    buy_price = data.loc[dt, "close"] * (1 + self.config.slippage)
+                    buy_price = raw_close * (1 + self.config.slippage)
                     shares = self._calculate_shares(capital, buy_price, data, dt, trades)
                     if shares > 0:
                         cost = shares * buy_price + shares * buy_price * self.config.commission_rate
@@ -193,11 +214,11 @@ class BacktestEngine:
                         position = shares
                         entry_price = buy_price
                         entry_date = dt
-                        peak_since_entry = high
+                        peak_since_entry = raw_high
 
                 # --- 賣出 ---
                 elif signal == -1 and position > 0:
-                    sell_price = data.loc[dt, "close"] * (1 - self.config.slippage)
+                    sell_price = raw_close * (1 - self.config.slippage)
                     revenue = position * sell_price
                     commission = revenue * self.config.commission_rate
                     tax = revenue * self.config.tax_rate
@@ -225,12 +246,12 @@ class BacktestEngine:
                     peak_since_entry = 0.0
 
             # 記錄每日權益
-            mark_to_market = capital + position * data.loc[dt, "close"]
+            mark_to_market = capital + position * raw_close
             equity_curve.append(mark_to_market)
 
         # 若回測結束時仍持有部位，以最後收盤價平倉
         if position > 0:
-            last_close = data.iloc[-1]["close"]
+            last_close = data.iloc[-1]["raw_close"] if has_raw else data.iloc[-1]["close"]
             sell_price = last_close * (1 - self.config.slippage)
             revenue = position * sell_price
             commission = revenue * self.config.commission_rate
@@ -387,11 +408,32 @@ class BacktestEngine:
     # ------------------------------------------------------------------ #
 
     def _compute_benchmark(self, data: pd.DataFrame) -> float | None:
-        """計算同期 buy & hold 報酬率（不含交易成本，純價差）。"""
+        """計算同期 buy & hold 報酬率（含股利，不含交易成本）。"""
         if data.empty or len(data) < 2:
             return None
-        first_close = data.iloc[0]["close"]
-        last_close = data.iloc[-1]["close"]
+
+        close_col = "raw_close" if "raw_close" in data.columns else "close"
+        first_close = data.iloc[0][close_col]
+        last_close = data.iloc[-1][close_col]
+        if first_close <= 0:
+            return None
+
+        dividends = getattr(self.strategy, "_dividends", None)
+        if dividends is not None and not dividends.empty:
+            # 模擬持有 1 股，累計現金股利 + 股票股利增股
+            shares = 1.0
+            total_cash_div = 0.0
+            for ex_date in dividends.index:
+                if ex_date < data.index[0] or ex_date > data.index[-1]:
+                    continue
+                cash_div = dividends.loc[ex_date, "cash_dividend"]
+                stock_div = dividends.loc[ex_date, "stock_dividend"]
+                total_cash_div += cash_div * shares
+                shares *= 1 + stock_div / 10
+
+            total_return = (last_close * shares + total_cash_div) / first_close - 1
+            return round(total_return * 100, 2)
+
         return round((last_close / first_close - 1) * 100, 2)
 
     def _compute_metrics(

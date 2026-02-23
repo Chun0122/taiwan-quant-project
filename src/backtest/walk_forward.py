@@ -288,13 +288,15 @@ class WalkForwardEngine:
         entry_date = None
         trades: list[TradeRecord] = []
         equity_curve: list[float] = []
+        has_raw = "raw_close" in data.columns
 
         for dt in data.index:
             close = data.loc[dt, "close"]
+            raw_close = data.loc[dt, "raw_close"] if has_raw else close
             signal = signals.get(dt, 0)
 
             if signal == 1 and position == 0:
-                buy_price = close * (1 + self.config.slippage)
+                buy_price = raw_close * (1 + self.config.slippage)
                 commission = capital * self.config.commission_rate
                 available = capital - commission
                 shares = int(available // buy_price)
@@ -306,7 +308,7 @@ class WalkForwardEngine:
                     entry_date = dt
 
             elif signal == -1 and position > 0:
-                sell_price = close * (1 - self.config.slippage)
+                sell_price = raw_close * (1 - self.config.slippage)
                 revenue = position * sell_price
                 commission = revenue * self.config.commission_rate
                 tax = revenue * self.config.tax_rate
@@ -331,11 +333,11 @@ class WalkForwardEngine:
                 entry_price = 0.0
                 entry_date = None
 
-            equity_curve.append(capital + position * close)
+            equity_curve.append(capital + position * raw_close)
 
         # 強制平倉
         if position > 0:
-            last_close = data.iloc[-1]["close"]
+            last_close = data.iloc[-1]["raw_close"] if has_raw else data.iloc[-1]["close"]
             sell_price = last_close * (1 - self.config.slippage)
             revenue = position * sell_price
             commission = revenue * self.config.commission_rate

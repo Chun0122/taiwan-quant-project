@@ -39,8 +39,9 @@ class MLStrategy(Strategy):
         train_ratio: float = 0.7,
         threshold: float = 0.6,
         forward_days: int = 5,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
         self.model_type = model_type
         self.lookback = lookback
         self.train_ratio = train_ratio

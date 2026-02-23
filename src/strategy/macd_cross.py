@@ -22,8 +22,9 @@ class MACDCrossStrategy(Strategy):
         fast: int = 12,
         slow: int = 26,
         signal: int = 9,
+        adjust_dividend: bool = False,
     ) -> None:
-        super().__init__(stock_id, start_date, end_date)
+        super().__init__(stock_id, start_date, end_date, adjust_dividend=adjust_dividend)
         self.fast = fast
         self.slow = slow
         self.signal_period = signal
