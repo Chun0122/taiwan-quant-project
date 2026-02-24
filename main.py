@@ -705,24 +705,34 @@ def cmd_industry(args: argparse.Namespace) -> None:
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
-    """執行全市場選股掃描。"""
+    """執行全市場選股掃描（momentum / swing 模式）。"""
     from src.data.database import init_db
     from src.data.pipeline import sync_market_data, sync_stock_info
-    from src.discovery.scanner import MarketScanner
+    from src.discovery.scanner import MomentumScanner, SwingScanner
 
     init_db()
+
+    mode = getattr(args, "mode", "momentum") or "momentum"
+    mode_label = {"momentum": "Momentum 短線動能", "swing": "Swing 中期波段"}[mode]
+
+    # swing 模式自動擴展同步天數
+    sync_days = args.sync_days
+    if mode == "swing" and sync_days < 80:
+        sync_days = 80
+        print(f"  [Swing 模式] 自動擴展同步天數至 {sync_days} 天（SMA60 / 60日動能需要）")
 
     # 同步全市場資料（除非 --skip-sync）
     if not args.skip_sync:
         print("正在同步股票基本資料...")
         sync_stock_info(force_refresh=False)
         print("正在同步全市場資料（TWSE/TPEX 官方資料）...")
-        counts = sync_market_data(days=args.sync_days, max_stocks=args.max_stocks)
+        counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
         print(f"  日K線: {counts['daily_price']:,} 筆 | 法人: {counts['institutional']:,} 筆")
 
-    # 執行掃描
-    print("正在掃描全市場...")
-    scanner = MarketScanner(
+    # 選擇 scanner
+    ScannerClass = MomentumScanner if mode == "momentum" else SwingScanner
+    print(f"正在掃描全市場 [{mode_label}]...")
+    scanner = ScannerClass(
         min_price=args.min_price,
         max_price=args.max_price,
         min_volume=args.min_volume,
@@ -737,7 +747,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
     # 顯示結果
     display = result.rankings.head(args.top)
     print(f"\n{'=' * 80}")
-    print(f"全市場選股掃描 — 掃描 {result.total_stocks} 支 → 粗篩 {result.after_coarse} 支 → Top {len(display)}")
+    print(
+        f"全市場選股掃描 [{mode_label}] — "
+        f"掃描 {result.total_stocks} 支 → 粗篩 {result.after_coarse} 支 → Top {len(display)}"
+    )
     print(f"{'=' * 80}")
     print(
         f"{'#':>3}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  {'綜合':>6}  "
@@ -918,7 +931,14 @@ def main() -> None:
     sp_ind.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
     # discover 子命令
-    sp_disc = subparsers.add_parser("discover", help="全市場選股掃描")
+    sp_disc = subparsers.add_parser("discover", help="全市場選股掃描 (momentum/swing)")
+    sp_disc.add_argument(
+        "mode",
+        nargs="?",
+        default="momentum",
+        choices=["momentum", "swing"],
+        help="掃描模式：momentum=短線動能, swing=中期波段 (預設 momentum)",
+    )
     sp_disc.add_argument("--top", type=int, default=20, help="顯示前 N 名 (預設 20)")
     sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")
     sp_disc.add_argument("--max-price", type=float, default=2000, help="最高股價 (預設 2000)")

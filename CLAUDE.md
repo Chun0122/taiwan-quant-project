@@ -21,14 +21,16 @@ python main.py [command] [options]
 python main.py sync                          # 從 FinMind 同步觀察清單資料
 python main.py compute                       # 計算技術指標
 python main.py backtest --stock 2330 --strategy sma_cross
-python main.py discover --top 20             # 全市場掃描（TWSE/TPEX）
+python main.py discover --top 20             # 全市場掃描（預設 momentum 模式）
+python main.py discover momentum --top 20   # 短線動能掃描
+python main.py discover swing --top 20      # 中期波段掃描
 python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
 ```
 
 ### 測試
 
-使用 pytest 測試框架，98 個測試覆蓋核心模組：
+使用 pytest 測試框架，134 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -49,7 +51,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算                | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
-| `tests/test_scanner.py`         | `src/discovery/scanner.py` 掃描計算 + 籌碼/技術/基本面分數 | 純函數                 |
+| `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing 三類掃描 | 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
@@ -110,7 +112,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
 | `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
-| `src/discovery/scanner.py`          | 全市場四階段漏斗：~6000 → 粗篩 150 → 評分（技術 6 因子 + 籌碼 5 因子 + 基本面） → Top N                            |
+| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum（短線動能 Tech45%+Chip45%+Fund10%）與 Swing（中期波段 Tech30%+Chip30%+Fund40%）兩模式 |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能）                                                                               |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
 | `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |

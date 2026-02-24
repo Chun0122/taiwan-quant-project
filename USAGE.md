@@ -621,11 +621,14 @@ python main.py industry --notify
 
 ### 4.13 全市場選股掃描 (`discover`)
 
-從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。使用 TWSE/TPEX 官方開放資料（免費、無需 Token），僅需 4 次 API 呼叫即可取得全市場日行情 + 三大法人資料。
+從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援兩種掃描模式：
+
+- **momentum**（預設）：短線動能股（1~10 天），抓突破 + 資金流 + 量能擴張
+- **swing**：中期波段股（1~3 個月），抓趨勢 + 基本面 + 法人布局
 
 **漏斗架構：**
 ```
-全市場 ~6000 支 → 粗篩 ~150 支 → 細評排名 → Top N 推薦
+全市場 ~6000 支 → 粗篩 ~150 支 → 細評排名 → 風險過濾 → Top N 推薦
 ```
 
 **資料來源優先順序：**
@@ -634,50 +637,64 @@ python main.py industry --notify
 3. FinMind 逐股抓取（免費帳號備案，較慢）
 
 ```bash
-# 預設掃描（同步資料 + 篩選 Top 20）
+# 預設 momentum 模式（同步資料 + 篩選 Top 20）
 python main.py discover
 
-# 顯示前 30 名
-python main.py discover --top 30
+# 明確指定 momentum 模式
+python main.py discover momentum --top 30
+
+# 中期波段模式（自動擴展 sync-days 至 80 天）
+python main.py discover swing --top 20
 
 # 調整股價範圍
-python main.py discover --min-price 50 --max-price 500
-
-# 調整最低成交量
-python main.py discover --min-volume 1000000
+python main.py discover momentum --min-price 50 --max-price 500
 
 # 跳過資料同步（使用 DB 已有資料）
 python main.py discover --skip-sync
 
-# 匯出 CSV
-python main.py discover --export picks.csv
-
-# 發送 Discord 通知
-python main.py discover --notify
-
-# 組合使用
-python main.py discover --top 30 --min-price 50 --export picks.csv --notify
+# 匯出 CSV + 通知
+python main.py discover swing --top 30 --export picks.csv --notify
 ```
 
 | 參數 | 說明 |
 |------|------|
+| `mode` | 掃描模式：`momentum`（短線動能）或 `swing`（中期波段），預設 momentum |
 | `--top N` | 顯示前 N 名（預設 20） |
 | `--min-price N` | 最低股價門檻（預設 10） |
 | `--max-price N` | 最高股價門檻（預設 2000） |
 | `--min-volume N` | 最低成交量/股（預設 500000） |
-| `--sync-days N` | 同步最近幾個交易日（預設 3） |
+| `--sync-days N` | 同步最近幾個交易日（預設 3，swing 模式自動擴展至 80） |
 | `--skip-sync` | 跳過全市場資料同步，直接用 DB 既有資料 |
 | `--export PATH` | 匯出 CSV |
 | `--notify` | 發送 Discord 通知 |
+
+**Momentum 模式：**
+
+| 維度 | 權重 | 因子 |
+|------|------|------|
+| 技術面 | 45% | 5日動能、10日動能、20日突破、量比、成交量加速 |
+| 籌碼面 | 45% | 外資連續買超天數(40%)、法人買超/成交量(30%)、合計買超(30%) |
+| 基本面 | 10% | 營收 YoY > 0 過濾（加分/不加分） |
+| 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
+
+**Swing 模式：**
+
+| 維度 | 權重 | 因子 |
+|------|------|------|
+| 技術面 | 30% | 趨勢確認(close>SMA60)、均線排列(SMA20>SMA60)、60日動能、量價齊揚 |
+| 籌碼面 | 30% | 投信淨買超(50%)、法人20日累積買超(50%) |
+| 基本面 | 40% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 風險過濾 | — | 年化波動率 > 85th percentile 剔除 |
 
 **篩選流程說明：**
 
 | 階段 | 動作 | 說明 |
 |------|------|------|
-| Stage 1 | 資料載入 | 從 DB 讀取最近 N 天全市場日K + 三大法人 |
-| Stage 2 | 粗篩 | 股價範圍、成交量門檻、法人買賣超、短期動能加權排名，取前 150 名 |
-| Stage 2.5 | 營收補抓 | 從 FinMind 逐股補抓候選股月營收（需 API Token，每支 0.5 秒，約 75 秒） |
-| Stage 3 | 細評 | 三維度評分：技術面(35%) + 籌碼面(45%) + 基本面(20%) |
+| Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人（momentum: 25天, swing: 80天） |
+| Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名（swing 額外要求 close > SMA60） |
+| Stage 2.5 | 營收補抓 | 從 FinMind 逐股補抓候選股月營收（需 API Token） |
+| Stage 3 | 細評 | 模式專屬因子 + 權重評分 |
+| Stage 3.5 | 風險過濾 | 剔除高波動股（momentum: ATR, swing: 年化波動率） |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
 > **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收。若無 Token，基本面分數會 fallback 到 0.5（中性值），不影響其他維度評分。Token 設定方式見「FinMind API Token」章節。

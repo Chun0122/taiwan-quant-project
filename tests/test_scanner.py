@@ -1,11 +1,11 @@
-"""測試 src/discovery/scanner.py — MarketScanner 純計算方法。"""
+"""測試 src/discovery/scanner.py — MarketScanner / MomentumScanner / SwingScanner 純計算方法。"""
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
-from src.discovery.scanner import MarketScanner
+from src.discovery.scanner import MarketScanner, MomentumScanner, SwingScanner
 
 
 @pytest.fixture()
@@ -323,3 +323,485 @@ class TestComputeFundamentalScores:
         scores = result["fundamental_score"]
         # 至少有 3 個不同的分數值（分散性）
         assert scores.nunique() >= 3
+
+
+# ─── _base_filter ─────────────────────────────────────────
+
+
+class TestBaseFilter:
+    def test_filters_out_etf(self, scanner):
+        """排除 00 開頭的 ETF"""
+        df_price = _make_price_df(5)
+        etf_row = pd.DataFrame(
+            [
+                {
+                    "stock_id": "0050",
+                    "date": date(2025, 1, 3),
+                    "open": 150,
+                    "high": 152,
+                    "low": 148,
+                    "close": 151,
+                    "volume": 10_000_000,
+                }
+            ]
+        )
+        df_price = pd.concat([df_price, etf_row], ignore_index=True)
+        result = scanner._base_filter(df_price)
+        assert "0050" not in result["stock_id"].tolist()
+
+
+# ====================================================================== #
+#  MomentumScanner 測試
+# ====================================================================== #
+
+
+def _make_momentum_price_df(n_days: int = 25, n_stocks: int = 5) -> pd.DataFrame:
+    """建立動能模式所需的多日市場資料。"""
+    rows = []
+    base_date = date(2025, 1, 1)
+    for i in range(n_stocks):
+        sid = f"{2000 + i}"
+        for d in range(n_days):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            # 股票 2004 最強動能（每天漲 1%），2000 最弱
+            base_close = 100 + i * 20
+            close = base_close * (1 + 0.002 * i) ** d
+            vol = 500_000 + i * 100_000 + d * 10_000 * (i + 1)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": close * 0.99,
+                    "high": close * 1.02,
+                    "low": close * 0.98,
+                    "close": close,
+                    "volume": int(vol),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture()
+def momentum_scanner():
+    return MomentumScanner(
+        min_price=10,
+        max_price=2000,
+        min_volume=100_000,
+        top_n_candidates=10,
+        top_n_results=5,
+    )
+
+
+class TestMomentumTechnicalScores:
+    def test_scores_in_valid_range(self, momentum_scanner):
+        df_price = _make_momentum_price_df(25, 5)
+        sids = df_price["stock_id"].unique().tolist()
+        result = momentum_scanner._compute_technical_scores(sids, df_price)
+        assert (result["technical_score"] >= 0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+    def test_insufficient_data_gets_default(self, momentum_scanner):
+        df_price = pd.DataFrame(
+            [
+                {
+                    "stock_id": "9999",
+                    "date": date(2025, 1, 3),
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 500_000,
+                }
+            ]
+        )
+        result = momentum_scanner._compute_technical_scores(["9999"], df_price)
+        assert result.iloc[0]["technical_score"] == pytest.approx(0.5)
+
+    def test_five_factors_computed(self, momentum_scanner):
+        """25 天資料應觸發全部 5 個因子。"""
+        df_price = _make_momentum_price_df(25, 3)
+        sids = df_price["stock_id"].unique().tolist()
+        result = momentum_scanner._compute_technical_scores(sids, df_price)
+        # 有足夠資料時分數不應全部相同
+        assert result["technical_score"].nunique() >= 2
+
+    def test_stronger_momentum_higher_score(self, momentum_scanner):
+        """動能更強的股票，技術分數應更高。"""
+        df_price = _make_momentum_price_df(25, 5)
+        sids = df_price["stock_id"].unique().tolist()
+        result = momentum_scanner._compute_technical_scores(sids, df_price)
+        scores = result.set_index("stock_id")["technical_score"]
+        # 2004 動能最強，2000 最弱
+        assert scores["2004"] >= scores["2000"]
+
+
+class TestMomentumChipScores:
+    def test_empty_inst_returns_default(self, momentum_scanner):
+        result = momentum_scanner._compute_chip_scores(["1000"], pd.DataFrame())
+        assert result.iloc[0]["chip_score"] == pytest.approx(0.5)
+
+    def test_three_factors_weighted(self, momentum_scanner):
+        """連續外資買超天數 + 買超佔量比 + 合計買超。"""
+        sids = ["1000", "1001"]
+        rows = []
+        for d in range(5):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            # 1001: 外資每天都買超，1000: 只有最後一天
+            rows.append({"stock_id": "1000", "date": day, "name": "外資買賣超", "net": 100 if d == 4 else -50})
+            rows.append({"stock_id": "1001", "date": day, "name": "外資買賣超", "net": 500})
+        df_inst = pd.DataFrame(rows)
+        df_price = _make_momentum_price_df(5, 2)
+        # 需要 stock_id 對應
+        df_price["stock_id"] = df_price["stock_id"].map({"2000": "1000", "2001": "1001"})
+        result = momentum_scanner._compute_chip_scores(sids, df_inst, df_price)
+        scores = result.set_index("stock_id")["chip_score"]
+        assert scores["1001"] > scores["1000"]
+
+
+class TestMomentumFundamentalScores:
+    def test_yoy_positive_gets_higher(self, momentum_scanner):
+        """YoY > 0 得 0.7，YoY <= 0 得 0.3。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [10.0, -5.0],
+                "mom_growth": [5.0, 5.0],
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] == pytest.approx(0.7)
+        assert scores["1001"] == pytest.approx(0.3)
+
+    def test_no_data_fallback(self, momentum_scanner):
+        result = momentum_scanner._compute_fundamental_scores(
+            ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+        )
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+
+class TestMomentumRiskFilter:
+    def test_removes_high_volatility(self, momentum_scanner):
+        """ATR 過濾應剔除前 20% 高波動股。"""
+        rows = []
+        sids = [f"{3000 + i}" for i in range(10)]
+        for i, sid in enumerate(sids):
+            for d in range(15):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                base = 100 + i * 10
+                # 最後一支股票波動極大
+                spread = 20 if i == 9 else 1
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": base,
+                        "high": base + spread,
+                        "low": base - spread,
+                        "close": base + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        result = momentum_scanner._apply_risk_filter(scored, df_price)
+        # 至少應剔除 1 支（前 20%）
+        assert len(result) < len(scored)
+
+    def test_empty_scored_returns_empty(self, momentum_scanner):
+        result = momentum_scanner._apply_risk_filter(pd.DataFrame(columns=["stock_id"]), pd.DataFrame())
+        assert result.empty
+
+
+class TestMomentumCompositeWeights:
+    def test_weights_45_45_10(self, momentum_scanner):
+        """確認綜合分數為 Tech 45% + Chip 45% + Fund 10%。"""
+        candidates = pd.DataFrame({"stock_id": ["1000"], "close": [100], "volume": [500_000]})
+        # mock 各維度分數
+        df_price = _make_momentum_price_df(25, 1)
+        df_price["stock_id"] = "1000"
+        sids = ["1000"]
+        df_inst = pd.DataFrame([{"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100}])
+        df_revenue = pd.DataFrame({"stock_id": ["1000"], "yoy_growth": [10.0], "mom_growth": [5.0]})
+
+        result = momentum_scanner._score_candidates(candidates, df_price, df_inst, df_revenue)
+        tech = result.iloc[0]["technical_score"]
+        chip = result.iloc[0]["chip_score"]
+        fund = result.iloc[0]["fundamental_score"]
+        expected = tech * 0.45 + chip * 0.45 + fund * 0.10
+        assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
+
+
+# ====================================================================== #
+#  SwingScanner 測試
+# ====================================================================== #
+
+
+def _make_swing_price_df(n_days: int = 80, n_stocks: int = 5) -> pd.DataFrame:
+    """建立波段模式所需的長期市場資料。"""
+    rows = []
+    for i in range(n_stocks):
+        sid = f"{4000 + i}"
+        for d in range(n_days):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            base_close = 80 + i * 30
+            # 上升趨勢，i 越大越強
+            close = base_close * (1 + 0.001 * (i + 1)) ** d
+            vol = 300_000 + i * 50_000 + d * 5_000
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": close * 0.995,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": int(vol),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture()
+def swing_scanner():
+    return SwingScanner(
+        min_price=10,
+        max_price=2000,
+        min_volume=100_000,
+        top_n_candidates=10,
+        top_n_results=5,
+    )
+
+
+class TestSwingCoarseFilter:
+    def test_requires_sma60(self, swing_scanner):
+        """close > SMA60 過濾：低於 SMA60 的股票應被排除。"""
+        rows = []
+        # 股票 A：穩定上升（close > SMA60）
+        for d in range(65):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": "5000",
+                    "date": day,
+                    "open": 99 + d * 0.5,
+                    "high": 101 + d * 0.5,
+                    "low": 98 + d * 0.5,
+                    "close": 100 + d * 0.5,
+                    "volume": 500_000,
+                }
+            )
+        # 股票 B：穩定下降（close < SMA60）
+        for d in range(65):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": "5001",
+                    "date": day,
+                    "open": 201 - d * 0.5,
+                    "high": 203 - d * 0.5,
+                    "low": 199 - d * 0.5,
+                    "close": 200 - d * 0.5,
+                    "volume": 500_000,
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        result = swing_scanner._coarse_filter(df_price, pd.DataFrame())
+        sids = result["stock_id"].tolist() if not result.empty else []
+        # 上升股票應被保留，下降股票應被排除
+        assert "5000" in sids
+        assert "5001" not in sids
+
+
+class TestSwingTechnicalScores:
+    def test_scores_in_valid_range(self, swing_scanner):
+        df_price = _make_swing_price_df(80, 5)
+        sids = df_price["stock_id"].unique().tolist()
+        result = swing_scanner._compute_technical_scores(sids, df_price)
+        assert (result["technical_score"] >= 0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+    def test_uptrend_scores_higher(self, swing_scanner):
+        """穩定上升趨勢的股票應在趨勢因子得高分。"""
+        rows = []
+        # 上升趨勢
+        for d in range(65):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            close = 100 + d * 0.5
+            vol = 500_000 + d * 5_000
+            rows.append(
+                {
+                    "stock_id": "UP",
+                    "date": day,
+                    "open": close * 0.99,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": vol,
+                }
+            )
+        # 下降趨勢
+        for d in range(65):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            close = 200 - d * 0.5
+            vol = 500_000 - d * 2_000
+            rows.append(
+                {
+                    "stock_id": "DOWN",
+                    "date": day,
+                    "open": close * 1.01,
+                    "high": close * 1.02,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": max(vol, 100_000),
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        result = swing_scanner._compute_technical_scores(["UP", "DOWN"], df_price)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["UP"] > scores["DOWN"]
+
+    def test_insufficient_data_gets_default(self, swing_scanner):
+        df_price = pd.DataFrame(
+            [
+                {
+                    "stock_id": "9999",
+                    "date": date(2025, 1, 3),
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 500_000,
+                }
+            ]
+        )
+        result = swing_scanner._compute_technical_scores(["9999"], df_price)
+        assert result.iloc[0]["technical_score"] == pytest.approx(0.5)
+
+
+class TestSwingChipScores:
+    def test_trust_and_cumulative(self, swing_scanner):
+        """投信買超 + 20 日累積買超。"""
+        sids = ["1000", "1001"]
+        rows = []
+        for d in range(20):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            # 1001 投信每天大量買超
+            rows.append({"stock_id": "1000", "date": day, "name": "投信買賣超", "net": 50})
+            rows.append({"stock_id": "1001", "date": day, "name": "投信買賣超", "net": 500})
+            rows.append({"stock_id": "1000", "date": day, "name": "外資買賣超", "net": 100})
+            rows.append({"stock_id": "1001", "date": day, "name": "外資買賣超", "net": 800})
+        df_inst = pd.DataFrame(rows)
+        result = swing_scanner._compute_chip_scores(sids, df_inst)
+        scores = result.set_index("stock_id")["chip_score"]
+        assert scores["1001"] > scores["1000"]
+
+    def test_empty_inst_returns_default(self, swing_scanner):
+        result = swing_scanner._compute_chip_scores(["1000"], pd.DataFrame())
+        assert result.iloc[0]["chip_score"] == pytest.approx(0.5)
+
+
+class TestSwingFundamentalScores:
+    def test_with_acceleration(self, swing_scanner):
+        """含加速度的 3 因子計算。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "yoy_growth": [10.0, 30.0, -5.0],
+                "mom_growth": [5.0, -2.0, 3.0],
+                "prev_yoy_growth": [5.0, 35.0, 0.0],
+                "prev_mom_growth": [3.0, -5.0, 5.0],
+            }
+        )
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001", "1002"], df_revenue)
+        assert len(result) == 3
+        assert (result["fundamental_score"].dropna() >= 0).all()
+        assert (result["fundamental_score"].dropna() <= 1).all()
+
+    def test_without_prev_data_fallback(self, swing_scanner):
+        """無上月資料時，加速度 fallback 0.5。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [10.0],
+                "mom_growth": [5.0],
+            }
+        )
+        result = swing_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert len(result) == 1
+        score = result.iloc[0]["fundamental_score"]
+        assert 0 <= score <= 1
+
+    def test_acceleration_boosts_score(self, swing_scanner):
+        """營收加速成長（YoY 越來越高）應有更高的基本面分數。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [20.0, 20.0],
+                "mom_growth": [5.0, 5.0],
+                "prev_yoy_growth": [10.0, 30.0],  # 1000 加速，1001 減速
+                "prev_mom_growth": [5.0, 5.0],
+            }
+        )
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        # 1000 加速 (20-10=+10) vs 1001 減速 (20-30=-10)
+        assert scores["1000"] > scores["1001"]
+
+    def test_empty_revenue_returns_default(self, swing_scanner):
+        result = swing_scanner._compute_fundamental_scores(
+            ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+        )
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+
+class TestSwingCompositeWeights:
+    def test_weights_30_30_40(self, swing_scanner):
+        """確認綜合分數為 Tech 30% + Chip 30% + Fund 40%。"""
+        candidates = pd.DataFrame({"stock_id": ["4000"], "close": [100], "volume": [500_000]})
+        df_price = _make_swing_price_df(80, 1)
+        df_inst = pd.DataFrame([{"stock_id": "4000", "date": date(2025, 3, 1), "name": "投信買賣超", "net": 100}])
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["4000"],
+                "yoy_growth": [10.0],
+                "mom_growth": [5.0],
+                "prev_yoy_growth": [5.0],
+                "prev_mom_growth": [3.0],
+            }
+        )
+
+        result = swing_scanner._score_candidates(candidates, df_price, df_inst, df_revenue)
+        tech = result.iloc[0]["technical_score"]
+        chip = result.iloc[0]["chip_score"]
+        fund = result.iloc[0]["fundamental_score"]
+        expected = tech * 0.30 + chip * 0.30 + fund * 0.40
+        assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
+
+
+class TestSwingRiskFilter:
+    def test_removes_high_volatility(self, swing_scanner):
+        """波動率過濾應剔除前 15% 高波動股。"""
+        rows = []
+        sids = [f"{6000 + i}" for i in range(10)]
+        for i, sid in enumerate(sids):
+            for d in range(25):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                base = 100
+                # 最後一支波動極大
+                spread = 15 if i == 9 else 0.5
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": base,
+                        "high": base + spread,
+                        "low": base - spread,
+                        "close": base + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        result = swing_scanner._apply_risk_filter(scored, df_price)
+        assert len(result) < len(scored)
