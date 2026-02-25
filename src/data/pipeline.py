@@ -22,6 +22,7 @@ from src.data.schema import (
     PortfolioBacktestResult,
     PortfolioTrade,
     StockInfo,
+    StockValuation,
     TechnicalIndicator,
     Trade,
 )
@@ -80,6 +81,46 @@ def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
 def _upsert_dividend(df: pd.DataFrame) -> int:
     """將股利 DataFrame 寫入 dividend 表。"""
     return _upsert_batch(Dividend, df, ["stock_id", "date"])
+
+
+def _upsert_valuation(df: pd.DataFrame) -> int:
+    """將估值 DataFrame 寫入 stock_valuation 表。"""
+    return _upsert_batch(StockValuation, df, ["stock_id", "date"])
+
+
+def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
+    """為指定股票補抓最新估值資料（PE/PB/殖利率）。
+
+    用於 discover value 模式：粗篩後候選股約 150 支，
+    在細評前自動從 FinMind 補抓估值資料。
+
+    Args:
+        stock_ids: 要補抓的股票代號清單
+
+    Returns:
+        新增的估值筆數
+    """
+    fetcher = FinMindFetcher()
+    total = 0
+    start = (date.today() - timedelta(days=30)).isoformat()
+    end = date.today().isoformat()
+    skipped = 0
+
+    for sid in stock_ids:
+        last = _get_last_date(StockValuation, sid)
+        # 如果 DB 已有 7 天內的資料，跳過
+        if last and (date.today() - date.fromisoformat(last)).days < 7:
+            skipped += 1
+            continue
+        try:
+            df = fetcher.fetch_per_pbr(sid, last or start, end)
+            total += _upsert_valuation(df)
+        except Exception:
+            logger.warning("[%s] 估值資料補抓失敗，跳過", sid)
+
+    if skipped:
+        logger.info("[估值補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+    return total
 
 
 def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
@@ -277,10 +318,10 @@ def sync_market_data(
     fetcher: FinMindFetcher | None = None,
     max_stocks: int = 200,
 ) -> dict[str, int]:
-    """同步全市場資料（日K + 三大法人），用於 discover 掃描。
+    """同步全市場資料（日K + 三大法人 + 融資融券），用於 discover 掃描。
 
     資料來源優先順序：
-    1. TWSE/TPEX 官方開放資料（免費，4 次 API 取得全市場）
+    1. TWSE/TPEX 官方開放資料（免費，6 次 API 取得全市場）
     2. FinMind 批次 API（需付費帳號）
     3. FinMind 逐股抓取（免費帳號備案，較慢）
 
@@ -290,15 +331,16 @@ def sync_market_data(
         max_stocks: 備案策略最多抓取的股票數
 
     Returns:
-        dict: {"daily_price": N, "institutional": M}
+        dict: {"daily_price": N, "institutional": M, "margin": K}
     """
     from src.data.twse_fetcher import (
         fetch_market_daily_prices,
         fetch_market_institutional,
+        fetch_market_margin,
     )
 
     init_db()
-    result = {"daily_price": 0, "institutional": 0}
+    result = {"daily_price": 0, "institutional": 0, "margin": 0}
 
     # --- 策略 1：TWSE/TPEX 官方資料（免費、快速） ---
     end = date.today()
@@ -328,6 +370,10 @@ def sync_market_data(
             df_inst = fetch_market_institutional(d)
             if not df_inst.empty:
                 result["institutional"] += _upsert_institutional(df_inst)
+
+            df_margin = fetch_market_margin(d)
+            if not df_margin.empty:
+                result["margin"] += _upsert_margin(df_margin)
         else:
             logger.info("[全市場] %s 無資料（假日），跳過", d.isoformat())
 
@@ -335,10 +381,11 @@ def sync_market_data(
 
     if success_count > 0:
         logger.info(
-            "[全市場] TWSE/TPEX 同步完成 — %d 個交易日, 日K %d 筆, 法人 %d 筆",
+            "[全市場] TWSE/TPEX 同步完成 — %d 個交易日, 日K %d 筆, 法人 %d 筆, 融資融券 %d 筆",
             success_count,
             result["daily_price"],
             result["institutional"],
+            result["margin"],
         )
         return result
 

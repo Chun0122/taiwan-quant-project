@@ -621,10 +621,11 @@ python main.py industry --notify
 
 ### 4.13 全市場選股掃描 (`discover`)
 
-從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援兩種掃描模式：
+從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援三種掃描模式：
 
 - **momentum**（預設）：短線動能股（1~10 天），抓突破 + 資金流 + 量能擴張
 - **swing**：中期波段股（1~3 個月），抓趨勢 + 基本面 + 法人布局
+- **value**：價值修復股，低估值 + 基本面轉佳 + 法人布局
 
 **漏斗架構：**
 ```
@@ -632,9 +633,11 @@ python main.py industry --notify
 ```
 
 **資料來源優先順序：**
-1. TWSE/TPEX 官方開放資料（免費，4 次 API 呼叫取得全市場）
+1. TWSE/TPEX 官方開放資料（免費，6 次 API 呼叫取得全市場，含融資融券）
 2. FinMind 批次 API（需付費帳號）
 3. FinMind 逐股抓取（免費帳號備案，較慢）
+
+**市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways），動態調整各模式的因子權重。多頭加重技術面，空頭加重基本面。
 
 ```bash
 # 預設 momentum 模式（同步資料 + 篩選 Top 20）
@@ -645,6 +648,9 @@ python main.py discover momentum --top 30
 
 # 中期波段模式（自動擴展 sync-days 至 80 天）
 python main.py discover swing --top 20
+
+# 價值修復模式（低 PE + 高殖利率 + 基本面轉佳）
+python main.py discover value --top 20
 
 # 調整股價範圍
 python main.py discover momentum --min-price 50 --max-price 500
@@ -658,7 +664,7 @@ python main.py discover swing --top 30 --export picks.csv --notify
 
 | 參數 | 說明 |
 |------|------|
-| `mode` | 掃描模式：`momentum`（短線動能）或 `swing`（中期波段），預設 momentum |
+| `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復），預設 momentum |
 | `--top N` | 顯示前 N 名（預設 20） |
 | `--min-price N` | 最低股價門檻（預設 10） |
 | `--max-price N` | 最高股價門檻（預設 2000） |
@@ -668,12 +674,12 @@ python main.py discover swing --top 30 --export picks.csv --notify
 | `--export PATH` | 匯出 CSV |
 | `--notify` | 發送 Discord 通知 |
 
-**Momentum 模式：**
+**Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 
 | 維度 | 權重 | 因子 |
 |------|------|------|
 | 技術面 | 45% | 5日動能、10日動能、20日突破、量比、成交量加速 |
-| 籌碼面 | 45% | 外資連續買超天數(40%)、法人買超/成交量(30%)、合計買超(30%) |
+| 籌碼面 | 45% | 外資連續買超天數 + 法人買超/成交量 + 合計買超 + 券資比（有資料時） |
 | 基本面 | 10% | 營收 YoY > 0 過濾（加分/不加分） |
 | 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
 
@@ -686,25 +692,37 @@ python main.py discover swing --top 30 --export picks.csv --notify
 | 基本面 | 40% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
 | 風險過濾 | — | 年化波動率 > 85th percentile 剔除 |
 
+**Value 模式：**
+
+| 維度 | 權重 | 因子 |
+|------|------|------|
+| 基本面 | 50% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 估值面 | 30% | PE反向排名(40%)、PB反向排名(30%)、殖利率排名(30%) |
+| 籌碼面 | 20% | 投信近期買超(50%)、法人累積買超(50%) |
+| 粗篩門檻 | — | PE > 0 且 < 30、殖利率 > 2% |
+| 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
+
+**Regime 權重調整矩陣（系統自動偵測）：**
+
+| 模式 | 面向 | 多頭 | 盤整 | 空頭 |
+|------|------|------|------|------|
+| Momentum | Tech / Chip / Fund | 50/40/10 | 45/45/10 | 35/45/20 |
+| Swing | Tech / Chip / Fund | 35/25/40 | 30/30/40 | 20/30/50 |
+| Value | Fund / Val / Chip | 40/40/20 | 50/30/20 | 60/25/15 |
+
 **篩選流程說明：**
 
 | 階段 | 動作 | 說明 |
 |------|------|------|
-| Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人（momentum: 25天, swing: 80天） |
-| Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名（swing 額外要求 close > SMA60） |
-| Stage 2.5 | 營收補抓 | 從 FinMind 逐股補抓候選股月營收（需 API Token） |
-| Stage 3 | 細評 | 模式專屬因子 + 權重評分 |
-| Stage 3.5 | 風險過濾 | 剔除高波動股（momentum: ATR, swing: 年化波動率） |
+| Stage 0 | 市場狀態偵測 | 根據 TAIEX 判斷 bull/bear/sideways，動態調整權重 |
+| Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
+| Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名 |
+| Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
+| Stage 3 | 細評 | 模式專屬因子 + Regime 動態權重評分 |
+| Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
-> **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收。若無 Token，基本面分數會 fallback 到 0.5（中性值），不影響其他維度評分。Token 設定方式見「FinMind API Token」章節。
-
-粗篩分數權重：成交量 30% + 法人淨買超 40% + 短期動能 30%
-
-細評三維度：
-- **技術面 (35%)**：6 因子 — SMA 趨勢、短期動能、價格位置、成交量趨勢、波動度收斂（BB 寬度縮窄，盤整越緊分越高）、量價背離偵測（價漲量增加分，價漲量縮扣分）。直接從 OHLCV 計算，不依賴 EAV 指標表。
-- **籌碼面 (45%)**：5 因子 — 外資淨買超排名(30%)、投信淨買超排名(20%)、合計淨買超排名(20%)、連續買超天數排名(15%)、買超佔成交量比排名(15%)。全部使用排名百分位。
-- **基本面 (20%)**：月營收 YoY 成長率 + MoM 成長加分（查詢 DB 最近 90 天內最新月營收，無資料時預設 0.5）
+> **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收與估值資料。若無 Token，基本面/估值分數會 fallback 到 0.5（中性值），不影響其他維度評分。
 
 ### 4.14 資料庫遷移 (`migrate`)
 

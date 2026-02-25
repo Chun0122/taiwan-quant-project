@@ -241,6 +241,30 @@ class FinMindFetcher(DataFetcher):
 
         return df
 
+    def fetch_per_pbr(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
+        """抓取本益比/股價淨值比/殖利率（FinMind TaiwanStockPER）。
+
+        回傳欄位: date, stock_id, pe_ratio, pb_ratio, dividend_yield
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockPER", stock_id, start, end)
+        if df.empty:
+            return df
+
+        rename_map = {
+            "PER": "pe_ratio",
+            "PBR": "pb_ratio",
+            "DividendYield": "dividend_yield",
+        }
+        df = df.rename(columns=rename_map)
+
+        keep = ["date", "stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
     def fetch_dividend(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取股利資料。
 

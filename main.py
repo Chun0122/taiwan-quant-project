@@ -705,15 +705,19 @@ def cmd_industry(args: argparse.Namespace) -> None:
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
-    """執行全市場選股掃描（momentum / swing 模式）。"""
+    """執行全市場選股掃描（momentum / swing / value 模式）。"""
     from src.data.database import init_db
     from src.data.pipeline import sync_market_data, sync_stock_info
-    from src.discovery.scanner import MomentumScanner, SwingScanner
+    from src.discovery.scanner import MomentumScanner, SwingScanner, ValueScanner
 
     init_db()
 
     mode = getattr(args, "mode", "momentum") or "momentum"
-    mode_label = {"momentum": "Momentum 短線動能", "swing": "Swing 中期波段"}[mode]
+    mode_label = {
+        "momentum": "Momentum 短線動能",
+        "swing": "Swing 中期波段",
+        "value": "Value 價值修復",
+    }[mode]
 
     # swing 模式自動擴展同步天數
     sync_days = args.sync_days
@@ -727,10 +731,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
         sync_stock_info(force_refresh=False)
         print("正在同步全市場資料（TWSE/TPEX 官方資料）...")
         counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
-        print(f"  日K線: {counts['daily_price']:,} 筆 | 法人: {counts['institutional']:,} 筆")
+        print(
+            f"  日K線: {counts['daily_price']:,} 筆 | "
+            f"法人: {counts['institutional']:,} 筆 | "
+            f"融資融券: {counts['margin']:,} 筆"
+        )
 
     # 選擇 scanner
-    ScannerClass = MomentumScanner if mode == "momentum" else SwingScanner
+    scanner_map = {"momentum": MomentumScanner, "swing": SwingScanner, "value": ValueScanner}
+    ScannerClass = scanner_map[mode]
     print(f"正在掃描全市場 [{mode_label}]...")
     scanner = ScannerClass(
         min_price=args.min_price,
@@ -936,8 +945,8 @@ def main() -> None:
         "mode",
         nargs="?",
         default="momentum",
-        choices=["momentum", "swing"],
-        help="掃描模式：momentum=短線動能, swing=中期波段 (預設 momentum)",
+        choices=["momentum", "swing", "value"],
+        help="掃描模式：momentum=短線動能, swing=中期波段, value=價值修復 (預設 momentum)",
     )
     sp_disc.add_argument("--top", type=int, default=20, help="顯示前 N 名 (預設 20)")
     sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")

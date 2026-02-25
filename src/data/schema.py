@@ -1,15 +1,17 @@
 """SQLAlchemy ORM 資料表定義。
 
-九張核心表：
+十一張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
 - MonthlyRevenue:          月營收
+- StockValuation:          估值資料（PE/PB/殖利率）
 - Dividend:                股利資料
 - TechnicalIndicator:      技術指標（EAV 長表）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
+- PortfolioBacktestResult: 投資組合回測結果
 """
 
 from datetime import date, datetime
@@ -96,6 +98,23 @@ class MonthlyRevenue(Base):
 
     def __repr__(self) -> str:
         return f"<MonthlyRevenue {self.stock_id} {self.date} revenue={self.revenue:,}>"
+
+
+class StockValuation(Base):
+    """估值資料（本益比/股淨比/殖利率）。"""
+
+    __tablename__ = "stock_valuation"
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_stock_valuation"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    pe_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)  # 本益比
+    pb_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)  # 股價淨值比
+    dividend_yield: Mapped[float | None] = mapped_column(Float, nullable=True)  # 殖利率 (%)
+
+    def __repr__(self) -> str:
+        return f"<Valuation {self.stock_id} {self.date} PE={self.pe_ratio} PB={self.pb_ratio}>"
 
 
 class Dividend(Base):

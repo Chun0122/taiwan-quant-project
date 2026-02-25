@@ -411,6 +411,168 @@ def fetch_tpex_institutional(target_date: date | None = None) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ #
+#  融資融券
+# ------------------------------------------------------------------ #
+
+
+def fetch_twse_margin(target_date: date | None = None) -> pd.DataFrame:
+    """抓取 TWSE 上市股票全市場融資融券。
+
+    回傳欄位: date, stock_id, margin_buy, margin_sell, margin_balance,
+              short_sell, short_buy, short_balance
+    """
+    if target_date is None:
+        target_date = _find_last_trading_day(date.today())
+
+    date_str = target_date.strftime("%Y%m%d")
+    url = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+    params = {"date": date_str, "selectType": "STOCK", "response": "json"}
+
+    logger.info("抓取 TWSE 上市融資融券: %s", target_date.isoformat())
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("TWSE 融資融券請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if data.get("stat") != "OK":
+        logger.warning("TWSE 融資融券無資料: %s", data.get("stat", ""))
+        return pd.DataFrame()
+
+    # 找到包含個股資料的 table（fields 包含「股票代號」）
+    stock_table = None
+    for table in data.get("tables", []):
+        fields = table.get("fields", [])
+        if fields and "股票代號" in fields[0]:
+            stock_table = table
+            break
+
+    if stock_table is None:
+        logger.warning("TWSE 融資融券: 找不到個股資料 table")
+        return pd.DataFrame()
+
+    rows = []
+    for item in stock_table.get("data", []):
+        if len(item) < 13:
+            continue
+
+        stock_id = item[0].strip()
+        # 融資: 買進(1), 賣出(2), 現金償還(3), 前日餘額(4), 今日餘額(5)
+        margin_buy = _parse_number(item[1]) or 0
+        margin_sell = _parse_number(item[2]) or 0
+        margin_balance = _parse_number(item[5]) or 0
+        # 融券: 賣出(7), 買進(8), 現券償還(9), 前日餘額(10), 當日餘額(11)
+        short_sell = _parse_number(item[7]) or 0
+        short_buy = _parse_number(item[8]) or 0
+        short_balance = _parse_number(item[11]) or 0
+
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "margin_buy": int(margin_buy),
+                "margin_sell": int(margin_sell),
+                "margin_balance": int(margin_balance),
+                "short_sell": int(short_sell),
+                "short_buy": int(short_buy),
+                "short_balance": int(short_balance),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.info("TWSE 融資融券: %d 支股票", len(df))
+    time.sleep(_REQUEST_DELAY)
+    return df
+
+
+def fetch_tpex_margin(target_date: date | None = None) -> pd.DataFrame:
+    """抓取 TPEX 上櫃股票全市場融資融券。
+
+    回傳欄位同 TWSE: date, stock_id, margin_buy, margin_sell, margin_balance,
+                      short_sell, short_buy, short_balance
+    """
+    if target_date is None:
+        target_date = _find_last_trading_day(date.today())
+
+    roc_date = _to_roc_date(target_date)
+    url = "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
+    params = {"l": "zh-tw", "d": roc_date, "se": "AL"}
+
+    logger.info("抓取 TPEX 上櫃融資融券: %s", target_date.isoformat())
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("TPEX 融資融券請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if data.get("stat") != "ok" and data.get("stat") != "OK":
+        logger.warning("TPEX 融資融券無資料: %s", data.get("stat", ""))
+        return pd.DataFrame()
+
+    tables = data.get("tables", [])
+    if not tables:
+        logger.warning("TPEX 融資融券: 無 tables")
+        return pd.DataFrame()
+
+    rows = []
+    for item in tables[0].get("data", []):
+        if len(item) < 13:
+            continue
+
+        stock_id = item[0].strip()
+        # TPEX 融資融券欄位配置：
+        # 融資: 買進(2), 賣出(3), 現償(4), 餘額(5 or 6)
+        # 融券: 賣出(8), 買進(9), 現償(10), 餘額(11 or 12)
+        margin_buy = _parse_number(item[2]) or 0
+        margin_sell = _parse_number(item[3]) or 0
+        margin_balance = _parse_number(item[5]) or 0
+        short_sell = _parse_number(item[8]) or 0
+        short_buy = _parse_number(item[9]) or 0
+        short_balance = _parse_number(item[11]) or 0
+
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "margin_buy": int(margin_buy),
+                "margin_sell": int(margin_sell),
+                "margin_balance": int(margin_balance),
+                "short_sell": int(short_sell),
+                "short_buy": int(short_buy),
+                "short_balance": int(short_balance),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.info("TPEX 融資融券: %d 支股票", len(df))
+    time.sleep(_REQUEST_DELAY)
+    return df
+
+
+def fetch_market_margin(target_date: date | None = None) -> pd.DataFrame:
+    """抓取全市場（上市 + 上櫃）融資融券。
+
+    合併 TWSE + TPEX 資料，回傳統一欄位的 DataFrame。
+    """
+    df_twse = fetch_twse_margin(target_date)
+    df_tpex = fetch_tpex_margin(target_date)
+
+    dfs = [df for df in [df_twse, df_tpex] if not df.empty]
+    if not dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(dfs, ignore_index=True)
+    logger.info("全市場融資融券合計: %d 支股票", len(result))
+    return result
+
+
+# ------------------------------------------------------------------ #
 #  整合：全市場 (TWSE + TPEX)
 # ------------------------------------------------------------------ #
 
