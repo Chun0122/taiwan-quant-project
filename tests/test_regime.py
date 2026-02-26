@@ -86,9 +86,10 @@ class TestRegimeWeights:
     def test_get_weights_known_mode(self):
         """get_weights 回傳正確的權重。"""
         w = MarketRegimeDetector.get_weights("momentum", "bull")
-        assert w["technical"] == 0.50
-        assert w["chip"] == 0.40
+        assert w["technical"] == 0.45
+        assert w["chip"] == 0.35
         assert w["fundamental"] == 0.10
+        assert w["news"] == 0.10
 
     def test_get_weights_unknown_mode_returns_default(self):
         """未知模式回傳預設權重。"""

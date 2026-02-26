@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十一張核心表：
+十二張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -8,6 +8,7 @@
 - StockValuation:          估值資料（PE/PB/殖利率）
 - Dividend:                股利資料
 - TechnicalIndicator:      技術指標（EAV 長表）
+- Announcement:            MOPS 重大訊息公告
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
@@ -154,6 +155,24 @@ class TechnicalIndicator(Base):
 
     def __repr__(self) -> str:
         return f"<Indicator {self.stock_id} {self.date} {self.name}={self.value}>"
+
+
+class Announcement(Base):
+    """MOPS 重大訊息公告。"""
+
+    __tablename__ = "announcement"
+    __table_args__ = (UniqueConstraint("stock_id", "date", "seq", name="uq_announcement"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    seq: Mapped[str] = mapped_column(String(10), nullable=False)  # 當日序號
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)  # 公告主旨
+    spoke_time: Mapped[str | None] = mapped_column(String(10), nullable=True)  # 發言時間
+    sentiment: Mapped[int] = mapped_column(Integer, default=0)  # +1 正面 / 0 中性 / -1 負面
+
+    def __repr__(self) -> str:
+        return f"<Announcement {self.stock_id} {self.date} seq={self.seq}>"
 
 
 class BacktestResult(Base):

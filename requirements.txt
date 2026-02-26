@@ -1,6 +1,7 @@
 # Data fetching
 requests>=2.31.0
 FinMind>=1.6.0
+beautifulsoup4>=4.12.0
 
 # Data processing
 pandas>=2.1.0

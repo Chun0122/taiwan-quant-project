@@ -29,19 +29,19 @@ RegimeType = Literal["bull", "bear", "sideways"]
 # Regime 對 Discover 各模式的權重調整矩陣
 REGIME_WEIGHTS: dict[str, dict[RegimeType, dict[str, float]]] = {
     "momentum": {
-        "bull": {"technical": 0.50, "chip": 0.40, "fundamental": 0.10},
-        "sideways": {"technical": 0.45, "chip": 0.45, "fundamental": 0.10},
-        "bear": {"technical": 0.35, "chip": 0.45, "fundamental": 0.20},
+        "bull": {"technical": 0.45, "chip": 0.35, "fundamental": 0.10, "news": 0.10},
+        "sideways": {"technical": 0.40, "chip": 0.40, "fundamental": 0.10, "news": 0.10},
+        "bear": {"technical": 0.30, "chip": 0.40, "fundamental": 0.15, "news": 0.15},
     },
     "swing": {
-        "bull": {"technical": 0.35, "chip": 0.25, "fundamental": 0.40},
-        "sideways": {"technical": 0.30, "chip": 0.30, "fundamental": 0.40},
-        "bear": {"technical": 0.20, "chip": 0.30, "fundamental": 0.50},
+        "bull": {"technical": 0.30, "chip": 0.20, "fundamental": 0.40, "news": 0.10},
+        "sideways": {"technical": 0.25, "chip": 0.25, "fundamental": 0.35, "news": 0.15},
+        "bear": {"technical": 0.15, "chip": 0.25, "fundamental": 0.45, "news": 0.15},
     },
     "value": {
-        "bull": {"fundamental": 0.40, "valuation": 0.40, "chip": 0.20},
-        "sideways": {"fundamental": 0.50, "valuation": 0.30, "chip": 0.20},
-        "bear": {"fundamental": 0.60, "valuation": 0.25, "chip": 0.15},
+        "bull": {"fundamental": 0.40, "valuation": 0.35, "chip": 0.15, "news": 0.10},
+        "sideways": {"fundamental": 0.45, "valuation": 0.25, "chip": 0.15, "news": 0.15},
+        "bear": {"fundamental": 0.50, "valuation": 0.20, "chip": 0.10, "news": 0.20},
     },
 }
 
@@ -191,4 +191,4 @@ class MarketRegimeDetector:
         if mode in REGIME_WEIGHTS and regime in REGIME_WEIGHTS[mode]:
             return REGIME_WEIGHTS[mode][regime]
         # 預設權重
-        return {"technical": 0.35, "chip": 0.45, "fundamental": 0.20}
+        return {"technical": 0.30, "chip": 0.40, "fundamental": 0.20, "news": 0.10}

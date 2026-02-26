@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from src.data.database import get_session
 from src.data.schema import (
+    Announcement,
     DailyPrice,
     InstitutionalInvestor,
     MarginTrading,
@@ -132,8 +133,15 @@ class MarketScanner:
         except Exception:
             logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
 
+        # Stage 2.7: 載入候選股近期 MOPS 公告
+        df_ann = self._load_announcement_data(candidate_ids)
+        if not df_ann.empty:
+            logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
+        else:
+            logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
+
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.5: 風險過濾
@@ -321,6 +329,86 @@ class MarketScanner:
 
         return pd.DataFrame(result_rows)
 
+    def _load_announcement_data(self, stock_ids: list[str] | None = None, days: int = 10) -> pd.DataFrame:
+        """從 DB 查詢近 N 日的 MOPS 重大訊息公告。
+
+        Args:
+            stock_ids: 限定查詢的股票清單，None 表示查全部
+            days: 回溯天數
+
+        Returns:
+            DataFrame(stock_id, date, seq, subject, sentiment)
+        """
+        cutoff = date.today() - timedelta(days=days)
+
+        with get_session() as session:
+            query = select(
+                Announcement.stock_id,
+                Announcement.date,
+                Announcement.seq,
+                Announcement.subject,
+                Announcement.sentiment,
+            ).where(Announcement.date >= cutoff)
+
+            if stock_ids:
+                query = query.where(Announcement.stock_id.in_(stock_ids))
+
+            rows = session.execute(query).all()
+
+        return pd.DataFrame(
+            rows,
+            columns=["stock_id", "date", "seq", "subject", "sentiment"],
+        )
+
+    def _compute_news_scores(self, stock_ids: list[str], df_ann: pd.DataFrame) -> pd.DataFrame:
+        """計算消息面分數（3 因子：公告密度 + 正面訊號 + 負面懲罰）。
+
+        Args:
+            stock_ids: 候選股代號清單
+            df_ann: 公告資料 DataFrame
+
+        Returns:
+            DataFrame(stock_id, news_score) — 分數 0~1，0.5 為中性預設
+        """
+        default = pd.DataFrame({"stock_id": stock_ids, "news_score": [0.5] * len(stock_ids)})
+
+        if df_ann.empty:
+            return default
+
+        ann = df_ann[df_ann["stock_id"].isin(stock_ids)]
+        if ann.empty:
+            return default
+
+        df = pd.DataFrame({"stock_id": stock_ids})
+
+        # 1) 公告密度：近期重訊數量排名（30%）
+        ann_count = ann.groupby("stock_id").size().reset_index(name="ann_count")
+        df = df.merge(ann_count, on="stock_id", how="left")
+        df["ann_count"] = df["ann_count"].fillna(0)
+
+        # 2) 正面訊號：sentiment=+1 的公告數量排名（40%）
+        positive = ann[ann["sentiment"] == 1].groupby("stock_id").size().reset_index(name="pos_count")
+        df = df.merge(positive, on="stock_id", how="left")
+        df["pos_count"] = df["pos_count"].fillna(0)
+
+        # 3) 負面懲罰：sentiment=-1 的公告數量（倒數排名，越多越低分）（30%）
+        negative = ann[ann["sentiment"] == -1].groupby("stock_id").size().reset_index(name="neg_count")
+        df = df.merge(negative, on="stock_id", how="left")
+        df["neg_count"] = df["neg_count"].fillna(0)
+
+        # 排名百分位（有公告的才有區分度，無公告者 = 0.5）
+        if df["ann_count"].sum() == 0:
+            return default
+
+        density_rank = df["ann_count"].rank(pct=True)
+        pos_rank = df["pos_count"].rank(pct=True)
+        # 負面用倒數排名：neg_count 越大 → 排名越低
+        neg_rank = (-df["neg_count"]).rank(pct=True)
+
+        df["news_score"] = density_rank * 0.30 + pos_rank * 0.40 + neg_rank * 0.30
+
+        return df[["stock_id", "news_score"]]
+
     # ------------------------------------------------------------------ #
     #  Stage 2: 粗篩
     # ------------------------------------------------------------------ #
@@ -399,8 +487,9 @@ class MarketScanner:
         df_inst: pd.DataFrame,
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
+        df_ann: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """對候選股進行三維度評分：技術(35%) + 籌碼(45%) + 基本面(20%)。"""
+        """對候選股進行四維度評分：技術 + 籌碼 + 基本面 + 消息面。"""
         stock_ids = candidates["stock_id"].tolist()
 
         # --- 技術分數 ---
@@ -412,19 +501,29 @@ class MarketScanner:
         # --- 基本面分數 ---
         fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
 
+        # --- 消息面分數 ---
+        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
+
         candidates = candidates.copy()
         candidates = candidates.merge(tech_scores, on="stock_id", how="left")
         candidates = candidates.merge(chip_scores, on="stock_id", how="left")
         candidates = candidates.merge(fund_scores, on="stock_id", how="left")
+        candidates = candidates.merge(news_scores, on="stock_id", how="left")
         candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
         candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
         candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
+        candidates["news_score"] = candidates["news_score"].fillna(0.5)
 
-        # 綜合分數
+        # 綜合分數（含消息面第四維度）
+        from src.regime.detector import MarketRegimeDetector
+
+        regime = getattr(self, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights(self.mode_name, regime)
         candidates["composite_score"] = (
-            candidates["technical_score"] * 0.35
-            + candidates["chip_score"] * 0.45
-            + candidates["fundamental_score"] * 0.20
+            candidates["technical_score"] * w.get("technical", 0.35)
+            + candidates["chip_score"] * w.get("chip", 0.40)
+            + candidates["fundamental_score"] * w.get("fundamental", 0.20)
+            + candidates["news_score"] * w.get("news", 0.10)
         )
 
         return candidates
@@ -663,6 +762,7 @@ class MarketScanner:
             "technical_score",
             "chip_score",
             "fundamental_score",
+            "news_score",
             "industry_category",
             "momentum",
             "inst_net",
@@ -767,21 +867,25 @@ class MomentumScanner(MarketScanner):
         df_inst: pd.DataFrame,
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
+        df_ann: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式細評：技術 45% + 籌碼 45% + 基本面 10%。"""
+        """動能模式細評：技術 + 籌碼 + 基本面 + 消息面（權重依 regime 動態調整）。"""
         stock_ids = candidates["stock_id"].tolist()
 
         tech_scores = self._compute_technical_scores(stock_ids, df_price)
         chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price, df_margin)
         fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
+        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
 
         candidates = candidates.copy()
         candidates = candidates.merge(tech_scores, on="stock_id", how="left")
         candidates = candidates.merge(chip_scores, on="stock_id", how="left")
         candidates = candidates.merge(fund_scores, on="stock_id", how="left")
+        candidates = candidates.merge(news_scores, on="stock_id", how="left")
         candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
         candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
         candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
+        candidates["news_score"] = candidates["news_score"].fillna(0.5)
 
         # 綜合分數：根據 regime 動態調整權重
         regime = getattr(self, "regime", "sideways")
@@ -792,6 +896,7 @@ class MomentumScanner(MarketScanner):
             candidates["technical_score"] * w["technical"]
             + candidates["chip_score"] * w["chip"]
             + candidates["fundamental_score"] * w["fundamental"]
+            + candidates["news_score"] * w.get("news", 0.10)
         )
 
         return candidates
@@ -1151,21 +1256,25 @@ class SwingScanner(MarketScanner):
         df_inst: pd.DataFrame,
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
+        df_ann: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """波段模式細評：技術 30% + 籌碼 30% + 基本面 40%。"""
+        """波段模式細評：技術 + 籌碼 + 基本面 + 消息面（權重依 regime 動態調整）。"""
         stock_ids = candidates["stock_id"].tolist()
 
         tech_scores = self._compute_technical_scores(stock_ids, df_price)
         chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
         fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
+        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
 
         candidates = candidates.copy()
         candidates = candidates.merge(tech_scores, on="stock_id", how="left")
         candidates = candidates.merge(chip_scores, on="stock_id", how="left")
         candidates = candidates.merge(fund_scores, on="stock_id", how="left")
+        candidates = candidates.merge(news_scores, on="stock_id", how="left")
         candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
         candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
         candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
+        candidates["news_score"] = candidates["news_score"].fillna(0.5)
 
         # 綜合分數：根據 regime 動態調整權重
         regime = getattr(self, "regime", "sideways")
@@ -1176,6 +1285,7 @@ class SwingScanner(MarketScanner):
             candidates["technical_score"] * w["technical"]
             + candidates["chip_score"] * w["chip"]
             + candidates["fundamental_score"] * w["fundamental"]
+            + candidates["news_score"] * w.get("news", 0.10)
         )
 
         return candidates
@@ -1571,21 +1681,25 @@ class ValueScanner(MarketScanner):
         df_inst: pd.DataFrame,
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
+        df_ann: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """價值模式細評：基本面 50% + 估值面 30% + 籌碼面 20%。"""
+        """價值模式細評：基本面 + 估值面 + 籌碼面 + 消息面（權重依 regime 動態調整）。"""
         stock_ids = candidates["stock_id"].tolist()
 
         fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
         val_scores = self._compute_valuation_scores(stock_ids)
         chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
+        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
 
         candidates = candidates.copy()
         candidates = candidates.merge(fund_scores, on="stock_id", how="left")
         candidates = candidates.merge(val_scores, on="stock_id", how="left")
         candidates = candidates.merge(chip_scores, on="stock_id", how="left")
+        candidates = candidates.merge(news_scores, on="stock_id", how="left")
         candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
         candidates["valuation_score"] = candidates["valuation_score"].fillna(0.5)
         candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
+        candidates["news_score"] = candidates["news_score"].fillna(0.5)
 
         # 用 technical_score 欄位存估值分數（供 _rank_and_enrich 保留）
         candidates["technical_score"] = candidates["valuation_score"]
@@ -1599,6 +1713,7 @@ class ValueScanner(MarketScanner):
             candidates["fundamental_score"] * w["fundamental"]
             + candidates["valuation_score"] * w["valuation"]
             + candidates["chip_score"] * w["chip"]
+            + candidates["news_score"] * w.get("news", 0.10)
         )
 
         return candidates

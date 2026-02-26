@@ -48,6 +48,7 @@ taiwan-quant-project/
 │   │   ├── schema.py        # ORM 資料表定義（含投資組合表 + StockInfo）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
 │   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
+│   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
@@ -637,7 +638,9 @@ python main.py industry --notify
 2. FinMind 批次 API（需付費帳號）
 3. FinMind 逐股抓取（免費帳號備案，較慢）
 
-**市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways），動態調整各模式的因子權重。多頭加重技術面，空頭加重基本面。
+**市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways），動態調整各模式的四維度因子權重（技術面 + 籌碼面 + 基本面 + 消息面）。多頭加重技術面，空頭加重基本面與消息面。
+
+**消息面評分（MOPS 重大訊息）：** 系統會自動從公開資訊觀測站抓取近期重大訊息，以關鍵字規則分類情緒（正面/中性/負面），並計算消息面分數。三因子加權：公告密度 30% + 正面訊號 40% + 負面懲罰 30%。
 
 ```bash
 # 預設 momentum 模式（同步資料 + 篩選 Top 20）
@@ -706,9 +709,9 @@ python main.py discover swing --top 30 --export picks.csv --notify
 
 | 模式 | 面向 | 多頭 | 盤整 | 空頭 |
 |------|------|------|------|------|
-| Momentum | Tech / Chip / Fund | 50/40/10 | 45/45/10 | 35/45/20 |
-| Swing | Tech / Chip / Fund | 35/25/40 | 30/30/40 | 20/30/50 |
-| Value | Fund / Val / Chip | 40/40/20 | 50/30/20 | 60/25/15 |
+| Momentum | Tech / Chip / Fund / News | 45/35/10/10 | 40/40/10/10 | 30/40/15/15 |
+| Swing | Tech / Chip / Fund / News | 30/20/40/10 | 25/25/35/15 | 15/25/45/15 |
+| Value | Fund / Val / Chip / News | 40/35/15/10 | 45/25/15/15 | 50/20/10/20 |
 
 **篩選流程說明：**
 
@@ -718,13 +721,34 @@ python main.py discover swing --top 30 --export picks.csv --notify
 | Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
 | Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名 |
 | Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
-| Stage 3 | 細評 | 模式專屬因子 + Regime 動態權重評分 |
+| Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
+| Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
 > **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收與估值資料。若無 Token，基本面/估值分數會 fallback 到 0.5（中性值），不影響其他維度評分。
 
-### 4.14 資料庫遷移 (`migrate`)
+### 4.14 同步 MOPS 重大訊息 (`sync-mops`)
+
+從公開資訊觀測站（MOPS）抓取上市/上櫃公司重大訊息公告。資料用於 discover 的消息面評分。
+
+```bash
+# 同步最近 7 天的重大訊息（預設）
+python main.py sync-mops
+
+# 同步最近 30 天
+python main.py sync-mops --days 30
+```
+
+| 參數 | 說明 |
+|------|------|
+| `--days N` | 回溯天數（預設 7） |
+
+系統會自動對公告主旨進行關鍵字情緒分類（+1 正面 / 0 中性 / -1 負面），同步完成後顯示情緒分布統計。
+
+> **注意**：`discover` 命令的全市場同步會自動附帶 MOPS 同步（最近 5 天），一般情況下無需單獨執行此命令。若需要更長時間範圍的公告資料，再手動執行。
+
+### 4.15 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -739,7 +763,7 @@ python main.py migrate
 
 已存在的欄位會自動跳過，可重複執行。
 
-### 4.15 查看資料庫概況 (`status`)
+### 4.16 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -757,7 +781,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。九張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。十二張核心表：
 
 ### daily_price（日K線）
 
@@ -918,6 +942,19 @@ python main.py status
 | pnl | Float | 損益金額 |
 | return_pct | Float | 報酬率 (%) |
 | exit_reason | String | 出場原因 |
+
+### announcement（MOPS 重大訊息公告）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 公告日期 |
+| seq | String | 當日序號 |
+| subject | String | 公告主旨 |
+| spoke_time | String | 發言時間 |
+| sentiment | Integer | 情緒分類（+1 正面 / 0 中性 / -1 負面） |
+
+唯一鍵：`(stock_id, date, seq)`
 
 ### stock_info（股票基本資料，P8 新增）
 

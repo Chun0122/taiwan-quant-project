@@ -548,13 +548,13 @@ class TestMomentumRiskFilter:
 
 
 class TestMomentumCompositeWeights:
-    def test_weights_45_45_10(self, momentum_scanner):
-        """確認綜合分數為 Tech 45% + Chip 45% + Fund 10%。"""
+    def test_weights_with_regime(self, momentum_scanner):
+        """確認綜合分數依 regime 權重計算（含消息面）。"""
+        from src.regime.detector import MarketRegimeDetector
+
         candidates = pd.DataFrame({"stock_id": ["1000"], "close": [100], "volume": [500_000]})
-        # mock 各維度分數
         df_price = _make_momentum_price_df(25, 1)
         df_price["stock_id"] = "1000"
-        sids = ["1000"]
         df_inst = pd.DataFrame([{"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100}])
         df_revenue = pd.DataFrame({"stock_id": ["1000"], "yoy_growth": [10.0], "mom_growth": [5.0]})
 
@@ -563,7 +563,10 @@ class TestMomentumCompositeWeights:
         tech = result.iloc[0]["technical_score"]
         chip = result.iloc[0]["chip_score"]
         fund = result.iloc[0]["fundamental_score"]
-        expected = tech * 0.45 + chip * 0.45 + fund * 0.10
+        news = result.iloc[0]["news_score"]
+        regime = getattr(momentum_scanner, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights("momentum", regime)
+        expected = tech * w["technical"] + chip * w["chip"] + fund * w["fundamental"] + news * w.get("news", 0.10)
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 
@@ -791,8 +794,10 @@ class TestSwingFundamentalScores:
 
 
 class TestSwingCompositeWeights:
-    def test_weights_30_30_40(self, swing_scanner):
-        """確認綜合分數為 Tech 30% + Chip 30% + Fund 40%。"""
+    def test_weights_with_regime(self, swing_scanner):
+        """確認綜合分數依 regime 權重計算（含消息面）。"""
+        from src.regime.detector import MarketRegimeDetector
+
         candidates = pd.DataFrame({"stock_id": ["4000"], "close": [100], "volume": [500_000]})
         df_price = _make_swing_price_df(80, 1)
         df_inst = pd.DataFrame([{"stock_id": "4000", "date": date(2025, 3, 1), "name": "投信買賣超", "net": 100}])
@@ -811,7 +816,10 @@ class TestSwingCompositeWeights:
         tech = result.iloc[0]["technical_score"]
         chip = result.iloc[0]["chip_score"]
         fund = result.iloc[0]["fundamental_score"]
-        expected = tech * 0.30 + chip * 0.30 + fund * 0.40
+        news = result.iloc[0]["news_score"]
+        regime = getattr(swing_scanner, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights("swing", regime)
+        expected = tech * w["technical"] + chip * w["chip"] + fund * w["fundamental"] + news * w.get("news", 0.10)
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 
@@ -917,8 +925,10 @@ class TestValueFundamentalScores:
 
 
 class TestValueCompositeWeights:
-    def test_weights_50_30_20(self, value_scanner):
-        """確認 sideways 下綜合分數為 Fund 50% + Val 30% + Chip 20%。"""
+    def test_weights_with_regime(self, value_scanner):
+        """確認綜合分數依 regime 權重計算（含消息面）。"""
+        from src.regime.detector import MarketRegimeDetector
+
         candidates = pd.DataFrame({"stock_id": ["1000"], "close": [100], "volume": [500_000]})
         df_price = _make_momentum_price_df(25, 1)
         df_price["stock_id"] = "1000"
@@ -939,7 +949,10 @@ class TestValueCompositeWeights:
         fund = result.iloc[0]["fundamental_score"]
         val = result.iloc[0]["valuation_score"]
         chip = result.iloc[0]["chip_score"]
-        expected = fund * 0.50 + val * 0.30 + chip * 0.20
+        news = result.iloc[0]["news_score"]
+        regime = getattr(value_scanner, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights("value", regime)
+        expected = fund * w["fundamental"] + val * w["valuation"] + chip * w["chip"] + news * w.get("news", 0.10)
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 

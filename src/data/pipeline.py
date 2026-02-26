@@ -13,6 +13,7 @@ from src.config import settings
 from src.data.database import get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
+    Announcement,
     BacktestResult,
     DailyPrice,
     Dividend,
@@ -88,6 +89,11 @@ def _upsert_valuation(df: pd.DataFrame) -> int:
     return _upsert_batch(StockValuation, df, ["stock_id", "date"])
 
 
+def _upsert_announcement(df: pd.DataFrame) -> int:
+    """將 MOPS 公告 DataFrame 寫入 announcement 表。"""
+    return _upsert_batch(Announcement, df, ["stock_id", "date", "seq"])
+
+
 def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
     """為指定股票補抓最新估值資料（PE/PB/殖利率）。
 
@@ -155,6 +161,47 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
 
     if skipped:
         logger.info("[營收補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+    return total
+
+
+def sync_mops_announcements(days: int = 7) -> int:
+    """同步最近 N 個交易日的 MOPS 重大訊息公告。
+
+    Args:
+        days: 回溯天數（預設 7 天）
+
+    Returns:
+        新增的公告筆數
+    """
+    from src.data.mops_fetcher import fetch_mops_announcements
+
+    init_db()
+    total = 0
+    d = date.today()
+    success_count = 0
+    max_attempts = days + 10  # 預留假日空間
+
+    logger.info("[MOPS] 同步重大訊息，目標 %d 個交易日", days)
+
+    for _ in range(max_attempts):
+        if success_count >= days:
+            break
+        if d.weekday() >= 5:
+            d -= timedelta(days=1)
+            continue
+
+        df = fetch_mops_announcements(d)
+        if not df.empty:
+            count = _upsert_announcement(df)
+            total += count
+            success_count += 1
+            logger.info("[MOPS] %s: %d 筆公告", d.isoformat(), count)
+        else:
+            success_count += 1  # 假日也算一個交易日嘗試
+
+        d -= timedelta(days=1)
+
+    logger.info("[MOPS] 同步完成 — 共 %d 筆公告", total)
     return total
 
 
@@ -378,6 +425,25 @@ def sync_market_data(
             logger.info("[全市場] %s 無資料（假日），跳過", d.isoformat())
 
         d -= timedelta(days=1)
+
+    # --- MOPS 重大訊息同步（附加於全市場同步，失敗不影響其他資料） ---
+    try:
+        from src.data.mops_fetcher import fetch_mops_announcements
+
+        result["announcements"] = 0
+        mops_d = date.today()
+        for _ in range(min(days, 5)):  # MOPS 最多抓 5 天，避免太慢
+            if mops_d.weekday() >= 5:
+                mops_d -= timedelta(days=1)
+                continue
+            df_ann = fetch_mops_announcements(mops_d)
+            if not df_ann.empty:
+                result["announcements"] += _upsert_announcement(df_ann)
+            mops_d -= timedelta(days=1)
+        if result["announcements"]:
+            logger.info("[全市場] MOPS 重訊: %d 筆", result["announcements"])
+    except Exception:
+        logger.warning("[全市場] MOPS 重訊同步失敗，不影響其他資料")
 
     if success_count > 0:
         logger.info(
