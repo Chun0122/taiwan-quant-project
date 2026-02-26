@@ -165,10 +165,13 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
 
 
 def sync_mops_announcements(days: int = 7) -> int:
-    """同步最近 N 個交易日的 MOPS 重大訊息公告。
+    """同步 MOPS 最新重大訊息公告。
+
+    MOPS 備援站僅提供最新一個交易日的公告，因此每次呼叫只會抓取
+    一天的資料。建議搭配每日排程使用，逐日累積歷史公告。
 
     Args:
-        days: 回溯天數（預設 7 天）
+        days: 未使用（保留以維持 CLI 相容），實際只抓取最新一天
 
     Returns:
         新增的公告筆數
@@ -176,32 +179,17 @@ def sync_mops_announcements(days: int = 7) -> int:
     from src.data.mops_fetcher import fetch_mops_announcements
 
     init_db()
-    total = 0
-    d = date.today()
-    success_count = 0
-    max_attempts = days + 10  # 預留假日空間
 
-    logger.info("[MOPS] 同步重大訊息，目標 %d 個交易日", days)
+    logger.info("[MOPS] 同步最新重大訊息")
 
-    for _ in range(max_attempts):
-        if success_count >= days:
-            break
-        if d.weekday() >= 5:
-            d -= timedelta(days=1)
-            continue
+    df = fetch_mops_announcements()
+    if df.empty:
+        logger.info("[MOPS] 無公告資料")
+        return 0
 
-        df = fetch_mops_announcements(d)
-        if not df.empty:
-            count = _upsert_announcement(df)
-            total += count
-            success_count += 1
-            logger.info("[MOPS] %s: %d 筆公告", d.isoformat(), count)
-        else:
-            success_count += 1  # 假日也算一個交易日嘗試
-
-        d -= timedelta(days=1)
-
-    logger.info("[MOPS] 同步完成 — 共 %d 筆公告", total)
+    total = _upsert_announcement(df)
+    actual_date = df["date"].iloc[0] if not df.empty else "N/A"
+    logger.info("[MOPS] 同步完成 — %s: %d 筆公告", actual_date, total)
     return total
 
 

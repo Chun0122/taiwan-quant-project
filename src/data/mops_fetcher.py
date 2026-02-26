@@ -79,12 +79,15 @@ def _find_last_trading_day(target: date, max_lookback: int = 7) -> date:
 
 
 def fetch_mops_announcements(target_date: date | None = None) -> pd.DataFrame:
-    """抓取 MOPS 某日全市場重大訊息公告。
+    """抓取 MOPS 最新全市場重大訊息公告。
 
-    使用 MOPS ajax_t05sr01_1 端點，一次查詢取得上市 + 上櫃所有重訊。
+    使用 MOPS 備援站 ajax_t05sr01_1 端點，一次查詢取得上市 + 上櫃所有重訊。
+
+    注意：MOPS 備援站僅返回最新一個交易日的公告，target_date 參數不影響
+    實際回傳內容。實際公告日期從 HTML 中的「發言日期」欄位解析。
 
     Args:
-        target_date: 目標日期，預設為最近交易日
+        target_date: 未使用（保留參數以維持向後相容），實際日期從 HTML 解析
 
     Returns:
         DataFrame 欄位: date, stock_id, seq, subject, spoke_time, sentiment
@@ -92,13 +95,13 @@ def fetch_mops_announcements(target_date: date | None = None) -> pd.DataFrame:
     if target_date is None:
         target_date = _find_last_trading_day(date.today())
 
-    # MOPS 使用民國年
+    # MOPS 使用民國年（參數不影響結果，但仍需傳入）
     roc_year = target_date.year - 1911
-    date_str = f"{roc_year}/{target_date.month:02d}/{target_date.day:02d}"
 
-    url = "https://mops.twse.com.tw/mops/web/ajax_t05sr01_1"
+    # 使用 mopsov 備援站（主站 mops.twse.com.tw 會擋自動化請求）
+    url = "https://mopsov.twse.com.tw/mops/web/ajax_t05sr01_1"
 
-    logger.info("抓取 MOPS 重大訊息: %s", target_date.isoformat())
+    logger.info("抓取 MOPS 最新重大訊息")
 
     # 嘗試上市 (sii) 和上櫃 (otc) 兩種市場
     all_rows: list[dict] = []
@@ -106,7 +109,7 @@ def fetch_mops_announcements(target_date: date | None = None) -> pd.DataFrame:
     for typek in ("sii", "otc"):
         form_data = {
             "encodeURIComponent": "1",
-            "step": "1",
+            "step": "0",
             "firstin": "1",
             "off": "1",
             "TYPEK": typek,
@@ -130,27 +133,43 @@ def fetch_mops_announcements(target_date: date | None = None) -> pd.DataFrame:
             time.sleep(_REQUEST_DELAY)
             continue
 
-        rows = _parse_announcement_html(resp.text, target_date)
+        rows = _parse_announcement_html(resp.text)
         all_rows.extend(rows)
         logger.info("MOPS %s 重訊: %d 筆", typek.upper(), len(rows))
 
         time.sleep(_REQUEST_DELAY)
 
     if not all_rows:
-        logger.info("MOPS 重訊: 當日無公告 (%s)", target_date.isoformat())
+        logger.info("MOPS 重訊: 當日無公告")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
-    logger.info("MOPS 重訊合計: %d 筆", len(df))
+    actual_date = df["date"].iloc[0] if not df.empty else "N/A"
+    logger.info("MOPS 重訊合計: %d 筆（公告日期: %s）", len(df), actual_date)
     return df
 
 
-def _parse_announcement_html(html: str, target_date: date) -> list[dict]:
+def _parse_roc_date(roc_date_str: str) -> date | None:
+    """將民國日期字串（如 '115/02/26'）轉為 date 物件。"""
+    m = re.match(r"(\d{2,3})/(\d{2})/(\d{2})", roc_date_str)
+    if not m:
+        return None
+    year = int(m.group(1)) + 1911
+    month = int(m.group(2))
+    day = int(m.group(3))
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _parse_announcement_html(html: str) -> list[dict]:
     """解析 MOPS 重訊回傳的 HTML 表格。
+
+    從 HTML 中的「發言日期」欄位解析實際公告日期。
 
     Args:
         html: MOPS 回傳的 HTML 內容
-        target_date: 查詢日期
 
     Returns:
         解析後的公告列表
@@ -163,37 +182,43 @@ def _parse_announcement_html(html: str, target_date: date) -> list[dict]:
     if not tables:
         return rows
 
+    # 用序號計數器為同一 stock_id 同一天產生唯一 seq
+    seq_counter: dict[str, int] = {}
+
     for table in tables:
         trs = table.find_all("tr")
         for tr in trs:
             tds = tr.find_all("td")
-            if len(tds) < 4:
+            if len(tds) < 5:
                 continue
 
-            # 欄位順序：公司代號、公司名稱、發言日期、發言時間、主旨
-            # 實際欄位可能因頁面版本不同，需要彈性處理
+            # 欄位順序：[0]公司代號 [1]公司簡稱 [2]發言日期 [3]發言時間 [4]主旨 [5](空)
             texts = [td.get_text(strip=True) for td in tds]
 
-            # 找到包含股票代號的列（4 位數字開頭）
+            # 找到包含股票代號的列（4~6 位數字開頭）
             stock_id = texts[0].strip()
-            if not re.match(r"^\d{4}", stock_id):
+            if not re.match(r"^\d{4,6}$", stock_id):
                 continue
 
-            # 取得主要欄位
-            seq = texts[2].strip() if len(texts) > 2 else "1"  # 序號
-            spoke_time = texts[3].strip() if len(texts) > 3 else ""
-            subject = texts[4].strip() if len(texts) > 4 else ""
+            # 從「發言日期」欄位解析實際日期
+            actual_date = _parse_roc_date(texts[2].strip())
+            if actual_date is None:
+                continue
 
-            if not subject:
-                # 若第 5 欄無資料，嘗試最後一欄
-                subject = texts[-1].strip() if texts[-1].strip() else ""
+            spoke_time = texts[3].strip()
+            subject = texts[4].strip()
 
             if not subject:
                 continue
+
+            # 同一 stock_id 同一天用遞增序號
+            key = f"{stock_id}_{actual_date}"
+            seq_counter[key] = seq_counter.get(key, 0) + 1
+            seq = str(seq_counter[key])
 
             rows.append(
                 {
-                    "date": target_date,
+                    "date": actual_date,
                     "stock_id": stock_id,
                     "seq": seq,
                     "subject": subject,

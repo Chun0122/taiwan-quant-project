@@ -804,9 +804,8 @@ def cmd_sync_mops(args: argparse.Namespace) -> None:
     """同步 MOPS 重大訊息公告。"""
     from src.data.pipeline import sync_mops_announcements
 
-    days = args.days
-    print(f"同步最近 {days} 個交易日的 MOPS 重大訊息...")
-    count = sync_mops_announcements(days=days)
+    print("同步 MOPS 最新重大訊息...")
+    count = sync_mops_announcements()
     print(f"\nMOPS 公告同步完成: {count:,} 筆")
 
     # 顯示情緒分布統計
@@ -987,8 +986,7 @@ def main() -> None:
     sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
     # sync-mops 子命令
-    sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 重大訊息公告")
-    sp_mops.add_argument("--days", type=int, default=7, help="回溯天數 (預設 7)")
+    sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")
 
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
