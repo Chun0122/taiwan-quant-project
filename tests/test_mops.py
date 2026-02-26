@@ -15,7 +15,6 @@ import pytest
 from src.data.mops_fetcher import classify_sentiment
 from src.regime.detector import REGIME_WEIGHTS, MarketRegimeDetector
 
-
 # ------------------------------------------------------------------ #
 #  classify_sentiment 情緒分類
 # ------------------------------------------------------------------ #
