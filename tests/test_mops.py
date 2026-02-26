@@ -222,9 +222,7 @@ class TestRegimeWeightsWithNews:
         """所有模式各 regime 權重加總 = 1.0。"""
         for regime in ("bull", "sideways", "bear"):
             w = REGIME_WEIGHTS[mode][regime]
-            assert sum(w.values()) == pytest.approx(1.0), (
-                f"{mode}/{regime}: {w} 總和={sum(w.values())}"
-            )
+            assert sum(w.values()) == pytest.approx(1.0), f"{mode}/{regime}: {w} 總和={sum(w.values())}"
 
     @pytest.mark.parametrize("mode", ["momentum", "swing", "value"])
     def test_news_key_exists(self, mode):
@@ -244,6 +242,4 @@ class TestRegimeWeightsWithNews:
         for mode in ("momentum", "swing", "value"):
             bull_news = REGIME_WEIGHTS[mode]["bull"]["news"]
             bear_news = REGIME_WEIGHTS[mode]["bear"]["news"]
-            assert bear_news >= bull_news, (
-                f"{mode}: bear news={bear_news} < bull news={bull_news}"
-            )
+            assert bear_news >= bull_news, f"{mode}: bear news={bear_news} < bull news={bull_news}"
