@@ -48,8 +48,10 @@ _POSITIVE_KEYWORDS = [
     "得標",
     "股利",
     "配息",
-    "增資",
-    "現金增資",
+    "盈餘轉增資",
+    "處分不動產",
+    "處分有價證券",
+    "處分資產",
 ]
 
 _NEGATIVE_KEYWORDS = [
@@ -70,7 +72,9 @@ _NEGATIVE_KEYWORDS = [
     "停產",
     "訴訟",
     "求償",
-    "處分",
+    "罰鍰",
+    "糾正",
+    "現金增資",
     "警示",
 ]
 
@@ -87,6 +91,11 @@ def classify_sentiment(subject: str) -> int:
     if not subject:
         return 0
 
+    # 「澄清媒體報導」通常為中性（依法回應媒體傳言），不應被內文關鍵字誤判
+    if "澄清" in subject or "說明媒體" in subject:
+        return 0
+
+    # 負面優先比對（負面關鍵字多為具體搭配如「終止上市」「現金增資」）
     for kw in _NEGATIVE_KEYWORDS:
         if kw in subject:
             return -1

@@ -30,7 +30,8 @@ class TestClassifySentiment:
             "本公司合併營收創歷史新高",
             "本公司與XX公司簽訂合併契約",
             "本公司取得專利權",
-            "本公司董事會決議現金增資發行新股",
+            "本公司董事會決議盈餘轉增資",
+            "本公司處分不動產取得收益",
         ],
     )
     def test_positive_keywords(self, subject):
@@ -46,6 +47,7 @@ class TestClassifySentiment:
             "本公司違約交割",
             "本公司受金管會裁罰",
             "本公司董事會決議減資彌補虧損",
+            "本公司董事會決議現金增資發行新股",
         ],
     )
     def test_negative_keywords(self, subject):
@@ -73,10 +75,21 @@ class TestClassifySentiment:
         """None → 0。"""
         assert classify_sentiment(None) == 0
 
-    def test_negative_takes_priority(self):
-        """同時包含正負面關鍵字時，負面優先。"""
+    def test_asset_disposal_is_positive(self):
+        """處分不動產/有價證券/資產屬正面（業外收益）。"""
+        assert classify_sentiment("本公司處分不動產取得收益公告") == 1
+        assert classify_sentiment("本公司處分有價證券") == 1
+        assert classify_sentiment("本公司處分資產") == 1
+
+    def test_both_negative_keywords(self):
+        """主旨同時含多個負面關鍵字 → -1。"""
         subject = "本公司因虧損決議減資彌補後辦理現金增資"
         assert classify_sentiment(subject) == -1
+
+    def test_clarification_returns_neutral(self):
+        """澄清媒體報導 → 0（不受內文關鍵字影響）。"""
+        assert classify_sentiment("澄清媒體報導本公司營收創歷史新高") == 0
+        assert classify_sentiment("說明媒體報導本公司合併案") == 0
 
 
 # ------------------------------------------------------------------ #
