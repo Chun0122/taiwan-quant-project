@@ -715,7 +715,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
     """執行全市場選股掃描（momentum / swing / value 模式）。"""
     from src.data.database import init_db
     from src.data.pipeline import sync_market_data, sync_stock_info
-    from src.discovery.scanner import MomentumScanner, SwingScanner, ValueScanner
+    from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
 
     init_db()
 
@@ -724,6 +724,8 @@ def cmd_discover(args: argparse.Namespace) -> None:
         "momentum": "Momentum 短線動能",
         "swing": "Swing 中期波段",
         "value": "Value 價值修復",
+        "dividend": "Dividend 高息存股",
+        "growth": "Growth 高成長",
     }[mode]
 
     # swing 模式自動擴展同步天數
@@ -745,7 +747,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
         )
 
     # 選擇 scanner
-    scanner_map = {"momentum": MomentumScanner, "swing": SwingScanner, "value": ValueScanner}
+    scanner_map = {
+        "momentum": MomentumScanner,
+        "swing": SwingScanner,
+        "value": ValueScanner,
+        "dividend": DividendScanner,
+        "growth": GrowthScanner,
+    }
     ScannerClass = scanner_map[mode]
     print(f"正在掃描全市場 [{mode_label}]...")
     scanner = ScannerClass(
@@ -949,7 +957,7 @@ def _show_discovery_comparison(mode: str, current_result) -> None:
 
     if rank_changes:
         rank_changes.sort(key=lambda x: -x[2])  # 上升最多的排前面
-        print(f"\n  排名變動（變動 >= 3 名）：")
+        print("\n  排名變動（變動 >= 3 名）：")
         for sid, curr_r, delta in rank_changes:
             arrow = "↑" if delta > 0 else "↓"
             row = current_result.rankings[current_result.rankings["stock_id"] == sid].iloc[0]
@@ -976,9 +984,7 @@ def cmd_sync_mops(args: argparse.Namespace) -> None:
         from src.data.schema import Announcement
 
         with get_session() as session:
-            dist = session.execute(
-                select(Announcement.sentiment, func.count()).group_by(Announcement.sentiment)
-            ).all()
+            dist = session.execute(select(Announcement.sentiment, func.count()).group_by(Announcement.sentiment)).all()
 
         sentiment_labels = {1: "正面", 0: "中性", -1: "負面"}
         print("\n情緒分布:")
@@ -1155,13 +1161,13 @@ def main() -> None:
     sp_ind.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
     # discover 子命令
-    sp_disc = subparsers.add_parser("discover", help="全市場選股掃描 (momentum/swing)")
+    sp_disc = subparsers.add_parser("discover", help="全市場選股掃描 (momentum/swing/value/dividend/growth)")
     sp_disc.add_argument(
         "mode",
         nargs="?",
         default="momentum",
-        choices=["momentum", "swing", "value"],
-        help="掃描模式：momentum=短線動能, swing=中期波段, value=價值修復 (預設 momentum)",
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="掃描模式：momentum=短線動能, swing=中期波段, value=價值修復, dividend=高息存股, growth=高成長 (預設 momentum)",
     )
     sp_disc.add_argument("--top", type=int, default=20, help="顯示前 N 名 (預設 20)")
     sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")
@@ -1176,7 +1182,9 @@ def main() -> None:
 
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
-    sp_db.add_argument("--mode", required=True, choices=["momentum", "swing", "value"], help="掃描模式")
+    sp_db.add_argument(
+        "--mode", required=True, choices=["momentum", "swing", "value", "dividend", "growth"], help="掃描模式"
+    )
     sp_db.add_argument("--days", default="5,10,20", help="持有天數（逗號分隔，預設 5,10,20）")
     sp_db.add_argument("--top", type=int, default=None, help="只計算每次掃描前 N 名的績效")
     sp_db.add_argument("--start", default=None, help="掃描日期範圍起始 (YYYY-MM-DD)")

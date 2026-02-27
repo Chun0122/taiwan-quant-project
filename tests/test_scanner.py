@@ -1,11 +1,18 @@
-"""測試 src/discovery/scanner.py — MarketScanner / MomentumScanner / SwingScanner / ValueScanner 純計算方法。"""
+"""測試 src/discovery/scanner.py — MarketScanner / MomentumScanner / SwingScanner / ValueScanner / DividendScanner / GrowthScanner 純計算方法。"""
 
 from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
-from src.discovery.scanner import MarketScanner, MomentumScanner, SwingScanner, ValueScanner
+from src.discovery.scanner import (
+    DividendScanner,
+    GrowthScanner,
+    MarketScanner,
+    MomentumScanner,
+    SwingScanner,
+    ValueScanner,
+)
 
 
 @pytest.fixture()
@@ -1060,3 +1067,412 @@ class TestValueRiskFilter:
         scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
         result = value_scanner._apply_risk_filter(scored, df_price)
         assert len(result) < len(scored)
+
+
+# ====================================================================== #
+#  DividendScanner 測試
+# ====================================================================== #
+
+
+@pytest.fixture()
+def dividend_scanner():
+    return DividendScanner(
+        min_price=10,
+        max_price=2000,
+        min_volume=100_000,
+        top_n_candidates=10,
+        top_n_results=5,
+    )
+
+
+class TestDividendCoarseFilter:
+    def test_dividend_yield_threshold(self, dividend_scanner):
+        """殖利率 > 3% 門檻過濾。"""
+        df_price = _make_price_df(10)
+        sids = df_price[df_price["date"] == df_price["date"].max()]["stock_id"].unique().tolist()
+
+        dividend_scanner._df_valuation = pd.DataFrame(
+            {
+                "stock_id": sids,
+                "date": [date(2025, 1, 3)] * len(sids),
+                "pe_ratio": [12.0] * len(sids),
+                "pb_ratio": [1.5] * len(sids),
+                # 只有前 3 支殖利率 > 3%
+                "dividend_yield": [5.0, 4.0, 3.5, 2.5, 1.0, 0.5, 2.0, 1.5, 0.0, 2.9],
+            }
+        )
+        result = dividend_scanner._coarse_filter(df_price, pd.DataFrame())
+        if not result.empty:
+            # 通過粗篩的應該只有殖利率 > 3% 的
+            passed_ids = set(result["stock_id"].tolist())
+            for sid in passed_ids:
+                val_row = dividend_scanner._df_valuation[dividend_scanner._df_valuation["stock_id"] == sid]
+                assert val_row.iloc[0]["dividend_yield"] > 3.0
+
+    def test_pe_positive_filter(self, dividend_scanner):
+        """PE > 0 過濾：排除虧損股。"""
+        df_price = _make_price_df(5)
+        sids = df_price[df_price["date"] == df_price["date"].max()]["stock_id"].unique().tolist()
+
+        dividend_scanner._df_valuation = pd.DataFrame(
+            {
+                "stock_id": sids,
+                "date": [date(2025, 1, 3)] * len(sids),
+                "pe_ratio": [12.0, -5.0, 15.0, 0.0, 8.0],
+                "pb_ratio": [1.5] * len(sids),
+                "dividend_yield": [5.0, 5.0, 5.0, 5.0, 5.0],
+            }
+        )
+        result = dividend_scanner._coarse_filter(df_price, pd.DataFrame())
+        if not result.empty:
+            passed_ids = set(result["stock_id"].tolist())
+            for sid in passed_ids:
+                val_row = dividend_scanner._df_valuation[dividend_scanner._df_valuation["stock_id"] == sid]
+                assert val_row.iloc[0]["pe_ratio"] > 0
+
+    def test_no_valuation_returns_empty(self, dividend_scanner):
+        """無估值資料時回傳空。"""
+        df_price = _make_price_df(5)
+        dividend_scanner._df_valuation = pd.DataFrame()
+        result = dividend_scanner._coarse_filter(df_price, pd.DataFrame())
+        assert result.empty
+
+
+class TestDividendDividendScores:
+    def test_higher_yield_gets_higher_score(self, dividend_scanner):
+        """殖利率越高應得分越高。"""
+        dividend_scanner._df_valuation = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "date": [date(2025, 1, 25)] * 3,
+                "pe_ratio": [12.0, 12.0, 12.0],
+                "pb_ratio": [1.5, 1.5, 1.5],
+                "dividend_yield": [8.0, 4.0, 1.0],
+            }
+        )
+        result = dividend_scanner._compute_dividend_scores(["1000", "1001", "1002"])
+        scores = result.set_index("stock_id")["dividend_score"]
+        assert scores["1000"] > scores["1002"]
+
+    def test_lower_pe_gets_higher_score(self, dividend_scanner):
+        """PE 越低應得分越高（反向排名）。"""
+        dividend_scanner._df_valuation = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "date": [date(2025, 1, 25)] * 3,
+                "pe_ratio": [8.0, 15.0, 25.0],
+                "pb_ratio": [1.0, 1.0, 1.0],
+                "dividend_yield": [5.0, 5.0, 5.0],
+            }
+        )
+        result = dividend_scanner._compute_dividend_scores(["1000", "1001", "1002"])
+        scores = result.set_index("stock_id")["dividend_score"]
+        assert scores["1000"] > scores["1002"]
+
+    def test_no_valuation_data_returns_default(self, dividend_scanner):
+        """無估值資料時回傳 0.5。"""
+        dividend_scanner._df_valuation = pd.DataFrame()
+        result = dividend_scanner._compute_dividend_scores(["1000"])
+        assert result.iloc[0]["dividend_score"] == pytest.approx(0.5)
+
+
+class TestDividendFundamentalScores:
+    def test_with_acceleration(self, dividend_scanner):
+        """含加速度的 3 因子計算。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [20.0, -5.0],
+                "mom_growth": [10.0, -2.0],
+                "prev_yoy_growth": [10.0, 0.0],
+                "prev_mom_growth": [5.0, 0.0],
+            }
+        )
+        result = dividend_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_empty_revenue_returns_default(self, dividend_scanner):
+        result = dividend_scanner._compute_fundamental_scores(
+            ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+        )
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+
+class TestDividendRiskFilter:
+    def test_removes_high_volatility(self, dividend_scanner):
+        """波動率過濾應剔除前 10% 高波動股。"""
+        rows = []
+        sids = [f"{8000 + i}" for i in range(10)]
+        for i, sid in enumerate(sids):
+            for d in range(15):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                base = 100
+                spread = 20 if i == 9 else 0.5
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": base,
+                        "high": base + spread,
+                        "low": base - spread,
+                        "close": base + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        result = dividend_scanner._apply_risk_filter(scored, df_price)
+        assert len(result) < len(scored)
+
+
+class TestDividendRegimeWeights:
+    def test_weights_exist_for_all_regimes(self):
+        """確認 dividend 模式在三種 regime 下都有權重。"""
+        from src.regime.detector import MarketRegimeDetector
+
+        for regime in ["bull", "bear", "sideways"]:
+            w = MarketRegimeDetector.get_weights("dividend", regime)
+            assert "fundamental" in w
+            assert "dividend" in w
+            assert "chip" in w
+            assert "news" in w
+            assert abs(sum(w.values()) - 1.0) < 1e-6
+
+    def test_composite_weight_calculation(self, dividend_scanner):
+        """確認綜合分數依 regime 權重計算。"""
+        from src.regime.detector import MarketRegimeDetector
+
+        candidates = pd.DataFrame({"stock_id": ["1000"], "close": [100], "volume": [500_000]})
+        df_price = _make_momentum_price_df(25, 1)
+        df_price["stock_id"] = "1000"
+        df_inst = pd.DataFrame([{"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100}])
+        df_margin = pd.DataFrame()
+        df_revenue = pd.DataFrame({"stock_id": ["1000"], "yoy_growth": [10.0], "mom_growth": [5.0]})
+        dividend_scanner._df_valuation = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "date": [date(2025, 1, 25)],
+                "pe_ratio": [12.0],
+                "pb_ratio": [1.5],
+                "dividend_yield": [5.0],
+            }
+        )
+
+        result = dividend_scanner._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue)
+        fund = result.iloc[0]["fundamental_score"]
+        div = result.iloc[0]["dividend_score"]
+        chip = result.iloc[0]["chip_score"]
+        news = result.iloc[0]["news_score"]
+        regime = getattr(dividend_scanner, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights("dividend", regime)
+        expected = fund * w["fundamental"] + div * w["dividend"] + chip * w["chip"] + news * w.get("news", 0.10)
+        assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
+
+
+# ====================================================================== #
+#  GrowthScanner 測試
+# ====================================================================== #
+
+
+@pytest.fixture()
+def growth_scanner():
+    return GrowthScanner(
+        min_price=10,
+        max_price=2000,
+        min_volume=100_000,
+        top_n_candidates=10,
+        top_n_results=5,
+    )
+
+
+class TestGrowthCoarseFilter:
+    def test_yoy_threshold(self, growth_scanner):
+        """YoY > 10% 門檻過濾。"""
+        df_price = _make_price_df(10)
+        sids = df_price[df_price["date"] == df_price["date"].max()]["stock_id"].unique().tolist()
+
+        # 手動設定營收資料（只有部分 YoY > 10%）
+        growth_scanner._coarse_revenue = pd.DataFrame(
+            {
+                "stock_id": sids,
+                "yoy_growth": [15.0, 25.0, 5.0, -3.0, 50.0, 8.0, 11.0, 2.0, 30.0, 9.0],
+                "mom_growth": [5.0] * len(sids),
+            }
+        )
+        result = growth_scanner._coarse_filter(df_price, pd.DataFrame())
+        if not result.empty:
+            passed_ids = set(result["stock_id"].tolist())
+            for sid in passed_ids:
+                rev_row = growth_scanner._coarse_revenue[growth_scanner._coarse_revenue["stock_id"] == sid]
+                assert rev_row.iloc[0]["yoy_growth"] > 10.0
+
+    def test_no_revenue_returns_empty(self, growth_scanner):
+        """無營收資料時回傳空。"""
+        df_price = _make_price_df(5)
+        growth_scanner._coarse_revenue = pd.DataFrame()
+        result = growth_scanner._coarse_filter(df_price, pd.DataFrame())
+        assert result.empty
+
+
+class TestGrowthTechnicalScores:
+    def test_scores_in_valid_range(self, growth_scanner):
+        df_price = _make_momentum_price_df(25, 5)
+        sids = df_price["stock_id"].unique().tolist()
+        result = growth_scanner._compute_technical_scores(sids, df_price)
+        assert (result["technical_score"] >= 0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+    def test_insufficient_data_gets_default(self, growth_scanner):
+        df_price = pd.DataFrame(
+            [
+                {
+                    "stock_id": "9999",
+                    "date": date(2025, 1, 3),
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 500_000,
+                }
+            ]
+        )
+        result = growth_scanner._compute_technical_scores(["9999"], df_price)
+        assert result.iloc[0]["technical_score"] == pytest.approx(0.5)
+
+    def test_stronger_momentum_higher_score(self, growth_scanner):
+        """動能更強的股票，技術分數應更高。"""
+        df_price = _make_momentum_price_df(25, 5)
+        sids = df_price["stock_id"].unique().tolist()
+        result = growth_scanner._compute_technical_scores(sids, df_price)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["2004"] >= scores["2000"]
+
+
+class TestGrowthFundamentalScores:
+    def test_with_acceleration(self, growth_scanner):
+        """含加速度的 3 因子計算。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [20.0, 20.0],
+                "mom_growth": [5.0, 5.0],
+                "prev_yoy_growth": [10.0, 30.0],  # 1000 加速，1001 減速
+                "prev_mom_growth": [5.0, 5.0],
+            }
+        )
+        result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_empty_revenue_returns_default(self, growth_scanner):
+        result = growth_scanner._compute_fundamental_scores(
+            ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+        )
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+
+class TestGrowthChipScores:
+    def test_empty_inst_returns_default(self, growth_scanner):
+        result = growth_scanner._compute_chip_scores(["1000"], pd.DataFrame())
+        assert result.iloc[0]["chip_score"] == pytest.approx(0.5)
+
+    def test_margin_data_adds_short_margin_factor(self, growth_scanner):
+        """有融資融券資料時，籌碼面使用 4 因子加權（含券資比）。"""
+        sids = ["1000", "1001"]
+        df_inst = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100},
+            ]
+        )
+        df_margin = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "margin_balance": 1000, "short_balance": 500},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "margin_balance": 1000, "short_balance": 100},
+            ]
+        )
+        result = growth_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
+        assert len(result) == 2
+        scores = result.set_index("stock_id")["chip_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_consecutive_foreign_buy(self, growth_scanner):
+        """外資連續買超天數越多分數越高。"""
+        sids = ["1000", "1001"]
+        rows = []
+        for d in range(5):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append({"stock_id": "1000", "date": day, "name": "外資買賣超", "net": 100 if d == 4 else -50})
+            rows.append({"stock_id": "1001", "date": day, "name": "外資買賣超", "net": 500})
+        df_inst = pd.DataFrame(rows)
+        df_price = _make_momentum_price_df(5, 2)
+        df_price["stock_id"] = df_price["stock_id"].map({"2000": "1000", "2001": "1001"})
+        result = growth_scanner._compute_chip_scores(sids, df_inst, df_price)
+        scores = result.set_index("stock_id")["chip_score"]
+        assert scores["1001"] > scores["1000"]
+
+
+class TestGrowthRiskFilter:
+    def test_removes_high_atr(self, growth_scanner):
+        """ATR 過濾應剔除前 20% 高波動股。"""
+        rows = []
+        sids = [f"{9000 + i}" for i in range(10)]
+        for i, sid in enumerate(sids):
+            for d in range(15):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                base = 100 + i * 10
+                spread = 20 if i == 9 else 1
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": base,
+                        "high": base + spread,
+                        "low": base - spread,
+                        "close": base + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        result = growth_scanner._apply_risk_filter(scored, df_price)
+        assert len(result) < len(scored)
+
+    def test_empty_scored_returns_empty(self, growth_scanner):
+        result = growth_scanner._apply_risk_filter(pd.DataFrame(columns=["stock_id"]), pd.DataFrame())
+        assert result.empty
+
+
+class TestGrowthRegimeWeights:
+    def test_weights_exist_for_all_regimes(self):
+        """確認 growth 模式在三種 regime 下都有權重。"""
+        from src.regime.detector import MarketRegimeDetector
+
+        for regime in ["bull", "bear", "sideways"]:
+            w = MarketRegimeDetector.get_weights("growth", regime)
+            assert "fundamental" in w
+            assert "technical" in w
+            assert "chip" in w
+            assert "news" in w
+            assert abs(sum(w.values()) - 1.0) < 1e-6
+
+    def test_composite_weight_calculation(self, growth_scanner):
+        """確認綜合分數依 regime 權重計算。"""
+        from src.regime.detector import MarketRegimeDetector
+
+        candidates = pd.DataFrame({"stock_id": ["2000"], "close": [100], "volume": [500_000]})
+        df_price = _make_momentum_price_df(25, 1)
+        df_inst = pd.DataFrame([{"stock_id": "2000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100}])
+        df_margin = pd.DataFrame()
+        df_revenue = pd.DataFrame({"stock_id": ["2000"], "yoy_growth": [30.0], "mom_growth": [10.0]})
+
+        result = growth_scanner._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue)
+        tech = result.iloc[0]["technical_score"]
+        fund = result.iloc[0]["fundamental_score"]
+        chip = result.iloc[0]["chip_score"]
+        news = result.iloc[0]["news_score"]
+        regime = getattr(growth_scanner, "regime", "sideways")
+        w = MarketRegimeDetector.get_weights("growth", regime)
+        expected = fund * w["fundamental"] + tech * w["technical"] + chip * w["chip"] + news * w.get("news", 0.10)
+        assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)

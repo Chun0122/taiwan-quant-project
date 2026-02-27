@@ -43,6 +43,16 @@ REGIME_WEIGHTS: dict[str, dict[RegimeType, dict[str, float]]] = {
         "sideways": {"fundamental": 0.45, "valuation": 0.25, "chip": 0.15, "news": 0.15},
         "bear": {"fundamental": 0.50, "valuation": 0.20, "chip": 0.10, "news": 0.20},
     },
+    "dividend": {
+        "bull": {"fundamental": 0.35, "dividend": 0.35, "chip": 0.20, "news": 0.10},
+        "sideways": {"fundamental": 0.40, "dividend": 0.30, "chip": 0.15, "news": 0.15},
+        "bear": {"fundamental": 0.45, "dividend": 0.25, "chip": 0.10, "news": 0.20},
+    },
+    "growth": {
+        "bull": {"fundamental": 0.45, "technical": 0.30, "chip": 0.15, "news": 0.10},
+        "sideways": {"fundamental": 0.40, "technical": 0.25, "chip": 0.20, "news": 0.15},
+        "bear": {"fundamental": 0.50, "technical": 0.15, "chip": 0.15, "news": 0.20},
+    },
 }
 
 
@@ -182,7 +192,7 @@ class MarketRegimeDetector:
         """取得指定模式 + 市場狀態下的權重。
 
         Args:
-            mode: discover 模式名稱 ("momentum", "swing", "value")
+            mode: discover 模式名稱 ("momentum", "swing", "value", "dividend", "growth")
             regime: 市場狀態 ("bull", "bear", "sideways")
 
         Returns:

@@ -622,11 +622,13 @@ python main.py industry --notify
 
 ### 4.13 全市場選股掃描 (`discover`)
 
-從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援三種掃描模式：
+從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援五種掃描模式：
 
 - **momentum**（預設）：短線動能股（1~10 天），抓突破 + 資金流 + 量能擴張
 - **swing**：中期波段股（1~3 個月），抓趨勢 + 基本面 + 法人布局
 - **value**：價值修復股，低估值 + 基本面轉佳 + 法人布局
+- **dividend**：高息存股，高殖利率 + 配息穩定 + 估值合理
+- **growth**：高成長股，營收高速成長 + 動能啟動
 
 **漏斗架構：**
 ```
@@ -655,6 +657,12 @@ python main.py discover swing --top 20
 # 價值修復模式（低 PE + 高殖利率 + 基本面轉佳）
 python main.py discover value --top 20
 
+# 高息存股模式（殖利率 > 3% + PE > 0 + 配息穩定）
+python main.py discover dividend --top 20
+
+# 高成長模式（營收 YoY > 10% + 動能啟動）
+python main.py discover growth --top 20
+
 # 調整股價範圍
 python main.py discover momentum --min-price 50 --max-price 500
 
@@ -673,7 +681,7 @@ python main.py discover momentum --skip-sync --compare
 
 | 參數 | 說明 |
 |------|------|
-| `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復），預設 momentum |
+| `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復）、`dividend`（高息存股）、`growth`（高成長），預設 momentum |
 | `--top N` | 顯示前 N 名（預設 20） |
 | `--min-price N` | 最低股價門檻（預設 10） |
 | `--max-price N` | 最高股價門檻（預設 2000） |
@@ -712,6 +720,26 @@ python main.py discover momentum --skip-sync --compare
 | 粗篩門檻 | — | PE > 0 且 < 30、殖利率 > 2% |
 | 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
 
+**Dividend 模式：**
+
+| 維度 | 權重 | 因子 |
+|------|------|------|
+| 基本面 | 35~45% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 殖利率面 | 25~35% | 殖利率排名(50%)、PE反向排名(30%)、PB反向排名(20%) |
+| 籌碼面 | 10~20% | 投信近期買超(50%)、法人累積買超(50%) |
+| 粗篩門檻 | — | 殖利率 > 3%、PE > 0 |
+| 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
+
+**Growth 模式：**
+
+| 維度 | 權重 | 因子 |
+|------|------|------|
+| 基本面 | 40~50% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 技術面 | 15~30% | 5日動能、10日動能、20日突破、量比、成交量加速 |
+| 籌碼面 | 15~20% | 外資連續買超天數 + 買超佔量比 + 合計買超 + 券資比（有資料時） |
+| 粗篩門檻 | — | 營收 YoY > 10% |
+| 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
+
 **Regime 權重調整矩陣（系統自動偵測）：**
 
 | 模式 | 面向 | 多頭 | 盤整 | 空頭 |
@@ -719,6 +747,8 @@ python main.py discover momentum --skip-sync --compare
 | Momentum | Tech / Chip / Fund / News | 45/35/10/10 | 40/40/10/10 | 30/40/15/15 |
 | Swing | Tech / Chip / Fund / News | 30/20/40/10 | 25/25/35/15 | 15/25/45/15 |
 | Value | Fund / Val / Chip / News | 40/35/15/10 | 45/25/15/15 | 50/20/10/20 |
+| Dividend | Fund / Div / Chip / News | 35/35/20/10 | 40/30/15/15 | 45/25/10/20 |
+| Growth | Fund / Tech / Chip / News | 45/30/15/10 | 40/25/20/15 | 50/15/15/20 |
 
 **篩選流程說明：**
 
@@ -761,7 +791,7 @@ python main.py discover-backtest --mode momentum --export result.csv
 
 | 參數 | 說明 |
 |------|------|
-| `--mode` | 必填，掃描模式：`momentum` / `swing` / `value` |
+| `--mode` | 必填，掃描模式：`momentum` / `swing` / `value` / `dividend` / `growth` |
 | `--days` | 持有天數，逗號分隔（預設 `5,10,20`） |
 | `--top` | 只計算每次掃描前 N 名的績效（預設全部） |
 | `--start` | 掃描日期範圍起始（YYYY-MM-DD） |

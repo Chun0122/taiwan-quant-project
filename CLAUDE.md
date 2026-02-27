@@ -25,6 +25,8 @@ python main.py discover --top 20             # 全市場掃描（預設 momentum
 python main.py discover momentum --top 20   # 短線動能掃描
 python main.py discover swing --top 20      # 中期波段掃描
 python main.py discover value --top 20      # 價值修復掃描
+python main.py discover dividend --top 20   # 高息存股掃描
+python main.py discover growth --top 20     # 高成長掃描
 python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
 python main.py discover --compare            # 顯示與上次推薦的差異比較
 python main.py discover-backtest --mode momentum  # 推薦績效回測（預設 5,10,20 天）
@@ -35,7 +37,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，206 個測試覆蓋核心模組：
+使用 pytest 測試框架，231 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -56,7 +58,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算                | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
-| `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value 四類掃描 + 產業加成 | 純函數                 |
+| `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value+Dividend+Growth 六類掃描 + 產業加成 | 純函數                 |
 | `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
 | `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 | 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
@@ -121,9 +123,9 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
 | `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
-| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value 三模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%），權重依 Regime 動態調整。Value 模式粗篩為嚴格模式：必須有估值資料且 PE 或殖利率至少一項合格 |
+| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value / Dividend / Growth 五模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%），權重依 Regime 動態調整。Value/Dividend 模式粗篩為嚴格模式：必須有估值資料。Growth 模式粗篩需 YoY > 10% |
 | `src/discovery/performance.py`      | Discover 推薦績效回測（讀取歷史推薦 vs DailyPrice，計算 N 日報酬率、勝率、三層聚合統計）                           |
-| `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出各模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
+| `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出五模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用               |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
 | `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |
@@ -156,6 +158,22 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
     1. `CLAUDE.md`：若涉及架構變更、新增指令、新增測試或模組職責異動，須立即修正。
     2. `usage.md`：若涉及用戶端指令 (CLI) 參數變動、工作流程調整或新功能上線，須同步更新使用手冊。
   - **排除對象**：僅進行「規劃 (Planning)」或「詢問 (Ask)」而不涉及實際檔案寫入時，無需更新。
+
+## Pending Tasks
+
+依優先順序排列，完成後將狀態改為 ✅：
+
+| # | 狀態 | 項目 | 說明 |
+|---|------|------|------|
+| 1 | ✅ | **新增 Scanner 模式（高息股 / 高成長）** | DividendScanner（殖利率>3%、PE>0）+ GrowthScanner（YoY>10%、動能確認），已完成並通過 231 測試 |
+| 2 | ⬜ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖），參考 industry_rotation.py |
+| 3 | ⬜ | **補齊測試覆蓋** | 為缺少測試的模組補充單元測試：strategy、portfolio、walk_forward、grid_search、screener engine、indicators、report engine、formatter、pipeline、notification |
+| 4 | ⬜ | **CLI `validate` 命令（資料品質檢查）** | 檢測缺漏交易日、異常值（連續漲跌停、零成交量）、資料表日期範圍不一致，輸出品質報告 |
+| 5 | ⬜ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），目前僅 equal_weight |
+| 6 | ⬜ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），新增 FinancialStatement ORM 表 |
+| 7 | ⬜ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度雷達圖 |
+| 8 | ⬜ | **CLI `export`/`import` 通用命令** | export：匯出任意資料表為 CSV/Parquet；import：從 CSV 批次匯入自訂資料（含驗證） |
+| 9 | ⬜ | **個股分析頁面增強** | 成交量柱狀圖疊加 K 線、技術指標可勾選疊加、法人買賣超累積圖、融資融券走勢、MOPS 公告時間軸 |
 
 ## 已確認事項（規劃時勿重複提出）
 
