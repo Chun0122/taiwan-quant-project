@@ -27,6 +27,7 @@ python main.py discover swing --top 20      # 中期波段掃描
 python main.py discover value --top 20      # 價值修復掃描
 python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
 python main.py discover --compare            # 顯示與上次推薦的差異比較
+python main.py discover-backtest --mode momentum  # 推薦績效回測（預設 5,10,20 天）
 python main.py sync-mops                     # 同步 MOPS 重大訊息（預設 7 天）
 python main.py sync-mops --days 30           # 同步最近 30 天
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
@@ -34,7 +35,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，201 個測試覆蓋核心模組：
+使用 pytest 測試框架，206 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -61,6 +62,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
+| `tests/test_discover_performance.py` | `src/discovery/performance.py` 推薦績效回測    | in-memory SQLite       |
 | `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord        | in-memory SQLite       |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
@@ -120,6 +122,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
 | `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
 | `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value 三模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%），權重依 Regime 動態調整。Value 模式粗篩為嚴格模式：必須有估值資料且 PE 或殖利率至少一項合格 |
+| `src/discovery/performance.py`      | Discover 推薦績效回測（讀取歷史推薦 vs DailyPrice，計算 N 日報酬率、勝率、三層聚合統計）                           |
 | `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出各模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用               |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |

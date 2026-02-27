@@ -71,6 +71,13 @@ Usage:
     python main.py discover --skip-sync --top 10
     python main.py discover --export picks.csv --notify
 
+    # Discover 推薦績效回測
+    python main.py discover-backtest --mode momentum
+    python main.py discover-backtest --mode swing --days 5,10,20,60
+    python main.py discover-backtest --mode value --top 10
+    python main.py discover-backtest --mode momentum --start 2025-06-01 --end 2025-12-31
+    python main.py discover-backtest --mode momentum --export result.csv
+
     # DB 遷移
     python main.py migrate
 """
@@ -993,6 +1000,34 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         print("資料庫已是最新，無需遷移")
 
 
+def cmd_discover_backtest(args: argparse.Namespace) -> None:
+    """評估 Discover 推薦的歷史績效。"""
+    from src.data.database import init_db
+    from src.discovery.performance import DiscoveryPerformance, print_performance_report
+
+    init_db()
+
+    holding_days = [int(d) for d in args.days.split(",")]
+
+    perf = DiscoveryPerformance(
+        mode=args.mode,
+        holding_days=holding_days,
+        top_n=args.top,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+    print(f"正在計算 {args.mode} 推薦績效...")
+    result = perf.evaluate()
+
+    print_performance_report(result, args.mode, args.start, args.end)
+
+    # 匯出 CSV
+    if args.export and not result["detail"].empty:
+        result["detail"].to_csv(args.export, index=False, encoding="utf-8-sig")
+        print(f"\n明細已匯出至: {args.export}")
+
+
 def main() -> None:
     setup_logging()
 
@@ -1139,6 +1174,15 @@ def main() -> None:
     sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
     sp_disc.add_argument("--compare", action="store_true", help="顯示與上次推薦的差異比較")
 
+    # discover-backtest 子命令
+    sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
+    sp_db.add_argument("--mode", required=True, choices=["momentum", "swing", "value"], help="掃描模式")
+    sp_db.add_argument("--days", default="5,10,20", help="持有天數（逗號分隔，預設 5,10,20）")
+    sp_db.add_argument("--top", type=int, default=None, help="只計算每次掃描前 N 名的績效")
+    sp_db.add_argument("--start", default=None, help="掃描日期範圍起始 (YYYY-MM-DD)")
+    sp_db.add_argument("--end", default=None, help="掃描日期範圍結束 (YYYY-MM-DD)")
+    sp_db.add_argument("--export", default=None, help="匯出明細 CSV 路徑")
+
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")
 
@@ -1178,6 +1222,8 @@ def main() -> None:
         cmd_industry(args)
     elif args.command == "discover":
         cmd_discover(args)
+    elif args.command == "discover-backtest":
+        cmd_discover_backtest(args)
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "migrate":

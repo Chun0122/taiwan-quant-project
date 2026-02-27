@@ -736,7 +736,47 @@ python main.py discover momentum --skip-sync --compare
 
 > **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收與估值資料。若無 Token，基本面/估值分數會 fallback 到 0.5（中性值），不影響其他維度評分。
 
-### 4.14 同步 MOPS 重大訊息 (`sync-mops`)
+### 4.14 Discover 推薦績效回測 (`discover-backtest`)
+
+評估歷史 `discover` 推薦的實際表現：讀取 DiscoveryRecord 歷史記錄，對照 DailyPrice 計算推薦後 N 天的實際報酬率，輸出勝率/平均報酬/最大虧損等統計。
+
+```bash
+# 評估 momentum 推薦績效（預設持有 5,10,20 天）
+python main.py discover-backtest --mode momentum
+
+# 自訂持有天數
+python main.py discover-backtest --mode swing --days 5,10,20,60
+
+# 只看每次掃描前 10 名的績效
+python main.py discover-backtest --mode value --top 10
+
+# 指定掃描日期範圍
+python main.py discover-backtest --mode momentum --start 2025-06-01 --end 2025-12-31
+
+# 匯出明細 CSV
+python main.py discover-backtest --mode momentum --export result.csv
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `--mode` | 必填，掃描模式：`momentum` / `swing` / `value` |
+| `--days` | 持有天數，逗號分隔（預設 `5,10,20`） |
+| `--top` | 只計算每次掃描前 N 名的績效（預設全部） |
+| `--start` | 掃描日期範圍起始（YYYY-MM-DD） |
+| `--end` | 掃描日期範圍結束（YYYY-MM-DD） |
+| `--export` | 匯出明細 CSV 路徑 |
+
+**輸出三層聚合：**
+
+1. **整體摘要**：每個持有天數的勝率、平均報酬、中位數、最大獲利/虧損
+2. **逐次掃描**：每個掃描日期的平均報酬、勝率、最佳/最差個股
+3. **個股明細**：每筆推薦的報酬率（供 `--export` 匯出）
+
+> **前提**：須先有足夠的 `discover` 歷史記錄（每次執行 `discover` 會自動存入 DB），以及推薦日之後的 DailyPrice 資料。
+
+### 4.15 同步 MOPS 重大訊息 (`sync-mops`)
 
 從公開資訊觀測站（MOPS）備援站抓取上市/上櫃公司最新重大訊息公告。資料用於 discover 的消息面評分。
 
@@ -749,7 +789,7 @@ python main.py sync-mops
 
 > **注意**：MOPS 備援站僅提供最新一個交易日的公告，無法查詢歷史資料。建議搭配每日排程使用，逐日累積公告歷史。`discover` 命令的全市場同步也會自動附帶 MOPS 同步。
 
-### 4.15 資料庫遷移 (`migrate`)
+### 4.16 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -764,7 +804,7 @@ python main.py migrate
 
 已存在的欄位會自動跳過，可重複執行。
 
-### 4.16 查看資料庫概況 (`status`)
+### 4.17 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
