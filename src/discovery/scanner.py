@@ -1683,11 +1683,11 @@ class ValueScanner(MarketScanner):
                 on="stock_id",
                 how="left",
             )
-            # 有估值資料的才做 PE/殖利率過濾
+            # 嚴格模式：必須有估值資料，且 PE 或殖利率至少一項合格
             has_val = filtered["pe_ratio"].notna()
             pe_ok = (filtered["pe_ratio"] > 0) & (filtered["pe_ratio"] < 30)
             dy_ok = filtered["dividend_yield"] > 2.0
-            filtered = filtered[~has_val | (pe_ok & dy_ok)].copy()
+            filtered = filtered[has_val & (pe_ok | dy_ok)].copy()
         else:
             filtered["pe_ratio"] = None
             filtered["pb_ratio"] = None
