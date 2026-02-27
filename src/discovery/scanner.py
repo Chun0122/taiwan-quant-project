@@ -451,8 +451,9 @@ class MarketScanner:
         scored = scored.merge(bonus_df, on="stock_id", how="left")
         scored["sector_bonus"] = scored["sector_bonus"].fillna(0.0)
         scored["composite_score"] = scored["composite_score"] * (1 + scored["sector_bonus"])
-        logger.info("Stage 3.3: 產業加成已套用（範圍 %.3f ~ %.3f）",
-                     scored["sector_bonus"].min(), scored["sector_bonus"].max())
+        logger.info(
+            "Stage 3.3: 產業加成已套用（範圍 %.3f ~ %.3f）", scored["sector_bonus"].min(), scored["sector_bonus"].max()
+        )
         return scored
 
     # ------------------------------------------------------------------ #

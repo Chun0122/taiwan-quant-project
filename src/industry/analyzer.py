@@ -268,9 +268,7 @@ class IndustryRotationAnalyzer:
         # 從 StockInfo 取得 stock_id → industry_category 對照
         with get_session() as session:
             rows = session.execute(
-                select(StockInfo.stock_id, StockInfo.industry_category).where(
-                    StockInfo.stock_id.in_(stock_ids)
-                )
+                select(StockInfo.stock_id, StockInfo.industry_category).where(StockInfo.stock_id.in_(stock_ids))
             ).all()
         industry_map = {r[0]: (r[1] or "未分類") for r in rows}
 

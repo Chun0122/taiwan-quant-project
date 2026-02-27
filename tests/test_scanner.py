@@ -989,16 +989,20 @@ class TestApplySectorBonus:
 
     def test_sector_bonus_applied_to_composite_score(self, scanner):
         """sector_bonus 應乘以 (1 + bonus) 套用到 composite_score。"""
-        scored = pd.DataFrame({
-            "stock_id": ["1000", "1001"],
-            "composite_score": [0.8, 0.6],
-        })
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "composite_score": [0.8, 0.6],
+            }
+        )
         # Mock _compute_sector_bonus 回傳已知值
         original_method = scanner._compute_sector_bonus
-        scanner._compute_sector_bonus = lambda sids: pd.DataFrame({
-            "stock_id": sids,
-            "sector_bonus": [0.05, -0.05],
-        })
+        scanner._compute_sector_bonus = lambda sids: pd.DataFrame(
+            {
+                "stock_id": sids,
+                "sector_bonus": [0.05, -0.05],
+            }
+        )
         try:
             result = scanner._apply_sector_bonus(scored)
             assert "sector_bonus" in result.columns
@@ -1015,14 +1019,18 @@ class TestApplySectorBonus:
 
     def test_zero_bonus_no_change(self, scanner):
         """bonus=0 時 composite_score 不變。"""
-        scored = pd.DataFrame({
-            "stock_id": ["1000"],
-            "composite_score": [0.75],
-        })
-        scanner._compute_sector_bonus = lambda sids: pd.DataFrame({
-            "stock_id": sids,
-            "sector_bonus": [0.0],
-        })
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "composite_score": [0.75],
+            }
+        )
+        scanner._compute_sector_bonus = lambda sids: pd.DataFrame(
+            {
+                "stock_id": sids,
+                "sector_bonus": [0.0],
+            }
+        )
         result = scanner._apply_sector_bonus(scored)
         assert result.iloc[0]["composite_score"] == pytest.approx(0.75, abs=1e-6)
 
