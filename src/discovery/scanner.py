@@ -536,43 +536,58 @@ class MarketScanner:
         df_revenue: pd.DataFrame,
         df_ann: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """對候選股進行四維度評分：技術 + 籌碼 + 基本面 + 消息面。"""
+        """對候選股進行多維度評分（通用流程）。
+
+        子類透過覆寫 _compute_*  方法客製化各維度計算，
+        透過 _compute_extra_scores() 新增額外維度，
+        透過 _post_score() 做加權後處理。
+        """
         stock_ids = candidates["stock_id"].tolist()
+        ann = df_ann if df_ann is not None else pd.DataFrame()
 
-        # --- 技術分數 ---
-        tech_scores = self._compute_technical_scores(stock_ids, df_price)
-
-        # --- 籌碼分數 ---
-        chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
-
-        # --- 基本面分數 ---
-        fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
-
-        # --- 消息面分數 ---
-        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
+        # 各維度分數（子類覆寫 _compute_* 即可客製化）
+        score_dfs = [
+            self._compute_technical_scores(stock_ids, df_price),
+            self._compute_chip_scores(stock_ids, df_inst, df_price, df_margin),
+            self._compute_fundamental_scores(stock_ids, df_revenue),
+            self._compute_news_scores(stock_ids, ann),
+        ]
+        # hook：子類可加額外維度（如 ValueScanner 的 valuation_score）
+        score_dfs.extend(self._compute_extra_scores(stock_ids))
 
         candidates = candidates.copy()
-        candidates = candidates.merge(tech_scores, on="stock_id", how="left")
-        candidates = candidates.merge(chip_scores, on="stock_id", how="left")
-        candidates = candidates.merge(fund_scores, on="stock_id", how="left")
-        candidates = candidates.merge(news_scores, on="stock_id", how="left")
-        candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
-        candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
-        candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
-        candidates["news_score"] = candidates["news_score"].fillna(0.5)
+        for df in score_dfs:
+            candidates = candidates.merge(df, on="stock_id", how="left")
 
-        # 綜合分數（含消息面第四維度）
+        # 所有 *_score 欄位 fillna(0.5)
+        score_cols = [c for c in candidates.columns if c.endswith("_score") and c != "composite_score"]
+        for col in score_cols:
+            candidates[col] = candidates[col].fillna(0.5)
+
+        # 根據 regime 動態加權（weight key 直接映射 {key}_score 欄位）
         from src.regime.detector import MarketRegimeDetector
 
         regime = getattr(self, "regime", "sideways")
         w = MarketRegimeDetector.get_weights(self.mode_name, regime)
-        candidates["composite_score"] = (
-            candidates["technical_score"] * w.get("technical", 0.35)
-            + candidates["chip_score"] * w.get("chip", 0.40)
-            + candidates["fundamental_score"] * w.get("fundamental", 0.20)
-            + candidates["news_score"] * w.get("news", 0.10)
-        )
 
+        composite = pd.Series(0.0, index=candidates.index)
+        for key, weight in w.items():
+            col = f"{key}_score"
+            if col in candidates.columns:
+                composite += candidates[col] * weight
+        candidates["composite_score"] = composite
+
+        # hook：子類可在加權後做額外處理
+        candidates = self._post_score(candidates)
+
+        return candidates
+
+    def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
+        """hook：子類可覆寫以新增額外評分維度。回傳 DataFrame 的 list。"""
+        return []
+
+    def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """hook：子類可在加權後做額外處理。"""
         return candidates
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
@@ -662,7 +677,11 @@ class MarketScanner:
         return pd.DataFrame(results)
 
     def _compute_chip_scores(
-        self, stock_ids: list[str], df_inst: pd.DataFrame, df_price: pd.DataFrame | None = None
+        self,
+        stock_ids: list[str],
+        df_inst: pd.DataFrame,
+        df_price: pd.DataFrame | None = None,
+        df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """計算籌碼面分數（5 因子：淨買超 × 3 + 連續買超天數 + 買超佔量比）。"""
         if df_inst.empty:
@@ -907,47 +926,6 @@ class MomentumScanner(MarketScanner):
 
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
-
-    def _score_candidates(
-        self,
-        candidates: pd.DataFrame,
-        df_price: pd.DataFrame,
-        df_inst: pd.DataFrame,
-        df_margin: pd.DataFrame,
-        df_revenue: pd.DataFrame,
-        df_ann: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
-        """動能模式細評：技術 + 籌碼 + 基本面 + 消息面（權重依 regime 動態調整）。"""
-        stock_ids = candidates["stock_id"].tolist()
-
-        tech_scores = self._compute_technical_scores(stock_ids, df_price)
-        chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price, df_margin)
-        fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
-        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
-
-        candidates = candidates.copy()
-        candidates = candidates.merge(tech_scores, on="stock_id", how="left")
-        candidates = candidates.merge(chip_scores, on="stock_id", how="left")
-        candidates = candidates.merge(fund_scores, on="stock_id", how="left")
-        candidates = candidates.merge(news_scores, on="stock_id", how="left")
-        candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
-        candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
-        candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
-        candidates["news_score"] = candidates["news_score"].fillna(0.5)
-
-        # 綜合分數：根據 regime 動態調整權重
-        regime = getattr(self, "regime", "sideways")
-        from src.regime.detector import MarketRegimeDetector
-
-        w = MarketRegimeDetector.get_weights("momentum", regime)
-        candidates["composite_score"] = (
-            candidates["technical_score"] * w["technical"]
-            + candidates["chip_score"] * w["chip"]
-            + candidates["fundamental_score"] * w["fundamental"]
-            + candidates["news_score"] * w.get("news", 0.10)
-        )
-
-        return candidates
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """動能模式技術面 5 因子：5日動能 + 10日動能 + 20日突破 + 量比 + 成交量加速。"""
@@ -1297,47 +1275,6 @@ class SwingScanner(MarketScanner):
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
 
-    def _score_candidates(
-        self,
-        candidates: pd.DataFrame,
-        df_price: pd.DataFrame,
-        df_inst: pd.DataFrame,
-        df_margin: pd.DataFrame,
-        df_revenue: pd.DataFrame,
-        df_ann: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
-        """波段模式細評：技術 + 籌碼 + 基本面 + 消息面（權重依 regime 動態調整）。"""
-        stock_ids = candidates["stock_id"].tolist()
-
-        tech_scores = self._compute_technical_scores(stock_ids, df_price)
-        chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
-        fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
-        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
-
-        candidates = candidates.copy()
-        candidates = candidates.merge(tech_scores, on="stock_id", how="left")
-        candidates = candidates.merge(chip_scores, on="stock_id", how="left")
-        candidates = candidates.merge(fund_scores, on="stock_id", how="left")
-        candidates = candidates.merge(news_scores, on="stock_id", how="left")
-        candidates["technical_score"] = candidates["technical_score"].fillna(0.5)
-        candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
-        candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
-        candidates["news_score"] = candidates["news_score"].fillna(0.5)
-
-        # 綜合分數：根據 regime 動態調整權重
-        regime = getattr(self, "regime", "sideways")
-        from src.regime.detector import MarketRegimeDetector
-
-        w = MarketRegimeDetector.get_weights("swing", regime)
-        candidates["composite_score"] = (
-            candidates["technical_score"] * w["technical"]
-            + candidates["chip_score"] * w["chip"]
-            + candidates["fundamental_score"] * w["fundamental"]
-            + candidates["news_score"] * w.get("news", 0.10)
-        )
-
-        return candidates
-
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """波段模式技術面 4 因子：趨勢確認 + 均線排列 + 60日動能 + 量價齊揚。"""
         results = []
@@ -1392,7 +1329,11 @@ class SwingScanner(MarketScanner):
         return pd.DataFrame(results)
 
     def _compute_chip_scores(
-        self, stock_ids: list[str], df_inst: pd.DataFrame, df_price: pd.DataFrame | None = None
+        self,
+        stock_ids: list[str],
+        df_inst: pd.DataFrame,
+        df_price: pd.DataFrame | None = None,
+        df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """波段模式籌碼面 2 因子：投信淨買超 50% + 三大法人 20 日累積買超 50%。"""
         if df_inst.empty:
@@ -1725,48 +1666,14 @@ class ValueScanner(MarketScanner):
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
 
-    def _score_candidates(
-        self,
-        candidates: pd.DataFrame,
-        df_price: pd.DataFrame,
-        df_inst: pd.DataFrame,
-        df_margin: pd.DataFrame,
-        df_revenue: pd.DataFrame,
-        df_ann: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
-        """價值模式細評：基本面 + 估值面 + 籌碼面 + 消息面（權重依 regime 動態調整）。"""
-        stock_ids = candidates["stock_id"].tolist()
+    def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
+        """價值模式額外維度：估值面分數。"""
+        return [self._compute_valuation_scores(stock_ids)]
 
-        fund_scores = self._compute_fundamental_scores(stock_ids, df_revenue)
-        val_scores = self._compute_valuation_scores(stock_ids)
-        chip_scores = self._compute_chip_scores(stock_ids, df_inst, df_price)
-        news_scores = self._compute_news_scores(stock_ids, df_ann if df_ann is not None else pd.DataFrame())
-
-        candidates = candidates.copy()
-        candidates = candidates.merge(fund_scores, on="stock_id", how="left")
-        candidates = candidates.merge(val_scores, on="stock_id", how="left")
-        candidates = candidates.merge(chip_scores, on="stock_id", how="left")
-        candidates = candidates.merge(news_scores, on="stock_id", how="left")
-        candidates["fundamental_score"] = candidates["fundamental_score"].fillna(0.5)
-        candidates["valuation_score"] = candidates["valuation_score"].fillna(0.5)
-        candidates["chip_score"] = candidates["chip_score"].fillna(0.5)
-        candidates["news_score"] = candidates["news_score"].fillna(0.5)
-
-        # 用 technical_score 欄位存估值分數（供 _rank_and_enrich 保留）
-        candidates["technical_score"] = candidates["valuation_score"]
-
-        # 綜合分數：根據 regime 動態調整權重
-        regime = getattr(self, "regime", "sideways")
-        from src.regime.detector import MarketRegimeDetector
-
-        w = MarketRegimeDetector.get_weights("value", regime)
-        candidates["composite_score"] = (
-            candidates["fundamental_score"] * w["fundamental"]
-            + candidates["valuation_score"] * w["valuation"]
-            + candidates["chip_score"] * w["chip"]
-            + candidates["news_score"] * w.get("news", 0.10)
-        )
-
+    def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """用 technical_score 欄位存估值分數（供 _rank_and_enrich 顯示用）。"""
+        if "valuation_score" in candidates.columns:
+            candidates["technical_score"] = candidates["valuation_score"]
         return candidates
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
@@ -1820,7 +1727,11 @@ class ValueScanner(MarketScanner):
         return result
 
     def _compute_chip_scores(
-        self, stock_ids: list[str], df_inst: pd.DataFrame, df_price: pd.DataFrame | None = None
+        self,
+        stock_ids: list[str],
+        df_inst: pd.DataFrame,
+        df_price: pd.DataFrame | None = None,
+        df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """價值模式籌碼面 2 因子：投信近期買超 50% + 三大法人累積 50%。"""
         if df_inst.empty:
