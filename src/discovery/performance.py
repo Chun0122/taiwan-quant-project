@@ -144,9 +144,11 @@ class DiscoveryPerformance:
             entry_close = rec["close"]
 
             # 取該股票在推薦日之後的價格序列
-            future_prices = prices_df[
-                (prices_df["stock_id"] == stock_id) & (prices_df["date"] > scan_date)
-            ].sort_values("date").reset_index(drop=True)
+            future_prices = (
+                prices_df[(prices_df["stock_id"] == stock_id) & (prices_df["date"] > scan_date)]
+                .sort_values("date")
+                .reset_index(drop=True)
+            )
 
             row = {
                 "scan_date": scan_date,
@@ -179,26 +181,30 @@ class DiscoveryPerformance:
             col = f"return_{days}d"
             valid = detail[col].dropna()
             if valid.empty:
-                rows.append({
-                    "holding_days": days,
-                    "evaluable": 0,
-                    "win_rate": None,
-                    "avg_return": None,
-                    "median_return": None,
-                    "max_gain": None,
-                    "max_loss": None,
-                })
+                rows.append(
+                    {
+                        "holding_days": days,
+                        "evaluable": 0,
+                        "win_rate": None,
+                        "avg_return": None,
+                        "median_return": None,
+                        "max_gain": None,
+                        "max_loss": None,
+                    }
+                )
                 continue
 
-            rows.append({
-                "holding_days": days,
-                "evaluable": len(valid),
-                "win_rate": (valid > 0).mean(),
-                "avg_return": valid.mean(),
-                "median_return": valid.median(),
-                "max_gain": valid.max(),
-                "max_loss": valid.min(),
-            })
+            rows.append(
+                {
+                    "holding_days": days,
+                    "evaluable": len(valid),
+                    "win_rate": (valid > 0).mean(),
+                    "avg_return": valid.mean(),
+                    "median_return": valid.median(),
+                    "max_gain": valid.max(),
+                    "max_loss": valid.min(),
+                }
+            )
 
         return pd.DataFrame(rows)
 
@@ -218,17 +224,19 @@ class DiscoveryPerformance:
                 best_row = detail.loc[best_idx]
                 worst_row = detail.loc[worst_idx]
 
-                rows.append({
-                    "holding_days": days,
-                    "scan_date": scan_date,
-                    "count": len(valid),
-                    "win_rate": (valid > 0).mean(),
-                    "avg_return": valid.mean(),
-                    "best_stock": best_row["stock_id"],
-                    "best_return": valid.max(),
-                    "worst_stock": worst_row["stock_id"],
-                    "worst_return": valid.min(),
-                })
+                rows.append(
+                    {
+                        "holding_days": days,
+                        "scan_date": scan_date,
+                        "count": len(valid),
+                        "win_rate": (valid > 0).mean(),
+                        "avg_return": valid.mean(),
+                        "best_stock": best_row["stock_id"],
+                        "best_return": valid.max(),
+                        "worst_stock": worst_row["stock_id"],
+                        "worst_return": valid.min(),
+                    }
+                )
 
         return pd.DataFrame(rows)
 
@@ -263,7 +271,9 @@ def print_performance_report(result: dict, mode: str, start_date=None, end_date=
     print(f"{'=' * 80}")
 
     # 整體摘要
-    print(f"\n{'持有天數':>8}  {'可評估':>6}  {'勝率':>7}  {'平均報酬':>8}  {'中位數':>8}  {'最大獲利':>8}  {'最大虧損':>8}")
+    print(
+        f"\n{'持有天數':>8}  {'可評估':>6}  {'勝率':>7}  {'平均報酬':>8}  {'中位數':>8}  {'最大獲利':>8}  {'最大虧損':>8}"
+    )
     print(f"{'─' * 70}")
     for _, row in summary.iterrows():
         days = int(row["holding_days"])
@@ -293,6 +303,4 @@ def print_performance_report(result: dict, mode: str, start_date=None, end_date=
                 avg = f"{row['avg_return']:+.2%}"
                 best = f"{row['best_stock']} {row['best_return']:+.1%}"
                 worst = f"{row['worst_stock']} {row['worst_return']:+.1%}"
-                print(
-                    f"{row['scan_date']}  {int(row['count']):>5}  {wr:>7}  {avg:>8}  {best:>16}  {worst:>16}"
-                )
+                print(f"{row['scan_date']}  {int(row['count']):>5}  {wr:>7}  {avg:>8}  {best:>16}  {worst:>16}")

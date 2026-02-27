@@ -3,7 +3,6 @@
 from datetime import date
 
 import pandas as pd
-import pytest
 
 from src.data.schema import DailyPrice, DiscoveryRecord
 from src.discovery.performance import DiscoveryPerformance
@@ -11,15 +10,17 @@ from src.discovery.performance import DiscoveryPerformance
 
 def _insert_discovery(session, scan_date, mode, rank, stock_id, close, score=0.8, name=None):
     """輔助：插入一筆 DiscoveryRecord。"""
-    session.add(DiscoveryRecord(
-        scan_date=scan_date,
-        mode=mode,
-        rank=rank,
-        stock_id=stock_id,
-        stock_name=name or stock_id,
-        close=close,
-        composite_score=score,
-    ))
+    session.add(
+        DiscoveryRecord(
+            scan_date=scan_date,
+            mode=mode,
+            rank=rank,
+            stock_id=stock_id,
+            stock_name=name or stock_id,
+            close=close,
+            composite_score=score,
+        )
+    )
     session.flush()
 
 
@@ -27,17 +28,19 @@ def _insert_prices(session, stock_id, start_date, prices):
     """輔助：插入多日 DailyPrice。prices 為收盤價列表。"""
     dates = pd.bdate_range(start_date, periods=len(prices))
     for dt, close in zip(dates, prices):
-        session.add(DailyPrice(
-            stock_id=stock_id,
-            date=dt.date(),
-            open=close,
-            high=close + 1,
-            low=close - 1,
-            close=close,
-            volume=1_000_000,
-            turnover=100_000_000,
-            spread=0.5,
-        ))
+        session.add(
+            DailyPrice(
+                stock_id=stock_id,
+                date=dt.date(),
+                open=close,
+                high=close + 1,
+                low=close - 1,
+                close=close,
+                volume=1_000_000,
+                turnover=100_000_000,
+                spread=0.5,
+            )
+        )
     session.flush()
 
 
@@ -50,10 +53,28 @@ class TestBasicReturn:
         _insert_discovery(db_session, scan_date, "momentum", 1, "2330", 100.0)
 
         # 推薦日後 20 個交易日的價格（從 6/3 開始）
-        prices = [101, 102, 103, 104, 105,  # day 1-5
-                  106, 107, 108, 109, 110,  # day 6-10
-                  111, 112, 113, 114, 115,  # day 11-15
-                  116, 117, 118, 119, 120]  # day 16-20
+        prices = [
+            101,
+            102,
+            103,
+            104,
+            105,  # day 1-5
+            106,
+            107,
+            108,
+            109,
+            110,  # day 6-10
+            111,
+            112,
+            113,
+            114,
+            115,  # day 11-15
+            116,
+            117,
+            118,
+            119,
+            120,
+        ]  # day 16-20
         _insert_prices(db_session, "2330", "2025-06-03", prices)
 
         perf = DiscoveryPerformance(mode="momentum", holding_days=[5, 10, 20])
@@ -150,14 +171,20 @@ class TestTopNFilter:
         scan_date = date(2025, 9, 1)
         for i in range(1, 11):
             _insert_discovery(
-                db_session, scan_date, "momentum", i,
-                f"B{i:03d}", 100.0 + i,
+                db_session,
+                scan_date,
+                "momentum",
+                i,
+                f"B{i:03d}",
+                100.0 + i,
             )
 
         # 為所有股票插入 5 天價格
         for i in range(1, 11):
             _insert_prices(
-                db_session, f"B{i:03d}", "2025-09-02",
+                db_session,
+                f"B{i:03d}",
+                "2025-09-02",
                 [101 + i, 102 + i, 103 + i, 104 + i, 105 + i],
             )
 
@@ -183,7 +210,9 @@ class TestDateRangeFilter:
         for d in dates:
             next_day = pd.bdate_range(d, periods=2)[-1]  # 下一個交易日
             _insert_prices(
-                db_session, "C001", str(next_day.date()),
+                db_session,
+                "C001",
+                str(next_day.date()),
                 [101, 102, 103, 104, 105],
             )
 
