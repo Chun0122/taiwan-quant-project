@@ -37,7 +37,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，231 個測試覆蓋核心模組：
+使用 pytest 測試框架，360 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -66,6 +66,14 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
 | `tests/test_discover_performance.py` | `src/discovery/performance.py` 推薦績效回測    | in-memory SQLite       |
 | `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord        | in-memory SQLite       |
+| `tests/test_indicators.py`     | `src/features/indicators.py` compute_indicators_from_df() | 純函數           |
+| `tests/test_strategies.py`     | 6 個策略 generate_signals() + 除權息調整          | 純函數                 |
+| `tests/test_formatter.py`      | `src/report/formatter.py` 4 個格式化函數          | 純函數                 |
+| `tests/test_notification.py`   | `src/notification/line_notify.py` 通知模組        | 純函數 + mock HTTP     |
+| `tests/test_report_engine.py`  | `src/report/engine.py` 4 個 _compute_* 評分函數   | 純函數                 |
+| `tests/test_portfolio.py`      | `src/backtest/portfolio.py` 組合回測              | 純函數 + mock Strategy |
+| `tests/test_walk_forward.py`   | `src/backtest/walk_forward.py` Walk-Forward 驗證  | 純函數 + mock Strategy |
+| `tests/test_pipeline.py`       | `src/data/pipeline.py` ETL 函數                   | in-memory SQLite       |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -153,6 +161,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - **日期格式**：FinMind 使用 ISO 格式（`YYYY-MM-DD`）；TWSE 使用 `YYYYMMDD`；TPEX 使用民國曆（`YYY/MM/DD`，年 = 西元年 - 1911）。
 - **回測成本**：手續費 0.1425%、交易稅 0.3%（賣出時）、滑價 0.05%。
 - **測試慣例**：純函數優先測試（零 mock）。DB 整合測試使用 in-memory SQLite + transaction rollback 隔離。HTTP 測試 mock `requests.Session.get` + `time.sleep`。新增計算邏輯時應補充對應測試。
+- **代碼品質與格式 (Ruff)**：
+  - 在提交任何變更或 Push 到 GitHub 之前，**必須執行 Ruff 檢查**。
+  - 執行 `ruff check .` 確保無 Lint 錯誤。
+  - 執行 `ruff format .` 確保格式統一。
 - **文件聯動更新 (重要)**：
   - 每當修改原始碼（如 `src/` 或 `main.py`）後，**必須自動同步更新**以下兩份檔案：
     1. `CLAUDE.md`：若涉及架構變更、新增指令、新增測試或模組職責異動，須立即修正。
@@ -167,7 +179,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |---|------|------|------|
 | 1 | ✅ | **新增 Scanner 模式（高息股 / 高成長）** | DividendScanner（殖利率>3%、PE>0）+ GrowthScanner（YoY>10%、動能確認），已完成並通過 231 測試 |
 | 2 | ✅ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖、個股排行、明細 CSV 匯出），已完成 |
-| 3 | ⬜ | **補齊測試覆蓋** | 為缺少測試的模組補充單元測試：strategy、portfolio、walk_forward、grid_search、screener engine、indicators、report engine、formatter、pipeline、notification |
+| 3 | ✅ | **補齊測試覆蓋** | 新增 8 個測試檔共 129 個測試（231→360），覆蓋 indicators、strategies、formatter、notification、report engine、portfolio、walk_forward、pipeline |
 | 4 | ⬜ | **CLI `validate` 命令（資料品質檢查）** | 檢測缺漏交易日、異常值（連續漲跌停、零成交量）、資料表日期範圍不一致，輸出品質報告 |
 | 5 | ⬜ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），目前僅 equal_weight |
 | 6 | ⬜ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），新增 FinancialStatement ORM 表 |
