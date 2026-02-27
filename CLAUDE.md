@@ -33,7 +33,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，188 個測試覆蓋核心模組：
+使用 pytest 測試框架，194 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -54,7 +54,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算                | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
-| `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value 四類掃描 | 純函數                 |
+| `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value 四類掃描 + 產業加成 | 純函數                 |
 | `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
 | `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 | 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
@@ -118,9 +118,9 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
 | `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
-| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value 三模式，四維度評分（技術+籌碼+基本面+消息面），權重依 Regime 動態調整 |
+| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value 三模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%），權重依 Regime 動態調整 |
 | `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出各模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
-| `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能）                                                                               |
+| `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用               |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
 | `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |
 | `src/strategy_rank/engine.py`       | 策略排名引擎（批次回測 watchlist × strategies）                                                                   |

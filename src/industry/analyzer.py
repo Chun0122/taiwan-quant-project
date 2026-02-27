@@ -231,6 +231,70 @@ class IndustryRotationAnalyzer:
         ]
         return merged[[c for c in cols if c in merged.columns]]
 
+    def compute_sector_scores_for_stocks(
+        self,
+        stock_ids: list[str],
+        bonus_range: float = 0.05,
+    ) -> pd.DataFrame:
+        """計算每支股票所屬產業的熱度加成分數。
+
+        用 rank_sectors() 取得產業排名，將排名百分位線性映射到
+        [-bonus_range, +bonus_range]。排名第 1 → +bonus_range，
+        排名最末 → -bonus_range。
+
+        Args:
+            stock_ids: 要計算的股票代號清單
+            bonus_range: 加成幅度上限（預設 0.05 = ±5%）
+
+        Returns:
+            DataFrame(stock_id, sector_bonus)
+        """
+        default = pd.DataFrame({"stock_id": stock_ids, "sector_bonus": [0.0] * len(stock_ids)})
+
+        if not stock_ids:
+            return default
+
+        # 用傳入的 stock_ids 計算產業熱度
+        analyzer = IndustryRotationAnalyzer(
+            watchlist=stock_ids,
+            lookback_days=self.lookback_days,
+            momentum_days=self.momentum_days,
+        )
+        sector_df = analyzer.rank_sectors()
+
+        if sector_df.empty:
+            return default
+
+        # 從 StockInfo 取得 stock_id → industry_category 對照
+        with get_session() as session:
+            rows = session.execute(
+                select(StockInfo.stock_id, StockInfo.industry_category).where(
+                    StockInfo.stock_id.in_(stock_ids)
+                )
+            ).all()
+        industry_map = {r[0]: (r[1] or "未分類") for r in rows}
+
+        # 將產業排名轉為 bonus：rank 1 → +bonus_range, 最末 → -bonus_range
+        n_sectors = len(sector_df)
+        sector_bonus_map = {}
+        for _, row in sector_df.iterrows():
+            rank = row["rank"]
+            if n_sectors == 1:
+                bonus = 0.0
+            else:
+                # 線性映射：rank=1 → +bonus_range, rank=n → -bonus_range
+                bonus = bonus_range * (1 - 2 * (rank - 1) / (n_sectors - 1))
+            sector_bonus_map[row["industry"]] = bonus
+
+        # 映射到每支股票
+        records = []
+        for sid in stock_ids:
+            industry = industry_map.get(sid, "未分類")
+            bonus = sector_bonus_map.get(industry, 0.0)
+            records.append({"stock_id": sid, "sector_bonus": bonus})
+
+        return pd.DataFrame(records)
+
     def top_stocks_from_hot_sectors(
         self,
         sector_df: pd.DataFrame,

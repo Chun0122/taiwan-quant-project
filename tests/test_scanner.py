@@ -956,6 +956,77 @@ class TestValueCompositeWeights:
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 
+# ====================================================================== #
+#  產業加成測試
+# ====================================================================== #
+
+
+class TestComputeSectorBonus:
+    """_compute_sector_bonus() 回傳格式與範圍測試。"""
+
+    def test_returns_correct_format(self, scanner):
+        """應回傳 DataFrame(stock_id, sector_bonus)。"""
+        # _compute_sector_bonus 依賴 DB，失敗時應 graceful fallback 回傳全 0
+        result = scanner._compute_sector_bonus(["1000", "1001"])
+        assert "stock_id" in result.columns
+        assert "sector_bonus" in result.columns
+        assert len(result) == 2
+
+    def test_bonus_range(self, scanner):
+        """sector_bonus 應在 -0.05 ~ +0.05 範圍內（或 fallback 0）。"""
+        result = scanner._compute_sector_bonus(["1000", "1001", "1002"])
+        assert (result["sector_bonus"] >= -0.05).all()
+        assert (result["sector_bonus"] <= 0.05).all()
+
+    def test_empty_stock_ids(self, scanner):
+        """空 stock_ids 應回傳空 DataFrame。"""
+        result = scanner._compute_sector_bonus([])
+        assert result.empty or len(result) == 0
+
+
+class TestApplySectorBonus:
+    """_apply_sector_bonus() 套用到 composite_score 的測試。"""
+
+    def test_sector_bonus_applied_to_composite_score(self, scanner):
+        """sector_bonus 應乘以 (1 + bonus) 套用到 composite_score。"""
+        scored = pd.DataFrame({
+            "stock_id": ["1000", "1001"],
+            "composite_score": [0.8, 0.6],
+        })
+        # Mock _compute_sector_bonus 回傳已知值
+        original_method = scanner._compute_sector_bonus
+        scanner._compute_sector_bonus = lambda sids: pd.DataFrame({
+            "stock_id": sids,
+            "sector_bonus": [0.05, -0.05],
+        })
+        try:
+            result = scanner._apply_sector_bonus(scored)
+            assert "sector_bonus" in result.columns
+            # 0.8 * 1.05 = 0.84, 0.6 * 0.95 = 0.57
+            assert result.iloc[0]["composite_score"] == pytest.approx(0.84, abs=1e-6)
+            assert result.iloc[1]["composite_score"] == pytest.approx(0.57, abs=1e-6)
+        finally:
+            scanner._compute_sector_bonus = original_method
+
+    def test_empty_scored_returns_empty(self, scanner):
+        """空 DataFrame 應直接回傳。"""
+        result = scanner._apply_sector_bonus(pd.DataFrame())
+        assert result.empty
+
+    def test_zero_bonus_no_change(self, scanner):
+        """bonus=0 時 composite_score 不變。"""
+        scored = pd.DataFrame({
+            "stock_id": ["1000"],
+            "composite_score": [0.75],
+        })
+        scanner._compute_sector_bonus = lambda sids: pd.DataFrame({
+            "stock_id": sids,
+            "sector_bonus": [0.0],
+        })
+        result = scanner._apply_sector_bonus(scored)
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.75, abs=1e-6)
+
+
 class TestValueRiskFilter:
     def test_removes_high_volatility(self, value_scanner):
         """波動率過濾應剔除前 10% 高波動股。"""

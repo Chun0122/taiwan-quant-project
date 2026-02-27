@@ -144,6 +144,9 @@ class MarketScanner:
         scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
+        # Stage 3.3: 產業加成
+        scored = self._apply_sector_bonus(scored)
+
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
 
@@ -408,6 +411,49 @@ class MarketScanner:
         df["news_score"] = density_rank * 0.30 + pos_rank * 0.40 + neg_rank * 0.30
 
         return df[["stock_id", "news_score"]]
+
+    # ------------------------------------------------------------------ #
+    #  產業加成
+    # ------------------------------------------------------------------ #
+
+    def _compute_sector_bonus(self, stock_ids: list[str]) -> pd.DataFrame:
+        """計算候選股的產業熱度加成分數（±5%）。
+
+        呼叫 IndustryRotationAnalyzer 計算產業排名，將排名百分位
+        映射為 sector_bonus（-0.05 ~ +0.05）。失敗時回傳全 0。
+
+        Returns:
+            DataFrame(stock_id, sector_bonus)
+        """
+        default = pd.DataFrame({"stock_id": stock_ids, "sector_bonus": [0.0] * len(stock_ids)})
+        try:
+            from src.industry.analyzer import IndustryRotationAnalyzer
+
+            analyzer = IndustryRotationAnalyzer(watchlist=stock_ids)
+            result = analyzer.compute_sector_scores_for_stocks(stock_ids)
+            if result.empty:
+                return default
+            return result
+        except Exception:
+            logger.warning("產業加成計算失敗，跳過")
+            return default
+
+    def _apply_sector_bonus(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """將產業加成套用到 composite_score。
+
+        final_score = composite_score × (1 + sector_bonus)
+        """
+        if scored.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        bonus_df = self._compute_sector_bonus(stock_ids)
+        scored = scored.merge(bonus_df, on="stock_id", how="left")
+        scored["sector_bonus"] = scored["sector_bonus"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["sector_bonus"])
+        logger.info("Stage 3.3: 產業加成已套用（範圍 %.3f ~ %.3f）",
+                     scored["sector_bonus"].min(), scored["sector_bonus"].max())
+        return scored
 
     # ------------------------------------------------------------------ #
     #  Stage 2: 粗篩
@@ -763,6 +809,7 @@ class MarketScanner:
             "chip_score",
             "fundamental_score",
             "news_score",
+            "sector_bonus",
             "industry_category",
             "momentum",
             "inst_net",
@@ -1579,6 +1626,9 @@ class ValueScanner(MarketScanner):
         # Stage 3: 細評
         scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
+
+        # Stage 3.3: 產業加成
+        scored = self._apply_sector_bonus(scored)
 
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)

@@ -723,6 +723,7 @@ python main.py discover swing --top 30 --export picks.csv --notify
 | Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
+| Stage 3.3 | 產業加成 | 用 IndustryRotationAnalyzer 計算產業排名，熱門產業 +5%、冷門產業 -5% 線性加成到 composite_score |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
