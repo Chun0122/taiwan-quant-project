@@ -787,6 +787,13 @@ def cmd_discover(args: argparse.Namespace) -> None:
         for _, sr in result.sector_summary.head(8).iterrows():
             print(f"  {sr['industry']:<14} {int(sr['count']):>3} 支  (均分 {sr['avg_score']:.3f})")
 
+    # 儲存推薦記錄到 DB
+    _save_discovery_records(result, mode, scanner)
+
+    # 歷史比較
+    if args.compare:
+        _show_discovery_comparison(mode, result)
+
     # 匯出 CSV
     if args.export:
         result.rankings.to_csv(args.export, index=False)
@@ -801,6 +808,149 @@ def cmd_discover(args: argparse.Namespace) -> None:
         for msg in msgs:
             send_message(msg)
         print("Discord 通知已發送")
+
+
+def _save_discovery_records(result, mode: str, scanner) -> None:
+    """將 discover 推薦結果存入 DB（供歷史追蹤用）。"""
+    from src.data.database import get_session
+    from src.data.schema import DiscoveryRecord
+
+    if result.rankings.empty:
+        return
+
+    regime = getattr(scanner, "regime", "sideways")
+    scan_date = result.scan_date
+
+    records = []
+    for _, row in result.rankings.iterrows():
+        records.append(
+            DiscoveryRecord(
+                scan_date=scan_date,
+                mode=mode,
+                rank=int(row["rank"]),
+                stock_id=row["stock_id"],
+                stock_name=str(row.get("stock_name", "")) or None,
+                close=float(row["close"]),
+                composite_score=float(row["composite_score"]),
+                technical_score=float(row.get("technical_score", 0.5)),
+                chip_score=float(row.get("chip_score", 0.5)),
+                fundamental_score=float(row.get("fundamental_score", 0.5)),
+                news_score=float(row.get("news_score", 0.5)),
+                sector_bonus=float(row.get("sector_bonus", 0.0)) if pd.notna(row.get("sector_bonus")) else 0.0,
+                industry_category=str(row.get("industry_category", "")) or None,
+                regime=regime,
+                total_stocks=result.total_stocks,
+                after_coarse=result.after_coarse,
+            )
+        )
+
+    with get_session() as session:
+        # 先刪除同日同模式的舊記錄（重跑時覆蓋）
+        session.query(DiscoveryRecord).filter(
+            DiscoveryRecord.scan_date == scan_date,
+            DiscoveryRecord.mode == mode,
+        ).delete()
+        session.add_all(records)
+        session.commit()
+
+    print(f"\n推薦記錄已存入 DB（{len(records)} 筆，{scan_date} {mode}）")
+
+
+def _show_discovery_comparison(mode: str, current_result) -> None:
+    """顯示本次推薦與上次推薦的差異（新進/退出/排名變化）。"""
+    from sqlalchemy import func, select
+
+    from src.data.database import get_session
+    from src.data.schema import DiscoveryRecord
+
+    if current_result.rankings.empty:
+        return
+
+    scan_date = current_result.scan_date
+
+    with get_session() as session:
+        # 找到上次掃描日期（同模式、日期 < 今天）
+        prev_date_row = session.execute(
+            select(func.max(DiscoveryRecord.scan_date)).where(
+                DiscoveryRecord.mode == mode,
+                DiscoveryRecord.scan_date < scan_date,
+            )
+        ).scalar()
+
+        if prev_date_row is None:
+            print(f"\n{'─' * 40}")
+            print("歷史比較：無前次記錄可供比較")
+            return
+
+        prev_date = prev_date_row
+
+        # 載入上次記錄
+        prev_rows = session.execute(
+            select(
+                DiscoveryRecord.stock_id,
+                DiscoveryRecord.stock_name,
+                DiscoveryRecord.rank,
+                DiscoveryRecord.composite_score,
+            ).where(
+                DiscoveryRecord.scan_date == prev_date,
+                DiscoveryRecord.mode == mode,
+            )
+        ).all()
+
+    if not prev_rows:
+        print(f"\n{'─' * 40}")
+        print("歷史比較：無前次記錄可供比較")
+        return
+
+    prev_df = pd.DataFrame(prev_rows, columns=["stock_id", "stock_name", "rank", "composite_score"])
+    prev_ids = set(prev_df["stock_id"])
+    prev_rank = dict(zip(prev_df["stock_id"], prev_df["rank"]))
+
+    curr_ids = set(current_result.rankings["stock_id"])
+    curr_rank = dict(zip(current_result.rankings["stock_id"], current_result.rankings["rank"]))
+
+    new_entries = curr_ids - prev_ids
+    exits = prev_ids - curr_ids
+    stayed = curr_ids & prev_ids
+
+    print(f"\n{'─' * 50}")
+    print(f"歷史比較（vs {prev_date}）")
+    print(f"{'─' * 50}")
+
+    # 新進
+    if new_entries:
+        print(f"\n  新進（{len(new_entries)} 支）：")
+        for sid in sorted(new_entries, key=lambda s: curr_rank[s]):
+            row = current_result.rankings[current_result.rankings["stock_id"] == sid].iloc[0]
+            name = str(row.get("stock_name", ""))[:6]
+            print(f"    + #{curr_rank[sid]:>2}  {sid:>6} {name:<6}  綜合 {row['composite_score']:.3f}")
+
+    # 退出
+    if exits:
+        print(f"\n  退出（{len(exits)} 支）：")
+        for sid in sorted(exits, key=lambda s: prev_rank[s]):
+            prev_row = prev_df[prev_df["stock_id"] == sid].iloc[0]
+            name = str(prev_row.get("stock_name", ""))[:6]
+            print(f"    - 前#{prev_rank[sid]:>2}  {sid:>6} {name:<6}")
+
+    # 排名變化（僅顯示變動 >= 3 名的）
+    rank_changes = []
+    for sid in stayed:
+        delta = prev_rank[sid] - curr_rank[sid]  # 正=上升, 負=下降
+        if abs(delta) >= 3:
+            rank_changes.append((sid, curr_rank[sid], delta))
+
+    if rank_changes:
+        rank_changes.sort(key=lambda x: -x[2])  # 上升最多的排前面
+        print(f"\n  排名變動（變動 >= 3 名）：")
+        for sid, curr_r, delta in rank_changes:
+            arrow = "↑" if delta > 0 else "↓"
+            row = current_result.rankings[current_result.rankings["stock_id"] == sid].iloc[0]
+            name = str(row.get("stock_name", ""))[:6]
+            print(f"    {arrow} #{curr_r:>2} ({delta:>+3})  {sid:>6} {name:<6}  綜合 {row['composite_score']:.3f}")
+
+    if not new_entries and not exits and not rank_changes:
+        print("  推薦清單無顯著變化")
 
 
 def cmd_sync_mops(args: argparse.Namespace) -> None:
@@ -987,6 +1137,7 @@ def main() -> None:
     sp_disc.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
     sp_disc.add_argument("--export", default=None, help="匯出 CSV 路徑")
     sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+    sp_disc.add_argument("--compare", action="store_true", help="顯示與上次推薦的差異比較")
 
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")

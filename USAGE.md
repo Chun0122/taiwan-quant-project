@@ -663,7 +663,13 @@ python main.py discover --skip-sync
 
 # 匯出 CSV + 通知
 python main.py discover swing --top 30 --export picks.csv --notify
+
+# 與上次推薦比較（顯示新進/退出/排名變化）
+python main.py discover --compare
+python main.py discover momentum --skip-sync --compare
 ```
+
+每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。
 
 | 參數 | 說明 |
 |------|------|
@@ -676,6 +682,7 @@ python main.py discover swing --top 30 --export picks.csv --notify
 | `--skip-sync` | 跳過全市場資料同步，直接用 DB 既有資料 |
 | `--export PATH` | 匯出 CSV |
 | `--notify` | 發送 Discord 通知 |
+| `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名） |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 

@@ -1565,8 +1565,15 @@ class ValueScanner(MarketScanner):
         except Exception:
             logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
 
+        # Stage 2.7: 載入候選股近期 MOPS 公告
+        df_ann = self._load_announcement_data(candidate_ids)
+        if not df_ann.empty:
+            logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
+        else:
+            logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
+
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.3: 產業加成

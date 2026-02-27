@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十二張核心表：
+十三張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -13,6 +13,7 @@
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
 - PortfolioBacktestResult: 投資組合回測結果
+- DiscoveryRecord:         Discover 推薦記錄（歷史追蹤）
 """
 
 from datetime import date, datetime
@@ -295,3 +296,36 @@ class PortfolioTrade(Base):
 
     def __repr__(self) -> str:
         return f"<PortfolioTrade {self.stock_id} {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
+
+
+class DiscoveryRecord(Base):
+    """Discover 推薦記錄 — 追蹤每次掃描的推薦結果。
+
+    每次 discover 執行後，將 Top N 結果逐筆存入此表，
+    供歷史比較（新進/退出/排名變化）與推薦績效回測使用。
+    """
+
+    __tablename__ = "discovery_record"
+    __table_args__ = (UniqueConstraint("scan_date", "mode", "stock_id", name="uq_discovery_record"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # momentum/swing/value
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[str] = mapped_column(String(50), nullable=True)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    composite_score: Mapped[float] = mapped_column(Float, nullable=False)
+    technical_score: Mapped[float] = mapped_column(Float, nullable=True)
+    chip_score: Mapped[float] = mapped_column(Float, nullable=True)
+    fundamental_score: Mapped[float] = mapped_column(Float, nullable=True)
+    news_score: Mapped[float] = mapped_column(Float, nullable=True)
+    sector_bonus: Mapped[float] = mapped_column(Float, nullable=True)
+    industry_category: Mapped[str] = mapped_column(String(50), nullable=True)
+    regime: Mapped[str] = mapped_column(String(20), nullable=True)  # bull/bear/sideways
+    total_stocks: Mapped[int] = mapped_column(Integer, nullable=True)  # 掃描總股數
+    after_coarse: Mapped[int] = mapped_column(Integer, nullable=True)  # 粗篩後股數
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<DiscoveryRecord {self.scan_date} {self.mode} #{self.rank} {self.stock_id}>"

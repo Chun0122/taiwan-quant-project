@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from src.data.database import init_db
 from src.data.pipeline import _get_last_date, _upsert_batch
-from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
+from src.data.schema import DailyPrice, DiscoveryRecord, InstitutionalInvestor, StockInfo
 
 
 class TestInitDb:
@@ -20,6 +20,7 @@ class TestInitDb:
         assert "technical_indicator" in table_names
         assert "backtest_result" in table_names
         assert "stock_info" in table_names
+        assert "discovery_record" in table_names
 
 
 class TestUpsertBatch:
@@ -179,3 +180,111 @@ class TestOrmCrud:
         )
         assert len(rows) == 1
         assert rows[0].net == 5_000_000
+
+
+class TestDiscoveryRecord:
+    def test_insert_and_query(self, db_session):
+        """DiscoveryRecord 基本 CRUD。"""
+        rec = DiscoveryRecord(
+            scan_date=date(2025, 6, 1),
+            mode="momentum",
+            rank=1,
+            stock_id="2330",
+            stock_name="台積電",
+            close=950.0,
+            composite_score=0.85,
+            technical_score=0.9,
+            chip_score=0.8,
+            fundamental_score=0.7,
+            news_score=0.6,
+            sector_bonus=0.03,
+            industry_category="半導體業",
+            regime="bull",
+            total_stocks=1800,
+            after_coarse=120,
+        )
+        db_session.add(rec)
+        db_session.flush()
+
+        rows = (
+            db_session.execute(
+                select(DiscoveryRecord).where(
+                    DiscoveryRecord.scan_date == date(2025, 6, 1),
+                    DiscoveryRecord.mode == "momentum",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].stock_id == "2330"
+        assert rows[0].composite_score == 0.85
+        assert rows[0].regime == "bull"
+
+    def test_unique_constraint(self, db_session):
+        """同日同模式同股票不可重複。"""
+        from sqlalchemy.exc import IntegrityError
+
+        rec1 = DiscoveryRecord(
+            scan_date=date(2025, 6, 2),
+            mode="swing",
+            rank=1,
+            stock_id="2317",
+            close=100.0,
+            composite_score=0.7,
+        )
+        rec2 = DiscoveryRecord(
+            scan_date=date(2025, 6, 2),
+            mode="swing",
+            rank=2,
+            stock_id="2317",
+            close=100.0,
+            composite_score=0.6,
+        )
+        db_session.add(rec1)
+        db_session.flush()
+        db_session.add(rec2)
+        try:
+            db_session.flush()
+            assert False, "應該觸發 IntegrityError"
+        except IntegrityError:
+            db_session.rollback()
+
+    def test_multiple_dates_for_comparison(self, db_session):
+        """多日記錄查詢：可找到前一次掃描日期。"""
+        from sqlalchemy import func
+
+        for day, stock_id in [(1, "2330"), (3, "2330"), (3, "2317")]:
+            db_session.add(
+                DiscoveryRecord(
+                    scan_date=date(2025, 6, day),
+                    mode="momentum",
+                    rank=1 if stock_id == "2330" else 2,
+                    stock_id=stock_id,
+                    close=100.0,
+                    composite_score=0.8,
+                )
+            )
+        db_session.flush()
+
+        # 查詢 6/3 之前最近的掃描日期
+        prev_date = db_session.execute(
+            select(func.max(DiscoveryRecord.scan_date)).where(
+                DiscoveryRecord.mode == "momentum",
+                DiscoveryRecord.scan_date < date(2025, 6, 3),
+            )
+        ).scalar()
+        assert prev_date == date(2025, 6, 1)
+
+        # 6/3 有兩筆記錄
+        rows = (
+            db_session.execute(
+                select(DiscoveryRecord).where(
+                    DiscoveryRecord.scan_date == date(2025, 6, 3),
+                    DiscoveryRecord.mode == "momentum",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2

@@ -26,6 +26,7 @@ python main.py discover momentum --top 20   # 短線動能掃描
 python main.py discover swing --top 20      # 中期波段掃描
 python main.py discover value --top 20      # 價值修復掃描
 python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
+python main.py discover --compare            # 顯示與上次推薦的差異比較
 python main.py sync-mops                     # 同步 MOPS 重大訊息（預設 7 天）
 python main.py sync-mops --days 30           # 同步最近 30 天
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
@@ -33,7 +34,7 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 
 ### 測試
 
-使用 pytest 測試框架，194 個測試覆蓋核心模組：
+使用 pytest 測試框架，201 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -60,7 +61,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
-| `tests/test_db_integration.py`  | ORM + upsert + pipeline                          | in-memory SQLite       |
+| `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord        | in-memory SQLite       |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -104,7 +105,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）                                                                                |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站重大訊息（全市場、免費）                                                                       |
-| `src/data/schema.py`                | 12 張 SQLAlchemy ORM 資料表（含 Announcement）                                                                    |
+| `src/data/schema.py`                | 13 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord）                                                   |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）                                |
