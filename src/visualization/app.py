@@ -11,7 +11,7 @@ st.set_page_config(
 # --- 頁面路由 ---
 page = st.sidebar.radio(
     "功能選單",
-    ["📈 個股分析", "🔄 回測結果", "📊 投資組合", "🔍 選股篩選", "🤖 ML 策略分析", "🏭 產業輪動"],
+    ["📈 個股分析", "🔄 回測結果", "📊 投資組合", "🔍 選股篩選", "🤖 ML 策略分析", "🏭 產業輪動", "📋 推薦歷史"],
 )
 
 if page == "📈 個股分析":
@@ -36,5 +36,9 @@ elif page == "🤖 ML 策略分析":
     render()
 elif page == "🏭 產業輪動":
     from src.visualization.pages.industry_rotation import render
+
+    render()
+elif page == "📋 推薦歷史":
+    from src.visualization.pages.discovery_history import render
 
     render()

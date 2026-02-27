@@ -96,7 +96,8 @@ taiwan-quant-project/
 │           ├── screener_results.py    # 選股篩選頁
 │           ├── portfolio_review.py    # 投資組合頁
 │           ├── ml_analysis.py         # ML 策略分析頁
-│           └── industry_rotation.py   # 產業輪動分析頁
+│           ├── industry_rotation.py   # 產業輪動分析頁
+│           └── discovery_history.py   # 推薦歷史頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -342,7 +343,7 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含六個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含七個頁面：
 
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
@@ -350,6 +351,7 @@ python main.py dashboard
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 - **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
 - **產業輪動**: 產業綜合排名 + 泡泡圖（法人 vs 動能）+ 法人淨買超長條圖 + 精選個股
+- **推薦歷史**: Discover 推薦歷史視覺化（日曆熱圖、績效分析、個股排行、歷史明細 CSV 匯出）
 
 ### 4.5 多因子選股篩選 (`scan`)
 

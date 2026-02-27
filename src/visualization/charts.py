@@ -472,3 +472,283 @@ def plot_per_stock_returns(per_stock_returns: dict[str, float]) -> go.Figure:
         margin=dict(l=60, r=20, t=40, b=40),
     )
     return fig
+
+
+# ------------------------------------------------------------------ #
+#  Discover 推薦歷史圖表
+# ------------------------------------------------------------------ #
+
+
+def plot_discovery_calendar_heatmap(
+    df: pd.DataFrame,
+    value_col: str,
+    title: str,
+    colorscale: str = "Blues",
+) -> go.Figure:
+    """日曆熱圖 — 以「年月 × 月內第幾週」矩陣呈現。
+
+    Parameters
+    ----------
+    df : DataFrame
+        需含 scan_date 欄（date 型別）和 value_col 欄位
+    value_col : str
+        熱圖顯示的數值欄位名稱
+    title : str
+        圖表標題
+    colorscale : str
+        Plotly 色階名稱
+    """
+    if df.empty:
+        return go.Figure().update_layout(title=f"{title}（無資料）")
+
+    df = df.copy()
+    df["scan_date"] = pd.to_datetime(df["scan_date"])
+    df["year_month"] = df["scan_date"].dt.to_period("M").astype(str)
+    df["day"] = df["scan_date"].dt.day
+    # 月內第幾週（1~5）
+    df["week_of_month"] = (df["day"] - 1) // 7 + 1
+
+    # 聚合：同一年月 + 同一週可能有多個值
+    pivot = df.pivot_table(
+        index="year_month",
+        columns="week_of_month",
+        values=value_col,
+        aggfunc="mean",
+    )
+    pivot = pivot.sort_index()
+
+    # 格式化 hover text
+    if "return" in value_col.lower() or "avg" in value_col.lower():
+        text = pivot.map(lambda v: f"{v:+.2%}" if pd.notna(v) else "")
+    else:
+        text = pivot.map(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=pivot.values,
+            x=[f"第{w}週" for w in pivot.columns],
+            y=pivot.index.tolist(),
+            colorscale=colorscale,
+            text=text.values,
+            texttemplate="%{text}",
+            hovertemplate="月份: %{y}<br>%{x}<br>值: %{text}<extra></extra>",
+            colorbar=dict(title=value_col),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=max(250, len(pivot) * 30 + 100),
+        margin=dict(l=100, r=20, t=40, b=40),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def plot_discovery_monthly_stats(
+    counts_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+) -> go.Figure:
+    """月度統計柱狀圖（推薦數柱 + 勝率折線，雙 Y 軸）。"""
+    if counts_df.empty:
+        return go.Figure().update_layout(title="月度統計（無資料）")
+
+    counts_df = counts_df.copy()
+    counts_df["scan_date"] = pd.to_datetime(counts_df["scan_date"])
+    counts_df["month"] = counts_df["scan_date"].dt.to_period("M").astype(str)
+    monthly_counts = counts_df.groupby("month")["count"].sum().reset_index()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=monthly_counts["month"],
+            y=monthly_counts["count"],
+            name="推薦數",
+            marker_color="#42A5F5",
+        ),
+        secondary_y=False,
+    )
+
+    if not returns_df.empty:
+        returns_df = returns_df.copy()
+        returns_df["scan_date"] = pd.to_datetime(returns_df["scan_date"])
+        returns_df["month"] = returns_df["scan_date"].dt.to_period("M").astype(str)
+        monthly_returns = (
+            returns_df.groupby("month")
+            .apply(
+                lambda g: (g["avg_return"] > 0).sum() / len(g) if len(g) > 0 else 0,
+                include_groups=False,
+            )
+            .reset_index(name="win_rate")
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_returns["month"],
+                y=monthly_returns["win_rate"],
+                name="勝率",
+                mode="lines+markers",
+                line=dict(color="#FF7043", width=2),
+                marker=dict(size=6),
+            ),
+            secondary_y=True,
+        )
+        fig.update_yaxes(title_text="勝率", tickformat=".0%", secondary_y=True)
+
+    fig.update_layout(
+        title="月度推薦統計",
+        height=350,
+        margin=dict(l=60, r=60, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    fig.update_yaxes(title_text="推薦數", secondary_y=False)
+    return fig
+
+
+def plot_discovery_return_boxplot(
+    detail_df: pd.DataFrame,
+    holding_days: list[int],
+) -> go.Figure:
+    """報酬率箱型圖（三組 Box 並列，含盈虧平衡線）。"""
+    if detail_df.empty:
+        return go.Figure().update_layout(title="報酬率分布（無資料）")
+
+    fig = go.Figure()
+    colors = {5: "#42A5F5", 10: "#66BB6A", 20: "#FFA726"}
+
+    for days in holding_days:
+        col = f"return_{days}d"
+        if col not in detail_df.columns:
+            continue
+        values = detail_df[col].dropna() * 100  # 轉為百分比
+        fig.add_trace(
+            go.Box(
+                y=values,
+                name=f"{days}天",
+                marker_color=colors.get(days, "#9E9E9E"),
+                boxmean=True,
+            )
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="盈虧平衡")
+    fig.update_layout(
+        title="持有期報酬率分布",
+        yaxis_title="報酬率 (%)",
+        height=400,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def plot_discovery_cumulative_return(
+    by_scan_df: pd.DataFrame,
+    holding_days: int,
+) -> go.Figure:
+    """累積報酬率時間序列（折線 + 填充）。"""
+    if by_scan_df.empty:
+        return go.Figure().update_layout(title="累積報酬率（無資料）")
+
+    df = by_scan_df[by_scan_df["holding_days"] == holding_days].copy()
+    if df.empty:
+        return go.Figure().update_layout(title=f"累積報酬率（{holding_days}天，無資料）")
+
+    df = df.sort_values("scan_date").reset_index(drop=True)
+    df["cumulative"] = (1 + df["avg_return"]).cumprod() - 1
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["scan_date"],
+            y=df["cumulative"] * 100,
+            mode="lines",
+            name=f"累積報酬（{holding_days}天）",
+            line=dict(color="#2196F3", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(33,150,243,0.1)",
+        )
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.update_layout(
+        title=f"累積報酬率（持有 {holding_days} 天）",
+        yaxis_title="累積報酬率 (%)",
+        xaxis_title="掃描日期",
+        height=350,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def plot_discovery_winrate_scatter(
+    by_scan_df: pd.DataFrame,
+    holding_days: int,
+) -> go.Figure:
+    """勝率 vs 報酬率散佈圖（點大小 = 推薦數，顏色 = 正負）。"""
+    if by_scan_df.empty:
+        return go.Figure().update_layout(title="勝率 vs 報酬率（無資料）")
+
+    df = by_scan_df[by_scan_df["holding_days"] == holding_days].copy()
+    if df.empty:
+        return go.Figure().update_layout(title=f"勝率 vs 報酬率（{holding_days}天，無資料）")
+
+    colors = ["#26A69A" if r > 0 else "#EF5350" for r in df["avg_return"]]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["win_rate"] * 100,
+            y=df["avg_return"] * 100,
+            mode="markers",
+            marker=dict(
+                size=df["count"] * 2 + 5,
+                color=colors,
+                line=dict(width=1, color="white"),
+                opacity=0.7,
+            ),
+            text=df["scan_date"].astype(str),
+            hovertemplate="日期: %{text}<br>勝率: %{x:.1f}%<br>平均報酬: %{y:.2f}%<extra></extra>",
+        )
+    )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.5)
+
+    fig.update_layout(
+        title=f"勝率 vs 平均報酬率（持有 {holding_days} 天）",
+        xaxis_title="勝率 (%)",
+        yaxis_title="平均報酬率 (%)",
+        height=400,
+        margin=dict(l=60, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def plot_stock_frequency_bar(
+    freq_df: pd.DataFrame,
+    top_n: int = 20,
+) -> go.Figure:
+    """推薦頻率 Top N 橫向柱狀圖。"""
+    if freq_df.empty:
+        return go.Figure().update_layout(title="推薦頻率排行（無資料）")
+
+    df = freq_df.head(top_n).sort_values("recommend_count")
+    labels = df["stock_id"] + " " + df["stock_name"].fillna("")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=df["recommend_count"],
+            y=labels,
+            orientation="h",
+            marker_color="#42A5F5",
+            text=df["recommend_count"],
+            textposition="outside",
+        )
+    )
+
+    fig.update_layout(
+        title=f"推薦頻率 Top {top_n}",
+        xaxis_title="推薦次數",
+        height=max(350, len(df) * 25 + 100),
+        margin=dict(l=120, r=40, t=40, b=40),
+    )
+    return fig

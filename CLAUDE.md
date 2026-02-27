@@ -136,7 +136,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
-| `src/visualization/pages/`          | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation） |
+| `src/visualization/pages/`          | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history） |
 | `main.py`                           | CLI 調度器（argparse 子命令）                                                                                     |
 
 ### 設定
@@ -166,7 +166,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | # | 狀態 | 項目 | 說明 |
 |---|------|------|------|
 | 1 | ✅ | **新增 Scanner 模式（高息股 / 高成長）** | DividendScanner（殖利率>3%、PE>0）+ GrowthScanner（YoY>10%、動能確認），已完成並通過 231 測試 |
-| 2 | ⬜ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖），參考 industry_rotation.py |
+| 2 | ✅ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖、個股排行、明細 CSV 匯出），已完成 |
 | 3 | ⬜ | **補齊測試覆蓋** | 為缺少測試的模組補充單元測試：strategy、portfolio、walk_forward、grid_search、screener engine、indicators、report engine、formatter、pipeline、notification |
 | 4 | ⬜ | **CLI `validate` 命令（資料品質檢查）** | 檢測缺漏交易日、異常值（連續漲跌停、零成交量）、資料表日期範圍不一致，輸出品質報告 |
 | 5 | ⬜ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），目前僅 equal_weight |

@@ -9,6 +9,7 @@ from src.data.database import get_session, init_db
 from src.data.schema import (
     BacktestResult,
     DailyPrice,
+    DiscoveryRecord,
     InstitutionalInvestor,
     MarginTrading,
     PortfolioBacktestResult,
@@ -352,6 +353,157 @@ def load_portfolio_trades(portfolio_id: int) -> pd.DataFrame:
                 "pnl": r.pnl,
                 "return_pct": r.return_pct,
                 "exit_reason": getattr(r, "exit_reason", None),
+            }
+            for r in rows
+        ]
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Discover 推薦歷史
+# ------------------------------------------------------------------ #
+
+
+def _discovery_date_filters(stmt, start_date=None, end_date=None):
+    """共用日期篩選。"""
+    if start_date:
+        stmt = stmt.where(DiscoveryRecord.scan_date >= start_date)
+    if end_date:
+        stmt = stmt.where(DiscoveryRecord.scan_date <= end_date)
+    return stmt
+
+
+def load_discovery_calendar_counts(mode: str, start_date=None, end_date=None) -> pd.DataFrame:
+    """每日推薦次數（日曆熱圖用）。"""
+    with get_session() as session:
+        stmt = (
+            select(
+                DiscoveryRecord.scan_date,
+                func.count(DiscoveryRecord.id).label("count"),
+            )
+            .where(DiscoveryRecord.mode == mode)
+            .group_by(DiscoveryRecord.scan_date)
+            .order_by(DiscoveryRecord.scan_date)
+        )
+        stmt = _discovery_date_filters(stmt, start_date, end_date)
+        rows = session.execute(stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["scan_date", "count"])
+    return pd.DataFrame(rows, columns=["scan_date", "count"])
+
+
+def load_discovery_calendar_returns(
+    mode: str,
+    holding_days: int = 5,
+    top_n: int | None = None,
+    start_date=None,
+    end_date=None,
+) -> pd.DataFrame:
+    """每日平均報酬率（日曆熱圖用，透過 DiscoveryPerformance 計算）。"""
+    from src.discovery.performance import DiscoveryPerformance
+
+    perf = DiscoveryPerformance(
+        mode=mode,
+        holding_days=[holding_days],
+        top_n=top_n,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    result = perf.evaluate()
+    by_scan = result["by_scan"]
+    if by_scan.empty:
+        return pd.DataFrame(columns=["scan_date", "avg_return", "count"])
+    by_scan = by_scan[by_scan["holding_days"] == holding_days].copy()
+    return by_scan[["scan_date", "avg_return", "count"]].reset_index(drop=True)
+
+
+def load_discovery_performance(
+    mode: str,
+    holding_days: list[int] | None = None,
+    top_n: int | None = None,
+    start_date=None,
+    end_date=None,
+) -> dict:
+    """呼叫 DiscoveryPerformance.evaluate() 回傳完整結果。"""
+    from src.discovery.performance import DiscoveryPerformance
+
+    perf = DiscoveryPerformance(
+        mode=mode,
+        holding_days=holding_days or [5, 10, 20],
+        top_n=top_n,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    return perf.evaluate()
+
+
+def load_discovery_stock_frequency(
+    mode: str,
+    top_n: int = 20,
+    start_date=None,
+    end_date=None,
+) -> pd.DataFrame:
+    """推薦頻率排行（SQL GROUP BY）。"""
+    with get_session() as session:
+        stmt = (
+            select(
+                DiscoveryRecord.stock_id,
+                DiscoveryRecord.stock_name,
+                func.count(DiscoveryRecord.id).label("recommend_count"),
+                func.avg(DiscoveryRecord.rank).label("avg_rank"),
+                func.avg(DiscoveryRecord.composite_score).label("avg_composite_score"),
+            )
+            .where(DiscoveryRecord.mode == mode)
+            .group_by(DiscoveryRecord.stock_id, DiscoveryRecord.stock_name)
+            .order_by(func.count(DiscoveryRecord.id).desc())
+            .limit(top_n)
+        )
+        stmt = _discovery_date_filters(stmt, start_date, end_date)
+        rows = session.execute(stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "recommend_count", "avg_rank", "avg_composite_score"])
+    return pd.DataFrame(
+        rows,
+        columns=["stock_id", "stock_name", "recommend_count", "avg_rank", "avg_composite_score"],
+    )
+
+
+def load_discovery_records(
+    mode: str,
+    start_date=None,
+    end_date=None,
+) -> pd.DataFrame:
+    """原始推薦記錄（純 DiscoveryRecord 查詢）。"""
+    with get_session() as session:
+        stmt = (
+            select(DiscoveryRecord)
+            .where(DiscoveryRecord.mode == mode)
+            .order_by(DiscoveryRecord.scan_date.desc(), DiscoveryRecord.rank)
+        )
+        stmt = _discovery_date_filters(stmt, start_date, end_date)
+        rows = session.execute(stmt).scalars().all()
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        [
+            {
+                "scan_date": r.scan_date,
+                "rank": r.rank,
+                "stock_id": r.stock_id,
+                "stock_name": r.stock_name,
+                "close": r.close,
+                "composite_score": r.composite_score,
+                "technical_score": r.technical_score,
+                "chip_score": r.chip_score,
+                "fundamental_score": r.fundamental_score,
+                "news_score": r.news_score,
+                "sector_bonus": r.sector_bonus,
+                "industry_category": r.industry_category,
+                "regime": r.regime,
             }
             for r in rows
         ]
