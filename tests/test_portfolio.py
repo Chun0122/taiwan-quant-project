@@ -217,3 +217,49 @@ class TestPortfolioBacktestIntegration:
         )
         result = engine.run()
         assert len(result.equity_curve) == 10
+
+    def test_risk_parity_weight_computed(self):
+        """risk_parity 模式可正常執行回測。"""
+        data_a = _make_stock_data(n=60, base=100)
+        data_b = _make_stock_data(n=60, base=200)
+        dates = list(data_a.index)
+
+        signals_a = {dates[5]: 1, dates[-1]: -1}
+        signals_b = {dates[5]: 1, dates[-1]: -1}
+
+        strat_a = MockStrategy("A", data_a, signals_a)
+        strat_b = MockStrategy("B", data_b, signals_b)
+
+        config = PortfolioConfig(allocation_method="risk_parity")
+        engine = PortfolioBacktestEngine(
+            strategies=[strat_a, strat_b],
+            config=BacktestConfig(initial_capital=1_000_000),
+            portfolio_config=config,
+        )
+        result = engine.run()
+        assert isinstance(result, PortfolioResultData)
+        assert result.allocation_method == "risk_parity"
+        assert result.total_trades >= 2
+
+    def test_mean_variance_weight_computed(self):
+        """mean_variance 模式可正常執行回測。"""
+        data_a = _make_stock_data(n=60, base=100)
+        data_b = _make_stock_data(n=60, base=200)
+        dates = list(data_a.index)
+
+        signals_a = {dates[5]: 1, dates[-1]: -1}
+        signals_b = {dates[5]: 1, dates[-1]: -1}
+
+        strat_a = MockStrategy("A", data_a, signals_a)
+        strat_b = MockStrategy("B", data_b, signals_b)
+
+        config = PortfolioConfig(allocation_method="mean_variance")
+        engine = PortfolioBacktestEngine(
+            strategies=[strat_a, strat_b],
+            config=BacktestConfig(initial_capital=1_000_000),
+            portfolio_config=config,
+        )
+        result = engine.run()
+        assert isinstance(result, PortfolioResultData)
+        assert result.allocation_method == "mean_variance"
+        assert result.total_trades >= 1

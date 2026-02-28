@@ -314,6 +314,12 @@ python main.py backtest --stock 2330 --strategy sma_cross --sizing atr
 # 等權配置
 python main.py backtest --stocks 2330 2317 2454 --strategy sma_cross
 
+# 風險平價配置（波動大的股票權重低）
+python main.py backtest --stocks 2330 2317 2454 --strategy sma_cross --allocation risk_parity
+
+# 均值-方差最佳化（最大化 Sharpe ratio）
+python main.py backtest --stocks 2330 2317 2454 --strategy sma_cross --allocation mean_variance
+
 # 加停損
 python main.py backtest --stocks 2330 2317 --strategy multi_factor --stop-loss 5
 
@@ -321,10 +327,21 @@ python main.py backtest --stocks 2330 2317 --strategy multi_factor --stop-loss 5
 python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-loss 5 --take-profit 15
 ```
 
+配置方式說明：
+
+| 模式 | 說明 |
+|------|------|
+| `equal_weight` | 等權配置，每支股票分配相同資金（預設） |
+| `custom` | 自訂權重（程式化呼叫時使用） |
+| `risk_parity` | 風險平價，使各資產的風險貢獻相等。波動大的股票分配較少權重（需 scipy） |
+| `mean_variance` | Markowitz 均值-方差最佳化，最大化 Sharpe ratio。高報酬低風險的股票獲得較高權重（需 scipy） |
+
+> **注意**：`risk_parity` 和 `mean_variance` 需要至少 30 天的歷史資料計算報酬率。資料不足時會自動 fallback 到 `equal_weight`。
+
 | 參數 | 說明 |
 |------|------|
 | `--stocks SID1 SID2 ...` | 多支股票代號（與 `--stock` 互斥） |
-| `--allocation METHOD` | 配置方式：`equal_weight`（預設）/ `custom` |
+| `--allocation METHOD` | 配置方式：`equal_weight`（預設）/ `custom` / `risk_parity` / `mean_variance` |
 
 #### 績效指標
 
@@ -1065,7 +1082,7 @@ python main.py status
 | var_95 | Float | VaR 95% |
 | cvar_95 | Float | CVaR 95% |
 | profit_factor | Float | Profit Factor |
-| allocation_method | String | 配置方式（equal_weight/custom） |
+| allocation_method | String | 配置方式（equal_weight/custom/risk_parity/mean_variance） |
 | created_at | DateTime | 建立時間 |
 
 ### portfolio_trade（投資組合交易明細，P6 新增）

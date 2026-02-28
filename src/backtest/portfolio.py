@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class PortfolioConfig:
     """投資組合配置。"""
 
-    allocation_method: str = "equal_weight"  # "equal_weight" | "custom"
+    allocation_method: str = "equal_weight"  # "equal_weight" | "custom" | "risk_parity" | "mean_variance"
     weights: dict[str, float] | None = None  # stock_id → 權重（custom 時使用）
     max_position_pct: float = 0.5  # 單股最大持倉比例
 
@@ -116,7 +116,7 @@ class PortfolioBacktestEngine:
         all_dates = sorted(set().union(*(df.index for df in stock_data.values())))
 
         # 3. 計算配置權重
-        weights = self._compute_weights(stock_ids)
+        weights = self._compute_weights(stock_ids, stock_data)
 
         # 4. 逐日模擬
         capital = self.config.initial_capital
@@ -353,9 +353,13 @@ class PortfolioBacktestEngine:
             per_stock_returns=per_stock_returns,
         )
 
-    def _compute_weights(self, stock_ids: list[str]) -> dict[str, float]:
+    def _compute_weights(
+        self, stock_ids: list[str], stock_data: dict[str, pd.DataFrame] | None = None
+    ) -> dict[str, float]:
         """計算各股票的資金配置權重。"""
-        if self.portfolio_config.allocation_method == "custom" and self.portfolio_config.weights:
+        method = self.portfolio_config.allocation_method
+
+        if method == "custom" and self.portfolio_config.weights:
             weights = {}
             for sid in stock_ids:
                 weights[sid] = self.portfolio_config.weights.get(sid, 0.0)
@@ -365,9 +369,36 @@ class PortfolioBacktestEngine:
                 weights = {sid: w / total for sid, w in weights.items()}
             return weights
 
-        # equal_weight
+        if method in ("risk_parity", "mean_variance") and stock_data:
+            returns = self._build_returns_df(stock_ids, stock_data)
+            if returns is not None and len(returns) >= 30:
+                from src.backtest.allocator import mean_variance_weights, risk_parity_weights
+
+                if method == "risk_parity":
+                    return risk_parity_weights(returns)
+                else:
+                    return mean_variance_weights(returns)
+            else:
+                logger.warning("報酬率資料不足（< 30 天），%s fallback 到 equal_weight", method)
+
+        # equal_weight（預設或 fallback）
         n = len(stock_ids)
         return {sid: 1.0 / n for sid in stock_ids}
+
+    @staticmethod
+    def _build_returns_df(stock_ids: list[str], stock_data: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+        """從各股票的 OHLCV DataFrame 建立日報酬率矩陣。"""
+        series_map = {}
+        for sid in stock_ids:
+            df = stock_data[sid]
+            col = "raw_close" if "raw_close" in df.columns else "close"
+            series_map[sid] = df[col]
+
+        prices = pd.DataFrame(series_map)
+        prices = prices.dropna()
+        if len(prices) < 2:
+            return None
+        return prices.pct_change().dropna()
 
     def _compute_metrics(
         self,

@@ -79,6 +79,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_portfolio.py`      | `src/backtest/portfolio.py` 組合回測              | 純函數 + mock Strategy |
 | `tests/test_walk_forward.py`   | `src/backtest/walk_forward.py` Walk-Forward 驗證  | 純函數 + mock Strategy |
 | `tests/test_pipeline.py`       | `src/data/pipeline.py` ETL 函數                   | in-memory SQLite       |
+| `tests/test_allocator.py`      | `src/backtest/allocator.py` risk_parity + mean_variance 權重計算 + fallback | 純函數 + scipy         |
 | `tests/test_validator.py`      | `src/data/validator.py` 6 個品質檢查純函數         | 純函數                 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
@@ -133,7 +134,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
 | `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
 | `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管、除權息股利入帳                                                                      |
-| `src/backtest/portfolio.py`         | 多股票組合回測                                                                                                    |
+| `src/backtest/allocator.py`         | 投資組合配置計算（risk_parity / mean_variance），scipy 優化純函數                                                 |
+| `src/backtest/portfolio.py`         | 多股票組合回測，支援 equal_weight / custom / risk_parity / mean_variance 四種配置                                 |
 | `src/backtest/walk_forward.py`      | Walk-Forward 滾動窗口驗證（防過擬合）                                                                             |
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
@@ -188,7 +190,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 2 | ✅ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖、個股排行、明細 CSV 匯出），已完成 |
 | 3 | ✅ | **補齊測試覆蓋** | 新增 8 個測試檔共 129 個測試（231→360），覆蓋 indicators、strategies、formatter、notification、report engine、portfolio、walk_forward、pipeline |
 | 4 | ✅ | **CLI `validate` 命令（資料品質檢查）** | 6 個純函數檢查（缺漏交易日、零成交量、連續漲跌停、價格異常、日期範圍一致性、資料新鮮度），支援 CSV 匯出 |
-| 5 | ⬜ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），目前僅 equal_weight |
+| 5 | ✅ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），allocator.py 純函數模組 + scipy 優化 |
 | 6 | ⬜ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），新增 FinancialStatement ORM 表 |
 | 7 | ⬜ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度雷達圖 |
 | 8 | ⬜ | **CLI `export`/`import` 通用命令** | export：匯出任意資料表為 CSV/Parquet；import：從 CSV 批次匯入自訂資料（含驗證） |

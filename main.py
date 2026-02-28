@@ -1114,7 +1114,10 @@ def main() -> None:
     )
     sp_bt.add_argument("--fraction", type=float, default=1.0, help="fixed_fraction 比例 (0.0~1.0)")
     sp_bt.add_argument(
-        "--allocation", default="equal_weight", choices=["equal_weight", "custom"], help="投資組合配置方式"
+        "--allocation",
+        default="equal_weight",
+        choices=["equal_weight", "custom", "risk_parity", "mean_variance"],
+        help="投資組合配置方式 (equal_weight/custom/risk_parity/mean_variance)",
     )
     sp_bt.add_argument(
         "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
