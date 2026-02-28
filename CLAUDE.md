@@ -38,11 +38,14 @@ python main.py dashboard                     # Streamlit 儀表板（localhost:8
 python main.py validate                      # 資料品質檢查（全部股票）
 python main.py validate --stocks 2330 2317   # 指定股票品質檢查
 python main.py validate --export issues.csv  # 匯出問題清單
+python main.py sync-financial                # 同步 watchlist 財報（預設最近 4 季）
+python main.py sync-financial --stocks 2330  # 指定股票
+python main.py sync-financial --quarters 8   # 最近 8 季
 ```
 
 ### 測試
 
-使用 pytest 測試框架，~390 個測試覆蓋核心模組：
+使用 pytest 測試框架，~438 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -81,6 +84,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_pipeline.py`       | `src/data/pipeline.py` ETL 函數                   | in-memory SQLite       |
 | `tests/test_allocator.py`      | `src/backtest/allocator.py` risk_parity + mean_variance 權重計算 + fallback | 純函數 + scipy         |
 | `tests/test_validator.py`      | `src/data/validator.py` 6 個品質檢查純函數         | 純函數                 |
+| `tests/test_financial.py`     | `src/data/fetcher.py` 財報 EAV pivot + 衍生比率 + pipeline upsert | 純函數 + mock API + in-memory SQLite |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -120,11 +124,11 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組                                | 角色                                                                                                              |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次）                                                                                   |
+| `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次 + 財報三表 EAV pivot）                                                              |
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）                                                                                |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）                                                              |
-| `src/data/schema.py`                | 13 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord）                                                   |
+| `src/data/schema.py`                | 14 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement）                               |
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
@@ -191,7 +195,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 3 | ✅ | **補齊測試覆蓋** | 新增 8 個測試檔共 129 個測試（231→360），覆蓋 indicators、strategies、formatter、notification、report engine、portfolio、walk_forward、pipeline |
 | 4 | ✅ | **CLI `validate` 命令（資料品質檢查）** | 6 個純函數檢查（缺漏交易日、零成交量、連續漲跌停、價格異常、日期範圍一致性、資料新鮮度），支援 CSV 匯出 |
 | 5 | ✅ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），allocator.py 純函數模組 + scipy 優化 |
-| 6 | ⬜ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），新增 FinancialStatement ORM 表 |
+| 6 | ✅ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），FinancialStatement ORM 表 + fetcher EAV pivot + pipeline sync + CLI sync-financial |
 | 7 | ⬜ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度雷達圖 |
 | 8 | ⬜ | **CLI `export`/`import` 通用命令** | export：匯出任意資料表為 CSV/Parquet；import：從 CSV 批次匯入自訂資料（含驗證） |
 | 9 | ⬜ | **個股分析頁面增強** | 成交量柱狀圖疊加 K 線、技術指標可勾選疊加、法人買賣超累積圖、融資融券走勢、MOPS 公告時間軸 |

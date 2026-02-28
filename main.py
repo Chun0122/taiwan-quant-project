@@ -78,6 +78,11 @@ Usage:
     python main.py discover-backtest --mode momentum --start 2025-06-01 --end 2025-12-31
     python main.py discover-backtest --mode momentum --export result.csv
 
+    # 同步財報資料
+    python main.py sync-financial                    # 同步 watchlist 財報（預設最近 4 季）
+    python main.py sync-financial --stocks 2330 2317 # 指定股票
+    python main.py sync-financial --quarters 8       # 最近 8 季
+
     # DB 遷移
     python main.py migrate
 
@@ -133,6 +138,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
                 f"融資融券={counts['margin']}",
                 f"營收={counts.get('revenue', 0)}",
                 f"股利={counts.get('dividend', 0)}",
+                f"財報={counts.get('financial', 0)}",
             ]
             print(f"  {stock_id}: {', '.join(parts)}")
 
@@ -336,6 +342,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         BacktestResult,
         DailyPrice,
         Dividend,
+        FinancialStatement,
         InstitutionalInvestor,
         MarginTrading,
         MonthlyRevenue,
@@ -352,6 +359,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             (MarginTrading, "融資融券"),
             (MonthlyRevenue, "月營收"),
             (Dividend, "股利"),
+            (FinancialStatement, "財報"),
             (TechnicalIndicator, "技術指標"),
         ]:
             total = session.execute(select(func.count()).select_from(model)).scalar()
@@ -1022,6 +1030,30 @@ def cmd_sync_revenue(args: argparse.Namespace) -> None:
         print(f"月營收資料庫: {total:,} 筆（{distinct_stocks:,} 支股票）")
 
 
+def cmd_sync_financial(args: argparse.Namespace) -> None:
+    """同步財報資料（季報損益表 + 資產負債表 + 現金流量表）。"""
+    from src.data.pipeline import sync_financial_statements
+
+    stocks = args.stocks if args.stocks else None
+    quarters = getattr(args, "quarters", 4)
+    print(f"同步財報資料（最近 {quarters} 季）...")
+    count = sync_financial_statements(watchlist=stocks, quarters=quarters)
+    print(f"\n財報同步完成: {count:,} 筆")
+
+    if count > 0:
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import FinancialStatement
+
+        with get_session() as session:
+            total = session.execute(select(func.count()).select_from(FinancialStatement)).scalar()
+            distinct_stocks = session.execute(select(func.count(func.distinct(FinancialStatement.stock_id)))).scalar()
+            max_date = session.execute(select(func.max(FinancialStatement.date))).scalar()
+
+        print(f"財報資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -1248,6 +1280,11 @@ def main() -> None:
     sp_rev = subparsers.add_parser("sync-revenue", help="從 MOPS 同步全市場月營收（上市+上櫃）")
     sp_rev.add_argument("--months", type=int, default=1, help="同步最近幾個月（預設 1）")
 
+    # sync-financial 子命令
+    sp_fin = subparsers.add_parser("sync-financial", help="同步財報資料（季報損益表+資產負債表+現金流量表）")
+    sp_fin.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_fin.add_argument("--quarters", type=int, default=4, help="同步最近幾季（預設 4）")
+
     # validate 子命令
     sp_val = subparsers.add_parser("validate", help="資料品質檢查（缺漏、異常值、新鮮度）")
     sp_val.add_argument("--stocks", nargs="+", help="指定股票代號（預設檢查全部）")
@@ -1298,6 +1335,8 @@ def main() -> None:
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":
         cmd_sync_revenue(args)
+    elif args.command == "sync-financial":
+        cmd_sync_financial(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     elif args.command == "validate":

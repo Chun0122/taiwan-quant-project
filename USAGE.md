@@ -45,7 +45,7 @@ taiwan-quant-project/
 │   ├── config.py            # 設定管理模組
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義（含投資組合表 + StockInfo）
+│   │   ├── schema.py        # ORM 資料表定義（14 張表，含 FinancialStatement）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
 │   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
 │   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
@@ -163,7 +163,7 @@ python main.py sync --stocks 2330 --start 2024-01-01
 python main.py sync --taiex
 ```
 
-每檔股票會同步五種資料：
+每檔股票會同步六種資料：
 | 資料類型 | FinMind Dataset | DB 資料表 |
 |----------|----------------|-----------|
 | 日K線（OHLCV） | TaiwanStockPrice | `daily_price` |
@@ -171,6 +171,7 @@ python main.py sync --taiex
 | 融資融券 | TaiwanStockMarginPurchaseShortSale | `margin_trading` |
 | 月營收 | TaiwanStockMonthRevenue | `monthly_revenue` |
 | 股利 | TaiwanStockDividend | `dividend` |
+| 財報（季報） | FinancialStatements + BalanceSheet + CashFlows | `financial_statement` |
 
 加上 `--taiex` 可同步加權指數（存入 daily_price，stock_id=TAIEX）。
 
@@ -860,7 +861,41 @@ python main.py sync-revenue --months 3
 
 > **自動同步**：`discover growth` 執行時若偵測到月營收覆蓋不足（< 500 支股票），會自動觸發 `sync_mops_revenue()` 補抓，無需手動執行此命令。
 
-### 4.17 資料品質檢查 (`validate`)
+### 4.17 同步財報資料 (`sync-financial`)
+
+從 FinMind 抓取季報財務資料（綜合損益表 + 資產負債表 + 現金流量表），合併三表並計算衍生比率後存入 `financial_statement` 表。
+
+```bash
+# 同步 watchlist 財報（預設最近 4 季）
+python main.py sync-financial
+
+# 指定股票
+python main.py sync-financial --stocks 2330 2317
+
+# 同步最近 8 季（2 年）
+python main.py sync-financial --quarters 8
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `--stocks SID ...` | 指定股票代號（預設使用 watchlist） |
+| `--quarters N` | 同步最近幾季（預設 4） |
+
+**同步內容：**
+
+| 來源 Dataset | 欄位 |
+|-------------|------|
+| TaiwanStockFinancialStatements | 營收、毛利、營業利益、稅後淨利、EPS |
+| TaiwanStockBalanceSheet | 總資產、總負債、股東權益 |
+| TaiwanStockCashFlowsStatement | 營業現金流、投資現金流、融資現金流 |
+
+**自動計算衍生比率：** 毛利率、營益率、淨利率、ROE、ROA、負債比、自由現金流。
+
+> **注意**：`sync` 命令也會自動同步財報，無需額外執行此命令。此命令適合初次設定或補抓歷史財報時使用。
+
+### 4.18 資料品質檢查 (`validate`)
 
 檢測 DB 中的資料品質問題：缺漏交易日、零成交量、連續漲跌停、價格異常（high < low、負價格）、資料表日期範圍不一致、資料新鮮度。
 
@@ -905,7 +940,7 @@ python main.py validate --export issues.csv
 | 日期範圍不一致 | warning | 同股不同表的最新日期差距 > 30 天 |
 | 資料過期 | warning | 最新資料距今 > 7 個營業日 |
 
-### 4.18 資料庫遷移 (`migrate`)
+### 4.19 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -920,7 +955,7 @@ python main.py migrate
 
 已存在的欄位會自動跳過，可重複執行。
 
-### 4.19 查看資料庫概況 (`status`)
+### 4.20 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status
@@ -938,7 +973,7 @@ python main.py status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。十二張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。十四張核心表：
 
 ### daily_price（日K線）
 
@@ -1112,6 +1147,35 @@ python main.py status
 | sentiment | Integer | 情緒分類（+1 正面 / 0 中性 / -1 負面） |
 
 唯一鍵：`(stock_id, date, seq)`
+
+### financial_statement（季報財務資料）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 季度結束日（如 2024-03-31） |
+| year | Integer | 年度 |
+| quarter | Integer | 季度（1~4） |
+| revenue | BigInteger | 營收 |
+| gross_profit | BigInteger | 毛利 |
+| operating_income | BigInteger | 營業利益 |
+| net_income | BigInteger | 稅後淨利 |
+| eps | Float | 每股盈餘 |
+| total_assets | BigInteger | 總資產 |
+| total_liabilities | BigInteger | 總負債 |
+| equity | BigInteger | 股東權益 |
+| operating_cf | BigInteger | 營業現金流 |
+| investing_cf | BigInteger | 投資現金流 |
+| financing_cf | BigInteger | 融資現金流 |
+| free_cf | BigInteger | 自由現金流（營業+投資） |
+| gross_margin | Float | 毛利率 (%) |
+| operating_margin | Float | 營益率 (%) |
+| net_margin | Float | 淨利率 (%) |
+| roe | Float | 股東權益報酬率 (%) |
+| roa | Float | 資產報酬率 (%) |
+| debt_ratio | Float | 負債比 (%) |
+
+唯一鍵：`(stock_id, date)`
 
 ### stock_info（股票基本資料，P8 新增）
 

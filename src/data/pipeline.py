@@ -17,6 +17,7 @@ from src.data.schema import (
     BacktestResult,
     DailyPrice,
     Dividend,
+    FinancialStatement,
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
@@ -161,6 +162,88 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
 
     if skipped:
         logger.info("[營收補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+    return total
+
+
+def _upsert_financial(df: pd.DataFrame) -> int:
+    """將財報 DataFrame 寫入 financial_statement 表。"""
+    return _upsert_batch(FinancialStatement, df, ["stock_id", "date"])
+
+
+def sync_financial_statements(
+    watchlist: list[str] | None = None,
+    quarters: int = 4,
+) -> int:
+    """同步 watchlist 財報資料（最近 N 季）。
+
+    Args:
+        watchlist: 股票代號清單（預設使用 settings.fetcher.watchlist）
+        quarters: 抓取最近幾季（預設 4 季 = 1 年）
+
+    Returns:
+        新增的財報筆數
+    """
+    if watchlist is None:
+        watchlist = settings.fetcher.watchlist
+
+    init_db()
+    fetcher = FinMindFetcher()
+
+    # 每季約 90 天，多抓一點確保覆蓋
+    start = (date.today() - timedelta(days=quarters * 95 + 30)).isoformat()
+    end = date.today().isoformat()
+    total = 0
+    skipped = 0
+
+    for sid in watchlist:
+        last = _get_last_date(FinancialStatement, sid)
+        # 如果 DB 已有 60 天內的資料，跳過
+        if last and (date.today() - date.fromisoformat(last)).days < 60:
+            skipped += 1
+            continue
+
+        try:
+            df = fetcher.fetch_financial_summary(sid, last or start, end)
+            total += _upsert_financial(df)
+        except Exception:
+            logger.warning("[%s] 財報同步失敗，跳過", sid)
+
+    if skipped:
+        logger.info("[財報同步] 跳過 %d 支（DB 已有近期資料）", skipped)
+    logger.info("[財報同步] 完成，共寫入 %d 筆", total)
+    return total
+
+
+def sync_financial_for_stocks(stock_ids: list[str], quarters: int = 4) -> int:
+    """為指定股票補抓財報資料（供 discover 或其他模組用）。
+
+    Args:
+        stock_ids: 要補抓財報的股票代號清單
+        quarters: 抓取最近幾季
+
+    Returns:
+        新增的財報筆數
+    """
+    fetcher = FinMindFetcher()
+    total = 0
+    start = (date.today() - timedelta(days=quarters * 95 + 30)).isoformat()
+    end = date.today().isoformat()
+    skipped = 0
+
+    for sid in stock_ids:
+        last = _get_last_date(FinancialStatement, sid)
+        # 如果 DB 已有 60 天內的資料，跳過
+        if last and (date.today() - date.fromisoformat(last)).days < 60:
+            skipped += 1
+            continue
+        try:
+            df = fetcher.fetch_financial_summary(sid, last or start, end)
+            total += _upsert_financial(df)
+        except Exception:
+            logger.warning("[%s] 財報補抓失敗，跳過", sid)
+
+    if skipped:
+        logger.info("[財報補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
     return total
 
 
@@ -313,6 +396,17 @@ def sync_stock(
     logger.info("[%s] 同步股利: %s ~ %s", stock_id, s, end_date)
     df_div = fetcher.fetch_dividend(stock_id, s, end_date)
     result["dividend"] = _upsert_dividend(df_div)
+
+    # --- 財報 ---
+    last = _get_last_date(FinancialStatement, stock_id)
+    s = last if last and last > default_start else default_start
+    logger.info("[%s] 同步財報: %s ~ %s", stock_id, s, end_date)
+    try:
+        df_fin = fetcher.fetch_financial_summary(stock_id, s, end_date)
+        result["financial"] = _upsert_financial(df_fin)
+    except Exception:
+        logger.warning("[%s] 財報同步失敗，跳過", stock_id)
+        result["financial"] = 0
 
     return result
 

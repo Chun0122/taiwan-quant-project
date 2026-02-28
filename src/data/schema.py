@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十三張核心表：
+十四張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -9,6 +9,7 @@
 - Dividend:                股利資料
 - TechnicalIndicator:      技術指標（EAV 長表）
 - Announcement:            MOPS 重大訊息公告
+- FinancialStatement:      季報財務資料（損益表+資產負債表+現金流量表）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
@@ -174,6 +175,52 @@ class Announcement(Base):
 
     def __repr__(self) -> str:
         return f"<Announcement {self.stock_id} {self.date} seq={self.seq}>"
+
+
+class FinancialStatement(Base):
+    """季報財務資料（損益表 + 資產負債表 + 現金流量表）。
+
+    來源：FinMind API（TaiwanStockFinancialStatements / BalanceSheet / CashFlowsStatement）。
+    EAV 格式 pivot 後存入此寬表，每支股票每季一筆。
+    """
+
+    __tablename__ = "financial_statement"
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_financial_statement"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)  # 季度結束日
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    quarter: Mapped[int] = mapped_column(Integer, nullable=False)  # 1~4
+
+    # 綜合損益表
+    revenue: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    gross_profit: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    operating_income: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    net_income: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 資產負債表
+    total_assets: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_liabilities: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    equity: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # 現金流量表
+    operating_cf: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    investing_cf: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    financing_cf: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    free_cf: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # = operating_cf + investing_cf
+
+    # 衍生比率（寫入時計算）
+    gross_margin: Mapped[float | None] = mapped_column(Float, nullable=True)  # 毛利率 %
+    operating_margin: Mapped[float | None] = mapped_column(Float, nullable=True)  # 營益率 %
+    net_margin: Mapped[float | None] = mapped_column(Float, nullable=True)  # 淨利率 %
+    roe: Mapped[float | None] = mapped_column(Float, nullable=True)  # ROE %
+    roa: Mapped[float | None] = mapped_column(Float, nullable=True)  # ROA %
+    debt_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)  # 負債比 %
+
+    def __repr__(self) -> str:
+        return f"<FinancialStatement {self.stock_id} {self.date} Q{self.quarter} EPS={self.eps}>"
 
 
 class BacktestResult(Base):
