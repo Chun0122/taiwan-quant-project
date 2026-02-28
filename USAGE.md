@@ -50,6 +50,7 @@ taiwan-quant-project/
 │   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
 │   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
+│   │   ├── validator.py     # 資料品質檢查（6 項檢查 + 報告）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
 │   │   ├── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
@@ -842,7 +843,52 @@ python main.py sync-revenue --months 3
 
 > **自動同步**：`discover growth` 執行時若偵測到月營收覆蓋不足（< 500 支股票），會自動觸發 `sync_mops_revenue()` 補抓，無需手動執行此命令。
 
-### 4.17 資料庫遷移 (`migrate`)
+### 4.17 資料品質檢查 (`validate`)
+
+檢測 DB 中的資料品質問題：缺漏交易日、零成交量、連續漲跌停、價格異常（high < low、負價格）、資料表日期範圍不一致、資料新鮮度。
+
+```bash
+# 檢查全部股票（預設）
+python main.py validate
+
+# 只檢查指定股票
+python main.py validate --stocks 2330 2317
+
+# 調整缺漏門檻（預設 5 個營業日）
+python main.py validate --gap-threshold 3
+
+# 調整連續漲跌停門檻（預設 5 天）
+python main.py validate --streak-threshold 3
+
+# 跳過資料新鮮度檢查
+python main.py validate --no-freshness
+
+# 匯出問題清單到 CSV
+python main.py validate --export issues.csv
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `--stocks SID ...` | 指定股票代號（預設檢查全部） |
+| `--gap-threshold N` | 缺漏營業日門檻（預設 5，>= 此值報 error） |
+| `--streak-threshold N` | 連續漲跌停天數門檻（預設 5，>= 此值報 warning） |
+| `--no-freshness` | 跳過資料新鮮度檢查 |
+| `--export PATH` | 匯出問題清單 CSV 路徑 |
+
+**六項檢查：**
+
+| 檢查項 | 嚴重度 | 說明 |
+|--------|--------|------|
+| 缺漏交易日 | error | 連續缺漏 >= 門檻個營業日 |
+| 零成交量 | error/warning | 連續 3+ 天為 error，單日為 warning |
+| 連續漲跌停 | warning | 日報酬率 >= 9.5% 且同方向連續 >= 門檻天 |
+| 價格異常 | error | high < low、close 超出 [low, high]、價格 <= 0 |
+| 日期範圍不一致 | warning | 同股不同表的最新日期差距 > 30 天 |
+| 資料過期 | warning | 最新資料距今 > 7 個營業日 |
+
+### 4.18 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
@@ -857,7 +903,7 @@ python main.py migrate
 
 已存在的欄位會自動跳過，可重複執行。
 
-### 4.17 查看資料庫概況 (`status`)
+### 4.19 查看資料庫概況 (`status`)
 
 ```bash
 python main.py status

@@ -80,6 +80,13 @@ Usage:
 
     # DB 遷移
     python main.py migrate
+
+    # 資料品質檢查
+    python main.py validate
+    python main.py validate --stocks 2330 2317
+    python main.py validate --gap-threshold 3 --streak-threshold 3
+    python main.py validate --no-freshness
+    python main.py validate --export issues.csv
 """
 
 from __future__ import annotations
@@ -1056,6 +1063,24 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
         print(f"\n明細已匯出至: {args.export}")
 
 
+def cmd_validate(args: argparse.Namespace) -> None:
+    """執行資料品質檢查。"""
+    from src.data.validator import export_issues_csv, print_validation_report, run_validation
+
+    stocks = args.stocks if args.stocks else None
+    report = run_validation(
+        stock_ids=stocks,
+        gap_threshold=args.gap_threshold,
+        streak_threshold=args.streak_threshold,
+        check_freshness=not args.no_freshness,
+    )
+
+    print_validation_report(report)
+
+    if args.export:
+        export_issues_csv(report, args.export)
+
+
 def main() -> None:
     setup_logging()
 
@@ -1220,6 +1245,14 @@ def main() -> None:
     sp_rev = subparsers.add_parser("sync-revenue", help="從 MOPS 同步全市場月營收（上市+上櫃）")
     sp_rev.add_argument("--months", type=int, default=1, help="同步最近幾個月（預設 1）")
 
+    # validate 子命令
+    sp_val = subparsers.add_parser("validate", help="資料品質檢查（缺漏、異常值、新鮮度）")
+    sp_val.add_argument("--stocks", nargs="+", help="指定股票代號（預設檢查全部）")
+    sp_val.add_argument("--gap-threshold", type=int, default=5, help="缺漏營業日門檻（預設 5）")
+    sp_val.add_argument("--streak-threshold", type=int, default=5, help="連續漲跌停天數門檻（預設 5）")
+    sp_val.add_argument("--no-freshness", action="store_true", help="跳過資料新鮮度檢查")
+    sp_val.add_argument("--export", default=None, help="匯出問題清單 CSV 路徑")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -1264,6 +1297,8 @@ def main() -> None:
         cmd_sync_revenue(args)
     elif args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "validate":
+        cmd_validate(args)
     else:
         parser.print_help()
         sys.exit(1)

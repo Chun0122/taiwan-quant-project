@@ -35,11 +35,14 @@ python main.py sync-mops --days 30           # 同步最近 30 天
 python main.py sync-revenue                  # 同步全市場月營收（上月，從 MOPS）
 python main.py sync-revenue --months 3       # 同步最近 3 個月
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
+python main.py validate                      # 資料品質檢查（全部股票）
+python main.py validate --stocks 2330 2317   # 指定股票品質檢查
+python main.py validate --export issues.csv  # 匯出問題清單
 ```
 
 ### 測試
 
-使用 pytest 測試框架，360 個測試覆蓋核心模組：
+使用 pytest 測試框架，~390 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -76,6 +79,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_portfolio.py`      | `src/backtest/portfolio.py` 組合回測              | 純函數 + mock Strategy |
 | `tests/test_walk_forward.py`   | `src/backtest/walk_forward.py` Walk-Forward 驗證  | 純函數 + mock Strategy |
 | `tests/test_pipeline.py`       | `src/data/pipeline.py` ETL 函數                   | in-memory SQLite       |
+| `tests/test_validator.py`      | `src/data/validator.py` 6 個品質檢查純函數         | 純函數                 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -120,6 +124,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）                                                              |
 | `src/data/schema.py`                | 13 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord）                                                   |
+| `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）                                |
@@ -182,7 +187,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 1 | ✅ | **新增 Scanner 模式（高息股 / 高成長）** | DividendScanner（殖利率>3%、PE>0）+ GrowthScanner（YoY>10%、動能確認），已完成並通過 231 測試 |
 | 2 | ✅ | **Dashboard 新增 Discover 推薦歷史頁** | 視覺化 DiscoveryRecord 歷史推薦 + 績效追蹤（日曆熱圖、報酬率箱型圖、個股排行、明細 CSV 匯出），已完成 |
 | 3 | ✅ | **補齊測試覆蓋** | 新增 8 個測試檔共 129 個測試（231→360），覆蓋 indicators、strategies、formatter、notification、report engine、portfolio、walk_forward、pipeline |
-| 4 | ⬜ | **CLI `validate` 命令（資料品質檢查）** | 檢測缺漏交易日、異常值（連續漲跌停、零成交量）、資料表日期範圍不一致，輸出品質報告 |
+| 4 | ✅ | **CLI `validate` 命令（資料品質檢查）** | 6 個純函數檢查（缺漏交易日、零成交量、連續漲跌停、價格異常、日期範圍一致性、資料新鮮度），支援 CSV 匯出 |
 | 5 | ⬜ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），目前僅 equal_weight |
 | 6 | ⬜ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），新增 FinancialStatement ORM 表 |
 | 7 | ⬜ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度雷達圖 |
