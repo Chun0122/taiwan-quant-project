@@ -18,7 +18,7 @@ pip install -r requirements.txt
 python main.py [command] [options]
 
 # 常見工作流程：
-python main.py sync                          # 從 FinMind 同步觀察清單資料
+python main.py sync                          # 從 FinMind 同步觀察清單資料（含 TAIEX）
 python main.py compute                       # 計算技術指標
 python main.py backtest --stock 2330 --strategy sma_cross
 python main.py discover --top 20             # 全市場掃描（預設 momentum 模式）
@@ -45,7 +45,7 @@ python main.py sync-financial --quarters 8   # 最近 8 季
 
 ### 測試
 
-使用 pytest 測試框架，~438 個測試覆蓋核心模組：
+使用 pytest 測試框架，~458 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -85,6 +85,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_allocator.py`      | `src/backtest/allocator.py` risk_parity + mean_variance 權重計算 + fallback | 純函數 + scipy         |
 | `tests/test_validator.py`      | `src/data/validator.py` 6 個品質檢查純函數         | 純函數                 |
 | `tests/test_financial.py`     | `src/data/fetcher.py` 財報 EAV pivot + 衍生比率 + pipeline upsert | 純函數 + mock API + in-memory SQLite |
+| `tests/test_market_overview.py` | `data_loader` 市場總覽查詢 + `charts` 4 個圖表函數 | in-memory SQLite + 純函數 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -157,7 +158,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
-| `src/visualization/pages/`          | 儀表板分頁（stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history） |
+| `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history） |
 | `main.py`                           | CLI 調度器（argparse 子命令）                                                                                     |
 
 ### 設定
@@ -196,7 +197,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 4 | ✅ | **CLI `validate` 命令（資料品質檢查）** | 6 個純函數檢查（缺漏交易日、零成交量、連續漲跌停、價格異常、日期範圍一致性、資料新鮮度），支援 CSV 匯出 |
 | 5 | ✅ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），allocator.py 純函數模組 + scipy 優化 |
 | 6 | ✅ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），FinancialStatement ORM 表 + fetcher EAV pivot + pipeline sync + CLI sync-financial |
-| 7 | ⬜ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度雷達圖 |
+| 7 | ✅ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度 Treemap，已完成 |
 | 8 | ⬜ | **CLI `export`/`import` 通用命令** | export：匯出任意資料表為 CSV/Parquet；import：從 CSV 批次匯入自訂資料（含驗證） |
 | 9 | ⬜ | **個股分析頁面增強** | 成交量柱狀圖疊加 K 線、技術指標可勾選疊加、法人買賣超累積圖、融資融券走勢、MOPS 公告時間軸 |
 

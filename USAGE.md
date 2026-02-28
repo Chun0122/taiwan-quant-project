@@ -97,6 +97,7 @@ taiwan-quant-project/
 │           ├── screener_results.py    # 選股篩選頁
 │           ├── portfolio_review.py    # 投資組合頁
 │           ├── ml_analysis.py         # ML 策略分析頁
+│           ├── market_overview.py     # 市場總覽首頁
 │           ├── industry_rotation.py   # 產業輪動分析頁
 │           └── discovery_history.py   # 推薦歷史頁
 ├── notebooks/               # Jupyter 分析筆記本
@@ -159,9 +160,11 @@ python main.py sync --start 2023-01-01 --end 2024-12-31
 # 組合使用
 python main.py sync --stocks 2330 --start 2024-01-01
 
-# 同時同步加權指數（用於 benchmark）
+# 同時同步加權指數（用於 benchmark，現已預設啟用）
 python main.py sync --taiex
 ```
+
+> **注意**：`sync` 命令現在預設會自動同步 TAIEX 加權指數，無需手動加 `--taiex`。
 
 每檔股票會同步六種資料：
 | 資料類型 | FinMind Dataset | DB 資料表 |
@@ -362,8 +365,9 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含七個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含八個頁面：
 
+- **市場總覽**: TAIEX 走勢 K 線 + SMA60/120 + Regime 狀態、市場廣度（漲跌家數）、法人買賣超排行、產業熱度 Treemap
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
 - **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
 - **投資組合**: 組合回測績效 + 個股配置圓餅圖 + 個股報酬柱狀圖 + 交易明細

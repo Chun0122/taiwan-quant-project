@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from src.data.database import get_session, init_db
 from src.data.schema import (
@@ -508,3 +508,166 @@ def load_discovery_records(
             for r in rows
         ]
     )
+
+
+# ------------------------------------------------------------------ #
+#  市場總覽
+# ------------------------------------------------------------------ #
+
+
+def load_taiex_history(days: int = 120) -> pd.DataFrame:
+    """載入 TAIEX 加權指數歷史 K 線。"""
+    with get_session() as session:
+        rows = session.execute(
+            select(
+                DailyPrice.date,
+                DailyPrice.open,
+                DailyPrice.high,
+                DailyPrice.low,
+                DailyPrice.close,
+                DailyPrice.volume,
+            )
+            .where(DailyPrice.stock_id == "TAIEX")
+            .order_by(DailyPrice.date.desc())
+            .limit(days)
+        ).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def load_market_breadth(days: int = 60) -> pd.DataFrame:
+    """計算每日漲跌家數 + 全市場成交量。
+
+    使用 DailyPrice.spread 欄位判斷漲跌，排除 TAIEX 本身。
+    """
+    with get_session() as session:
+        stmt = (
+            select(
+                DailyPrice.date,
+                func.sum(case((DailyPrice.spread > 0, 1), else_=0)).label("rising"),
+                func.sum(case((DailyPrice.spread < 0, 1), else_=0)).label("falling"),
+                func.sum(case((DailyPrice.spread == 0, 1), else_=0)).label("flat"),
+                func.sum(DailyPrice.volume).label("total_volume"),
+            )
+            .where(DailyPrice.stock_id != "TAIEX")
+            .where(DailyPrice.spread.is_not(None))
+            .group_by(DailyPrice.date)
+            .order_by(DailyPrice.date.desc())
+            .limit(days)
+        )
+        rows = session.execute(stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "rising", "falling", "flat", "total_volume"])
+
+    df = pd.DataFrame(rows, columns=["date", "rising", "falling", "flat", "total_volume"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def load_market_breadth_stats(windows: list[int] | None = None) -> pd.DataFrame:
+    """計算多窗口漲跌家數聚合統計（近 N 日平均）。"""
+    if windows is None:
+        windows = [1, 5, 20]
+
+    max_window = max(windows)
+    breadth = load_market_breadth(days=max_window + 5)
+    if breadth.empty:
+        return pd.DataFrame(columns=["window", "rising", "falling", "flat"])
+
+    results = []
+    for w in windows:
+        recent = breadth.tail(w)
+        results.append(
+            {
+                "window": f"近{w}日" if w > 1 else "當日",
+                "rising": int(recent["rising"].mean()),
+                "falling": int(recent["falling"].mean()),
+                "flat": int(recent["flat"].mean()),
+            }
+        )
+    return pd.DataFrame(results)
+
+
+def load_top_institutional(lookback: int = 5, top_n: int = 10) -> pd.DataFrame:
+    """載入近 N 日法人買賣超排行（合併三大法人）。"""
+    with get_session() as session:
+        # 取最近 lookback 個交易日
+        recent_dates = (
+            session.execute(
+                select(func.distinct(InstitutionalInvestor.date))
+                .order_by(InstitutionalInvestor.date.desc())
+                .limit(lookback)
+            )
+            .scalars()
+            .all()
+        )
+        if not recent_dates:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "foreign", "trust", "dealer", "total"])
+
+        min_date = min(recent_dates)
+
+        # 按法人類型分組聚合
+        stmt = (
+            select(
+                InstitutionalInvestor.stock_id,
+                InstitutionalInvestor.name,
+                func.sum(InstitutionalInvestor.net).label("net_sum"),
+            )
+            .where(InstitutionalInvestor.date >= min_date)
+            .group_by(InstitutionalInvestor.stock_id, InstitutionalInvestor.name)
+        )
+        rows = session.execute(stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "foreign", "trust", "dealer", "total"])
+
+    # pivot 成寬表
+    df = pd.DataFrame(rows, columns=["stock_id", "name", "net_sum"])
+    pivot = df.pivot_table(index="stock_id", columns="name", values="net_sum", aggfunc="sum").fillna(0)
+
+    result = pd.DataFrame({"stock_id": pivot.index})
+    result["foreign"] = pivot.get("Foreign_Investor", 0).values if "Foreign_Investor" in pivot.columns else 0
+    result["trust"] = pivot.get("Investment_Trust", 0).values if "Investment_Trust" in pivot.columns else 0
+    result["dealer"] = pivot.get("Dealer_self", 0).values if "Dealer_self" in pivot.columns else 0
+    result["total"] = result["foreign"] + result["trust"] + result["dealer"]
+
+    # JOIN stock_name
+    info_map = load_stock_info_map()
+    result["stock_name"] = result["stock_id"].map(lambda sid: info_map.get(sid, {}).get("stock_name", ""))
+
+    # 排序：取 total 絕對值最大的 top_n（含買超和賣超排行）
+    result = result.reindex(result["total"].abs().sort_values(ascending=False).index)
+    result = result.head(top_n).reset_index(drop=True)
+    return result
+
+
+def load_market_volume_summary(days: int = 60) -> pd.DataFrame:
+    """載入全市場每日成交量摘要。"""
+    with get_session() as session:
+        stmt = (
+            select(
+                DailyPrice.date,
+                func.sum(DailyPrice.turnover).label("total_turnover"),
+            )
+            .where(DailyPrice.stock_id != "TAIEX")
+            .group_by(DailyPrice.date)
+            .order_by(DailyPrice.date.desc())
+            .limit(days)
+        )
+        rows = session.execute(stmt).all()
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "total_turnover"])
+
+    df = pd.DataFrame(rows, columns=["date", "total_turnover"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"])
+    return df

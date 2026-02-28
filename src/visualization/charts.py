@@ -752,3 +752,237 @@ def plot_stock_frequency_bar(
         margin=dict(l=120, r=40, t=40, b=40),
     )
     return fig
+
+
+# ------------------------------------------------------------------ #
+#  市場總覽圖表
+# ------------------------------------------------------------------ #
+
+
+def plot_taiex_regime(df: pd.DataFrame, regime_info: dict) -> go.Figure:
+    """TAIEX K 線 + SMA60/SMA120（上圖）+ 20 日報酬率（下圖）。
+
+    Parameters
+    ----------
+    df : DataFrame
+        需含 date, open, high, low, close 欄位
+    regime_info : dict
+        MarketRegimeDetector.detect() 的回傳結果
+    """
+    if df.empty:
+        return go.Figure().update_layout(title="TAIEX 走勢（無資料）")
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.7, 0.3],
+        vertical_spacing=0.05,
+        subplot_titles=("TAIEX 加權指數", "20 日報酬率 (%)"),
+    )
+
+    # K 線
+    fig.add_trace(
+        go.Candlestick(
+            x=df["date"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="TAIEX",
+            increasing_line_color="#EF5350",
+            decreasing_line_color="#26A69A",
+            increasing_fillcolor="#EF5350",
+            decreasing_fillcolor="#26A69A",
+        ),
+        row=1,
+        col=1,
+    )
+
+    # SMA60 / SMA120
+    closes = df["close"]
+    for window, color, label in [
+        (60, "#FF9800", "SMA60"),
+        (120, "#9C27B0", "SMA120"),
+    ]:
+        if len(closes) >= window:
+            sma = closes.rolling(window).mean()
+            fig.add_trace(
+                go.Scatter(
+                    x=df["date"],
+                    y=sma,
+                    name=label,
+                    line=dict(width=1.5, color=color),
+                ),
+                row=1,
+                col=1,
+            )
+
+    # 20 日報酬率
+    if len(closes) > 20:
+        ret_20d = closes.pct_change(20) * 100
+        colors = ["#EF5350" if v >= 0 else "#26A69A" for v in ret_20d.fillna(0)]
+        fig.add_trace(
+            go.Bar(
+                x=df["date"],
+                y=ret_20d,
+                name="20日報酬率",
+                marker_color=colors,
+            ),
+            row=2,
+            col=1,
+        )
+        # ±3% 警戒線
+        fig.add_hline(y=3, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
+        fig.add_hline(y=-3, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
+
+    # Regime 標註
+    regime = regime_info.get("regime", "sideways")
+    regime_labels = {"bull": "多頭", "bear": "空頭", "sideways": "盤整"}
+    regime_colors = {"bull": "#26A69A", "bear": "#EF5350", "sideways": "#FF9800"}
+
+    fig.update_layout(
+        height=600,
+        xaxis_rangeslider_visible=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=60, r=20, t=60, b=40),
+        title=dict(
+            text=f"市場狀態: {regime_labels.get(regime, regime)}",
+            font=dict(color=regime_colors.get(regime, "#333")),
+        ),
+    )
+    fig.update_yaxes(title_text="指數", row=1, col=1)
+    fig.update_yaxes(title_text="報酬率 %", row=2, col=1)
+    return fig
+
+
+def plot_market_breadth_area(df: pd.DataFrame) -> go.Figure:
+    """漲跌家數堆疊面積圖。"""
+    if df.empty:
+        return go.Figure().update_layout(title="市場廣度（無資料）")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["rising"],
+            name="上漲",
+            mode="lines",
+            line=dict(width=0.5, color="#EF5350"),
+            fill="tozeroy",
+            fillcolor="rgba(239,83,80,0.4)",
+            stackgroup="one",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["flat"],
+            name="平盤",
+            mode="lines",
+            line=dict(width=0.5, color="#9E9E9E"),
+            fill="tonexty",
+            fillcolor="rgba(158,158,158,0.3)",
+            stackgroup="one",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["falling"],
+            name="下跌",
+            mode="lines",
+            line=dict(width=0.5, color="#26A69A"),
+            fill="tonexty",
+            fillcolor="rgba(38,166,154,0.4)",
+            stackgroup="one",
+        )
+    )
+
+    fig.update_layout(
+        title="每日漲跌家數",
+        height=400,
+        yaxis_title="家數",
+        margin=dict(l=60, r=20, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
+def plot_institutional_ranking(df: pd.DataFrame) -> go.Figure:
+    """法人買賣超排行（橫向堆疊柱狀圖）。"""
+    if df.empty:
+        return go.Figure().update_layout(title="法人買賣超排行（無資料）")
+
+    labels = df["stock_id"] + " " + df["stock_name"].fillna("")
+
+    fig = go.Figure()
+    for col_name, color, label in [
+        ("foreign", "#2196F3", "外資"),
+        ("trust", "#FF9800", "投信"),
+        ("dealer", "#9C27B0", "自營商"),
+    ]:
+        if col_name in df.columns:
+            fig.add_trace(
+                go.Bar(
+                    y=labels,
+                    x=df[col_name],
+                    name=label,
+                    orientation="h",
+                    marker_color=color,
+                )
+            )
+
+    fig.update_layout(
+        barmode="relative",
+        height=max(350, len(df) * 35 + 100),
+        title="法人買賣超排行",
+        xaxis_title="淨買賣超（股）",
+        margin=dict(l=120, r=20, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
+def plot_sector_treemap(sector_df: pd.DataFrame) -> go.Figure:
+    """產業熱度 Treemap（面積=淨買超絕對值，顏色=漲幅）。
+
+    Parameters
+    ----------
+    sector_df : DataFrame
+        需含 industry, total_net, avg_return_pct 欄位
+        （來自 IndustryRotationAnalyzer.rank_sectors()）
+    """
+    if sector_df.empty:
+        return go.Figure().update_layout(title="產業熱度（無資料）")
+
+    df = sector_df.copy()
+    df["abs_net"] = df["total_net"].abs()
+    # 過濾掉零值
+    df = df[df["abs_net"] > 0].reset_index(drop=True)
+    if df.empty:
+        return go.Figure().update_layout(title="產業熱度（無資料）")
+
+    fig = go.Figure(
+        go.Treemap(
+            labels=df["industry"],
+            parents=[""] * len(df),
+            values=df["abs_net"],
+            marker=dict(
+                colors=df["avg_return_pct"],
+                colorscale="RdYlGn",
+                cmid=0,
+                colorbar=dict(title="漲幅 %"),
+            ),
+            texttemplate="<b>%{label}</b><br>淨買超: %{value:,.0f}<br>漲幅: %{color:.2f}%",
+            hovertemplate="<b>%{label}</b><br>淨買超: %{value:,.0f}<br>漲幅: %{color:.2f}%<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="產業熱度 Treemap",
+        height=450,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig

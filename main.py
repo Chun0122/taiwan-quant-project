@@ -117,10 +117,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
     """執行資料同步。"""
     from src.data.pipeline import sync_taiex_index, sync_watchlist
 
-    # 同步 TAIEX 指數
-    if args.taiex:
-        taiex_count = sync_taiex_index(start_date=args.start, end_date=args.end)
-        print(f"\n  TAIEX 加權指數: {taiex_count} 筆")
+    # 同步 TAIEX 指數（預設啟用）
+    taiex_count = sync_taiex_index(start_date=args.start, end_date=args.end)
+    print(f"\n  TAIEX 加權指數: {taiex_count} 筆")
 
     stocks = args.stocks if args.stocks else None
     results = sync_watchlist(watchlist=stocks, start_date=args.start, end_date=args.end)
@@ -1124,7 +1123,7 @@ def main() -> None:
     sp_sync.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_sync.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
     sp_sync.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
-    sp_sync.add_argument("--taiex", action="store_true", help="同步加權指數")
+    sp_sync.add_argument("--taiex", action="store_true", help="同步加權指數（現預設啟用）")
 
     # compute 子命令
     sp_compute = subparsers.add_parser("compute", help="計算技術指標")
