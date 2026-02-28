@@ -2189,6 +2189,100 @@ class GrowthScanner(MarketScanner):
         kwargs.setdefault("lookback_days", 25)
         super().__init__(**kwargs)
 
+    def run(self) -> DiscoveryResult:
+        """覆寫 run()：粗篩前自動同步 MOPS 全市場月營收。"""
+        # Stage 0: Regime 偵測
+        try:
+            from src.regime.detector import MarketRegimeDetector
+
+            regime_info = MarketRegimeDetector().detect()
+            self.regime = regime_info["regime"]
+            logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
+        except Exception:
+            self.regime = "sideways"
+            logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
+
+        # Stage 0.5: 檢查月營收覆蓋率，不足時自動從 MOPS 補抓
+        try:
+            from sqlalchemy import func as sa_func
+
+            with get_session() as session:
+                rev_count = session.execute(select(sa_func.count(sa_func.distinct(MonthlyRevenue.stock_id)))).scalar()
+
+            if not rev_count or rev_count < 500:
+                logger.info(
+                    "Stage 0.5: 月營收僅 %d 支，自動從 MOPS 同步全市場月營收...",
+                    rev_count or 0,
+                )
+                from src.data.pipeline import sync_mops_revenue
+
+                mops_count = sync_mops_revenue(months=1)
+                logger.info("Stage 0.5: MOPS 月營收同步完成，新增 %d 筆", mops_count)
+        except Exception:
+            logger.warning("Stage 0.5: MOPS 月營收自動同步失敗，使用既有資料")
+
+        # Stage 1: 載入資料
+        df_price, df_inst, df_margin, df_revenue = self._load_market_data()
+        if df_price.empty:
+            logger.warning("無市場資料可供掃描")
+            return DiscoveryResult(rankings=pd.DataFrame(), total_stocks=0, after_coarse=0, mode=self.mode_name)
+
+        total_stocks = df_price["stock_id"].nunique()
+        logger.info("Stage 1: 載入 %d 支股票的市場資料", total_stocks)
+
+        # Stage 2: 粗篩
+        candidates = self._coarse_filter(df_price, df_inst)
+        after_coarse = len(candidates)
+        logger.info("Stage 2: 粗篩後剩 %d 支候選股", after_coarse)
+
+        if candidates.empty:
+            return DiscoveryResult(
+                rankings=pd.DataFrame(), total_stocks=total_stocks, after_coarse=0, mode=self.mode_name
+            )
+
+        # Stage 2.5: 補抓月營收 + 估值資料
+        candidate_ids = candidates["stock_id"].tolist()
+        try:
+            from src.data.pipeline import sync_revenue_for_stocks, sync_valuation_for_stocks
+
+            logger.info("Stage 2.5: 補抓 %d 支候選股月營收 + 估值...", len(candidate_ids))
+            rev_count = sync_revenue_for_stocks(candidate_ids)
+            val_count = sync_valuation_for_stocks(candidate_ids)
+            logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收, %d 筆估值", rev_count, val_count)
+            df_revenue = self._load_revenue_data(candidate_ids, months=2)
+        except Exception:
+            logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
+
+        # Stage 2.7: 載入候選股近期 MOPS 公告
+        df_ann = self._load_announcement_data(candidate_ids)
+        if not df_ann.empty:
+            logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
+        else:
+            logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
+
+        # Stage 3: 細評
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
+
+        # Stage 3.3: 產業加成
+        scored = self._apply_sector_bonus(scored)
+
+        # Stage 3.5: 風險過濾
+        scored = self._apply_risk_filter(scored, df_price)
+
+        # Stage 4
+        rankings = self._rank_and_enrich(scored)
+        sector_summary = self._compute_sector_summary(rankings)
+        logger.info("Stage 4: 輸出 Top %d", min(self.top_n_results, len(rankings)))
+
+        return DiscoveryResult(
+            rankings=rankings.head(self.top_n_results),
+            total_stocks=total_stocks,
+            after_coarse=after_coarse,
+            sector_summary=sector_summary,
+            mode=self.mode_name,
+        )
+
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """覆寫：growth 模式載入 2 個月營收資料（算加速度）。"""
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)

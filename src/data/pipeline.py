@@ -193,6 +193,70 @@ def sync_mops_announcements(days: int = 7) -> int:
     return total
 
 
+def sync_mops_revenue(months: int = 1) -> int:
+    """從 MOPS 同步全市場月營收（上市+上櫃）。
+
+    使用 MOPS 公開資訊觀測站的靜態 HTML 頁面，
+    兩次 HTTP 請求即可取得全市場 ~2000+ 支股票的月營收。
+
+    Args:
+        months: 同步最近幾個月的營收（預設 1 = 上月）
+
+    Returns:
+        新增的月營收筆數
+    """
+    from src.data.mops_fetcher import fetch_mops_monthly_revenue
+
+    init_db()
+
+    total = 0
+    today = date.today()
+
+    for i in range(months):
+        # 計算目標月份（從上月往回推）
+        target = today.replace(day=1) - timedelta(days=1)  # 上月底
+        for _ in range(i):
+            target = target.replace(day=1) - timedelta(days=1)  # 再往前推
+        target_year = target.year
+        target_month = target.month
+
+        # 檢查 DB 是否已有該月份全市場資料
+        with get_session() as session:
+            count = session.execute(
+                select(func.count())
+                .select_from(MonthlyRevenue)
+                .where(
+                    MonthlyRevenue.revenue_year == target_year,
+                    MonthlyRevenue.revenue_month == target_month,
+                )
+            ).scalar()
+
+        if count and count >= 500:
+            logger.info(
+                "[MOPS 月營收] %d/%d 已有 %d 筆（跳過）",
+                target_year,
+                target_month,
+                count,
+            )
+            continue
+
+        df = fetch_mops_monthly_revenue(year=target_year, month=target_month)
+        if df.empty:
+            continue
+
+        n = _upsert_monthly_revenue(df)
+        total += n
+        logger.info(
+            "[MOPS 月營收] %d/%d 寫入 %d 筆",
+            target_year,
+            target_month,
+            n,
+        )
+
+    logger.info("[MOPS 月營收] 同步完成，共寫入 %d 筆", total)
+    return total
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,

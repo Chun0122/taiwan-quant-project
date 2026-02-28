@@ -32,6 +32,8 @@ python main.py discover --compare            # 顯示與上次推薦的差異比
 python main.py discover-backtest --mode momentum  # 推薦績效回測（預設 5,10,20 天）
 python main.py sync-mops                     # 同步 MOPS 重大訊息（預設 7 天）
 python main.py sync-mops --days 30           # 同步最近 30 天
+python main.py sync-revenue                  # 同步全市場月營收（上月，從 MOPS）
+python main.py sync-revenue --months 3       # 同步最近 3 個月
 python main.py dashboard                     # Streamlit 儀表板（localhost:8501）
 ```
 
@@ -59,7 +61,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算                | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
 | `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value+Dividend+Growth 六類掃描 + 產業加成 | 純函數                 |
-| `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
+| `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + 月營收解析 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
 | `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 | 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
@@ -116,7 +118,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次）                                                                                   |
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）                                                                                |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
-| `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站重大訊息（全市場、免費）                                                                       |
+| `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）                                                              |
 | `src/data/schema.py`                | 13 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord）                                                   |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |

@@ -256,3 +256,263 @@ class TestRegimeWeightsWithNews:
             bull_news = REGIME_WEIGHTS[mode]["bull"]["news"]
             bear_news = REGIME_WEIGHTS[mode]["bear"]["news"]
             assert bear_news >= bull_news, f"{mode}: bear news={bear_news} < bull news={bull_news}"
+
+
+# ------------------------------------------------------------------ #
+#  MOPS 月營收解析
+# ------------------------------------------------------------------ #
+
+# 模擬 MOPS 月營收 HTML 表格（Big5 → 解碼後的 UTF-8）
+_SAMPLE_REVENUE_HTML = """
+<html>
+<body>
+<table>
+<tr>
+<th>公司代號</th><th>公司名稱</th><th>當月營收</th><th>上月營收</th>
+<th>去年當月營收</th><th>上月比較增減(%)</th><th>去年同月增減(%)</th>
+<th>當月累計營收</th><th>去年累計營收</th><th>前期比較增減(%)</th>
+</tr>
+<tr>
+<td>2330</td><td>台積電</td><td>263,530,917</td><td>246,217,000</td>
+<td>215,670,000</td><td>7.03</td><td>22.19</td>
+<td>263,530,917</td><td>215,670,000</td><td>22.19</td>
+</tr>
+<tr>
+<td>2317</td><td>鴻海</td><td>480,100,000</td><td>450,000,000</td>
+<td>520,000,000</td><td>6.69</td><td>-7.67</td>
+<td>480,100,000</td><td>520,000,000</td><td>-7.67</td>
+</tr>
+<tr>
+<td>合計</td><td></td><td>999,999,999</td><td>888,888,888</td>
+<td>777,777,777</td><td>5.00</td><td>10.00</td>
+<td>999,999,999</td><td>777,777,777</td><td>10.00</td>
+</tr>
+</table>
+</body>
+</html>
+"""
+
+
+class TestParseRevenueHtml:
+    """MOPS 月營收 HTML 解析測試。"""
+
+    def test_parse_basic(self):
+        """基本解析：兩支股票正確解出。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        assert len(df) == 2
+        assert set(df["stock_id"].tolist()) == {"2330", "2317"}
+
+    def test_parse_filters_non_stock_rows(self):
+        """合計列（非 4~6 位數字）應被過濾。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        assert "合計" not in df["stock_id"].values
+
+    def test_parse_revenue_values(self):
+        """營收值正確解析（千元 → 元）。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        tsmc = df[df["stock_id"] == "2330"].iloc[0]
+        # 263,530,917 千元 → 263,530,917,000 元
+        assert tsmc["revenue"] == 263_530_917_000
+
+    def test_parse_yoy_growth(self):
+        """YoY 成長率正確解析。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        tsmc = df[df["stock_id"] == "2330"].iloc[0]
+        assert tsmc["yoy_growth"] == pytest.approx(22.19)
+
+        foxconn = df[df["stock_id"] == "2317"].iloc[0]
+        assert foxconn["yoy_growth"] == pytest.approx(-7.67)
+
+    def test_parse_mom_growth(self):
+        """MoM 成長率正確解析。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        tsmc = df[df["stock_id"] == "2330"].iloc[0]
+        assert tsmc["mom_growth"] == pytest.approx(7.03)
+
+    def test_parse_date_fields(self):
+        """日期、月份、年度欄位正確。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        assert all(df["revenue_year"] == 2026)
+        assert all(df["revenue_month"] == 1)
+        # 1 月的最後一天
+        assert all(df["date"] == date(2026, 1, 31))
+
+    def test_parse_december_date(self):
+        """12 月的日期應為 12/31。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2025, 12)
+
+        assert all(df["date"] == date(2025, 12, 31))
+
+    def test_parse_output_columns(self):
+        """輸出欄位符合 MonthlyRevenue ORM。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        html_bytes = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        df = _parse_revenue_html(html_bytes, 2026, 1)
+
+        expected_cols = {"stock_id", "date", "revenue", "revenue_month", "revenue_year", "mom_growth", "yoy_growth"}
+        assert set(df.columns) == expected_cols
+
+    def test_parse_empty_html(self):
+        """空 HTML → 空 DataFrame。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        df = _parse_revenue_html(b"<html></html>", 2026, 1)
+        assert df.empty
+
+    def test_parse_invalid_html(self):
+        """無效 HTML → 空 DataFrame（不拋例外）。"""
+        from src.data.mops_fetcher import _parse_revenue_html
+
+        df = _parse_revenue_html(b"not html at all", 2026, 1)
+        assert df.empty
+
+
+class TestFetchMopsMonthlyRevenue:
+    """fetch_mops_monthly_revenue 高階函數測試。"""
+
+    def test_default_month_calculation(self):
+        """預設月份應為上月。"""
+        from unittest.mock import MagicMock, patch
+
+        from src.data.mops_fetcher import fetch_mops_monthly_revenue
+
+        mock_resp = MagicMock()
+        mock_resp.content = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        mock_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("src.data.mops_fetcher.requests.get", return_value=mock_resp) as mock_get,
+            patch("src.data.mops_fetcher.time.sleep"),
+        ):
+            df = fetch_mops_monthly_revenue()
+
+        # 應有兩次請求（sii + otc）
+        assert mock_get.call_count == 2
+        # 應回傳資料（兩個市場各 2 支 → 合計 4 支，但 stock_id 相同會重複）
+        assert not df.empty
+
+    def test_specified_year_month(self):
+        """指定年月應正確傳入 URL。"""
+        from unittest.mock import MagicMock, patch
+
+        from src.data.mops_fetcher import fetch_mops_monthly_revenue
+
+        mock_resp = MagicMock()
+        mock_resp.content = _SAMPLE_REVENUE_HTML.encode("utf-8")
+        mock_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("src.data.mops_fetcher.requests.get", return_value=mock_resp) as mock_get,
+            patch("src.data.mops_fetcher.time.sleep"),
+        ):
+            df = fetch_mops_monthly_revenue(year=2025, month=6)
+
+        # 確認 URL 包含民國年 114 和月份 6
+        url_sii = mock_get.call_args_list[0][0][0]
+        assert "114_6" in url_sii
+        assert "sii" in url_sii
+
+
+class TestSyncMopsRevenuePipeline:
+    """sync_mops_revenue pipeline 整合測試。"""
+
+    def test_upsert_mops_revenue(self, db_session):
+        """MOPS 月營收寫入 DB 並驗證。"""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+
+        from src.data.schema import MonthlyRevenue
+
+        records = [
+            {
+                "stock_id": "2330",
+                "date": date(2026, 1, 31),
+                "revenue": 263_530_917_000,
+                "revenue_month": 1,
+                "revenue_year": 2026,
+                "mom_growth": 7.03,
+                "yoy_growth": 22.19,
+            },
+            {
+                "stock_id": "2317",
+                "date": date(2026, 1, 31),
+                "revenue": 480_100_000_000,
+                "revenue_month": 1,
+                "revenue_year": 2026,
+                "mom_growth": 6.69,
+                "yoy_growth": -7.67,
+            },
+        ]
+
+        for rec in records:
+            stmt = sqlite_upsert(MonthlyRevenue).values(rec)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["stock_id", "date"])
+            db_session.execute(stmt)
+        db_session.flush()
+
+        result = (
+            db_session.query(MonthlyRevenue)
+            .filter(
+                MonthlyRevenue.revenue_year == 2026,
+                MonthlyRevenue.revenue_month == 1,
+            )
+            .all()
+        )
+        assert len(result) == 2
+
+        tsmc = [r for r in result if r.stock_id == "2330"][0]
+        assert tsmc.revenue == 263_530_917_000
+        assert tsmc.yoy_growth == pytest.approx(22.19)
+
+    def test_upsert_no_duplicate(self, db_session):
+        """重複寫入同月同股票 → 不新增。"""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+
+        from src.data.schema import MonthlyRevenue
+
+        rec = {
+            "stock_id": "2330",
+            "date": date(2026, 1, 31),
+            "revenue": 263_530_917_000,
+            "revenue_month": 1,
+            "revenue_year": 2026,
+            "mom_growth": 7.03,
+            "yoy_growth": 22.19,
+        }
+
+        # 寫入兩次
+        for _ in range(2):
+            stmt = sqlite_upsert(MonthlyRevenue).values(rec)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["stock_id", "date"])
+            db_session.execute(stmt)
+        db_session.flush()
+
+        result = db_session.query(MonthlyRevenue).filter_by(stock_id="2330").all()
+        assert len(result) == 1

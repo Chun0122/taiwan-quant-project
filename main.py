@@ -993,6 +993,28 @@ def cmd_sync_mops(args: argparse.Namespace) -> None:
             print(f"  {label}: {cnt:,} 筆")
 
 
+def cmd_sync_revenue(args: argparse.Namespace) -> None:
+    """從 MOPS 同步全市場月營收。"""
+    from src.data.pipeline import sync_mops_revenue
+
+    months = getattr(args, "months", 1)
+    print(f"從 MOPS 同步全市場月營收（最近 {months} 個月）...")
+    count = sync_mops_revenue(months=months)
+    print(f"\n月營收同步完成: {count:,} 筆")
+
+    if count > 0:
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import MonthlyRevenue
+
+        with get_session() as session:
+            total = session.execute(select(func.count()).select_from(MonthlyRevenue)).scalar()
+            distinct_stocks = session.execute(select(func.count(func.distinct(MonthlyRevenue.stock_id)))).scalar()
+
+        print(f"月營收資料庫: {total:,} 筆（{distinct_stocks:,} 支股票）")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -1194,6 +1216,10 @@ def main() -> None:
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")
 
+    # sync-revenue 子命令
+    sp_rev = subparsers.add_parser("sync-revenue", help="從 MOPS 同步全市場月營收（上市+上櫃）")
+    sp_rev.add_argument("--months", type=int, default=1, help="同步最近幾個月（預設 1）")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -1234,6 +1260,8 @@ def main() -> None:
         cmd_discover_backtest(args)
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
+    elif args.command == "sync-revenue":
+        cmd_sync_revenue(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     else:

@@ -759,6 +759,7 @@ python main.py discover momentum --skip-sync --compare
 | Stage 0 | 市場狀態偵測 | 根據 TAIEX 判斷 bull/bear/sideways，動態調整權重 |
 | Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
 | Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名 |
+| Stage 0.5 | MOPS 月營收同步 | （僅 growth 模式）檢查月營收覆蓋率，不足 500 支時自動從 MOPS 同步全市場月營收 |
 | Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
@@ -821,7 +822,27 @@ python main.py sync-mops
 
 > **注意**：MOPS 備援站僅提供最新一個交易日的公告，無法查詢歷史資料。建議搭配每日排程使用，逐日累積公告歷史。`discover` 命令的全市場同步也會自動附帶 MOPS 同步。
 
-### 4.16 資料庫遷移 (`migrate`)
+### 4.16 同步全市場月營收 (`sync-revenue`)
+
+從 MOPS 公開資訊觀測站抓取全市場（上市+上櫃）月營收。每次僅需 2 個 HTTP 請求即可取得 ~2000+ 支股票的月營收資料（含 YoY、MoM 成長率）。
+
+```bash
+# 同步上月全市場月營收
+python main.py sync-revenue
+
+# 同步最近 3 個月
+python main.py sync-revenue --months 3
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `--months` | 同步最近幾個月的營收（預設 1 = 上月） |
+
+> **自動同步**：`discover growth` 執行時若偵測到月營收覆蓋不足（< 500 支股票），會自動觸發 `sync_mops_revenue()` 補抓，無需手動執行此命令。
+
+### 4.17 資料庫遷移 (`migrate`)
 
 若升級 P6 後使用既有資料庫，需執行遷移以新增欄位與表：
 
