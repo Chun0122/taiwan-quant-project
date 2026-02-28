@@ -394,10 +394,7 @@ def _parse_revenue_html(html_content: bytes, year: int, month: int) -> pd.DataFr
         # 處理 MultiIndex 欄位（MOPS HTML 有多層表頭）
         if isinstance(tbl.columns, pd.MultiIndex):
             # 取最底層欄位名稱（如 '當月營收'），去除空白
-            tbl.columns = [
-                str(levels[-1]).replace("\u3000", "").strip()
-                for levels in tbl.columns
-            ]
+            tbl.columns = [str(levels[-1]).replace("\u3000", "").strip() for levels in tbl.columns]
 
         all_dfs.append(tbl)
 
