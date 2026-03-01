@@ -671,3 +671,38 @@ def load_market_volume_summary(days: int = 60) -> pd.DataFrame:
     df = df.sort_values("date").reset_index(drop=True)
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+def load_announcements(stock_id: str, start: str, end: str) -> pd.DataFrame:
+    """載入指定股票的 MOPS 重大訊息公告。"""
+    from src.data.schema import Announcement
+
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(Announcement)
+                .where(Announcement.stock_id == stock_id)
+                .where(Announcement.date >= start)
+                .where(Announcement.date <= end)
+                .order_by(Announcement.date, Announcement.seq)
+            )
+            .scalars()
+            .all()
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "subject", "sentiment", "spoke_time"])
+
+    df = pd.DataFrame(
+        [
+            {
+                "date": r.date,
+                "subject": r.subject,
+                "sentiment": r.sentiment,
+                "spoke_time": r.spoke_time,
+            }
+            for r in rows
+        ]
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    return df

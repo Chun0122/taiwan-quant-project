@@ -207,7 +207,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 6 | ✅ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），FinancialStatement ORM 表 + fetcher EAV pivot + pipeline sync + CLI sync-financial |
 | 7 | ✅ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度 Treemap，已完成 |
 | 8 | ✅ | **CLI `export`/`import-data` 通用命令** | export：匯出任意資料表為 CSV/Parquet（含 --stocks/--start/--end 篩選）；import-data：從 CSV/Parquet 匯入（含欄位驗證 + --dry-run） |
-| 9 | ⬜ | **個股分析頁面增強** | 成交量柱狀圖疊加 K 線、技術指標可勾選疊加、法人買賣超累積圖、融資融券走勢、MOPS 公告時間軸 |
+| 9 | ✅ | **個股分析頁面增強** | 成交量疊加 K 線（secondary_y）、Sidebar 指標 checkbox（SMA/BB/RSI/MACD）、法人累積買賣超折線、融資融券+券資比雙列圖、MOPS 公告 vline 標記 + expander 明細表，已完成並通過 491 測試 |
 
 ## 已確認事項（規劃時勿重複提出）
 

@@ -12,16 +12,46 @@ from plotly.subplots import make_subplots
 # ------------------------------------------------------------------ #
 
 
-def plot_candlestick(df: pd.DataFrame) -> go.Figure:
-    """K線圖 + SMA + 布林通道 + 成交量 + RSI + MACD 四合一圖。"""
+def plot_candlestick(
+    df: pd.DataFrame,
+    selected_indicators: set[str] | None = None,
+    df_announcements: pd.DataFrame | None = None,
+) -> go.Figure:
+    """K線圖 + 可選 SMA/BB/RSI/MACD + 成交量疊加（Row 1 secondary_y）+ MOPS 公告標記。"""
+    if selected_indicators is None:
+        selected_indicators = {"sma_5", "sma_10", "sma_20", "sma_60", "bb", "rsi", "macd"}
+
+    show_rsi = "rsi" in selected_indicators and "rsi_14" in df.columns
+    show_macd = "macd" in selected_indicators and "macd" in df.columns
+
+    # 動態決定列數與行高
+    subplot_titles = ["K線 / 均線 / 布林通道"]
+    row_heights_base = [0.55]
+    if show_rsi:
+        subplot_titles.append("RSI (14)")
+        row_heights_base.append(0.2)
+    if show_macd:
+        subplot_titles.append("MACD")
+        row_heights_base.append(0.25)
+
+    n_rows = len(subplot_titles)
+    total_h = sum(row_heights_base)
+    row_heights = [h / total_h for h in row_heights_base]
+    # Row 1 有 secondary_y（成交量），其餘無
+    specs = [[{"secondary_y": True}]] + [[{}] for _ in range(n_rows - 1)]
+
     fig = make_subplots(
-        rows=4,
+        rows=n_rows,
         cols=1,
         shared_xaxes=True,
-        row_heights=[0.5, 0.15, 0.15, 0.2],
+        row_heights=row_heights,
         vertical_spacing=0.03,
-        subplot_titles=("K線 / 均線 / 布林通道", "RSI (14)", "MACD", "成交量"),
+        subplot_titles=subplot_titles,
+        specs=specs,
     )
+
+    rsi_row = 2 if show_rsi else None
+    macd_row = (3 if show_rsi else 2) if show_macd else None
 
     # --- Row 1: K線 ---
     fig.add_trace(
@@ -39,25 +69,27 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
         ),
         row=1,
         col=1,
+        secondary_y=False,
     )
 
     # SMA
     sma_colors = {"sma_5": "#FF9800", "sma_10": "#2196F3", "sma_20": "#9C27B0", "sma_60": "#795548"}
-    for col, color in sma_colors.items():
-        if col in df.columns:
+    for sma_key, color in sma_colors.items():
+        if sma_key in selected_indicators and sma_key in df.columns:
             fig.add_trace(
                 go.Scatter(
                     x=df["date"],
-                    y=df[col],
-                    name=col.upper(),
+                    y=df[sma_key],
+                    name=sma_key.upper(),
                     line=dict(width=1, color=color),
                 ),
                 row=1,
                 col=1,
+                secondary_y=False,
             )
 
     # 布林通道
-    if "bb_upper" in df.columns:
+    if "bb" in selected_indicators and "bb_upper" in df.columns:
         fig.add_trace(
             go.Scatter(
                 x=df["date"],
@@ -67,6 +99,7 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
             ),
             row=1,
             col=1,
+            secondary_y=False,
         )
         fig.add_trace(
             go.Scatter(
@@ -79,10 +112,63 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
             ),
             row=1,
             col=1,
+            secondary_y=False,
         )
 
-    # --- Row 2: RSI ---
-    if "rsi_14" in df.columns:
+    # --- 成交量疊加（Row 1, secondary_y=True）---
+    if "volume" in df.columns:
+        vol_colors = []
+        for i in range(len(df)):
+            if i == 0:
+                vol_colors.append("#9E9E9E")
+            elif df.iloc[i]["close"] >= df.iloc[i - 1]["close"]:
+                vol_colors.append("#EF5350")
+            else:
+                vol_colors.append("#26A69A")
+        fig.add_trace(
+            go.Bar(
+                x=df["date"],
+                y=df["volume"],
+                name="成交量",
+                marker_color=vol_colors,
+                opacity=0.4,
+            ),
+            row=1,
+            col=1,
+            secondary_y=True,
+        )
+        # 讓成交量只佔底部約 20%
+        max_vol = df["volume"].dropna().max()
+        if pd.notna(max_vol) and max_vol > 0:
+            fig.update_yaxes(
+                range=[0, max_vol * 5],
+                showticklabels=False,
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
+
+    # --- MOPS 公告標記（vline）---
+    if df_announcements is not None and not df_announcements.empty:
+        sentiment_colors = {
+            1: "rgba(38,166,154,0.8)",
+            -1: "rgba(239,83,80,0.8)",
+            0: "rgba(158,158,158,0.6)",
+        }
+        for ann_date, group in df_announcements.groupby("date"):
+            sentiment = int(group["sentiment"].mode().iloc[0])
+            color = sentiment_colors.get(sentiment, sentiment_colors[0])
+            # 使用 timestamp 毫秒確保 plotly 正確定位（datetime 軸）
+            x_ms = int(pd.Timestamp(ann_date).timestamp() * 1000)
+            fig.add_vline(
+                x=x_ms,
+                line_dash="dot",
+                line_color=color,
+                line_width=1.5,
+            )
+
+    # --- RSI ---
+    if show_rsi and rsi_row is not None:
         fig.add_trace(
             go.Scatter(
                 x=df["date"],
@@ -90,14 +176,14 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
                 name="RSI",
                 line=dict(width=1.5, color="#E91E63"),
             ),
-            row=2,
+            row=rsi_row,
             col=1,
         )
-        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=rsi_row, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, row=rsi_row, col=1)
 
-    # --- Row 3: MACD ---
-    if "macd" in df.columns:
+    # --- MACD ---
+    if show_macd and macd_row is not None:
         fig.add_trace(
             go.Scatter(
                 x=df["date"],
@@ -105,7 +191,7 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
                 name="MACD",
                 line=dict(width=1.5, color="#2196F3"),
             ),
-            row=3,
+            row=macd_row,
             col=1,
         )
         if "macd_signal" in df.columns:
@@ -116,54 +202,35 @@ def plot_candlestick(df: pd.DataFrame) -> go.Figure:
                     name="Signal",
                     line=dict(width=1.5, color="#FF9800"),
                 ),
-                row=3,
+                row=macd_row,
                 col=1,
             )
         if "macd_hist" in df.columns:
-            colors = ["#EF5350" if v >= 0 else "#26A69A" for v in df["macd_hist"].fillna(0)]
+            hist_colors = ["#EF5350" if v >= 0 else "#26A69A" for v in df["macd_hist"].fillna(0)]
             fig.add_trace(
                 go.Bar(
                     x=df["date"],
                     y=df["macd_hist"],
                     name="Histogram",
-                    marker_color=colors,
+                    marker_color=hist_colors,
                 ),
-                row=3,
+                row=macd_row,
                 col=1,
             )
 
-    # --- Row 4: 成交量 ---
-    if "volume" in df.columns and "close" in df.columns:
-        colors = []
-        for i in range(len(df)):
-            if i == 0:
-                colors.append("#9E9E9E")
-            elif df.iloc[i]["close"] >= df.iloc[i - 1]["close"]:
-                colors.append("#EF5350")
-            else:
-                colors.append("#26A69A")
-        fig.add_trace(
-            go.Bar(
-                x=df["date"],
-                y=df["volume"],
-                name="成交量",
-                marker_color=colors,
-            ),
-            row=4,
-            col=1,
-        )
-
+    height = 500 if n_rows == 1 else (700 if n_rows == 2 else 900)
     fig.update_layout(
-        height=900,
+        height=height,
         xaxis_rangeslider_visible=False,
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=60, r=20, t=40, b=40),
     )
-    fig.update_yaxes(title_text="價格", row=1, col=1)
-    fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
-    fig.update_yaxes(title_text="量", row=4, col=1)
+    fig.update_yaxes(title_text="價格", row=1, col=1, secondary_y=False)
+    if show_rsi and rsi_row is not None:
+        fig.update_yaxes(title_text="RSI", row=rsi_row, col=1)
+    if show_macd and macd_row is not None:
+        fig.update_yaxes(title_text="MACD", row=macd_row, col=1)
 
     return fig
 
@@ -201,12 +268,54 @@ def plot_institutional(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def plot_institutional_cumulative(df: pd.DataFrame) -> go.Figure:
+    """三大法人買賣超累積折線圖（cumsum）。"""
+    if df.empty:
+        return go.Figure().update_layout(title="無法人資料")
+
+    pivot = df.pivot_table(index="date", columns="name", values="net", aggfunc="sum").fillna(0)
+    pivot = pivot.sort_index()
+
+    colors = {"Foreign_Investor": "#2196F3", "Investment_Trust": "#FF9800", "Dealer_self": "#9C27B0"}
+    labels = {"Foreign_Investor": "外資累積", "Investment_Trust": "投信累積", "Dealer_self": "自營商累積"}
+
+    fig = go.Figure()
+    for col in pivot.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=pivot.index,
+                y=pivot[col].cumsum(),
+                name=labels.get(col, col),
+                line=dict(color=colors.get(col, "#9E9E9E"), width=2),
+                mode="lines",
+            )
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.update_layout(
+        height=350,
+        title="三大法人累積買賣超",
+        yaxis_title="累積股數",
+        margin=dict(l=60, r=20, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
 def plot_margin(df: pd.DataFrame) -> go.Figure:
-    """融資融券餘額趨勢圖。"""
+    """融資融券餘額趨勢圖（含券資比）。"""
     if df.empty:
         return go.Figure().update_layout(title="無融資融券資料")
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        vertical_spacing=0.05,
+        subplot_titles=("融資 / 融券餘額", "券資比 (%)"),
+        specs=[[{"secondary_y": True}], [{}]],
+    )
 
     fig.add_trace(
         go.Scatter(
@@ -215,6 +324,8 @@ def plot_margin(df: pd.DataFrame) -> go.Figure:
             name="融資餘額",
             line=dict(color="#EF5350"),
         ),
+        row=1,
+        col=1,
         secondary_y=False,
     )
 
@@ -225,17 +336,33 @@ def plot_margin(df: pd.DataFrame) -> go.Figure:
             name="融券餘額",
             line=dict(color="#26A69A"),
         ),
+        row=1,
+        col=1,
         secondary_y=True,
     )
 
+    # 券資比（融券餘額 / 融資餘額）
+    ratio = df["short_balance"] / df["margin_balance"].replace(0, pd.NA) * 100
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=ratio,
+            name="券資比 (%)",
+            line=dict(color="#FF9800", width=1.5),
+        ),
+        row=2,
+        col=1,
+    )
+
     fig.update_layout(
-        height=350,
-        title="融資融券餘額",
+        height=450,
+        title="融資融券走勢",
         margin=dict(l=60, r=60, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
-    fig.update_yaxes(title_text="融資餘額", secondary_y=False)
-    fig.update_yaxes(title_text="融券餘額", secondary_y=True)
+    fig.update_yaxes(title_text="融資餘額", secondary_y=False, row=1, col=1)
+    fig.update_yaxes(title_text="融券餘額", secondary_y=True, row=1, col=1)
+    fig.update_yaxes(title_text="券資比 %", row=2, col=1)
     return fig
 
 

@@ -1,8 +1,10 @@
 """市場總覽相關模組測試。
 
 測試對象：
-- data_loader: load_market_breadth, load_market_breadth_stats, load_top_institutional, load_taiex_history
-- charts: plot_taiex_regime, plot_market_breadth_area, plot_institutional_ranking, plot_sector_treemap
+- data_loader: load_market_breadth, load_market_breadth_stats, load_top_institutional, load_taiex_history,
+  load_announcements
+- charts: plot_taiex_regime, plot_market_breadth_area, plot_institutional_ranking, plot_sector_treemap,
+  plot_institutional_cumulative, plot_candlestick (enhanced)
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
+from src.data.schema import Announcement, DailyPrice, InstitutionalInvestor, StockInfo
 
 # ------------------------------------------------------------------ #
 #  Fixtures
@@ -328,3 +330,177 @@ class TestPlotSectorTreemap:
         )
         fig = plot_sector_treemap(df)
         assert isinstance(fig, go.Figure)
+
+
+# ------------------------------------------------------------------ #
+#  load_announcements 測試
+# ------------------------------------------------------------------ #
+
+
+class TestLoadAnnouncements:
+    def test_returns_empty_when_no_data(self, db_session):
+        from src.visualization.data_loader import load_announcements
+
+        df = load_announcements("2330", "2025-01-01", "2025-12-31")
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 0
+        assert "subject" in df.columns
+        assert "sentiment" in df.columns
+
+    def test_returns_df_with_announcements(self, db_session):
+        from src.visualization.data_loader import load_announcements
+
+        db_session.add(
+            Announcement(
+                stock_id="2330",
+                date=date(2025, 6, 10),
+                seq="1",
+                subject="測試公告",
+                sentiment=1,
+                spoke_time="09:30",
+            )
+        )
+        db_session.flush()
+
+        df = load_announcements("2330", "2025-01-01", "2025-12-31")
+        assert len(df) == 1
+        assert df.iloc[0]["subject"] == "測試公告"
+        assert df.iloc[0]["sentiment"] == 1
+        assert pd.api.types.is_datetime64_any_dtype(df["date"])
+
+    def test_date_range_filter(self, db_session):
+        from src.visualization.data_loader import load_announcements
+
+        for i, d in enumerate([date(2025, 1, 1), date(2025, 6, 1), date(2025, 12, 1)]):
+            db_session.add(
+                Announcement(
+                    stock_id="2330",
+                    date=d,
+                    seq=str(i),
+                    subject=f"公告 {i}",
+                    sentiment=0,
+                )
+            )
+        db_session.flush()
+
+        df = load_announcements("2330", "2025-06-01", "2025-12-01")
+        assert len(df) == 2
+
+
+# ------------------------------------------------------------------ #
+#  plot_institutional_cumulative 測試
+# ------------------------------------------------------------------ #
+
+
+class TestPlotInstitutionalCumulative:
+    def test_returns_figure_with_data(self):
+        from src.visualization.charts import plot_institutional_cumulative
+
+        df = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=10),
+                "name": ["Foreign_Investor"] * 10,
+                "net": [5000] * 10,
+            }
+        )
+        fig = plot_institutional_cumulative(df)
+        assert isinstance(fig, go.Figure)
+        assert len(fig.data) > 0
+        # 確認是折線圖
+        scatter_traces = [t for t in fig.data if isinstance(t, go.Scatter)]
+        assert len(scatter_traces) > 0
+
+    def test_empty_returns_figure(self):
+        from src.visualization.charts import plot_institutional_cumulative
+
+        fig = plot_institutional_cumulative(pd.DataFrame())
+        assert isinstance(fig, go.Figure)
+
+    def test_cumulative_values_increase(self):
+        from src.visualization.charts import plot_institutional_cumulative
+
+        df = pd.DataFrame(
+            {
+                "date": pd.date_range("2025-01-01", periods=5),
+                "name": ["Foreign_Investor"] * 5,
+                "net": [1000] * 5,
+            }
+        )
+        fig = plot_institutional_cumulative(df)
+        y_values = list(fig.data[0].y)
+        # cumsum of [1000]*5 should be [1000, 2000, 3000, 4000, 5000]
+        assert y_values[-1] > y_values[0]
+
+
+# ------------------------------------------------------------------ #
+#  plot_candlestick 增強測試
+# ------------------------------------------------------------------ #
+
+
+class TestPlotCandlestickEnhanced:
+    @pytest.fixture()
+    def sample_df(self):
+        dates = pd.date_range("2025-01-01", periods=30)
+        return pd.DataFrame(
+            {
+                "date": dates,
+                "open": [100.0] * 30,
+                "high": [105.0] * 30,
+                "low": [95.0] * 30,
+                "close": [101.0] * 30,
+                "volume": [1_000_000] * 30,
+                "rsi_14": [50.0] * 30,
+                "macd": [0.5] * 30,
+                "macd_signal": [0.3] * 30,
+                "macd_hist": [0.2] * 30,
+            }
+        )
+
+    def test_selected_indicators_filter(self, sample_df):
+        from src.visualization.charts import plot_candlestick
+
+        # 只勾 RSI，不勾 MACD
+        fig = plot_candlestick(sample_df, selected_indicators={"rsi"})
+        macd_traces = [t for t in fig.data if t.name in ("MACD", "Signal", "Histogram")]
+        rsi_traces = [t for t in fig.data if t.name == "RSI"]
+        assert len(macd_traces) == 0
+        assert len(rsi_traces) == 1
+
+    def test_volume_overlay_in_row1(self, sample_df):
+        from src.visualization.charts import plot_candlestick
+
+        fig = plot_candlestick(sample_df, selected_indicators=set())
+        bar_traces = [t for t in fig.data if isinstance(t, go.Bar) and t.name == "成交量"]
+        assert len(bar_traces) == 1
+
+    def test_no_indicators_single_row(self, sample_df):
+        from src.visualization.charts import plot_candlestick
+
+        # 不勾任何指標 → 只有 1 row（K線），高度為 500
+        fig = plot_candlestick(sample_df, selected_indicators=set())
+        assert fig.layout.height == 500
+
+    def test_with_announcements(self, sample_df):
+        from src.visualization.charts import plot_candlestick
+
+        df_ann = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2025-01-10", "2025-01-15"]),
+                "subject": ["公告1", "公告2"],
+                "sentiment": [1, -1],
+                "spoke_time": ["09:30", "10:00"],
+            }
+        )
+        fig = plot_candlestick(sample_df, selected_indicators=set(), df_announcements=df_ann)
+        assert isinstance(fig, go.Figure)
+        # add_vline 會在 layout.shapes 中新增 shape
+        assert len(fig.layout.shapes) > 0
+
+    def test_backward_compatible_no_args(self, sample_df):
+        from src.visualization.charts import plot_candlestick
+
+        # 不傳新參數，應能正常執行（預設顯示全部指標）
+        fig = plot_candlestick(sample_df)
+        assert isinstance(fig, go.Figure)
+        rsi_traces = [t for t in fig.data if t.name == "RSI"]
+        assert len(rsi_traces) == 1
