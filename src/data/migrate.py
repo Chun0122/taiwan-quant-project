@@ -22,6 +22,11 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("backtest_result", "cvar_95", "REAL"),
     ("backtest_result", "profit_factor", "REAL"),
     ("trade", "exit_reason", "VARCHAR(20)"),
+    ("discovery_record", "entry_price", "REAL"),
+    ("discovery_record", "stop_loss", "REAL"),
+    ("discovery_record", "take_profit", "REAL"),
+    ("discovery_record", "entry_trigger", "VARCHAR(100)"),
+    ("discovery_record", "valid_until", "DATE"),
 ]
 
 

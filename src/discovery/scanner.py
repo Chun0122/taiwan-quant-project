@@ -39,6 +39,38 @@ from src.data.schema import (
 logger = logging.getLogger(__name__)
 
 
+def _calc_atr14(stock_data: pd.DataFrame) -> float:
+    """計算個股 ATR14。
+
+    TR = max(high - low, |high - prev_close|, |low - prev_close|)
+    ATR14 = 最近 14 日 TR 均值
+
+    stock_data 需含 high/low/close 欄位，已按日期排序，長度至少 2。
+    不足時回傳 0.0。
+    """
+    data = stock_data.tail(15)
+    if len(data) < 2:
+        return 0.0
+
+    highs = data["high"].values
+    lows = data["low"].values
+    closes = data["close"].values
+
+    trs = []
+    for i in range(1, len(highs)):
+        tr = max(
+            float(highs[i] - lows[i]),
+            abs(float(highs[i]) - float(closes[i - 1])),
+            abs(float(lows[i]) - float(closes[i - 1])),
+        )
+        trs.append(tr)
+
+    if not trs:
+        return 0.0
+
+    return float(np.mean(trs[-14:]))
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""
@@ -85,6 +117,8 @@ class MarketScanner:
 
     def run(self) -> DiscoveryResult:
         """執行四階段漏斗掃描。"""
+        self.scan_date = date.today()
+
         # Stage 0: 偵測市場狀態（Regime）
         try:
             from src.regime.detector import MarketRegimeDetector
@@ -583,6 +617,10 @@ class MarketScanner:
         # hook：子類可在加權後做額外處理
         candidates = self._post_score(candidates)
 
+        # 進出場建議欄位
+        entry_exit = self._compute_entry_exit_cols(stock_ids, df_price)
+        candidates = candidates.merge(entry_exit, on="stock_id", how="left")
+
         return candidates
 
     def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
@@ -592,6 +630,92 @@ class MarketScanner:
     def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
         """hook：子類可在加權後做額外處理。"""
         return candidates
+
+    def _compute_entry_exit_cols(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """計算每支股票的進出場建議欄位。
+
+        欄位：
+          entry_price  — 當日收盤價
+          stop_loss    — entry_price - 1.5 × ATR14
+          take_profit  — entry_price + 3.0 × ATR14（RR = 1:2）
+          entry_trigger — 依均線位置與波動率產生中文說明
+          valid_until  — scan_date + 5 工作日
+
+        Returns:
+            DataFrame，index reset，欄位含 stock_id 及上述五欄
+        """
+        scan_date = getattr(self, "scan_date", date.today())
+        valid_until = (pd.Timestamp(scan_date) + pd.offsets.BDay(5)).date()
+
+        rows = []
+        for sid in stock_ids:
+            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date").tail(30)
+
+            if stock_data.empty:
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "entry_price": None,
+                        "stop_loss": None,
+                        "take_profit": None,
+                        "entry_trigger": "資料不足，僅供參考",
+                        "valid_until": valid_until,
+                    }
+                )
+                continue
+
+            close = float(stock_data["close"].values[-1])
+
+            if len(stock_data) < 15:
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "entry_price": round(close, 2),
+                        "stop_loss": None,
+                        "take_profit": None,
+                        "entry_trigger": "資料不足，僅供參考",
+                        "valid_until": valid_until,
+                    }
+                )
+                continue
+
+            atr14 = _calc_atr14(stock_data)
+            stop_loss = round(close - 1.5 * atr14, 2) if atr14 > 0 else None
+            take_profit = round(close + 3.0 * atr14, 2) if atr14 > 0 else None
+
+            # SMA20 — 用 tail(20) 的平均收盤價
+            sma20 = float(stock_data["close"].tail(20).mean())
+
+            # 均線位置判斷
+            if sma20 > 0:
+                if close > sma20 * 1.01:
+                    trigger = "站上均線"
+                elif close >= sma20 * 0.99:
+                    trigger = "貼近均線"
+                else:
+                    trigger = "均線下方，等待確認"
+            else:
+                trigger = "均線下方，等待確認"
+
+            # 附加波動率說明
+            atr_pct = atr14 / close if close > 0 else 0.0
+            if atr_pct < 0.02:
+                trigger += "，低波動"
+            elif atr_pct > 0.04:
+                trigger += "，高波動謹慎"
+
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "entry_price": round(close, 2),
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "entry_trigger": trigger,
+                    "valid_until": valid_until,
+                }
+            )
+
+        return pd.DataFrame(rows)
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """從原始 OHLCV 計算技術面分數（6 因子：SMA + 動能 + 價格位置 + 量能比 + 波動收斂 + 量價背離）。"""
@@ -836,6 +960,11 @@ class MarketScanner:
             "industry_category",
             "momentum",
             "inst_net",
+            "entry_price",
+            "stop_loss",
+            "take_profit",
+            "entry_trigger",
+            "valid_until",
         ]
         return scored[[c for c in keep_cols if c in scored.columns]]
 
@@ -1102,28 +1231,8 @@ class MomentumScanner(MarketScanner):
         atr_ratios = []
         for sid in scored["stock_id"].tolist():
             stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 14:
-                atr_ratios.append({"stock_id": sid, "atr_ratio": 0.0})
-                continue
-
-            highs = stock_data["high"].values[-14:]
-            lows = stock_data["low"].values[-14:]
-            closes = stock_data["close"].values[-15:]  # 需要前一天 close
-
-            trs = []
-            for i in range(1, len(highs) + 1):
-                if i < len(closes):
-                    tr = max(
-                        highs[i - 1] - lows[i - 1],
-                        abs(highs[i - 1] - closes[i - 1]),
-                        abs(lows[i - 1] - closes[i - 1]),
-                    )
-                else:
-                    tr = highs[i - 1] - lows[i - 1]
-                trs.append(tr)
-
-            atr = np.mean(trs)
-            current_close = stock_data["close"].values[-1]
+            atr = _calc_atr14(stock_data)
+            current_close = stock_data["close"].values[-1] if not stock_data.empty else 1.0
             ratio = atr / current_close if current_close > 0 else 0.0
             atr_ratios.append({"stock_id": sid, "atr_ratio": ratio})
 

@@ -372,6 +372,11 @@ class DiscoveryRecord(Base):
     regime: Mapped[str] = mapped_column(String(20), nullable=True)  # bull/bear/sideways
     total_stocks: Mapped[int] = mapped_column(Integer, nullable=True)  # 掃描總股數
     after_coarse: Mapped[int] = mapped_column(Integer, nullable=True)  # 粗篩後股數
+    entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場參考價
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)  # 止損價（entry - 1.5×ATR14）
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)  # 止利價（entry + 3×ATR14）
+    entry_trigger: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 進場觸發條件說明
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)  # 建議有效日（+5 工作日）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

@@ -26,23 +26,24 @@ def scanner():
     )
 
 
-def _make_price_df(n_stocks: int = 20) -> pd.DataFrame:
-    """建立模擬市場日 K 資料（2 天）。"""
+def _make_price_df(n_stocks: int = 20, n_days: int = 20) -> pd.DataFrame:
+    """建立模擬市場日 K 資料（n_days 天，預設 20 天，供 ATR14 計算使用）。"""
     rows = []
-    d1, d2 = date(2025, 1, 2), date(2025, 1, 3)
+    base_date = date(2025, 1, 2)
     for i in range(n_stocks):
         sid = f"{1000 + i}"
-        close_d1 = 50 + i * 10
-        close_d2 = close_d1 + (i - n_stocks // 2)
-        for d, c in [(d1, close_d1), (d2, close_d2)]:
+        base_close = 50 + i * 10
+        for d in range(n_days):
+            day = base_date + timedelta(days=d)
+            close = base_close + d * 0.5 + (i - n_stocks // 2) * 0.1
             rows.append(
                 {
                     "stock_id": sid,
-                    "date": d,
-                    "open": c - 1,
-                    "high": c + 2,
-                    "low": c - 2,
-                    "close": c,
+                    "date": day,
+                    "open": close - 1,
+                    "high": close + 2,
+                    "low": close - 2,
+                    "close": close,
                     "volume": 200_000 + i * 50_000,
                 }
             )
@@ -1476,3 +1477,163 @@ class TestGrowthRegimeWeights:
         w = MarketRegimeDetector.get_weights("growth", regime)
         expected = fund * w["fundamental"] + tech * w["technical"] + chip * w["chip"] + news * w.get("news", 0.10)
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
+
+
+# ====================================================================== #
+#  進出場建議欄位測試（_calc_atr14 + _compute_entry_exit_cols）
+# ====================================================================== #
+
+
+def _make_entry_exit_price_df(sid: str = "1000", n_days: int = 20) -> pd.DataFrame:
+    """建立供進出場計算用的 20 天模擬價格資料。"""
+    rows = []
+    for d in range(n_days):
+        day = date(2025, 1, 1) + timedelta(days=d)
+        close = 100.0 + d * 0.5
+        rows.append(
+            {
+                "stock_id": sid,
+                "date": day,
+                "open": close - 1,
+                "high": close + 2,
+                "low": close - 2,
+                "close": close,
+                "volume": 500_000,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+class TestCalcAtr14:
+    def test_positive_with_enough_data(self):
+        """20 天資料應回傳正值 ATR14。"""
+        from src.discovery.scanner import _calc_atr14
+
+        df = _make_entry_exit_price_df()
+        atr = _calc_atr14(df)
+        assert atr > 0
+
+    def test_returns_zero_for_empty(self):
+        """空 DataFrame 應回傳 0.0。"""
+        from src.discovery.scanner import _calc_atr14
+
+        df = pd.DataFrame(columns=["high", "low", "close"])
+        assert _calc_atr14(df) == 0.0
+
+    def test_returns_zero_for_single_row(self):
+        """單筆資料（無法計算 TR）應回傳 0.0。"""
+        from src.discovery.scanner import _calc_atr14
+
+        df = pd.DataFrame([{"high": 102.0, "low": 98.0, "close": 100.0}])
+        assert _calc_atr14(df) == 0.0
+
+    def test_known_value(self):
+        """固定 high/low/close → ATR 應等於 high-low（無跳空）。"""
+        from src.discovery.scanner import _calc_atr14
+
+        rows = []
+        for d in range(16):
+            rows.append({"high": 102.0, "low": 98.0, "close": 100.0})
+        df = pd.DataFrame(rows)
+        atr = _calc_atr14(df)
+        # TR = max(102-98, |102-100|, |98-100|) = max(4, 2, 2) = 4
+        assert atr == pytest.approx(4.0, abs=1e-6)
+
+
+class TestComputeEntryExitCols:
+    def test_returns_five_columns(self, scanner):
+        """回傳 DataFrame 含五個進出場欄位。"""
+        df_price = _make_entry_exit_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df_price)
+        for col in ["entry_price", "stop_loss", "take_profit", "entry_trigger", "valid_until"]:
+            assert col in result.columns
+
+    def test_stop_loss_below_entry_take_profit_above(self, scanner):
+        """stop_loss < entry_price < take_profit（有足夠資料時）。"""
+        df_price = _make_entry_exit_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df_price)
+        row = result.iloc[0]
+        ep = row["entry_price"]
+        sl = row["stop_loss"]
+        tp = row["take_profit"]
+        assert pd.notna(ep) and ep > 0
+        assert pd.notna(sl) and sl < ep
+        assert pd.notna(tp) and tp > ep
+
+    def test_insufficient_data_trigger(self, scanner):
+        """不足 15 天 → trigger 為「資料不足，僅供參考」。"""
+        rows = []
+        for d in range(5):
+            rows.append(
+                {
+                    "stock_id": "9999",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": 99,
+                    "high": 102,
+                    "low": 98,
+                    "close": 100.0,
+                    "volume": 500_000,
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        result = scanner._compute_entry_exit_cols(["9999"], df_price)
+        assert result.iloc[0]["entry_trigger"] == "資料不足，僅供參考"
+
+    def test_valid_until_is_business_days_ahead(self, scanner):
+        """valid_until 應在 scan_date 之後（至少 5 個工作日）。"""
+        df_price = _make_entry_exit_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df_price)
+        valid = result.iloc[0]["valid_until"]
+        assert valid > date.today()
+
+    def test_above_sma20_trigger_says_站上均線(self, scanner):
+        """close > SMA20 × 1.01 → 「站上均線」。"""
+        rows = []
+        # 價格逐日遞增，最後一天顯著高於 SMA20
+        for d in range(20):
+            close = 80.0 + d * 2  # 最後一天 close=118, SMA20≈99
+            rows.append(
+                {
+                    "stock_id": "5555",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": close - 1,
+                    "high": close + 2,
+                    "low": close - 2,
+                    "close": close,
+                    "volume": 500_000,
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        result = scanner._compute_entry_exit_cols(["5555"], df_price)
+        trigger = result.iloc[0]["entry_trigger"]
+        assert "站上均線" in trigger
+
+
+class TestRankAndEnrichHasEntryExitCols:
+    """驗證 _score_candidates 輸出含五個進出場欄位且值合理。"""
+
+    def test_entry_exit_cols_present_and_reasonable(self, scanner):
+        """_score_candidates 結果含五欄位；stop_loss < close < take_profit。"""
+        df_price = _make_entry_exit_price_df()
+        candidates = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "close": [df_price[df_price["stock_id"] == "1000"]["close"].iloc[-1]],
+                "volume": [500_000],
+            }
+        )
+        result = scanner._score_candidates(candidates, df_price, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        for col in ["entry_price", "stop_loss", "take_profit", "entry_trigger", "valid_until"]:
+            assert col in result.columns
+
+        row = result.iloc[0]
+        ep = row["entry_price"]
+        sl = row["stop_loss"]
+        tp = row["take_profit"]
+
+        assert pd.notna(ep) and ep > 0
+        if pd.notna(sl):
+            assert sl < ep
+        if pd.notna(tp):
+            assert tp > ep
+        assert row["valid_until"] > date.today()

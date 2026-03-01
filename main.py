@@ -824,6 +824,27 @@ def cmd_discover(args: argparse.Namespace) -> None:
         for _, sr in result.sector_summary.head(8).iterrows():
             print(f"  {sr['industry']:<14} {int(sr['count']):>3} 支  (均分 {sr['avg_score']:.3f})")
 
+    # 進出場建議（Top 5）
+    ee_cols = ["entry_price", "stop_loss", "take_profit", "entry_trigger", "valid_until"]
+    if all(c in result.rankings.columns for c in ee_cols):
+        print(f"\n{'─' * 80}")
+        print("[ 進出場建議 ]")
+        print(f"{'#':>3}  {'代號':>6}  {'進場價':>8}  {'止損':>12}  {'止利':>12}  {'觸發條件':<18}  {'有效至'}")
+        print(f"{'─' * 80}")
+        for _, row in result.rankings.head(5).iterrows():
+            ep = row.get("entry_price")
+            sl = row.get("stop_loss")
+            tp = row.get("take_profit")
+            sl_str = f"{sl:.1f}({(sl - ep) / ep:+.1%})" if pd.notna(sl) and pd.notna(ep) and ep > 0 else "—"
+            tp_str = f"{tp:.1f}({(tp - ep) / ep:+.1%})" if pd.notna(tp) and pd.notna(ep) and ep > 0 else "—"
+            ep_str = f"{ep:.1f}" if pd.notna(ep) else "—"
+            trigger = str(row.get("entry_trigger", "")) or "—"
+            valid = str(row.get("valid_until", "")) or "—"
+            print(
+                f"{int(row['rank']):>3}  {row['stock_id']:>6}  "
+                f"{ep_str:>8}  {sl_str:>12}  {tp_str:>12}  {trigger:<18}  {valid}"
+            )
+
     # 儲存推薦記錄到 DB
     _save_discovery_records(result, mode, scanner)
 
@@ -1073,6 +1094,11 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 regime=regime,
                 total_stocks=result.total_stocks,
                 after_coarse=result.after_coarse,
+                entry_price=float(row.get("entry_price")) if pd.notna(row.get("entry_price")) else None,
+                stop_loss=float(row.get("stop_loss")) if pd.notna(row.get("stop_loss")) else None,
+                take_profit=float(row.get("take_profit")) if pd.notna(row.get("take_profit")) else None,
+                entry_trigger=str(row.get("entry_trigger", "")) or None,
+                valid_until=row.get("valid_until") if pd.notna(row.get("valid_until")) else None,
             )
         )
 

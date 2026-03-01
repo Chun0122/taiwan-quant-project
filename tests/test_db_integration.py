@@ -3,6 +3,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 from sqlalchemy import select
 
 from src.data.database import init_db
@@ -202,6 +203,11 @@ class TestDiscoveryRecord:
             regime="bull",
             total_stocks=1800,
             after_coarse=120,
+            entry_price=950.0,
+            stop_loss=910.5,
+            take_profit=1031.0,
+            entry_trigger="站上均線，低波動",
+            valid_until=date(2025, 6, 8),
         )
         db_session.add(rec)
         db_session.flush()
@@ -220,6 +226,65 @@ class TestDiscoveryRecord:
         assert rows[0].stock_id == "2330"
         assert rows[0].composite_score == 0.85
         assert rows[0].regime == "bull"
+        assert rows[0].entry_price == 950.0
+        assert rows[0].stop_loss == 910.5
+        assert rows[0].take_profit == 1031.0
+        assert rows[0].entry_trigger == "站上均線，低波動"
+        assert rows[0].valid_until == date(2025, 6, 8)
+
+    def test_entry_exit_persists(self, db_session):
+        """進出場建議欄位寫入後可正確讀取，nullable 欄位為 None 時也正常。"""
+        # 有進出場資料
+        rec_full = DiscoveryRecord(
+            scan_date=date(2025, 7, 1),
+            mode="swing",
+            rank=1,
+            stock_id="2317",
+            close=105.0,
+            composite_score=0.78,
+            entry_price=105.0,
+            stop_loss=99.75,
+            take_profit=120.75,
+            entry_trigger="貼近均線",
+            valid_until=date(2025, 7, 8),
+        )
+        # 無進出場資料（nullable）
+        rec_null = DiscoveryRecord(
+            scan_date=date(2025, 7, 1),
+            mode="swing",
+            rank=2,
+            stock_id="2454",
+            close=200.0,
+            composite_score=0.65,
+        )
+        db_session.add_all([rec_full, rec_null])
+        db_session.flush()
+
+        rows = (
+            db_session.execute(
+                select(DiscoveryRecord).where(
+                    DiscoveryRecord.scan_date == date(2025, 7, 1),
+                    DiscoveryRecord.mode == "swing",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_stock = {r.stock_id: r for r in rows}
+
+        # 完整欄位
+        r1 = by_stock["2317"]
+        assert r1.entry_price == pytest.approx(105.0)
+        assert r1.stop_loss == pytest.approx(99.75)
+        assert r1.take_profit == pytest.approx(120.75)
+        assert r1.entry_trigger == "貼近均線"
+        assert r1.valid_until == date(2025, 7, 8)
+
+        # nullable 欄位為 None
+        r2 = by_stock["2454"]
+        assert r2.entry_price is None
+        assert r2.stop_loss is None
+        assert r2.valid_until is None
 
     def test_unique_constraint(self, db_session):
         """同日同模式同股票不可重複。"""

@@ -200,6 +200,52 @@ def format_industry_report(
     return messages
 
 
+def format_discovery_entry_exit(rankings: "pd.DataFrame", top_n: int = 5) -> str:
+    """格式化進出場建議區塊（Top N）。
+
+    Args:
+        rankings: DiscoveryResult.rankings DataFrame
+        top_n: 顯示前 N 筆
+
+    Returns:
+        格式化字串；若無進出場欄位則回傳空字串
+    """
+    ee_cols = ["entry_price", "stop_loss", "take_profit", "entry_trigger", "valid_until"]
+    if rankings is None or rankings.empty:
+        return ""
+    if not all(c in rankings.columns for c in ee_cols):
+        return ""
+
+    display = rankings.head(top_n)
+    lines = [
+        "",
+        "📍 進出場建議（Top 5）",
+        "```",
+        f"{'代號':>6}  {'進場價':>7}  {'止損':>9}  {'止利':>9}  {'觸發':<14}  {'有效至'}",
+        "─" * 58,
+    ]
+
+    for _, row in display.iterrows():
+        ep = row.get("entry_price")
+        sl = row.get("stop_loss")
+        tp = row.get("take_profit")
+        valid = str(row.get("valid_until", ""))
+        # 縮短日期為 MM/DD
+        if len(valid) == 10:
+            valid = valid[5:]  # 保留 MM-DD，轉為 MM/DD
+            valid = valid.replace("-", "/")
+
+        sl_str = f"{sl:.1f}({(sl - ep) / ep:+.1%})" if pd.notna(sl) and pd.notna(ep) and ep > 0 else "—"
+        tp_str = f"{tp:.1f}({(tp - ep) / ep:+.1%})" if pd.notna(tp) and pd.notna(ep) and ep > 0 else "—"
+        ep_str = f"{ep:.1f}" if pd.notna(ep) else "—"
+        trigger = str(row.get("entry_trigger", "")) or "—"
+
+        lines.append(f"{row['stock_id']:>6}  {ep_str:>7}  {sl_str:>9}  {tp_str:>9}  {trigger:<14}  {valid}")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
 def format_discovery_report(result, top_n: int = 20) -> list[str]:
     """將全市場掃描結果格式化為 Discord 訊息。
 
@@ -264,4 +310,13 @@ def format_discovery_report(result, top_n: int = 20) -> list[str]:
             current_msg_lines = [sector_text]
 
     messages.append("\n".join(current_msg_lines))
+
+    # 進出場建議區塊
+    ee_block = format_discovery_entry_exit(result.rankings, top_n=5)
+    if ee_block:
+        if len(ee_block) <= 1950:
+            messages.append(ee_block)
+        else:
+            messages.append(ee_block[:1950])
+
     return messages

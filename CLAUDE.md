@@ -212,6 +212,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 8 | ✅ | **CLI `export`/`import-data` 通用命令** | export：匯出任意資料表為 CSV/Parquet（含 --stocks/--start/--end 篩選）；import-data：從 CSV/Parquet 匯入（含欄位驗證 + --dry-run） |
 | 9 | ✅ | **個股分析頁面增強** | 成交量疊加 K 線（secondary_y）、Sidebar 指標 checkbox（SMA/BB/RSI/MACD）、法人累積買賣超折線、融資融券+券資比雙列圖、MOPS 公告 vline 標記 + expander 明細表，已完成並通過 491 測試 |
 | 10 | ✅ | **多模式綜合比較（discover all）** | `discover all` 一次執行五個 Scanner，輸出交叉比較表（出現越多模式 = 高信心度），支援 `--min-appearances` 篩選、CSV 匯出、Discord 通知，只修改 main.py（+`_build_cross_comparison` 純函數 + `_cmd_discover_all`），通過 491 測試 |
+| 11 | ✅ | **Discover 進出場建議（Task A+D）** | `DiscoveryResult.rankings` 新增 entry_price/stop_loss/take_profit/entry_trigger/valid_until 五欄（基於 ATR14 + SMA20）；CLI 顯示 Top 5 進出場建議；Discord 通知附加進出場區塊；`DiscoveryRecord` ORM 新增對應欄位（含 migration）；507 測試通過 |
+| 12 | ⬜ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，輸出進場區間/止損/目標價/時機評估，可選 `--notify` |
+| 13 | ⬜ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 動態計算止損止利，TradeRecord 記錄實際 stop_price/target_price |
+| 14 | ⬜ | **持倉監控 Dashboard 頁面** | 新增 WatchEntry ORM 表 + CLI `watch` 子命令 + Dashboard「持倉監控」頁，自動標記止損/止利/過期狀態 |
 
 ## 已確認事項（規劃時勿重複提出）
 
