@@ -49,14 +49,14 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
     if df.empty:
         return 0
 
-    # 複製以避免修改原始 DataFrame
-    df = df.copy()
-
-    # 將 NaN 轉為 None，避免 SQLAlchemy 無法處理 float NaN 寫入日期等欄位
-    # 使用 where() 方法，這是 Pandas 處理 NaN 的標準方式
-    df = df.where(pd.notna(df), None)
-
-    records = df.to_dict("records")
+    # 先轉為 dict，再逐欄清理 NaN / NaT → None
+    # 注意：df.where(notna, None) 對 datetime64[ns] 欄位無效（None 會被轉回 NaT）
+    # 因此改用 to_dict 後逐欄位判斷
+    raw_records = df.to_dict("records")
+    records = [
+        {k: None if pd.isna(v) else v for k, v in row.items()}
+        for row in raw_records
+    ]
     with get_session() as session:
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
