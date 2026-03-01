@@ -49,7 +49,8 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
     if df.empty:
         return 0
 
-    records = df.to_dict("records")
+    # 將 NaN 轉為 None，避免 SQLAlchemy 無法處理 float NaN 寫入日期等欄位
+    records = df.where(df.notna(), other=None).to_dict("records")
     with get_session() as session:
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
