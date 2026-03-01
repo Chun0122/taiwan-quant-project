@@ -29,6 +29,9 @@ python main.py discover dividend --top 20   # 高息存股掃描
 python main.py discover growth --top 20     # 高成長掃描
 python main.py discover --skip-sync --top 10 # 使用已快取的 DB 資料
 python main.py discover --compare            # 顯示與上次推薦的差異比較
+python main.py discover all --skip-sync --top 20           # 五模式綜合比較
+python main.py discover all --skip-sync --min-appearances 2 # 只顯示出現 2+ 模式的股票
+python main.py discover all --skip-sync --export compare.csv # 匯出交叉比較表
 python main.py discover-backtest --mode momentum  # 推薦績效回測（預設 5,10,20 天）
 python main.py sync-mops                     # 同步 MOPS 重大訊息（預設 7 天）
 python main.py sync-mops --days 30           # 同步最近 30 天
@@ -208,6 +211,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 7 | ✅ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度 Treemap，已完成 |
 | 8 | ✅ | **CLI `export`/`import-data` 通用命令** | export：匯出任意資料表為 CSV/Parquet（含 --stocks/--start/--end 篩選）；import-data：從 CSV/Parquet 匯入（含欄位驗證 + --dry-run） |
 | 9 | ✅ | **個股分析頁面增強** | 成交量疊加 K 線（secondary_y）、Sidebar 指標 checkbox（SMA/BB/RSI/MACD）、法人累積買賣超折線、融資融券+券資比雙列圖、MOPS 公告 vline 標記 + expander 明細表，已完成並通過 491 測試 |
+| 10 | ✅ | **多模式綜合比較（discover all）** | `discover all` 一次執行五個 Scanner，輸出交叉比較表（出現越多模式 = 高信心度），支援 `--min-appearances` 篩選、CSV 匯出、Discord 通知，只修改 main.py（+`_build_cross_comparison` 純函數 + `_cmd_discover_all`），通過 491 測試 |
 
 ## 已確認事項（規劃時勿重複提出）
 

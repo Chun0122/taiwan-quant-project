@@ -648,13 +648,14 @@ python main.py industry --notify
 
 ### 4.13 全市場選股掃描 (`discover`)
 
-從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援五種掃描模式：
+從全台灣 ~6000 支股票（上市 + 上櫃）中自動篩選出值得關注的標的。支援六種掃描模式：
 
 - **momentum**（預設）：短線動能股（1~10 天），抓突破 + 資金流 + 量能擴張
 - **swing**：中期波段股（1~3 個月），抓趨勢 + 基本面 + 法人布局
 - **value**：價值修復股，低估值 + 基本面轉佳 + 法人布局
 - **dividend**：高息存股，高殖利率 + 配息穩定 + 估值合理
 - **growth**：高成長股，營收高速成長 + 動能啟動
+- **all**：五模式綜合比較，一次執行全部 Scanner，輸出交叉出現次數排行（出現越多模式 = 高信心度）
 
 **漏斗架構：**
 ```
@@ -701,22 +702,33 @@ python main.py discover swing --top 30 --export picks.csv --notify
 # 與上次推薦比較（顯示新進/退出/排名變化）
 python main.py discover --compare
 python main.py discover momentum --skip-sync --compare
+
+# ── all 模式：五模式綜合比較 ──
+# 一次跑完五個 Scanner，輸出交叉排行（出現越多模式 = 高信心度）
+python main.py discover all --skip-sync --top 20
+
+# 只顯示出現在 2 個以上模式的股票
+python main.py discover all --skip-sync --min-appearances 2
+
+# 匯出交叉比較表 CSV
+python main.py discover all --skip-sync --export compare.csv
 ```
 
-每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。
+每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。`all` 模式會將五個模式分別存入 DB。
 
 | 參數 | 說明 |
 |------|------|
-| `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復）、`dividend`（高息存股）、`growth`（高成長），預設 momentum |
+| `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復）、`dividend`（高息存股）、`growth`（高成長）、`all`（五模式綜合比較），預設 momentum |
 | `--top N` | 顯示前 N 名（預設 20） |
 | `--min-price N` | 最低股價門檻（預設 10） |
 | `--max-price N` | 最高股價門檻（預設 2000） |
 | `--min-volume N` | 最低成交量/股（預設 500000） |
-| `--sync-days N` | 同步最近幾個交易日（預設 3，swing 模式自動擴展至 80） |
+| `--sync-days N` | 同步最近幾個交易日（預設 3，swing 模式自動擴展至 80，all 模式自動取 max(sync_days, 80)） |
 | `--skip-sync` | 跳過全市場資料同步，直接用 DB 既有資料 |
 | `--export PATH` | 匯出 CSV |
 | `--notify` | 發送 Discord 通知 |
-| `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名） |
+| `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名，單模式有效） |
+| `--min-appearances N` | [all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示） |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 

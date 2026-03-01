@@ -70,6 +70,9 @@ Usage:
     python main.py discover --top 30 --min-price 50
     python main.py discover --skip-sync --top 10
     python main.py discover --export picks.csv --notify
+    python main.py discover all --skip-sync --top 20
+    python main.py discover all --skip-sync --min-appearances 2
+    python main.py discover all --skip-sync --export compare.csv
 
     # Discover 推薦績效回測
     python main.py discover-backtest --mode momentum
@@ -734,6 +737,11 @@ def cmd_discover(args: argparse.Namespace) -> None:
     init_db()
 
     mode = getattr(args, "mode", "momentum") or "momentum"
+
+    if mode == "all":
+        _cmd_discover_all(args)
+        return
+
     mode_label = {
         "momentum": "Momentum 短線動能",
         "swing": "Swing 中期波段",
@@ -836,6 +844,201 @@ def cmd_discover(args: argparse.Namespace) -> None:
         msgs = format_discovery_report(result, top_n=args.top)
         for msg in msgs:
             send_message(msg)
+        print("Discord 通知已發送")
+
+
+def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
+    """建立五模式交叉比較表。
+
+    Args:
+        results: dict[mode_key → ScanResult]（只含成功的模式）
+        top_n: 每個模式取前 N 名納入比較
+
+    Returns:
+        DataFrame，欄位：stock_id, stock_name, close, appearances, best_rank,
+        momentum_rank, swing_rank, value_rank, dividend_rank, growth_rank,
+        industry_category
+    """
+    mode_cols = ["momentum", "swing", "value", "dividend", "growth"]
+
+    # 收集各模式的 stock → rank 映射
+    mode_data: dict[str, dict] = {}
+    stock_meta: dict[str, dict] = {}  # stock_id → {name, close, industry}
+
+    for mode_key, result in results.items():
+        if result is None or result.rankings.empty:
+            mode_data[mode_key] = {}
+            continue
+        subset = result.rankings.head(top_n)
+        ranks = {}
+        for _, row in subset.iterrows():
+            sid = row["stock_id"]
+            ranks[sid] = int(row["rank"])
+            if sid not in stock_meta:
+                stock_meta[sid] = {
+                    "stock_name": str(row.get("stock_name", "")),
+                    "close": float(row.get("close", 0.0)),
+                    "industry_category": str(row.get("industry_category", "")),
+                }
+        mode_data[mode_key] = ranks
+
+    if not stock_meta:
+        return pd.DataFrame()
+
+    rows = []
+    for sid, meta in stock_meta.items():
+        row = {"stock_id": sid, **meta}
+        appearances = 0
+        best_rank = 9999
+        for col in mode_cols:
+            rank_val = mode_data.get(col, {}).get(sid)
+            row[f"{col}_rank"] = rank_val
+            if rank_val is not None:
+                appearances += 1
+                if rank_val < best_rank:
+                    best_rank = rank_val
+        row["appearances"] = appearances
+        row["best_rank"] = best_rank if best_rank < 9999 else None
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["appearances", "best_rank"], ascending=[False, True]).reset_index(drop=True)
+    return df
+
+
+def _cmd_discover_all(args: argparse.Namespace) -> None:
+    """執行五個 Scanner 並輸出多模式綜合比較表。"""
+    import datetime
+
+    from src.data.database import init_db
+    from src.data.pipeline import sync_market_data, sync_stock_info
+    from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
+
+    init_db()
+
+    # Swing 模式需要至少 80 天資料
+    sync_days = max(args.sync_days, 80)
+
+    if not args.skip_sync:
+        print("正在同步股票基本資料...")
+        sync_stock_info(force_refresh=False)
+        print(f"正在同步全市場資料（{sync_days} 天）...")
+        counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
+        print(
+            f"  日K線: {counts['daily_price']:,} 筆 | "
+            f"法人: {counts['institutional']:,} 筆 | "
+            f"融資融券: {counts['margin']:,} 筆"
+        )
+
+    scanner_classes = {
+        "momentum": MomentumScanner,
+        "swing": SwingScanner,
+        "value": ValueScanner,
+        "dividend": DividendScanner,
+        "growth": GrowthScanner,
+    }
+    mode_labels = {
+        "momentum": "動能",
+        "swing": "波段",
+        "value": "價值",
+        "dividend": "高息",
+        "growth": "成長",
+    }
+
+    results: dict = {}
+    scan_summaries: list[str] = []
+
+    for mode_key, ScannerClass in scanner_classes.items():
+        label = mode_labels[mode_key]
+        print(f"正在掃描 [{label}]...", end="", flush=True)
+        scanner = ScannerClass(
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_volume=args.min_volume,
+            top_n_results=args.top,
+        )
+        result = scanner.run()
+        results[mode_key] = result
+
+        if result.rankings.empty:
+            print(" (無符合條件的股票)")
+            scan_summaries.append(
+                f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → 0 筆"
+            )
+        else:
+            actual = len(result.rankings.head(args.top))
+            print(f" → Top {actual}")
+            scan_summaries.append(
+                f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → Top {actual}"
+            )
+            _save_discovery_records(result, mode_key, scanner)
+
+    # 建立比較表
+    df = _build_cross_comparison(results, args.top)
+
+    # 套用 --min-appearances 篩選
+    min_app = getattr(args, "min_appearances", 1)
+    if min_app > 1 and not df.empty:
+        df = df[df["appearances"] >= min_app].reset_index(drop=True)
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    n_modes = sum(1 for r in results.values() if r is not None and not r.rankings.empty)
+
+    print(f"\n{'═' * 82}")
+    print(f"多模式綜合比較 — {today}  ｜  掃描 {n_modes} 個模式  ×  Top {args.top}")
+    print(f"{'═' * 82}")
+
+    if df.empty:
+        print(f"  （無出現在 {min_app}+ 個模式的股票）")
+    else:
+        print(
+            f"{'出現':>5}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  "
+            f"{'動能':>5} {'波段':>5} {'價值':>5} {'高息':>5} {'成長':>5}  {'產業':<12}"
+        )
+        print(f"{'─' * 82}")
+
+        def _fmt_rank(val) -> str:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "  —  "
+            return f"#{int(val):<4}"
+
+        for _, row in df.iterrows():
+            app = int(row["appearances"])
+            star = f"★×{app}" if app < 5 else "★×5!"
+            name = str(row.get("stock_name", ""))[:8]
+            industry = str(row.get("industry_category", ""))[:12]
+            close_val = row.get("close", 0.0)
+            close_str = f"{close_val:>8.1f}" if pd.notna(close_val) else "       —"
+            print(
+                f"{star:>5}  {row['stock_id']:>6} {name:<8}  {close_str}  "
+                f"{_fmt_rank(row.get('momentum_rank')):>5} "
+                f"{_fmt_rank(row.get('swing_rank')):>5} "
+                f"{_fmt_rank(row.get('value_rank')):>5} "
+                f"{_fmt_rank(row.get('dividend_rank')):>5} "
+                f"{_fmt_rank(row.get('growth_rank')):>5}  {industry:<12}"
+            )
+
+    print(f"{'─' * 82}")
+    print("\n各模式掃描摘要：")
+    for s in scan_summaries:
+        print(s)
+
+    # CSV 匯出
+    if args.export and not df.empty:
+        df.to_csv(args.export, index=False)
+        print(f"\n結果已匯出至: {args.export}")
+
+    # Discord 通知
+    if args.notify and not df.empty:
+        from src.notification.line_notify import send_message
+
+        top10 = df[df["appearances"] >= max(2, min_app)].head(10) if len(df) > 0 else df.head(10)
+        lines = [f"**多模式綜合選股** ({today})", f"掃描 {n_modes} 個模式 × Top {args.top}", ""]
+        for _, row in top10.iterrows():
+            name = str(row.get("stock_name", ""))[:8]
+            app = int(row["appearances"])
+            lines.append(f"{'★' * app} {row['stock_id']} {name} (出現{app}模式)")
+        send_message("\n".join(lines))
         print("Discord 通知已發送")
 
 
@@ -1310,8 +1513,8 @@ def main() -> None:
         "mode",
         nargs="?",
         default="momentum",
-        choices=["momentum", "swing", "value", "dividend", "growth"],
-        help="掃描模式：momentum=短線動能, swing=中期波段, value=價值修復, dividend=高息存股, growth=高成長 (預設 momentum)",
+        choices=["momentum", "swing", "value", "dividend", "growth", "all"],
+        help="掃描模式：momentum=短線動能, swing=中期波段, value=價值修復, dividend=高息存股, growth=高成長, all=五模式綜合比較 (預設 momentum)",
     )
     sp_disc.add_argument("--top", type=int, default=20, help="顯示前 N 名 (預設 20)")
     sp_disc.add_argument("--min-price", type=float, default=10, help="最低股價 (預設 10)")
@@ -1323,6 +1526,12 @@ def main() -> None:
     sp_disc.add_argument("--export", default=None, help="匯出 CSV 路徑")
     sp_disc.add_argument("--notify", action="store_true", help="發送 Discord 通知")
     sp_disc.add_argument("--compare", action="store_true", help="顯示與上次推薦的差異比較")
+    sp_disc.add_argument(
+        "--min-appearances",
+        type=int,
+        default=1,
+        help="[all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示）",
+    )
 
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
