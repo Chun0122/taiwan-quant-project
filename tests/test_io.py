@@ -133,7 +133,6 @@ class TestExportTable:
                 close=605.0,
                 volume=30000000,
                 turnover=18000000000,
-                spread=5.0,
             )
         )
         db_session.commit()
@@ -376,7 +375,6 @@ class TestRoundTrip:
                 close=103.0,
                 volume=5000000,
                 turnover=500000000,
-                spread=3.0,
             )
         )
         db_session.commit()
