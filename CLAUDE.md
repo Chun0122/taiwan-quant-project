@@ -41,11 +41,17 @@ python main.py validate --export issues.csv  # 匯出問題清單
 python main.py sync-financial                # 同步 watchlist 財報（預設最近 4 季）
 python main.py sync-financial --stocks 2330  # 指定股票
 python main.py sync-financial --quarters 8   # 最近 8 季
+python main.py export --list                 # 列出所有可匯出的資料表及筆數
+python main.py export daily_price -o data/export/daily_price.csv  # 匯出日K線
+python main.py export daily_price --stocks 2330 --start 2024-01-01  # 篩選匯出
+python main.py export daily_price --format parquet -o data/export/dp.parquet  # Parquet 格式
+python main.py import-data daily_price data/export/daily_price.csv  # 匯入 CSV
+python main.py import-data daily_price data.csv --dry-run  # 僅驗證不寫入
 ```
 
 ### 測試
 
-使用 pytest 測試框架，~458 個測試覆蓋核心模組：
+使用 pytest 測試框架，~480 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -86,6 +92,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_validator.py`      | `src/data/validator.py` 6 個品質檢查純函數         | 純函數                 |
 | `tests/test_financial.py`     | `src/data/fetcher.py` 財報 EAV pivot + 衍生比率 + pipeline upsert | 純函數 + mock API + in-memory SQLite |
 | `tests/test_market_overview.py` | `data_loader` 市場總覽查詢 + `charts` 4 個圖表函數 | in-memory SQLite + 純函數 |
+| `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -131,6 +138,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）                                                              |
 | `src/data/schema.py`                | 14 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement）                               |
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
+| `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）                                |
@@ -198,7 +206,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 5 | ✅ | **投資組合配置模式擴充** | 新增 risk_parity（風險平價）、mean_variance（均值-方差優化），allocator.py 純函數模組 + scipy 優化 |
 | 6 | ✅ | **財報資料同步** | 新增季報/年報資料（EPS、ROE、毛利率、負債比、現金流），FinancialStatement ORM 表 + fetcher EAV pivot + pipeline sync + CLI sync-financial |
 | 7 | ✅ | **Dashboard 市場總覽首頁** | TAIEX 走勢 + Regime 狀態、市場廣度指標、法人買賣超排名、產業熱度 Treemap，已完成 |
-| 8 | ⬜ | **CLI `export`/`import` 通用命令** | export：匯出任意資料表為 CSV/Parquet；import：從 CSV 批次匯入自訂資料（含驗證） |
+| 8 | ✅ | **CLI `export`/`import-data` 通用命令** | export：匯出任意資料表為 CSV/Parquet（含 --stocks/--start/--end 篩選）；import-data：從 CSV/Parquet 匯入（含欄位驗證 + --dry-run） |
 | 9 | ⬜ | **個股分析頁面增強** | 成交量柱狀圖疊加 K 線、技術指標可勾選疊加、法人買賣超累積圖、融資融券走勢、MOPS 公告時間軸 |
 
 ## 已確認事項（規劃時勿重複提出）

@@ -1112,6 +1112,69 @@ def cmd_validate(args: argparse.Namespace) -> None:
         export_issues_csv(report, args.export)
 
 
+def cmd_export(args: argparse.Namespace) -> None:
+    """匯出資料表為 CSV/Parquet。"""
+    from src.data.database import init_db
+    from src.data.io import TABLE_REGISTRY, export_table, list_tables
+
+    init_db()
+
+    # --list 模式：列出所有表及筆數
+    if args.list:
+        tables = list_tables()
+        print("可匯出的資料表：")
+        print(f"{'資料表':<30} {'筆數':>10}")
+        print("-" * 42)
+        for t in tables:
+            print(f"{t['table']:<30} {t['count']:>10,}")
+        return
+
+    if not args.table:
+        print("錯誤：請指定資料表名稱，或使用 --list 查看所有表")
+        print(f"可用資料表: {', '.join(TABLE_REGISTRY.keys())}")
+        return
+
+    count = export_table(
+        table_name=args.table,
+        output_path=args.output,
+        fmt=args.format,
+        stocks=args.stocks,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+    if count == 0:
+        print("無資料可匯出（表為空或篩選條件無符合資料）")
+    else:
+        output = args.output or f"data/export/{args.table}.{args.format}"
+        print(f"結果已匯出至: {output}（共 {count:,} 筆）")
+
+
+def cmd_import_data(args: argparse.Namespace) -> None:
+    """從 CSV/Parquet 匯入資料。"""
+    from src.data.database import init_db
+    from src.data.io import import_table
+
+    init_db()
+
+    try:
+        count = import_table(
+            table_name=args.table,
+            source_path=args.source,
+            dry_run=args.dry_run,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        print(f"錯誤：{e}")
+        return
+
+    if args.dry_run:
+        print(f"驗證通過：{count:,} 筆資料（dry-run 模式，未寫入）")
+    elif count == 0:
+        print("無資料可匯入（檔案為空）")
+    else:
+        print(f"匯入完成：{count:,} 筆 → {args.table}（重複資料自動略過）")
+
+
 def main() -> None:
     setup_logging()
 
@@ -1292,6 +1355,22 @@ def main() -> None:
     sp_val.add_argument("--no-freshness", action="store_true", help="跳過資料新鮮度檢查")
     sp_val.add_argument("--export", default=None, help="匯出問題清單 CSV 路徑")
 
+    # export 子命令
+    sp_exp = subparsers.add_parser("export", help="匯出資料表為 CSV/Parquet")
+    sp_exp.add_argument("table", nargs="?", default=None, help="資料表名稱")
+    sp_exp.add_argument("-o", "--output", default=None, help="輸出檔案路徑")
+    sp_exp.add_argument("--format", default="csv", choices=["csv", "parquet"], help="輸出格式 (預設 csv)")
+    sp_exp.add_argument("--stocks", nargs="+", help="篩選股票代號")
+    sp_exp.add_argument("--start", default=None, help="起始日期 (YYYY-MM-DD)")
+    sp_exp.add_argument("--end", default=None, help="結束日期 (YYYY-MM-DD)")
+    sp_exp.add_argument("--list", action="store_true", help="列出所有可匯出的資料表及筆數")
+
+    # import-data 子命令
+    sp_imp = subparsers.add_parser("import-data", help="從 CSV/Parquet 匯入資料")
+    sp_imp.add_argument("table", help="目標資料表名稱")
+    sp_imp.add_argument("source", help="來源檔案路徑 (.csv 或 .parquet)")
+    sp_imp.add_argument("--dry-run", action="store_true", help="僅驗證資料格式，不實際寫入")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -1338,6 +1417,10 @@ def main() -> None:
         cmd_sync_financial(args)
     elif args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "export":
+        cmd_export(args)
+    elif args.command == "import-data":
+        cmd_import_data(args)
     elif args.command == "validate":
         cmd_validate(args)
     else:

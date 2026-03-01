@@ -51,6 +51,7 @@ taiwan-quant-project/
 │   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
 │   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
 │   │   ├── validator.py     # 資料品質檢查（6 項檢查 + 報告）
+│   │   ├── io.py            # 通用匯出/匯入（CSV/Parquet）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
 │   │   ├── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
@@ -972,6 +973,79 @@ python main.py status
 [三大法人] 31,111 筆 | 5 檔股票 | 2020-01-02 ~ 2026-02-11
 [融資融券] 6,224 筆 | 5 檔股票 | 2020-01-02 ~ 2026-02-11
 ```
+
+### 4.21 匯出資料表 (`export`)
+
+將任意 ORM 資料表匯出為 CSV 或 Parquet 檔案。支援股票代號篩選與日期範圍篩選。
+
+```bash
+# 列出所有可匯出的資料表及筆數
+python main.py export --list
+
+# 匯出日K線（CSV，預設輸出到 data/export/daily_price.csv）
+python main.py export daily_price
+
+# 指定輸出路徑
+python main.py export daily_price -o data/export/daily_price.csv
+
+# 篩選股票
+python main.py export daily_price --stocks 2330 2317
+
+# 篩選日期範圍
+python main.py export daily_price --start 2024-01-01 --end 2024-12-31
+
+# Parquet 格式（需安裝 pyarrow）
+python main.py export daily_price --format parquet -o data/export/daily_price.parquet
+
+# 組合使用
+python main.py export institutional_investor --stocks 2330 --start 2025-01-01 -o ii.csv
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `table` | 資料表名稱（見 `--list` 輸出） |
+| `-o / --output` | 輸出檔案路徑（預設: `data/export/<table>.<format>`） |
+| `--format` | 輸出格式：`csv`（預設）或 `parquet` |
+| `--stocks SID ...` | 篩選股票代號（僅限有 stock_id 欄位的表） |
+| `--start DATE` | 起始日期 YYYY-MM-DD（僅限有 date 欄位的表） |
+| `--end DATE` | 結束日期 YYYY-MM-DD |
+| `--list` | 列出所有支援的資料表名稱及筆數 |
+
+> **注意**：匯出時自動排除 `id` 自增主鍵欄位。CSV 編碼為 UTF-8 with BOM（`utf-8-sig`），可在 Excel 中正確顯示中文。
+
+### 4.22 匯入資料 (`import-data`)
+
+從 CSV 或 Parquet 檔案匯入資料到指定表。自動驗證欄位格式，重複資料靜默略過（upsert）。
+
+```bash
+# 匯入 CSV 到 daily_price 表
+python main.py import-data daily_price data/export/daily_price.csv
+
+# 匯入 Parquet
+python main.py import-data daily_price data/export/daily_price.parquet
+
+# 僅驗證資料格式，不實際寫入
+python main.py import-data daily_price data.csv --dry-run
+```
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `table` | 目標資料表名稱 |
+| `source` | 來源檔案路徑（`.csv` 或 `.parquet`） |
+| `--dry-run` | 僅驗證資料格式（檢查必要欄位、日期格式），不實際寫入 DB |
+
+**匯入行為：**
+- 自動偵測檔案格式（依副檔名 `.csv` / `.parquet`）
+- 驗證必要欄位是否存在（缺少則報錯）
+- 多餘欄位自動忽略
+- 重複資料（依唯一鍵衝突）靜默略過，不覆寫
+- 批次寫入（每批 80 筆），符合 SQLite 變數上限
+
+> **典型用途**：備份還原、跨環境資料搬遷、從 CSV 匯入外部資料。先用 `export` 匯出，再用 `import-data` 匯入。
 
 ---
 
