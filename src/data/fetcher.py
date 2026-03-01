@@ -303,9 +303,17 @@ class FinMindFetcher(DataFetcher):
         df["date"] = pd.to_datetime(df["date"]).dt.date
         for col in ("cash_payment_date", "announcement_date"):
             if col in df.columns:
+                # 先轉換為 datetime，然後轉換為 date，最後將 NaT 替換為 None
                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+                # 將 NaT（pandas datetime NaT）替換為 None
+                df.loc[pd.isna(df[col]), col] = None
         df["cash_dividend"] = df.get("cash_dividend", pd.Series(dtype=float)).fillna(0.0)
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
+        # 確保 year 欄位為字符串，並移除 NaN/None 值
+        if "year" in df.columns:
+            df["year"] = df["year"].astype(str)
+            # 將 'nan' 字符串或空字符串替換為 None（保持 nullable=False 的資料品質）
+            df.loc[df["year"].isin(["nan", ""]), "year"] = None
         return df
 
     def fetch_all_daily_price(self, start: str, end: str | None = None) -> pd.DataFrame:

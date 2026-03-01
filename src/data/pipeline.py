@@ -49,8 +49,14 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
     if df.empty:
         return 0
 
+    # 複製以避免修改原始 DataFrame
+    df = df.copy()
+
     # 將 NaN 轉為 None，避免 SQLAlchemy 無法處理 float NaN 寫入日期等欄位
-    records = df.where(df.notna(), other=None).to_dict("records")
+    # 使用 where() 方法，這是 Pandas 處理 NaN 的標準方式
+    df = df.where(pd.notna(df), None)
+
+    records = df.to_dict("records")
     with get_session() as session:
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
@@ -83,6 +89,12 @@ def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
 
 def _upsert_dividend(df: pd.DataFrame) -> int:
     """將股利 DataFrame 寫入 dividend 表。"""
+    if df.empty:
+        return 0
+    # 移除 year 為 NaN 的行（year 是 nullable=False，不能為空）
+    df = df.dropna(subset=["year"])
+    if df.empty:
+        return 0
     return _upsert_batch(Dividend, df, ["stock_id", "date"])
 
 
