@@ -50,11 +50,13 @@ python main.py export daily_price --stocks 2330 --start 2024-01-01  # 篩選匯�
 python main.py export daily_price --format parquet -o data/export/dp.parquet  # Parquet 格式
 python main.py import-data daily_price data/export/daily_price.csv  # 匯入 CSV
 python main.py import-data daily_price data.csv --dry-run  # 僅驗證不寫入
+python main.py suggest 2330                  # 單股進出場建議（ATR14+SMA20+RSI14+Regime）
+python main.py suggest 2330 --notify         # 含 Discord 通知
 ```
 
 ### 測試
 
-使用 pytest 測試框架，~480 個測試覆蓋核心模組：
+使用 pytest 測試框架，~541 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -96,6 +98,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_financial.py`     | `src/data/fetcher.py` 財報 EAV pivot + 衍生比率 + pipeline upsert | 純函數 + mock API + in-memory SQLite |
 | `tests/test_market_overview.py` | `data_loader` 市場總覽查詢 + `charts` 4 個圖表函數 | in-memory SQLite + 純函數 |
 | `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
+| `tests/test_suggest.py`        | `main.py` `_calc_rsi14_from_series` + `_assess_timing` + `_format_suggest_discord` | 純函數 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -213,7 +216,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 9 | ✅ | **個股分析頁面增強** | 成交量疊加 K 線（secondary_y）、Sidebar 指標 checkbox（SMA/BB/RSI/MACD）、法人累積買賣超折線、融資融券+券資比雙列圖、MOPS 公告 vline 標記 + expander 明細表，已完成並通過 491 測試 |
 | 10 | ✅ | **多模式綜合比較（discover all）** | `discover all` 一次執行五個 Scanner，輸出交叉比較表（出現越多模式 = 高信心度），支援 `--min-appearances` 篩選、CSV 匯出、Discord 通知，只修改 main.py（+`_build_cross_comparison` 純函數 + `_cmd_discover_all`），通過 491 測試 |
 | 11 | ✅ | **Discover 進出場建議（Task A+D）** | `DiscoveryResult.rankings` 新增 entry_price/stop_loss/take_profit/entry_trigger/valid_until 五欄（基於 ATR14 + SMA20）；CLI 顯示 Top 5 進出場建議；Discord 通知附加進出場區塊；`DiscoveryRecord` ORM 新增對應欄位（含 migration）；507 測試通過 |
-| 12 | ⬜ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，輸出進場區間/止損/目標價/時機評估，可選 `--notify` |
+| 12 | ✅ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，從 DB 讀取 60 日日K，計算 ATR14/SMA20/RSI14 + Regime 偵測，輸出進場區間/止損/目標價/時機評估，可選 `--notify`；541 測試通過 |
 | 13 | ⬜ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 動態計算止損止利，TradeRecord 記錄實際 stop_price/target_price |
 | 14 | ⬜ | **持倉監控 Dashboard 頁面** | 新增 WatchEntry ORM 表 + CLI `watch` 子命令 + Dashboard「持倉監控」頁，自動標記止損/止利/過期狀態 |
 
