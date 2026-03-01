@@ -927,6 +927,93 @@ def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
     return df
 
 
+def _calc_rsi14_from_series(closes: "pd.Series") -> float:
+    """從收盤價序列計算 RSI14（取最後一個有效值）。
+
+    使用 Wilder's smoothing（alpha=1/14 EWM）。
+    長度不足 15 時回傳 50.0（中性值）。
+
+    Args:
+        closes: 收盤價序列（pd.Series，已按日期升序排列）
+
+    Returns:
+        RSI14 值（0.0 ~ 100.0），資料不足時回傳 50.0
+    """
+    if len(closes) < 15:
+        return 50.0
+
+    delta = closes.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+
+    last_gain = float(avg_gain.iloc[-1])
+    last_loss = float(avg_loss.iloc[-1])
+
+    if last_loss == 0.0:
+        return 100.0 if last_gain > 0 else 50.0
+
+    rs = last_gain / last_loss
+    return round(100.0 - 100.0 / (1.0 + rs), 2)
+
+
+def _assess_timing(
+    rsi14: float,
+    close: float,
+    sma20: float,
+    atr_pct: float,
+    regime: str,
+) -> str:
+    """評估單股進場時機（純函數）。
+
+    綜合 RSI14 超買/超賣位置、均線相對位置、ATR 波動率、市場 Regime，
+    輸出中文時機評估字串。
+
+    Args:
+        rsi14:    最新 RSI14 值（0.0 ~ 100.0）
+        close:    最新收盤價
+        sma20:    SMA20 值
+        atr_pct:  ATR14 / close（波動率比例）
+        regime:   市場狀態 "bull" | "bear" | "sideways"
+
+    Returns:
+        中文時機評估字串
+    """
+    above_sma = sma20 > 0 and close > sma20 * 1.005
+
+    # 波動率修飾符
+    if atr_pct < 0.015:
+        vol_tag = "，低波動"
+    elif atr_pct > 0.04:
+        vol_tag = "，高波動謹慎"
+    else:
+        vol_tag = ""
+
+    # 決策矩陣
+    if rsi14 >= 70:
+        timing = "謹慎觀望：RSI 超買，追高風險高"
+    elif rsi14 <= 30:
+        if regime in ("bull", "sideways"):
+            timing = "潛在反彈：RSI 超賣，留意止損"
+        else:
+            timing = "下跌趨勢中超賣，等待企穩訊號"
+    elif above_sma and regime == "bull":
+        if rsi14 >= 55:
+            timing = "積極做多：動能強勁 + 趨勢向上"
+        else:
+            timing = "順勢佈局：趨勢向上，動能待確認"
+    elif above_sma and regime == "sideways":
+        timing = "區間上軌，注意壓力，設好止損"
+    elif regime == "bear":
+        timing = "空頭環境，建議觀望或嚴守止損"
+    else:
+        timing = "等待訊號：尚未站上均線"
+
+    return timing + vol_tag
+
+
 def _cmd_discover_all(args: argparse.Namespace) -> None:
     """執行五個 Scanner 並輸出多模式綜合比較表。"""
     import datetime
@@ -1061,6 +1148,68 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
             lines.append(f"{'★' * app} {row['stock_id']} {name} (出現{app}模式)")
         send_message("\n".join(lines))
         print("Discord 通知已發送")
+
+
+def _format_suggest_discord(
+    stock_id: str,
+    stock_name: str,
+    today: object,
+    close: float,
+    sma20: float,
+    rsi14: float,
+    atr_str: str,
+    regime_zh: str,
+    taiex_close: float,
+    entry_price: float,
+    sl_str: str,
+    tp_str: str,
+    rr_str: str,
+    trigger: str,
+    timing: str,
+    valid_until: object,
+) -> str:
+    """將 suggest 結果格式化為 Discord 訊息（純函數，≤ 2000 字元）。
+
+    Args:
+        stock_id:    股票代號
+        stock_name:  股票名稱
+        today:       分析日期
+        close:       最新收盤價
+        sma20:       SMA20 值
+        rsi14:       RSI14 值
+        atr_str:     ATR14 的格式化字串（含百分比）
+        regime_zh:   中文市場狀態（多頭/空頭/盤整）
+        taiex_close: 加權指數最新收盤
+        entry_price: 進場參考價
+        sl_str:      止損價格式化字串（含百分比）
+        tp_str:      目標價格式化字串（含百分比）
+        rr_str:      風險報酬比字串
+        trigger:     進場觸發條件
+        timing:      時機評估字串
+        valid_until: 建議有效日期
+
+    Returns:
+        格式化字串（已截斷至 2000 字元）
+    """
+    sep = "─" * 40
+    lines = [
+        f"**進出場建議 — {stock_id} {stock_name}**",
+        f"分析日期：{today}  ｜  市場：{regime_zh}（TAIEX {taiex_close:,.0f}）",
+        "```",
+        f"收盤  ：{close:.2f}   SMA20：{sma20:.2f}   RSI：{rsi14:.1f}",
+        f"ATR14 ：{atr_str}",
+        sep,
+        f"進場參考：{entry_price:.2f}",
+        f"止  損  ：{sl_str}",
+        f"目  標  ：{tp_str}",
+        f"風險報酬：{rr_str}",
+        sep,
+        f"觸發條件：{trigger}",
+        f"時機評估：{timing}",
+        f"有效至  ：{valid_until}",
+        "```",
+    ]
+    return "\n".join(lines)[:2000]
 
 
 def _save_discovery_records(result, mode: str, scanner) -> None:
@@ -1341,6 +1490,174 @@ def cmd_validate(args: argparse.Namespace) -> None:
         export_issues_csv(report, args.export)
 
 
+def cmd_suggest(args: argparse.Namespace) -> None:
+    """單股進出場建議。
+
+    從 DB 讀取最近 60 日日K線，計算 ATR14 / SMA20 / RSI14，
+    偵測市場 Regime，輸出進場區間、止損、目標價與時機評估。
+    """
+    import datetime
+
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session, init_db
+    from src.data.schema import DailyPrice, StockInfo
+    from src.discovery.scanner import _calc_atr14
+    from src.regime.detector import MarketRegimeDetector
+
+    stock_id: str = args.stock_id
+    init_db()
+
+    # ── 1. 從 DB 載入最近 60 日日K（倒序取 60 筆，再反轉為升序）──────
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(DailyPrice).where(DailyPrice.stock_id == stock_id).order_by(DailyPrice.date.desc()).limit(60)
+            )
+            .scalars()
+            .all()
+        )
+
+        info_row = session.execute(select(StockInfo.stock_name).where(StockInfo.stock_id == stock_id)).scalar()
+
+    if not rows:
+        print(f"錯誤：找不到股票 {stock_id} 的日K線資料（請先執行 sync）")
+        sys.exit(1)
+
+    stock_name: str = info_row or stock_id
+
+    df = (
+        pd.DataFrame(
+            [
+                {
+                    "date": r.date,
+                    "open": float(r.open),
+                    "high": float(r.high),
+                    "low": float(r.low),
+                    "close": float(r.close),
+                    "volume": float(r.volume),
+                }
+                for r in reversed(rows)
+            ]
+        )
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    # ── 2. 計算 ATR14、SMA20、RSI14 ────────────────────────────────
+    atr14 = _calc_atr14(df)
+    close = float(df["close"].iloc[-1])
+    sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else close
+    rsi14 = _calc_rsi14_from_series(df["close"])
+
+    # ── 3. 偵測市場 Regime ─────────────────────────────────────────
+    try:
+        regime_info = MarketRegimeDetector().detect()
+        regime: str = regime_info["regime"]
+        taiex_close: float = float(regime_info["taiex_close"])
+    except Exception:
+        regime = "sideways"
+        taiex_close = 0.0
+
+    # ── 4. 計算進出場數字 ──────────────────────────────────────────
+    today = datetime.date.today()
+    valid_until = (pd.Timestamp(today) + pd.offsets.BDay(5)).date()
+
+    entry_price = round(close, 2)
+    atr_pct = atr14 / close if close > 0 else 0.0
+
+    if atr14 > 0:
+        stop_loss = round(close - 1.5 * atr14, 2)
+        take_profit = round(close + 3.0 * atr14, 2)
+        risk_pct = (entry_price - stop_loss) / entry_price * 100
+        reward_pct = (take_profit - entry_price) / entry_price * 100
+        rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0.0
+        sl_str = f"{stop_loss:.2f}（-{risk_pct:.1f}%）"
+        tp_str = f"{take_profit:.2f}（+{reward_pct:.1f}%）"
+        rr_str = f"1 : {rr_ratio:.1f}"
+        atr_str = f"{atr14:.2f}（{atr_pct:.1%}）"
+    else:
+        stop_loss = None
+        take_profit = None
+        sl_str = "—"
+        tp_str = "—"
+        rr_str = "—"
+        atr_str = "—"
+
+    # ── 5. 計算 entry_trigger（與 scanner.py 邏輯一致）────────────
+    if sma20 > 0:
+        if close > sma20 * 1.01:
+            trigger = "站上均線"
+        elif close >= sma20 * 0.99:
+            trigger = "貼近均線"
+        else:
+            trigger = "均線下方，等待確認"
+    else:
+        trigger = "均線下方，等待確認"
+
+    if atr_pct < 0.02:
+        trigger += "，低波動"
+    elif atr_pct > 0.04:
+        trigger += "，高波動謹慎"
+
+    # ── 6. 時機評估 ────────────────────────────────────────────────
+    timing = _assess_timing(rsi14, close, sma20, atr_pct, regime)
+
+    # ── 7. 輸出 CLI ────────────────────────────────────────────────
+    regime_zh = {"bull": "多頭", "bear": "空頭", "sideways": "盤整"}.get(regime, regime)
+    taiex_str = f"TAIEX {taiex_close:,.0f}" if taiex_close > 0 else ""
+
+    sep60 = "═" * 60
+    sep_thin = "─" * 60
+    print(f"\n{sep60}")
+    print(f"  單股進出場建議  ｜  {stock_id} {stock_name}")
+    print(sep60)
+    print(f"  分析日期  ：{today}")
+    print(f"  最新收盤  ：{close:.2f}")
+    print(f"  SMA20    ：{sma20:.2f}")
+    print(f"  RSI14    ：{rsi14:.1f}")
+    print(f"  ATR14    ：{atr_str}")
+    print(sep_thin)
+    taiex_part = f"（{taiex_str}）" if taiex_str else ""
+    print(f"  市場 Regime ：{regime_zh}{taiex_part}")
+    print(sep_thin)
+    print(f"  進場參考價  ：{entry_price:.2f}")
+    print(f"  止 損 價   ：{sl_str}")
+    print(f"  目 標 價   ：{tp_str}")
+    print(f"  風 險 報 酬 ：{rr_str}")
+    print(sep_thin)
+    print(f"  進場觸發  ：{trigger}")
+    print(f"  時機評估  ：{timing}")
+    print(f"  建議有效至：{valid_until}")
+    print(f"{sep60}\n")
+
+    # ── 8. Discord 通知（--notify）────────────────────────────────
+    if args.notify:
+        from src.notification.line_notify import send_message
+
+        msg = _format_suggest_discord(
+            stock_id=stock_id,
+            stock_name=stock_name,
+            today=today,
+            close=close,
+            sma20=sma20,
+            rsi14=rsi14,
+            atr_str=atr_str,
+            regime_zh=regime_zh,
+            taiex_close=taiex_close,
+            entry_price=entry_price,
+            sl_str=sl_str,
+            tp_str=tp_str,
+            rr_str=rr_str,
+            trigger=trigger,
+            timing=timing,
+            valid_until=valid_until,
+        )
+        ok = send_message(msg)
+        print("Discord 通知已發送" if ok else "Discord 通知失敗")
+
+
 def cmd_export(args: argparse.Namespace) -> None:
     """匯出資料表為 CSV/Parquet。"""
     from src.data.database import init_db
@@ -1606,6 +1923,11 @@ def main() -> None:
     sp_imp.add_argument("source", help="來源檔案路徑 (.csv 或 .parquet)")
     sp_imp.add_argument("--dry-run", action="store_true", help="僅驗證資料格式，不實際寫入")
 
+    # suggest 子命令
+    sp_suggest = subparsers.add_parser("suggest", help="單股進出場建議（ATR14 + SMA20 + RSI14 + Regime）")
+    sp_suggest.add_argument("stock_id", help="股票代號（例：2330）")
+    sp_suggest.add_argument("--notify", action="store_true", help="發送 Discord 通知")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -1658,6 +1980,8 @@ def main() -> None:
         cmd_import_data(args)
     elif args.command == "validate":
         cmd_validate(args)
+    elif args.command == "suggest":
+        cmd_suggest(args)
     else:
         parser.print_help()
         sys.exit(1)
