@@ -731,7 +731,7 @@ def cmd_industry(args: argparse.Namespace) -> None:
 def cmd_discover(args: argparse.Namespace) -> None:
     """執行全市場選股掃描（momentum / swing / value 模式）。"""
     from src.data.database import init_db
-    from src.data.pipeline import sync_market_data, sync_stock_info
+    from src.data.pipeline import sync_market_data, sync_stock_info, sync_taiex_index
     from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
 
     init_db()
@@ -750,16 +750,21 @@ def cmd_discover(args: argparse.Namespace) -> None:
         "growth": "Growth 高成長",
     }[mode]
 
-    # swing 模式自動擴展同步天數
+    # 各模式自動擴展同步天數至 Scanner 所需的 lookback_days
     sync_days = args.sync_days
     if mode == "swing" and sync_days < 80:
         sync_days = 80
         print(f"  [Swing 模式] 自動擴展同步天數至 {sync_days} 天（SMA60 / 60日動能需要）")
+    elif mode in ("momentum", "value", "dividend", "growth") and sync_days < 25:
+        sync_days = 25
+        print(f"  [{mode_label}] 自動擴展同步天數至 {sync_days} 天（ATR14 / SMA20 需要）")
 
     # 同步全市場資料（除非 --skip-sync）
     if not args.skip_sync:
         print("正在同步股票基本資料...")
         sync_stock_info(force_refresh=False)
+        print("正在同步 TAIEX 加權指數（Regime 偵測用）...")
+        sync_taiex_index()
         print("正在同步全市場資料（TWSE/TPEX 官方資料）...")
         counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
         print(
@@ -1019,7 +1024,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     import datetime
 
     from src.data.database import init_db
-    from src.data.pipeline import sync_market_data, sync_stock_info
+    from src.data.pipeline import sync_market_data, sync_stock_info, sync_taiex_index
     from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
 
     init_db()
@@ -1030,6 +1035,8 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     if not args.skip_sync:
         print("正在同步股票基本資料...")
         sync_stock_info(force_refresh=False)
+        print("正在同步 TAIEX 加權指數（Regime 偵測用）...")
+        sync_taiex_index()
         print(f"正在同步全市場資料（{sync_days} 天）...")
         counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
         print(

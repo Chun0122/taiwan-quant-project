@@ -160,8 +160,8 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
 
     for sid in stock_ids:
         last = _get_last_date(MonthlyRevenue, sid)
-        # 如果 DB 已有 60 天內的資料，跳過（避免重複抓取）
-        if last and (date.today() - date.fromisoformat(last)).days < 60:
+        # 如果 DB 已有 30 天內的資料，跳過（月營收每月公布，確保月份更新時能重新補抓）
+        if last and (date.today() - date.fromisoformat(last)).days < 30:
             skipped += 1
             continue
         try:
@@ -588,7 +588,7 @@ def sync_market_data(
 
         result["announcements"] = 0
         mops_d = date.today()
-        for _ in range(min(days, 5)):  # MOPS 最多抓 5 天，避免太慢
+        for _ in range(min(days, 10)):  # MOPS 最多抓 10 天，與 Scanner 消息面評分 10 日窗口對齊
             if mops_d.weekday() >= 5:
                 mops_d -= timedelta(days=1)
                 continue

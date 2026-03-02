@@ -219,6 +219,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 12 | ✅ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，從 DB 讀取 60 日日K，計算 ATR14/SMA20/RSI14 + Regime 偵測，輸出進場區間/止損/目標價/時機評估，可選 `--notify`；541 測試通過 |
 | 13 | ⬜ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 動態計算止損止利，TradeRecord 記錄實際 stop_price/target_price |
 | 14 | ⬜ | **持倉監控 Dashboard 頁面** | 新增 WatchEntry ORM 表 + CLI `watch` 子命令 + Dashboard「持倉監控」頁，自動標記止損/止利/過期狀態 |
+| 15 | ⬜ | **估值 Cold-Start 修正（Value/Dividend Scanner）** | 首次執行時 StockValuation 為空，粗篩回傳 0 支。需在 Stage 2（粗篩）之前加入 Stage 0.5 機制（類似 GrowthScanner），先補抓全市場或抽樣估值資料，確保 ValueScanner/DividendScanner 首次執行不空手而回 |
 
 ## 已確認事項（規劃時勿重複提出）
 
