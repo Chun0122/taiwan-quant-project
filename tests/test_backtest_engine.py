@@ -260,3 +260,119 @@ class TestBacktestRun:
         result = engine.run()
 
         assert len(result.equity_curve) == 10
+
+
+# ─── ATR-based 止損止利 ────────────────────────────────────
+
+
+class TestAtrBasedStop:
+    def _make_uniform_data(self, n: int, high: float = 12.0, low: float = 10.0, close: float = 11.0) -> pd.DataFrame:
+        """建立均勻 OHLCV 資料（ATR14 ≈ high - low）。"""
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        return pd.DataFrame(
+            {
+                "open": [close] * n,
+                "high": [high] * n,
+                "low": [low] * n,
+                "close": [close] * n,
+                "volume": [10_000] * n,
+            },
+            index=[d.date() for d in dates],
+        )
+
+    def test_atr_stop_triggers_and_records_prices(self):
+        """ATR-based 止損在 low 跌破止損價時觸發，TradeRecord 正確記錄 stop_price/target_price。
+
+        資料設計：high=12, low=10, close=11 → TR=2.0, ATR14≈2.0
+        進場（Day 15）：entry_price ≈ 11，stop ≈ 11 - 1.5×2 = 8.0，target ≈ 11 + 3.0×2 = 17.0
+        Day 20：low 跌至 6.0 → 低於止損價 8.0 → 止損觸發
+        """
+        n = 30
+        data = self._make_uniform_data(n)
+
+        # Day 20：low 跌至 6.0，低於止損價（≈8.0）
+        data.iloc[20, data.columns.get_loc("low")] = 6.0
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1  # Day 15 買入（ATR14 已穩定）
+        signals.iloc[29] = -1  # Day 29 賣出訊號（不會觸達，止損先觸發）
+
+        risk_config = RiskConfig(atr_multiplier_stop=1.5, atr_multiplier_profit=3.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "stop_loss"
+        # stop_price ≈ 11 - 1.5×2 = 8.0（含滑價誤差）
+        assert trade.stop_price is not None
+        assert trade.stop_price == pytest.approx(8.0, abs=0.5)
+        # target_price ≈ 11 + 3.0×2 = 17.0（含滑價誤差）
+        assert trade.target_price is not None
+        assert trade.target_price == pytest.approx(17.0, abs=0.5)
+
+    def test_atr_take_profit_triggers(self):
+        """ATR-based 止利在 high 超過目標價時觸發。
+
+        進場（Day 15）：target ≈ 11 + 1.0×2 = 13.0
+        Day 20：high 上衝至 15.0 → 高於目標價 13.0 → 止利觸發
+        """
+        n = 30
+        data = self._make_uniform_data(n)
+
+        # Day 20：high 上衝至 15.0，高於目標價（≈13.0）
+        data.iloc[20, data.columns.get_loc("high")] = 15.0
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(atr_multiplier_stop=2.0, atr_multiplier_profit=1.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "take_profit"
+        assert trade.target_price is not None
+        assert trade.target_price == pytest.approx(13.0, abs=0.5)
+
+    def test_percentage_stop_still_works_without_atr_multiplier(self):
+        """未設定 atr_multiplier_stop 時，百分比停損行為與原有邏輯一致。"""
+        n = 30
+        data = self._make_uniform_data(n)
+
+        # Day 20 low 跌至 9.0，低於 10% 停損價（≈9.9）
+        data.iloc[20, data.columns.get_loc("low")] = 9.0
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(stop_loss_pct=10.0)  # 無 ATR 乘數
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "stop_loss"
+        # stop_price 由百分比計算，≈ 11×0.9 = 9.9
+        assert trade.stop_price is not None
+        assert trade.stop_price == pytest.approx(9.9, abs=0.5)
+        assert trade.target_price is None  # 未設定 take_profit
+
+    def test_no_stop_no_prices_recorded(self):
+        """未設定任何停損時，stop_price 與 target_price 應為 None。"""
+        n = 10
+        data = self._make_uniform_data(n)
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[0] = 1
+        signals.iloc[9] = -1
+
+        engine = _make_engine(data, signals)  # 無 risk_config
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.stop_price is None
+        assert trade.target_price is None

@@ -38,6 +38,8 @@ class RiskConfig:
     atr_risk_pct: float = 1.0  # ATR sizing: 每筆風險占資金 %
     atr_period: int = 14
     atr_multiplier: float = 2.0
+    atr_multiplier_stop: float | None = None  # ATR-based 止損乘數（止損 = 進場價 − N×ATR14）
+    atr_multiplier_profit: float | None = None  # ATR-based 止利乘數（止利 = 進場價 + N×ATR14）
 
 
 @dataclass
@@ -52,6 +54,8 @@ class TradeRecord:
     pnl: float = 0.0
     return_pct: float = 0.0
     exit_reason: str = "signal"  # signal / stop_loss / take_profit / trailing_stop / force_close
+    stop_price: float | None = None  # 進場時計算並固定的止損價
+    target_price: float | None = None  # 進場時計算並固定的目標價
 
 
 @dataclass
@@ -110,6 +114,8 @@ class BacktestEngine:
         entry_price = 0.0
         entry_date = None
         peak_since_entry = 0.0  # 移動停損用：進場後最高價
+        current_stop_price: float | None = None  # 進場時固定的止損價
+        current_target_price: float | None = None  # 進場時固定的目標價
         trades: list[TradeRecord] = []
         equity_curve: list[float] = []
 
@@ -149,21 +155,17 @@ class BacktestEngine:
                 if raw_high > peak_since_entry:
                     peak_since_entry = raw_high
 
-                # 1. 停損檢查
-                if self.risk_config.stop_loss_pct is not None:
-                    stop_price = entry_price * (1 - self.risk_config.stop_loss_pct / 100)
-                    if raw_low <= stop_price:
-                        risk_exit = True
-                        exit_reason = "stop_loss"
-                        raw_close = min(raw_close, stop_price)  # 以停損價出場
+                # 1. 停損檢查（使用進場時已計算並固定的止損價）
+                if current_stop_price is not None and raw_low <= current_stop_price:
+                    risk_exit = True
+                    exit_reason = "stop_loss"
+                    raw_close = min(raw_close, current_stop_price)
 
-                # 2. 停利檢查
-                if not risk_exit and self.risk_config.take_profit_pct is not None:
-                    tp_price = entry_price * (1 + self.risk_config.take_profit_pct / 100)
-                    if raw_high >= tp_price:
-                        risk_exit = True
-                        exit_reason = "take_profit"
-                        raw_close = max(raw_close, tp_price)  # 以停利價出場
+                # 2. 停利檢查（使用進場時已計算並固定的目標價）
+                if not risk_exit and current_target_price is not None and raw_high >= current_target_price:
+                    risk_exit = True
+                    exit_reason = "take_profit"
+                    raw_close = max(raw_close, current_target_price)
 
                 # 3. 移動停損檢查
                 if not risk_exit and self.risk_config.trailing_stop_pct is not None:
@@ -195,12 +197,16 @@ class BacktestEngine:
                         pnl=round(pnl, 2),
                         return_pct=round(ret_pct, 2),
                         exit_reason=exit_reason,
+                        stop_price=round(current_stop_price, 2) if current_stop_price is not None else None,
+                        target_price=round(current_target_price, 2) if current_target_price is not None else None,
                     )
                 )
                 position = 0
                 entry_price = 0.0
                 entry_date = None
                 peak_since_entry = 0.0
+                current_stop_price = None
+                current_target_price = None
 
             # --- 正常訊號處理（風險出場未觸發時） ---
             elif not risk_exit:
@@ -215,6 +221,23 @@ class BacktestEngine:
                         entry_price = buy_price
                         entry_date = dt
                         peak_since_entry = raw_high
+
+                        # 計算並固定止損價（ATR-based 優先，否則百分比，否則 None）
+                        atr_val = self._compute_atr(data, dt)
+                        if self.risk_config.atr_multiplier_stop is not None and atr_val is not None:
+                            current_stop_price = entry_price - self.risk_config.atr_multiplier_stop * atr_val
+                        elif self.risk_config.stop_loss_pct is not None:
+                            current_stop_price = entry_price * (1 - self.risk_config.stop_loss_pct / 100)
+                        else:
+                            current_stop_price = None
+
+                        # 計算並固定目標價（ATR-based 優先，否則百分比，否則 None）
+                        if self.risk_config.atr_multiplier_profit is not None and atr_val is not None:
+                            current_target_price = entry_price + self.risk_config.atr_multiplier_profit * atr_val
+                        elif self.risk_config.take_profit_pct is not None:
+                            current_target_price = entry_price * (1 + self.risk_config.take_profit_pct / 100)
+                        else:
+                            current_target_price = None
 
                 # --- 賣出 ---
                 elif signal == -1 and position > 0:
@@ -238,12 +261,16 @@ class BacktestEngine:
                             pnl=round(pnl, 2),
                             return_pct=round(ret_pct, 2),
                             exit_reason="signal",
+                            stop_price=round(current_stop_price, 2) if current_stop_price is not None else None,
+                            target_price=round(current_target_price, 2) if current_target_price is not None else None,
                         )
                     )
                     position = 0
                     entry_price = 0.0
                     entry_date = None
                     peak_since_entry = 0.0
+                    current_stop_price = None
+                    current_target_price = None
 
             # 記錄每日權益
             mark_to_market = capital + position * raw_close
@@ -272,6 +299,8 @@ class BacktestEngine:
                     pnl=round(pnl, 2),
                     return_pct=round(ret_pct, 2),
                     exit_reason="force_close",
+                    stop_price=round(current_stop_price, 2) if current_stop_price is not None else None,
+                    target_price=round(current_target_price, 2) if current_target_price is not None else None,
                 )
             )
             position = 0

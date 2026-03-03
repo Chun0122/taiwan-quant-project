@@ -967,7 +967,7 @@ python main.py migrate
 
 此命令會：
 - 為 `backtest_result` 表新增 `sortino_ratio`、`calmar_ratio`、`var_95`、`cvar_95`、`profit_factor` 欄位
-- 為 `trade` 表新增 `exit_reason` 欄位
+- 為 `trade` 表新增 `exit_reason`、`stop_price`、`target_price` 欄位
 - 建立 `portfolio_backtest_result` 和 `portfolio_trade` 新表
 
 已存在的欄位會自動跳過，可重複執行。
@@ -1241,6 +1241,8 @@ python main.py suggest 2317 --notify       # 附加 Discord 通知
 | pnl | Float | 損益金額 |
 | return_pct | Float | 報酬率 (%) |
 | exit_reason | String | 出場原因: signal/stop_loss/take_profit/trailing_stop/force_close（P6 新增） |
+| stop_price | Float | 進場時計算並固定的止損價（ATR-based 或百分比，無設定時為 NULL） |
+| target_price | Float | 進場時計算並固定的目標價（ATR-based 或百分比，無設定時為 NULL） |
 
 ### portfolio_backtest_result（投資組合回測結果，P6 新增）
 

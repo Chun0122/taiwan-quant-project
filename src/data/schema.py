@@ -270,6 +270,8 @@ class Trade(Base):
     exit_reason: Mapped[str | None] = mapped_column(
         String(20), nullable=True
     )  # signal/stop_loss/take_profit/trailing_stop/force_close
+    stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場時計算的止損價
+    target_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場時計算的目標價
 
     def __repr__(self) -> str:
         return f"<Trade {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
