@@ -263,6 +263,8 @@ def _render_stock_ranking_tab(mode, start_date, end_date, top_n, holding_days):
         st.info("無對應持有天數的報酬資料")
         return
 
+    detail = detail.copy()
+    detail[col_ret] = pd.to_numeric(detail[col_ret], errors="coerce")
     stock_stats = detail.groupby(["stock_id", "stock_name"])[col_ret].agg(["mean", "count"]).reset_index()
     stock_stats.columns = ["代號", "名稱", "平均報酬", "推薦次數"]
     stock_stats = stock_stats[stock_stats["推薦次數"] >= 1].copy()
