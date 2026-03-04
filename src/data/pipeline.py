@@ -548,6 +548,25 @@ def sync_market_data(
     # --- 策略 1：TWSE/TPEX 官方資料（免費、快速） ---
     end = date.today()
 
+    # 增量檢查：若 DB 已有近期資料，縮減 days 至實際缺口，避免重抓已有資料
+    try:
+        from sqlalchemy import func, select
+
+        with get_session() as session:
+            latest_in_db = session.execute(select(func.max(DailyPrice.date))).scalar()
+        if latest_in_db is not None:
+            days_gap = (end - latest_in_db).days
+            if days_gap < days:
+                logger.info(
+                    "[全市場] DB 最新日期 %s，縮減同步目標 %d→%d 天",
+                    latest_in_db,
+                    days,
+                    max(1, days_gap),
+                )
+                days = max(1, days_gap)
+    except Exception:
+        pass  # 查詢失敗不影響同步，使用原始 days
+
     # 從今天往前找，跳過週末，直到抓到 days 個有資料的交易日
     # （假日時 API 回傳空資料，自動往前找）
     d = end
@@ -583,20 +602,14 @@ def sync_market_data(
         d -= timedelta(days=1)
 
     # --- MOPS 重大訊息同步（附加於全市場同步，失敗不影響其他資料） ---
+    # fetch_mops_announcements 固定回傳今天的公告，只需呼叫一次
     try:
         from src.data.mops_fetcher import fetch_mops_announcements
 
         result["announcements"] = 0
-        mops_d = date.today()
-        for _ in range(min(days, 10)):  # MOPS 最多抓 10 天，與 Scanner 消息面評分 10 日窗口對齊
-            if mops_d.weekday() >= 5:
-                mops_d -= timedelta(days=1)
-                continue
-            df_ann = fetch_mops_announcements(mops_d)
-            if not df_ann.empty:
-                result["announcements"] += _upsert_announcement(df_ann)
-            mops_d -= timedelta(days=1)
-        if result["announcements"]:
+        df_ann = fetch_mops_announcements(date.today())
+        if not df_ann.empty:
+            result["announcements"] = _upsert_announcement(df_ann)
             logger.info("[全市場] MOPS 重訊: %d 筆", result["announcements"])
     except Exception:
         logger.warning("[全市場] MOPS 重訊同步失敗，不影響其他資料")

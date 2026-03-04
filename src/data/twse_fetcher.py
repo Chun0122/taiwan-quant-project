@@ -78,7 +78,7 @@ def fetch_twse_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TWSE 上市日行情: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -160,7 +160,7 @@ def fetch_twse_institutional(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TWSE 上市三大法人: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -251,7 +251,7 @@ def fetch_tpex_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃日行情: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -328,7 +328,7 @@ def fetch_tpex_institutional(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃三大法人: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -431,7 +431,7 @@ def fetch_twse_margin(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TWSE 上市融資融券: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -504,7 +504,7 @@ def fetch_tpex_margin(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃融資融券: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
