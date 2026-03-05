@@ -17,6 +17,7 @@ from src.data.schema import (
     StockInfo,
     TechnicalIndicator,
     Trade,
+    WatchEntry,
 )
 
 init_db()
@@ -706,3 +707,144 @@ def load_announcements(stock_id: str, start: str, end: str) -> pd.DataFrame:
     )
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+# ──────────────────────────────────────────────────────────────────── #
+#  持倉監控
+# ──────────────────────────────────────────────────────────────────── #
+
+
+def load_watch_entries_with_status(status_filter: str | None = "active") -> pd.DataFrame:
+    """載入 WatchEntry 持倉記錄，並根據最新收盤價計算即時狀態。
+
+    Args:
+        status_filter: "active" 只取持倉中，None/"all" 取全部。
+
+    Returns:
+        DataFrame，含欄位：
+        id, stock_id, stock_name, entry_date, entry_price,
+        stop_loss, take_profit, quantity, source, mode,
+        entry_trigger, valid_until, status, close_date, close_price,
+        notes, current_price, unrealized_pnl_pct, computed_status
+    """
+    import datetime
+
+    from main import _compute_watch_status
+
+    with get_session() as session:
+        q = select(WatchEntry).order_by(WatchEntry.entry_date.desc())
+        if status_filter and status_filter != "all":
+            q = q.where(WatchEntry.status == status_filter)
+        entries = session.execute(q).scalars().all()
+
+    if not entries:
+        return pd.DataFrame()
+
+    # 查各股票最新收盤價
+    stock_ids = list({e.stock_id for e in entries})
+    latest_prices: dict[str, float] = {}
+    with get_session() as session:
+        for sid in stock_ids:
+            row = session.execute(
+                select(DailyPrice.close).where(DailyPrice.stock_id == sid).order_by(DailyPrice.date.desc()).limit(1)
+            ).scalar()
+            if row is not None:
+                latest_prices[sid] = float(row)
+
+    today = datetime.date.today()
+    records = []
+    for e in entries:
+        cur_price = latest_prices.get(e.stock_id)
+        if cur_price is not None and e.entry_price:
+            pnl_pct = (cur_price - e.entry_price) / e.entry_price
+        else:
+            pnl_pct = None
+
+        # 對 active 記錄即時計算狀態
+        if e.status == "active":
+            computed = _compute_watch_status(
+                entry_price=e.entry_price,
+                stop_loss=e.stop_loss,
+                take_profit=e.take_profit,
+                valid_until=e.valid_until,
+                latest_price=cur_price,
+                today=today,
+            )
+        else:
+            computed = e.status  # closed/stopped_loss/taken_profit 已固化
+
+        records.append(
+            {
+                "id": e.id,
+                "stock_id": e.stock_id,
+                "stock_name": e.stock_name or e.stock_id,
+                "entry_date": e.entry_date,
+                "entry_price": e.entry_price,
+                "stop_loss": e.stop_loss,
+                "take_profit": e.take_profit,
+                "quantity": e.quantity,
+                "source": e.source,
+                "mode": e.mode,
+                "entry_trigger": e.entry_trigger,
+                "valid_until": e.valid_until,
+                "status": e.status,
+                "close_date": e.close_date,
+                "close_price": e.close_price,
+                "notes": e.notes,
+                "current_price": cur_price,
+                "unrealized_pnl_pct": pnl_pct,
+                "computed_status": computed,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def load_watch_entry_price_history(stock_id: str, entry_date: str, days: int = 60) -> pd.DataFrame:
+    """載入個股持倉區間日K線（從 entry_date 往後 days 天）。
+
+    Args:
+        stock_id:   股票代號
+        entry_date: 進場日（ISO 字串 YYYY-MM-DD）
+        days:       往後取幾天（預設 60）
+
+    Returns:
+        DataFrame，含 date/open/high/low/close/volume 欄位（升序）。
+    """
+    import datetime
+
+    try:
+        start = datetime.date.fromisoformat(str(entry_date))
+    except (ValueError, TypeError):
+        start = datetime.date.today()
+    end = (start + datetime.timedelta(days=days)).isoformat()
+
+    with get_session() as session:
+        rows = (
+            session.execute(
+                select(DailyPrice)
+                .where(DailyPrice.stock_id == stock_id)
+                .where(DailyPrice.date >= start.isoformat())
+                .where(DailyPrice.date <= end)
+                .order_by(DailyPrice.date)
+            )
+            .scalars()
+            .all()
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        [
+            {
+                "date": r.date,
+                "open": r.open,
+                "high": r.high,
+                "low": r.low,
+                "close": r.close,
+                "volume": r.volume,
+            }
+            for r in rows
+        ]
+    )

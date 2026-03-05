@@ -102,6 +102,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import date
 
 import pandas as pd
 
@@ -964,6 +965,39 @@ def _calc_rsi14_from_series(closes: "pd.Series") -> float:
     return round(100.0 - 100.0 / (1.0 + rs), 2)
 
 
+def _compute_watch_status(
+    entry_price: float,  # noqa: ARG001
+    stop_loss: float | None,
+    take_profit: float | None,
+    valid_until: date | None,
+    latest_price: float | None,
+    today: date,
+) -> str:
+    """根據最新價格與到期日計算持倉狀態（純函數，不寫 DB）。
+
+    優先級：止損 > 止利 > 過期 > active
+
+    Args:
+        entry_price: 進場價（保留供未來擴充，目前未使用）
+        stop_loss:   止損價，None 表示未設定
+        take_profit: 目標價，None 表示未設定
+        valid_until: 有效期限，None 表示永不過期
+        latest_price:最新收盤價，None 表示查無資料
+        today:       今日日期
+
+    Returns:
+        "stopped_loss" | "taken_profit" | "expired" | "active"
+    """
+    if latest_price is not None:
+        if stop_loss is not None and latest_price <= stop_loss:
+            return "stopped_loss"
+        if take_profit is not None and latest_price >= take_profit:
+            return "taken_profit"
+    if valid_until is not None and today > valid_until:
+        return "expired"
+    return "active"
+
+
 def _assess_timing(
     rsi14: float,
     close: float,
@@ -1665,6 +1699,273 @@ def cmd_suggest(args: argparse.Namespace) -> None:
         print("Discord 通知已發送" if ok else "Discord 通知失敗")
 
 
+def cmd_watch(args: argparse.Namespace) -> None:
+    """持倉監控管理（add / list / close / update-status）。"""
+    import datetime
+
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session, init_db
+    from src.data.schema import DailyPrice, DiscoveryRecord, StockInfo, WatchEntry
+    from src.discovery.scanner import _calc_atr14
+
+    init_db()
+    action: str = args.action
+
+    # ── add ──────────────────────────────────────────────────────────
+    if action == "add":
+        stock_id: str = args.stock_id
+        today = datetime.date.today()
+
+        # ① 查 StockInfo 取名稱
+        with get_session() as session:
+            stock_name_row = session.execute(
+                select(StockInfo.stock_name).where(StockInfo.stock_id == stock_id)
+            ).scalar()
+        stock_name: str = stock_name_row or stock_id
+
+        # ② 若 --from-discover，從最新 DiscoveryRecord 取進出場欄位
+        if args.from_discover:
+            mode_src: str = args.from_discover
+            with get_session() as session:
+                rec = (
+                    session.execute(
+                        select(DiscoveryRecord)
+                        .where(DiscoveryRecord.stock_id == stock_id)
+                        .where(DiscoveryRecord.mode == mode_src)
+                        .order_by(DiscoveryRecord.scan_date.desc())
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+            if rec is None:
+                print(f"錯誤：找不到 {stock_id} 在 {mode_src} 模式的推薦記錄")
+                return
+            entry_price_val = float(args.price) if args.price else (rec.entry_price or rec.close)
+            stop_loss_val = float(args.stop) if args.stop else rec.stop_loss
+            take_profit_val = float(args.target) if args.target else rec.take_profit
+            entry_trigger_val = rec.entry_trigger
+            valid_until_val = rec.valid_until
+            source_val = "discover"
+            mode_val: str | None = mode_src
+
+        else:
+            # ③ 從 DailyPrice 計算 ATR14/SMA20
+            with get_session() as session:
+                rows = (
+                    session.execute(
+                        select(DailyPrice)
+                        .where(DailyPrice.stock_id == stock_id)
+                        .order_by(DailyPrice.date.desc())
+                        .limit(30)
+                    )
+                    .scalars()
+                    .all()
+                )
+            if not rows:
+                print(f"錯誤：找不到 {stock_id} 的日K線資料（請先執行 sync）")
+                return
+
+            df = (
+                pd.DataFrame(
+                    [
+                        {
+                            "date": r.date,
+                            "open": float(r.open),
+                            "high": float(r.high),
+                            "low": float(r.low),
+                            "close": float(r.close),
+                            "volume": float(r.volume),
+                        }
+                        for r in reversed(rows)
+                    ]
+                )
+                .sort_values("date")
+                .reset_index(drop=True)
+            )
+
+            close = float(df["close"].iloc[-1])
+            atr14 = _calc_atr14(df)
+            sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else close
+            atr_pct = atr14 / close if close > 0 else 0.0
+
+            entry_price_val = round(float(args.price), 2) if args.price else round(close, 2)
+
+            if args.stop:
+                stop_loss_val: float | None = round(float(args.stop), 2)
+            elif atr14 > 0:
+                stop_loss_val = round(entry_price_val - 1.5 * atr14, 2)
+            else:
+                stop_loss_val = None
+
+            if args.target:
+                take_profit_val: float | None = round(float(args.target), 2)
+            elif atr14 > 0:
+                take_profit_val = round(entry_price_val + 3.0 * atr14, 2)
+            else:
+                take_profit_val = None
+
+            if sma20 > 0:
+                if close > sma20 * 1.01:
+                    entry_trigger_val: str | None = "站上均線"
+                elif close >= sma20 * 0.99:
+                    entry_trigger_val = "貼近均線"
+                else:
+                    entry_trigger_val = "均線下方，等待確認"
+            else:
+                entry_trigger_val = None
+
+            if entry_trigger_val and atr_pct > 0:
+                if atr_pct < 0.02:
+                    entry_trigger_val += "，低波動"
+                elif atr_pct > 0.04:
+                    entry_trigger_val += "，高波動謹慎"
+
+            valid_until_val = (pd.Timestamp(today) + pd.offsets.BDay(5)).date()
+            source_val = "manual"
+            mode_val = None
+
+        qty_val: int | None = int(args.qty) if args.qty else None
+        notes_val: str | None = args.notes or None
+
+        entry = WatchEntry(
+            stock_id=stock_id,
+            stock_name=stock_name,
+            entry_date=today,
+            entry_price=entry_price_val,
+            stop_loss=stop_loss_val,
+            take_profit=take_profit_val,
+            quantity=qty_val,
+            source=source_val,
+            mode=mode_val,
+            entry_trigger=entry_trigger_val,
+            valid_until=valid_until_val,
+            status="active",
+            notes=notes_val,
+        )
+
+        with get_session() as session:
+            session.add(entry)
+            session.commit()
+            entry_id = entry.id
+
+        sl_str = f"{stop_loss_val:.2f}" if stop_loss_val else "—"
+        tp_str = f"{take_profit_val:.2f}" if take_profit_val else "—"
+        print(f"\n已加入持倉監控 #{entry_id}：{stock_id} {stock_name}")
+        print(f"  進場價：{entry_price_val:.2f}  止損：{sl_str}  目標：{tp_str}")
+        if valid_until_val:
+            print(f"  有效至：{valid_until_val}  來源：{source_val}")
+        print()
+
+    # ── list ──────────────────────────────────────────────────────────
+    elif action == "list":
+        status_filter: str = args.status
+
+        with get_session() as session:
+            q = select(WatchEntry).order_by(WatchEntry.entry_date.desc())
+            if status_filter != "all":
+                q = q.where(WatchEntry.status == status_filter)
+            entries = session.execute(q).scalars().all()
+
+        if not entries:
+            label = "任何" if status_filter == "all" else status_filter
+            print(f"目前沒有 {label} 狀態的持倉記錄。使用 `watch add <stock_id>` 新增。")
+            return
+
+        STATUS_ZH = {
+            "active": "🟢 持倉中",
+            "stopped_loss": "🔴 止損",
+            "taken_profit": "🟡 止利",
+            "expired": "⚫ 過期",
+            "closed": "⚪ 已平倉",
+        }
+
+        print(f"\n{'ID':>4}  {'代號':<8} {'名稱':<12} {'進場日':<12} {'進場價':>8} {'止損':>8} {'目標':>8}  {'狀態'}")
+        print("─" * 75)
+        for e in entries:
+            sl_s = f"{e.stop_loss:.2f}" if e.stop_loss else "  —"
+            tp_s = f"{e.take_profit:.2f}" if e.take_profit else "  —"
+            st_s = STATUS_ZH.get(e.status, e.status)
+            name_s = (e.stock_name or "")[:10]
+            print(
+                f"{e.id:>4}  {e.stock_id:<8} {name_s:<12} {str(e.entry_date):<12} {e.entry_price:>8.2f} {sl_s:>8} {tp_s:>8}  {st_s}"
+            )
+        print()
+
+    # ── close ─────────────────────────────────────────────────────────
+    elif action == "close":
+        entry_id_arg: int = args.entry_id
+        close_price_arg: float | None = float(args.price) if args.price else None
+        close_date_today = datetime.date.today()
+
+        with get_session() as session:
+            entry_obj = session.execute(select(WatchEntry).where(WatchEntry.id == entry_id_arg)).scalars().first()
+
+            if entry_obj is None:
+                print(f"錯誤：找不到 ID={entry_id_arg} 的持倉記錄")
+                return
+
+            entry_obj.status = "closed"
+            entry_obj.close_date = close_date_today
+            entry_obj.close_price = close_price_arg
+            session.commit()
+
+        pnl_str = ""
+        if close_price_arg and entry_obj.entry_price:
+            pnl_pct = (close_price_arg - entry_obj.entry_price) / entry_obj.entry_price * 100
+            pnl_str = f"  損益：{pnl_pct:+.2f}%"
+        print(f"\n已平倉 #{entry_id_arg} {entry_obj.stock_id}（{close_date_today}）{pnl_str}\n")
+
+    # ── update-status ──────────────────────────────────────────────────
+    elif action == "update-status":
+        today = datetime.date.today()
+
+        with get_session() as session:
+            active_entries = session.execute(select(WatchEntry).where(WatchEntry.status == "active")).scalars().all()
+
+        if not active_entries:
+            print("目前沒有 active 持倉，無需更新。")
+            return
+
+        stock_ids = list({e.stock_id for e in active_entries})
+
+        # 查每支股票最新收盤價
+        latest_prices: dict[str, float] = {}
+        with get_session() as session:
+            for sid in stock_ids:
+                row = session.execute(
+                    select(DailyPrice.close).where(DailyPrice.stock_id == sid).order_by(DailyPrice.date.desc()).limit(1)
+                ).scalar()
+                if row is not None:
+                    latest_prices[sid] = float(row)
+
+        updated = 0
+        with get_session() as session:
+            for e in active_entries:
+                new_status = _compute_watch_status(
+                    entry_price=e.entry_price,
+                    stop_loss=e.stop_loss,
+                    take_profit=e.take_profit,
+                    valid_until=e.valid_until,
+                    latest_price=latest_prices.get(e.stock_id),
+                    today=today,
+                )
+                if new_status != "active":
+                    obj = session.execute(select(WatchEntry).where(WatchEntry.id == e.id)).scalars().first()
+                    if obj:
+                        obj.status = new_status
+                        updated += 1
+
+            session.commit()
+
+        print(f"\n更新完成：{len(active_entries)} 筆持倉，觸發狀態變更 {updated} 筆。\n")
+
+    else:
+        print(f"未知動作：{action}。可用動作：add / list / close / update-status")
+
+
 def cmd_export(args: argparse.Namespace) -> None:
     """匯出資料表為 CSV/Parquet。"""
     from src.data.database import init_db
@@ -1935,6 +2236,42 @@ def main() -> None:
     sp_suggest.add_argument("stock_id", help="股票代號（例：2330）")
     sp_suggest.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
+    # watch 子命令
+    sp_watch = subparsers.add_parser("watch", help="持倉監控管理（新增/列出/平倉/更新狀態）")
+    watch_sub = sp_watch.add_subparsers(dest="action")
+
+    # watch add
+    sp_wa = watch_sub.add_parser("add", help="新增持倉監控")
+    sp_wa.add_argument("stock_id", help="股票代號（例：2330）")
+    sp_wa.add_argument("--price", type=float, default=None, help="進場價（預設使用最新收盤）")
+    sp_wa.add_argument("--stop", type=float, default=None, help="止損價（預設 entry - 1.5×ATR14）")
+    sp_wa.add_argument("--target", type=float, default=None, help="目標價（預設 entry + 3.0×ATR14）")
+    sp_wa.add_argument("--qty", type=int, default=None, help="股數")
+    sp_wa.add_argument(
+        "--from-discover",
+        metavar="MODE",
+        default=None,
+        help="從最新 discover 推薦記錄匯入（MODE: momentum/swing/value/dividend/growth）",
+    )
+    sp_wa.add_argument("--notes", default=None, help="備註")
+
+    # watch list
+    sp_wl = watch_sub.add_parser("list", help="列出持倉")
+    sp_wl.add_argument(
+        "--status",
+        default="active",
+        choices=["active", "stopped_loss", "taken_profit", "expired", "closed", "all"],
+        help="篩選狀態（預設 active）",
+    )
+
+    # watch close
+    sp_wc = watch_sub.add_parser("close", help="平倉（標記 closed）")
+    sp_wc.add_argument("entry_id", type=int, help="持倉 ID（由 watch list 查詢）")
+    sp_wc.add_argument("--price", type=float, default=None, help="平倉價格")
+
+    # watch update-status
+    watch_sub.add_parser("update-status", help="批次更新持倉狀態（比對最新收盤價自動標記止損/止利/過期）")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -1989,6 +2326,11 @@ def main() -> None:
         cmd_validate(args)
     elif args.command == "suggest":
         cmd_suggest(args)
+    elif args.command == "watch":
+        if not args.action:
+            sp_watch.print_help()
+        else:
+            cmd_watch(args)
     else:
         parser.print_help()
         sys.exit(1)

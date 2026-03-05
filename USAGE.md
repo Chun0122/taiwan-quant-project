@@ -1117,9 +1117,62 @@ python main.py suggest 2317 --notify       # 附加 Discord 通知
 
 ---
 
+### 4.24 持倉監控 (`watch`)
+
+追蹤進場後的持倉狀態，自動比對最新收盤價標記止損/止利/過期。
+
+```bash
+# 新增持倉（自動計算 ATR14-based 止損止利）
+python main.py watch add 2330
+
+# 手動指定進場價/止損/目標/股數
+python main.py watch add 2330 --price 580 --stop 555 --target 635 --qty 1000
+
+# 從最新 discover 記錄匯入
+python main.py watch add 2330 --from-discover momentum
+
+# 列出持倉中記錄
+python main.py watch list
+
+# 列出全部記錄（含已平倉/止損/止利/過期）
+python main.py watch list --status all
+
+# 平倉（標記 closed，記錄平倉價）
+python main.py watch close 1 --price 595
+
+# 批次更新狀態（比對最新收盤價自動標記）
+python main.py watch update-status
+```
+
+**watch add 參數：**
+
+| 參數 | 說明 |
+|------|------|
+| `stock_id` | 股票代號（必填） |
+| `--price P` | 進場價（預設使用最新收盤）|
+| `--stop S` | 止損價（預設 entry - 1.5×ATR14）|
+| `--target T` | 目標價（預設 entry + 3.0×ATR14）|
+| `--qty Q` | 股數（選填）|
+| `--from-discover MODE` | 從最新 discover 記錄匯入（MODE: momentum/swing/value/dividend/growth）|
+| `--notes TEXT` | 備註（選填）|
+
+**狀態說明：**
+
+| 狀態 | 觸發條件 |
+|------|----------|
+| `active` | 持倉中（未觸發任何條件）|
+| `stopped_loss` | 最新收盤 ≤ stop_loss |
+| `taken_profit` | 最新收盤 ≥ take_profit |
+| `expired` | 今日 > valid_until |
+| `closed` | 手動執行 `watch close` 平倉 |
+
+> **Dashboard 整合**：啟動儀表板後，側邊欄選擇「👁️ 持倉監控」可視覺化持倉狀態，含 K 線圖（進場/止損/目標水平線）及預警列表。
+
+---
+
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。十四張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表：
 
 ### daily_price（日K線）
 

@@ -52,11 +52,18 @@ python main.py import-data daily_price data/export/daily_price.csv  # 匯入 CSV
 python main.py import-data daily_price data.csv --dry-run  # 僅驗證不寫入
 python main.py suggest 2330                  # 單股進出場建議（ATR14+SMA20+RSI14+Regime）
 python main.py suggest 2330 --notify         # 含 Discord 通知
+python main.py watch add 2330                # 新增持倉監控（ATR14-based 止損止利）
+python main.py watch add 2330 --price 580 --stop 555 --target 635 --qty 1000  # 手動指定
+python main.py watch add 2330 --from-discover momentum  # 從 discover 記錄匯入
+python main.py watch list                    # 列出持倉中的記錄
+python main.py watch list --status all       # 列出全部（含已平倉/止損/止利/過期）
+python main.py watch close 1 --price 595     # 平倉 ID=1 的持倉
+python main.py watch update-status           # 批次更新止損/止利/過期狀態
 ```
 
 ### 測試
 
-使用 pytest 測試框架，~545 個測試覆蓋核心模組：
+使用 pytest 測試框架，~555 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -99,6 +106,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_market_overview.py` | `data_loader` 市場總覽查詢 + `charts` 4 個圖表函數 | in-memory SQLite + 純函數 |
 | `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
 | `tests/test_suggest.py`        | `main.py` `_calc_rsi14_from_series` + `_assess_timing` + `_format_suggest_discord` | 純函數 |
+| `tests/test_watch.py`          | `main.py` `_compute_watch_status` 純函數 + `WatchEntry` ORM CRUD | 純函數 + in-memory SQLite |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。
 
@@ -142,7 +150,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）                                                                                |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）                                                              |
-| `src/data/schema.py`                | 14 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement）                               |
+| `src/data/schema.py`                | 15 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、WatchEntry）                    |
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
@@ -218,7 +226,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 11 | ✅ | **Discover 進出場建議（Task A+D）** | `DiscoveryResult.rankings` 新增 entry_price/stop_loss/take_profit/entry_trigger/valid_until 五欄（基於 ATR14 + SMA20）；CLI 顯示 Top 5 進出場建議；Discord 通知附加進出場區塊；`DiscoveryRecord` ORM 新增對應欄位（含 migration）；507 測試通過 |
 | 12 | ✅ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，從 DB 讀取 60 日日K，計算 ATR14/SMA20/RSI14 + Regime 偵測，輸出進場區間/止損/目標價/時機評估，可選 `--notify`；541 測試通過 |
 | 13 | ✅ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 進場時計算並固定止損/目標價，TradeRecord 記錄 stop_price/target_price，ATR-based 優先於百分比，Trade ORM 同步新增欄位，545 測試通過 |
-| 14 | ⬜ | **持倉監控 Dashboard 頁面** | 新增 WatchEntry ORM 表 + CLI `watch` 子命令 + Dashboard「持倉監控」頁，自動標記止損/止利/過期狀態 |
+| 14 | ✅ | **持倉監控 Dashboard 頁面** | WatchEntry ORM 表（15 欄）+ CLI `watch add/list/close/update-status` + Dashboard「👁️ 持倉監控」頁（3 Tab：總覽/個股走勢/預警列表），`_compute_watch_status` 純函數自動標記止損/止利/過期狀態，555 測試通過 |
 | 15 | ⬜ | **估值 Cold-Start 修正（Value/Dividend Scanner）** | 首次執行時 StockValuation 為空，粗篩回傳 0 支。需在 Stage 2（粗篩）之前加入 Stage 0.5 機制（類似 GrowthScanner），先補抓全市場或抽樣估值資料，確保 ValueScanner/DividendScanner 首次執行不空手而回 |
 
 ## 已確認事項（規劃時勿重複提出）

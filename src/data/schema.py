@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十四張核心表：
+十五張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -15,6 +15,7 @@
 - StockInfo:               股票基本資料（產業分類）
 - PortfolioBacktestResult: 投資組合回測結果
 - DiscoveryRecord:         Discover 推薦記錄（歷史追蹤）
+- WatchEntry:              持倉監控表（進出場追蹤 + 止損止利狀態）
 """
 
 from datetime import date, datetime
@@ -383,3 +384,35 @@ class DiscoveryRecord(Base):
 
     def __repr__(self) -> str:
         return f"<DiscoveryRecord {self.scan_date} {self.mode} #{self.rank} {self.stock_id}>"
+
+
+class WatchEntry(Base):
+    """持倉監控表 — 追蹤進場後的持倉狀態。
+
+    透過 CLI `watch add` 建立，記錄進場價/止損/目標，
+    並追蹤狀態（active / stopped_loss / taken_profit / expired / closed）。
+    """
+
+    __tablename__ = "watch_entry"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 股數
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")  # discover/suggest/manual
+    mode: Mapped[str | None] = mapped_column(String(20), nullable=True)  # discover mode（來源為 discover 時填入）
+    entry_trigger: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 進場觸發條件
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)  # 建議有效日
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    # status 可能值：active / stopped_loss / taken_profit / expired / closed
+    close_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    close_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<WatchEntry #{self.id} {self.stock_id} entry={self.entry_price} status={self.status}>"
