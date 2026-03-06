@@ -350,6 +350,64 @@ def sync_mops_revenue(months: int = 1) -> int:
     return total
 
 
+def sync_valuation_all_market() -> int:
+    """從 TWSE/TPEX 同步全市場估值資料（PE/PB/殖利率）。
+
+    使用 TWSE BWIBBU_d + TPEX pera 端點，
+    兩次 HTTP 請求即可取得全市場 ~1700+ 支股票的估值資料。
+    免費、無需 FinMind token。
+
+    用於 ValueScanner / DividendScanner 的 Stage 0.5 cold-start 補抓。
+
+    Returns:
+        新增的估值筆數
+    """
+    from src.data.twse_fetcher import _find_last_trading_day, fetch_market_valuation_all
+
+    init_db()
+
+    # 找最近一個交易日（避免週末/假日無資料）
+    target = _find_last_trading_day(date.today())
+
+    # 若 DB 已有該日期足夠資料，跳過
+    with get_session() as session:
+        count = session.execute(
+            select(func.count()).select_from(StockValuation).where(StockValuation.date == target)
+        ).scalar()
+
+    if count and count >= 500:
+        logger.info("[全市場估值] %s 已有 %d 筆（跳過）", target.isoformat(), count)
+        return 0
+
+    df = fetch_market_valuation_all(target)
+
+    # 非交易日 fallback：往前找最多 7 天，直到取到資料或確認 DB 已有舊資料
+    if df.empty:
+        logger.warning("[全市場估值] %s 無資料，往前尋找最近有效資料...", target.isoformat())
+        for days_back in range(1, 8):
+            alt = target - timedelta(days=days_back)
+            if alt.weekday() >= 5:
+                continue
+            with get_session() as session:
+                alt_count = session.execute(
+                    select(func.count()).select_from(StockValuation).where(StockValuation.date == alt)
+                ).scalar()
+            if alt_count and alt_count >= 500:
+                logger.info("[全市場估值] %s 已有 %d 筆（使用既有資料）", alt.isoformat(), alt_count)
+                return 0
+            df = fetch_market_valuation_all(alt)
+            if not df.empty:
+                break
+
+    if df.empty:
+        logger.warning("[全市場估值] 無法取得全市場估值資料")
+        return 0
+
+    n = _upsert_valuation(df)
+    logger.info("[全市場估值] 寫入 %d 筆估值資料", n)
+    return n
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,

@@ -611,3 +611,176 @@ def fetch_market_institutional(target_date: date | None = None) -> pd.DataFrame:
     result = pd.concat(dfs, ignore_index=True)
     logger.info("全市場三大法人合計: %d 支股票", len(result) // 3 if len(result) > 0 else 0)
     return result
+
+
+# ------------------------------------------------------------------ #
+#  估值（PE/PB/殖利率）
+# ------------------------------------------------------------------ #
+
+
+def fetch_twse_valuation_all(target_date: date | None = None) -> pd.DataFrame:
+    """抓取 TWSE 上市股票全市場本益比/殖利率/股價淨值比（BWIBBU_d）。
+
+    單次 HTTP 請求即可取得全市場（上市）所有股票的估值資料。
+    免費、無需 Token。
+
+    回傳欄位: date, stock_id, pe_ratio, pb_ratio, dividend_yield
+    """
+    if target_date is None:
+        target_date = _find_last_trading_day(date.today())
+
+    date_str = target_date.strftime("%Y%m%d")
+    url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
+    params = {"date": date_str, "selectType": "ALL", "response": "json"}
+
+    logger.info("抓取 TWSE 上市估值 (BWIBBU_d): %s", target_date.isoformat())
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("TWSE 估值請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if data.get("stat") != "OK":
+        logger.warning("TWSE 估值無資料（可能為假日）: %s", data.get("stat", ""))
+        return pd.DataFrame()
+
+    # BWIBBU_d 回傳格式：資料在頂層 data 陣列（非 tables）
+    # fields: ["證券代號", "證券名稱", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"]
+    raw_data = data.get("data", [])
+    if not raw_data:
+        logger.warning("TWSE 估值: 無資料列")
+        return pd.DataFrame()
+
+    # 欄位驗證防護（若 TWSE 改版則 log warning，不拋例外）
+    fields = data.get("fields", [])
+    if fields:
+        expected = {2: "殖利率", 4: "本益比", 5: "股價淨值比"}
+        for idx, keyword in expected.items():
+            if idx < len(fields) and keyword not in fields[idx]:
+                logger.warning(
+                    "TWSE BWIBBU_d 欄位結構可能異動！期待含 '%s' 在 index %d，實際: %s",
+                    keyword,
+                    idx,
+                    fields[idx],
+                )
+
+    rows = []
+    for item in raw_data:
+        if len(item) < 6:
+            continue
+
+        stock_id = item[0].strip()
+        # 只保留 4 碼純數字股票（排除指數、ETF 等非個股代號）
+        if not (stock_id.isdigit() and len(stock_id) == 4):
+            continue
+
+        dividend_yield = _parse_number(item[2])  # 殖利率(%)
+        pe_ratio = _parse_number(item[4])  # 本益比
+        pb_ratio = _parse_number(item[5])  # 股價淨值比
+
+        # 至少有一項估值資料才寫入
+        if dividend_yield is None and pe_ratio is None and pb_ratio is None:
+            continue
+
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "pe_ratio": pe_ratio,
+                "pb_ratio": pb_ratio,
+                "dividend_yield": dividend_yield,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.info("TWSE 估值: %d 支股票", len(df))
+    time.sleep(_REQUEST_DELAY)
+    return df
+
+
+def fetch_tpex_valuation_all(target_date: date | None = None) -> pd.DataFrame:
+    """抓取 TPEX 上櫃股票全市場本益比/殖利率/股價淨值比。
+
+    回傳欄位同 TWSE: date, stock_id, pe_ratio, pb_ratio, dividend_yield
+    """
+    if target_date is None:
+        target_date = _find_last_trading_day(date.today())
+
+    roc_date = _to_roc_date(target_date)
+    url = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_book/pera_result.php"
+    params = {"l": "zh-tw", "d": roc_date, "s": "0,asc"}
+
+    logger.info("抓取 TPEX 上櫃估值 (pera): %s", target_date.isoformat())
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("TPEX 估值請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if data.get("stat") not in ("ok", "OK"):
+        logger.warning("TPEX 估值無資料: %s", data.get("stat", ""))
+        return pd.DataFrame()
+
+    # TPEX pera 回傳：tables[0].data
+    # fields: ["代號", "名稱", "本益比", "殖利率(%)", "股價淨值比"]
+    tables = data.get("tables", [])
+    if not tables:
+        logger.warning("TPEX 估值: 無 tables")
+        return pd.DataFrame()
+
+    rows = []
+    for item in tables[0].get("data", []):
+        if len(item) < 5:
+            continue
+
+        stock_id = item[0].strip()
+        if not (stock_id.isdigit() and len(stock_id) == 4):
+            continue
+
+        pe_ratio = _parse_number(item[2])  # 本益比
+        dividend_yield = _parse_number(item[3])  # 殖利率(%)
+        pb_ratio = _parse_number(item[4])  # 股價淨值比
+
+        if dividend_yield is None and pe_ratio is None and pb_ratio is None:
+            continue
+
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "pe_ratio": pe_ratio,
+                "pb_ratio": pb_ratio,
+                "dividend_yield": dividend_yield,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.info("TPEX 估值: %d 支股票", len(df))
+    time.sleep(_REQUEST_DELAY)
+    return df
+
+
+def fetch_market_valuation_all(target_date: date | None = None) -> pd.DataFrame:
+    """抓取全市場（上市 + 上櫃）本益比/殖利率/股價淨值比。
+
+    合併 TWSE BWIBBU_d + TPEX pera，僅需 2 次 API 呼叫。
+    免費、無需 Token。用於 ValueScanner / DividendScanner Stage 0.5 cold-start 補抓。
+
+    回傳欄位: date, stock_id, pe_ratio, pb_ratio, dividend_yield
+    """
+    df_twse = fetch_twse_valuation_all(target_date)
+    df_tpex = fetch_tpex_valuation_all(target_date)
+
+    dfs = [df for df in [df_twse, df_tpex] if not df.empty]
+    if not dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(dfs, ignore_index=True)
+    logger.info("全市場估值合計: %d 支股票", len(result))
+    return result

@@ -1637,3 +1637,144 @@ class TestRankAndEnrichHasEntryExitCols:
         if pd.notna(tp):
             assert tp > ep
         assert row["valid_until"] > date.today()
+
+
+# ================================================================
+# Stage 0.5 Cold-Start 機制測試
+# ================================================================
+
+
+class TestValueScannerStage05:
+    """ValueScanner Stage 0.5: 估值 Cold-Start 自動補抓機制。"""
+
+    def _make_mocked_scanner(self, monkeypatch, val_count: int):
+        """回傳一個 Stage 0.5 完整 mock 的 ValueScanner。"""
+        from unittest.mock import MagicMock
+
+        scanner = ValueScanner(top_n_candidates=5, top_n_results=3)
+
+        # Mock _load_market_data 回傳空，讓 run() 在 Stage 1 後就提早返回
+        scanner._load_market_data = MagicMock(
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        )
+
+        # Mock get_session → 回傳 val_count（Stage 0.5 查詢用）
+        # Stage 0 (Regime 偵測) 有 try/except，失敗時自動 fallback，無需 mock
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session.execute.return_value.scalar.return_value = val_count
+
+        monkeypatch.setattr("src.discovery.scanner.get_session", lambda: mock_session)
+
+        return scanner
+
+    def test_stage05_triggers_when_no_valuation_data(self, monkeypatch):
+        """val_count = 0 時，應呼叫 sync_valuation_all_market。"""
+        import src.data.pipeline as pipeline_mod
+
+        sync_calls = []
+
+        def fake_sync():
+            sync_calls.append(1)
+            return 1200
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
+        scanner.run()
+        assert len(sync_calls) == 1, "Stage 0.5 應觸發一次 sync_valuation_all_market"
+
+    def test_stage05_skips_when_sufficient_data(self, monkeypatch):
+        """val_count >= 500 時，不應呼叫 sync_valuation_all_market。"""
+        import src.data.pipeline as pipeline_mod
+
+        sync_calls = []
+
+        def fake_sync():
+            sync_calls.append(1)
+            return 0
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=1200)
+        scanner.run()
+        assert len(sync_calls) == 0, "估值充足時不應觸發補抓"
+
+    def test_stage05_does_not_crash_on_sync_failure(self, monkeypatch):
+        """sync_valuation_all_market 拋例外時，掃描應繼續（不崩潰）。"""
+        import src.data.pipeline as pipeline_mod
+
+        def fake_sync():
+            raise RuntimeError("網路錯誤")
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
+        # 不應拋例外
+        result = scanner.run()
+        assert result is not None
+
+
+class TestDividendScannerStage05:
+    """DividendScanner Stage 0.5: 估值 Cold-Start 自動補抓機制。"""
+
+    def _make_mocked_scanner(self, monkeypatch, val_count: int):
+        """回傳一個 Stage 0.5 完整 mock 的 DividendScanner。"""
+        from unittest.mock import MagicMock
+
+        scanner = DividendScanner(top_n_candidates=5, top_n_results=3)
+
+        scanner._load_market_data = MagicMock(
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        )
+
+        # Mock get_session → 回傳 val_count（Stage 0.5 查詢用）
+        # Stage 0 (Regime 偵測) 有 try/except，失敗時自動 fallback，無需 mock
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session.execute.return_value.scalar.return_value = val_count
+
+        monkeypatch.setattr("src.discovery.scanner.get_session", lambda: mock_session)
+
+        return scanner
+
+    def test_stage05_triggers_when_no_valuation_data(self, monkeypatch):
+        """val_count = 0 時，應呼叫 sync_valuation_all_market。"""
+        import src.data.pipeline as pipeline_mod
+
+        sync_calls = []
+
+        def fake_sync():
+            sync_calls.append(1)
+            return 1200
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
+        scanner.run()
+        assert len(sync_calls) == 1, "Stage 0.5 應觸發一次 sync_valuation_all_market"
+
+    def test_stage05_skips_when_sufficient_data(self, monkeypatch):
+        """val_count >= 500 時，不應呼叫 sync_valuation_all_market。"""
+        import src.data.pipeline as pipeline_mod
+
+        sync_calls = []
+
+        def fake_sync():
+            sync_calls.append(1)
+            return 0
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=1200)
+        scanner.run()
+        assert len(sync_calls) == 0, "估值充足時不應觸發補抓"
+
+    def test_stage05_does_not_crash_on_sync_failure(self, monkeypatch):
+        """sync_valuation_all_market 拋例外時，掃描應繼續（不崩潰）。"""
+        import src.data.pipeline as pipeline_mod
+
+        def fake_sync():
+            raise RuntimeError("網路錯誤")
+
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
+        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
+        result = scanner.run()
+        assert result is not None

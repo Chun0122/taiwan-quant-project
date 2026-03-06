@@ -1643,6 +1643,24 @@ class ValueScanner(MarketScanner):
             self.regime = "sideways"
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
 
+        # Stage 0.5: 估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值
+        try:
+            from sqlalchemy import func as sa_func
+
+            with get_session() as session:
+                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
+            if not val_count or val_count < 500:
+                logger.info(
+                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
+                    val_count or 0,
+                )
+                from src.data.pipeline import sync_valuation_all_market
+
+                val_synced = sync_valuation_all_market()
+                logger.info("Stage 0.5: 全市場估值同步完成，新增 %d 筆", val_synced)
+        except Exception:
+            logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
+
         # Stage 1
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
         if df_price.empty:
@@ -2011,6 +2029,24 @@ class DividendScanner(MarketScanner):
         except Exception:
             self.regime = "sideways"
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
+
+        # Stage 0.5: 估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值
+        try:
+            from sqlalchemy import func as sa_func
+
+            with get_session() as session:
+                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
+            if not val_count or val_count < 500:
+                logger.info(
+                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
+                    val_count or 0,
+                )
+                from src.data.pipeline import sync_valuation_all_market
+
+                val_synced = sync_valuation_all_market()
+                logger.info("Stage 0.5: 全市場估值同步完成，新增 %d 筆", val_synced)
+        except Exception:
+            logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
 
         # Stage 1
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()

@@ -296,3 +296,83 @@ class TestSyncMopsAnnouncements:
         )
         count = sync_mops_announcements()
         assert count == 1
+
+
+# ================================================================
+# sync_valuation_all_market
+# ================================================================
+
+
+class TestSyncValuationAllMarket:
+    """測試 sync_valuation_all_market() — TWSE/TPEX 全市場估值同步。"""
+
+    def test_skips_when_db_already_has_500_records(self, monkeypatch):
+        """DB 已有 500+ 筆時不呼叫 fetch_market_valuation_all。"""
+        import src.data.pipeline as pipeline_mod
+
+        fetch_calls = []
+
+        def fake_fetch(*a, **kw):
+            fetch_calls.append(1)
+            return pd.DataFrame()
+
+        monkeypatch.setattr(
+            "src.data.twse_fetcher.fetch_market_valuation_all",
+            fake_fetch,
+        )
+        monkeypatch.setattr(pipeline_mod, "init_db", lambda: None)
+
+        # 在 DB 中插入 501 筆 StockValuation 使 count >= 500
+        from datetime import date as _date
+
+        from src.data.database import get_session
+        from src.data.schema import StockValuation
+
+        today = _date.today()
+        with get_session() as session:
+            for i in range(501):
+                session.execute(
+                    __import__("sqlalchemy.dialects.sqlite", fromlist=["insert"])
+                    .insert(StockValuation)
+                    .values(stock_id=f"{1000 + i}", date=today, pe_ratio=15.0, pb_ratio=1.5, dividend_yield=3.0)
+                    .on_conflict_do_nothing(index_elements=["stock_id", "date"])
+                )
+            session.commit()
+
+        result = pipeline_mod.sync_valuation_all_market()
+        assert result == 0
+        assert len(fetch_calls) == 0, "已有 500+ 筆時不應呼叫 fetch"
+
+    def test_calls_fetch_when_db_is_empty(self, monkeypatch):
+        """DB 為空時應呼叫 fetch_market_valuation_all 並寫入。"""
+        from datetime import date as _date
+
+        import src.data.pipeline as pipeline_mod
+
+        target = _date(2026, 3, 5)
+        fake_df = pd.DataFrame(
+            [
+                {
+                    "date": target,
+                    "stock_id": f"{2000 + i}",
+                    "pe_ratio": 15.0,
+                    "pb_ratio": 1.5,
+                    "dividend_yield": 3.5,
+                }
+                for i in range(10)
+            ]
+        )
+
+        monkeypatch.setattr(
+            "src.data.twse_fetcher.fetch_market_valuation_all",
+            lambda *a, **kw: fake_df,
+        )
+        monkeypatch.setattr(pipeline_mod, "init_db", lambda: None)
+        # 讓 _find_last_trading_day 直接回傳 target（跳過週末判斷）
+        monkeypatch.setattr(
+            "src.data.twse_fetcher._find_last_trading_day",
+            lambda d: target,
+        )
+
+        result = pipeline_mod.sync_valuation_all_market()
+        assert result == 10

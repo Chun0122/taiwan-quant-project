@@ -227,7 +227,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 12 | ✅ | **`suggest` 單股進出場命令** | 新增 `python main.py suggest <stock_id>` 命令，從 DB 讀取 60 日日K，計算 ATR14/SMA20/RSI14 + Regime 偵測，輸出進場區間/止損/目標價/時機評估，可選 `--notify`；541 測試通過 |
 | 13 | ✅ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 進場時計算並固定止損/目標價，TradeRecord 記錄 stop_price/target_price，ATR-based 優先於百分比，Trade ORM 同步新增欄位，545 測試通過 |
 | 14 | ✅ | **持倉監控 Dashboard 頁面** | WatchEntry ORM 表（15 欄）+ CLI `watch add/list/close/update-status` + Dashboard「👁️ 持倉監控」頁（3 Tab：總覽/個股走勢/預警列表），`_compute_watch_status` 純函數自動標記止損/止利/過期狀態，555 測試通過 |
-| 15 | ⬜ | **估值 Cold-Start 修正（Value/Dividend Scanner）** | 首次執行時 StockValuation 為空，粗篩回傳 0 支。需在 Stage 2（粗篩）之前加入 Stage 0.5 機制（類似 GrowthScanner），先補抓全市場或抽樣估值資料，確保 ValueScanner/DividendScanner 首次執行不空手而回 |
+| 15 | ✅ | **估值 Cold-Start 修正（Value/Dividend Scanner）** | 新增 `fetch_twse_valuation_all / fetch_tpex_valuation_all / fetch_market_valuation_all`（twse_fetcher.py，TWSE BWIBBU_d + TPEX pera，免費）+ `sync_valuation_all_market()`（pipeline.py）+ Stage 0.5 機制插入 ValueScanner.run() 和 DividendScanner.run()（閾值 500 支），568 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 
