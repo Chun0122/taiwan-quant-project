@@ -1428,6 +1428,37 @@ def cmd_sync_sbl(args: argparse.Namespace) -> None:
         print(f"借券資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def cmd_sync_broker(args: argparse.Namespace) -> None:
+    """同步分點交易資料（FinMind TaiwanStockTradingDailyReport）。"""
+    from src.data.pipeline import sync_broker_trades
+
+    stock_ids = args.stocks if args.stocks else None
+    days = getattr(args, "days", 5)
+
+    if getattr(args, "from_discover", False):
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import DiscoveryRecord
+
+        with get_session() as session:
+            latest_date = session.execute(select(func.max(DiscoveryRecord.scan_date))).scalar()
+            if latest_date:
+                rows = session.execute(
+                    select(DiscoveryRecord.stock_id).where(DiscoveryRecord.scan_date == latest_date).distinct()
+                ).all()
+                discover_stocks = [r[0] for r in rows]
+                from src.config import settings
+
+                watchlist = list(settings.fetcher.watchlist)
+                stock_ids = list(set((stock_ids or watchlist) + discover_stocks))
+                print(f"從最近 discover（{latest_date}）補抓 {len(discover_stocks)} 支，合計 {len(stock_ids)} 支")
+
+    print(f"同步分點交易資料（最近 {days} 日）...")
+    count = sync_broker_trades(stock_ids=stock_ids, days=days)
+    print(f"\n分點資料同步完成: {count:,} 筆")
+
+
 def cmd_alert_check(args: argparse.Namespace) -> None:
     """掃描近期 MOPS 重大事件警報（法說會、財報、高關注公告）。
 
@@ -2406,6 +2437,12 @@ def main() -> None:
     sp_sbl = subparsers.add_parser("sync-sbl", help="同步全市場借券賣出資料（TWSE TWT96U）")
     sp_sbl.add_argument("--days", type=int, default=3, help="同步最近幾個交易日（預設 3）")
 
+    # sync-broker 子命令
+    sp_broker = subparsers.add_parser("sync-broker", help="同步分點交易資料（FinMind TaiwanStockTradingDailyReport）")
+    sp_broker.add_argument("--stocks", nargs="+", help="指定股票代號（預設使用 watchlist）")
+    sp_broker.add_argument("--days", type=int, default=5, help="同步最近幾個交易日（預設 5）")
+    sp_broker.add_argument("--from-discover", action="store_true", help="補抓最近一次 discover 推薦結果的分點資料")
+
     # alert-check 子命令
     sp_alert = subparsers.add_parser("alert-check", help="掃描近期 MOPS 重大事件警報（法說會/財報/月營收）")
     sp_alert.add_argument("--days", type=int, default=7, help="查詢最近幾天（預設 7）")
@@ -2539,6 +2576,8 @@ def main() -> None:
         cmd_sync_holding(args)
     elif args.command == "sync-sbl":
         cmd_sync_sbl(args)
+    elif args.command == "sync-broker":
+        cmd_sync_broker(args)
     elif args.command == "alert-check":
         cmd_alert_check(args)
     elif args.command == "revenue-scan":

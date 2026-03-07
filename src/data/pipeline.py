@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -15,6 +16,7 @@ from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
     Announcement,
     BacktestResult,
+    BrokerTrade,
     DailyPrice,
     Dividend,
     FinancialStatement,
@@ -105,6 +107,11 @@ def _upsert_valuation(df: pd.DataFrame) -> int:
 def _upsert_sbl(df: pd.DataFrame) -> int:
     """將借券賣出 DataFrame 寫入 securities_lending 表。"""
     return _upsert_batch(SecuritiesLending, df, ["stock_id", "date"])
+
+
+def _upsert_broker_trade(df: pd.DataFrame) -> int:
+    """將分點交易 DataFrame 寫入 broker_trade 表。"""
+    return _upsert_batch(BrokerTrade, df, ["stock_id", "date", "broker_id"])
 
 
 def _upsert_announcement(df: pd.DataFrame) -> int:
@@ -506,6 +513,53 @@ def sync_sbl_all_market(days: int = 3) -> int:
         n = _upsert_sbl(df)
         logger.info("[全市場借券] %s 寫入 %d 筆", d.isoformat(), n)
         total += n
+
+    return total
+
+
+def sync_broker_trades(
+    stock_ids: list[str] | None = None,
+    days: int = 5,
+) -> int:
+    """同步分點交易資料（FinMind TaiwanStockTradingDailyReport，免費逐股）。
+
+    若 DB 已有 2 天內資料則跳過該股票（避免重複抓取）。
+
+    Args:
+        stock_ids: 指定股票代號清單，預設使用 watchlist
+        days:      同步最近幾個交易日（預設 5）
+
+    Returns:
+        新增的分點交易筆數
+    """
+    if stock_ids is None:
+        stock_ids = list(settings.fetcher.watchlist)
+
+    init_db()
+    fetcher = FinMindFetcher(api_token=settings.finmind.api_token)
+    end_date = date.today().isoformat()
+    start_date = (date.today() - timedelta(days=days + 3)).isoformat()
+
+    total = 0
+    for sid in stock_ids:
+        with get_session() as session:
+            latest = session.execute(select(func.max(BrokerTrade.date)).where(BrokerTrade.stock_id == sid)).scalar()
+        if latest and (date.today() - latest).days < 2:
+            logger.info("[分點] %s 已有最新資料（%s），跳過", sid, latest)
+            continue
+
+        try:
+            df = fetcher.fetch_broker_trades(sid, start_date, end_date)
+        except Exception as exc:
+            logger.warning("[分點] %s 抓取失敗: %s", sid, exc)
+            df = None
+
+        if df is not None and not df.empty:
+            n = _upsert_broker_trade(df)
+            total += n
+            logger.info("[分點] %s 寫入 %d 筆", sid, n)
+
+        time.sleep(0.5)  # FinMind 免費帳號速率限制
 
     return total
 

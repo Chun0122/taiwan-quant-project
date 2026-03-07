@@ -29,6 +29,7 @@ from sqlalchemy import select
 from src.data.database import get_session
 from src.data.schema import (
     Announcement,
+    BrokerTrade,
     DailyPrice,
     HoldingDistribution,
     InstitutionalInvestor,
@@ -161,6 +162,69 @@ def compute_sbl_score(df_sbl: pd.DataFrame) -> pd.DataFrame:
     latest = df_sbl["date"].max()
     df = df_sbl[df_sbl["date"] == latest][["stock_id", "sbl_balance", "sbl_change"]].copy()
     return df.reset_index(drop=True)
+
+
+def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
+    """計算主力分點集中度（HHI）與最強主力連續進場天數（純函數，可獨立測試）。
+
+    Args:
+        df_broker: BrokerTrade 資料，欄位需含 [date, stock_id, broker_id, buy, sell]
+
+    Returns:
+        DataFrame [stock_id, broker_concentration, broker_consecutive_days]
+        - broker_concentration:    當日淨買超分點的 HHI（0~1，越高=主力越集中）
+        - broker_consecutive_days: 最強主力分點連續淨買超天數（近 5 日）
+    """
+    required = {"date", "stock_id", "broker_id", "buy", "sell"}
+    if df_broker.empty or not required.issubset(df_broker.columns):
+        return pd.DataFrame(columns=["stock_id", "broker_concentration", "broker_consecutive_days"])
+
+    df = df_broker.copy()
+    df["net_buy"] = df["buy"].fillna(0).astype(int) - df["sell"].fillna(0).astype(int)
+
+    results = []
+    for stock_id, grp in df.groupby("stock_id"):
+        # ── HHI：以最新交易日計算 ──────────────────────────────────────
+        latest_date = grp["date"].max()
+        day_df = grp[grp["date"] == latest_date]
+        net_buyers = day_df[day_df["net_buy"] > 0]
+        if net_buyers.empty:
+            hhi = 0.0
+        else:
+            total_net = net_buyers["net_buy"].sum()
+            shares = net_buyers["net_buy"] / total_net
+            hhi = float((shares**2).sum())
+
+        # ── 連續天數：找近 5 日最活躍（累計淨買最多）的主力分點 ────────
+        recent_dates = sorted(grp["date"].unique())[-5:]
+        # 各分點在近 5 日的累計淨買
+        broker_net = grp[grp["date"].isin(recent_dates)].groupby("broker_id")["net_buy"].sum()
+        if broker_net.empty or broker_net.max() <= 0:
+            consec = 0
+        else:
+            top_broker = broker_net.idxmax()
+            top_broker_data = (
+                grp[grp["broker_id"] == top_broker].groupby("date")["net_buy"].sum().sort_index(ascending=False)
+            )
+            consec = 0
+            for net in top_broker_data.values:
+                if net > 0:
+                    consec += 1
+                else:
+                    break
+
+        results.append(
+            {
+                "stock_id": stock_id,
+                "broker_concentration": hhi,
+                "broker_consecutive_days": consec,
+            }
+        )
+
+    if not results:
+        return pd.DataFrame(columns=["stock_id", "broker_concentration", "broker_consecutive_days"])
+
+    return pd.DataFrame(results)
 
 
 @dataclass
@@ -1367,9 +1431,10 @@ class MomentumScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股 + 借券（有資料時）。
+        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
 
         權重組合（由資料可用性決定）：
+        - 7 因子（含分點）: 外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
         - 6 因子（含借券）: 外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
         - 5 因子（含大戶持股，無借券）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
         - 4 因子（含券資比，無大戶/借券）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
@@ -1454,6 +1519,18 @@ class MomentumScanner(MarketScanner):
             # 逆向評分：借券餘額低 → 空頭壓力小 → 評分高
             sbl_rank = 1.0 - df["sbl_balance"].rank(pct=True)
 
+        # ── 分點因子（主力集中度 HHI + 連續進場天數）────────────────
+        df_broker_raw = self._load_broker_data(stock_ids)
+        broker_df = compute_broker_score(df_broker_raw)
+        has_broker = not broker_df.empty
+        if has_broker:
+            df = df.merge(broker_df, on="stock_id", how="left")
+            df["broker_concentration"] = df["broker_concentration"].fillna(0.0)
+            df["broker_consecutive_days"] = df["broker_consecutive_days"].fillna(0.0)
+            broker_conc_rank = df["broker_concentration"].rank(pct=True)
+            broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
+            broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+
         # ── 融資融券因子 ──────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
@@ -1473,7 +1550,36 @@ class MomentumScanner(MarketScanner):
                 has_margin = False
 
         # ── 加權組合 ─────────────────────────────────────────────────
-        if has_sbl and has_margin and has_whale:
+        if has_broker and has_sbl and has_margin and has_whale:
+            # 7 因子：外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
+            df["chip_score"] = (
+                consec_rank * 0.20
+                + bvr_rank * 0.18
+                + total_rank * 0.18
+                + smr_rank * 0.11
+                + whale_rank * 0.13
+                + sbl_rank * 0.08
+                + broker_rank * 0.12
+            )
+        elif has_broker and has_sbl and has_margin:
+            # 6 因子（有分點、無大戶）：外資22%+量比20%+法人20%+券資比14%+借券12%+分點12%
+            df["chip_score"] = (
+                consec_rank * 0.22
+                + bvr_rank * 0.20
+                + total_rank * 0.20
+                + smr_rank * 0.14
+                + sbl_rank * 0.12
+                + broker_rank * 0.12
+            )
+        elif has_broker and has_sbl:
+            # 5 因子（有分點+借券、無大戶/融資券）：外資28%+量比22%+法人22%+借券14%+分點14%
+            df["chip_score"] = (
+                consec_rank * 0.28 + bvr_rank * 0.22 + total_rank * 0.22 + sbl_rank * 0.14 + broker_rank * 0.14
+            )
+        elif has_broker:
+            # 4 因子（僅分點）：外資32%+量比24%+法人24%+分點20%
+            df["chip_score"] = consec_rank * 0.32 + bvr_rank * 0.24 + total_rank * 0.24 + broker_rank * 0.20
+        elif has_sbl and has_margin and has_whale:
             # 6 因子：外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
             df["chip_score"] = (
                 consec_rank * 0.22
@@ -1560,6 +1666,32 @@ class MomentumScanner(MarketScanner):
             if not rows:
                 return pd.DataFrame()
             return pd.DataFrame(rows, columns=["stock_id", "date", "level", "percent"])
+        except Exception:
+            return pd.DataFrame()
+
+    def _load_broker_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 7 天的分點交易資料。
+
+        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
+        """
+        cutoff = date.today() - timedelta(days=7)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        BrokerTrade.stock_id,
+                        BrokerTrade.date,
+                        BrokerTrade.broker_id,
+                        BrokerTrade.buy,
+                        BrokerTrade.sell,
+                    ).where(
+                        BrokerTrade.stock_id.in_(stock_ids),
+                        BrokerTrade.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
         except Exception:
             return pd.DataFrame()
 

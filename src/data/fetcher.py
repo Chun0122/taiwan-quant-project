@@ -345,6 +345,38 @@ class FinMindFetcher(DataFetcher):
         df["percent"] = pd.to_numeric(df["percent"], errors="coerce").fillna(0.0)
         return df
 
+    def fetch_broker_trades(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
+        """抓取指定股票的分點交易資料（FinMind TaiwanStockTradingDailyReport）。
+
+        回傳欄位: date, stock_id, broker_id, broker_name, buy, sell, buy_price, sell_price
+        免費帳號支援逐股查詢，速率控制由 _request() 內部處理（0.5 秒間隔）。
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockTradingDailyReport", stock_id, start, end)
+        if df.empty:
+            return pd.DataFrame()
+
+        df = df.rename(
+            columns={
+                "securities_trader_id": "broker_id",
+                "securities_trader": "broker_name",
+            }
+        )
+        df["stock_id"] = stock_id
+        df["buy"] = pd.to_numeric(df.get("buy", 0), errors="coerce").fillna(0).astype(int)
+        df["sell"] = pd.to_numeric(df.get("sell", 0), errors="coerce").fillna(0).astype(int)
+        if "buy_price" in df.columns:
+            df["buy_price"] = pd.to_numeric(df["buy_price"], errors="coerce")
+        if "sell_price" in df.columns:
+            df["sell_price"] = pd.to_numeric(df["sell_price"], errors="coerce")
+
+        keep = ["date", "stock_id", "broker_id", "broker_name", "buy", "sell", "buy_price", "sell_price"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
     def fetch_all_daily_price(self, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取全市場日K線（不指定 stock_id，按日期查詢）。
 

@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十六張核心表：
+十八張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -11,6 +11,8 @@
 - Announcement:            MOPS 重大訊息公告
 - FinancialStatement:      季報財務資料（損益表+資產負債表+現金流量表）
 - HoldingDistribution:     大戶持股分級（週資料，FinMind TaiwanStockHoldingSharesPer）
+- SecuritiesLending:       借券賣出彙總（日資料，TWSE TWT96U）
+- BrokerTrade:             分點交易資料（日資料，FinMind TaiwanStockTradingDailyReport）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
@@ -270,6 +272,30 @@ class SecuritiesLending(Base):
 
     def __repr__(self) -> str:
         return f"<SecuritiesLending {self.stock_id} {self.date} bal={self.sbl_balance}>"
+
+
+class BrokerTrade(Base):
+    """分點交易資料（日資料，FinMind TaiwanStockTradingDailyReport）。
+
+    來源：FinMind API（免費帳號支援逐股查詢）。
+    每日更新，記錄各分點券商的買賣情況，用於計算主力集中度（HHI）與連續進場天數。
+    """
+
+    __tablename__ = "broker_trade"
+    __table_args__ = (UniqueConstraint("stock_id", "date", "broker_id", name="uq_broker_trade"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    broker_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    broker_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    buy: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 買進股數
+    sell: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 賣出股數
+    buy_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 平均買進價
+    sell_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # 平均賣出價
+
+    def __repr__(self) -> str:
+        return f"<BrokerTrade {self.stock_id} {self.date} broker={self.broker_id}>"
 
 
 class BacktestResult(Base):
