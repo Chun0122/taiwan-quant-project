@@ -45,7 +45,7 @@ taiwan-quant-project/
 │   ├── config.py            # 設定管理模組
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義（14 張表，含 FinancialStatement）
+│   │   ├── schema.py        # ORM 資料表定義（15 張表，含 DiscoveryRecord、WatchEntry、StockValuation）
 │   │   ├── fetcher.py       # FinMind API 資料抓取
 │   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
 │   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
@@ -100,7 +100,8 @@ taiwan-quant-project/
 │           ├── ml_analysis.py         # ML 策略分析頁
 │           ├── market_overview.py     # 市場總覽首頁
 │           ├── industry_rotation.py   # 產業輪動分析頁
-│           └── discovery_history.py   # 推薦歷史頁
+│           ├── discovery_history.py   # 推薦歷史頁
+│           └── position_monitoring.py # 持倉監控頁
 ├── notebooks/               # Jupyter 分析筆記本
 └── tests/                   # 測試
 ```
@@ -366,7 +367,7 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含八個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含九個頁面：
 
 - **市場總覽**: TAIEX 走勢 K 線 + SMA60/120 + Regime 狀態、市場廣度（漲跌家數）、法人買賣超排行、產業熱度 Treemap
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
@@ -376,6 +377,7 @@ python main.py dashboard
 - **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
 - **產業輪動**: 產業綜合排名 + 泡泡圖（法人 vs 動能）+ 法人淨買超長條圖 + 精選個股
 - **推薦歷史**: Discover 推薦歷史視覺化（日曆熱圖、績效分析、個股排行、歷史明細 CSV 匯出）
+- **持倉監控**: 持倉總覽（狀態/損益/距目標%）+ 個股 K 線走勢（含進場/止損/目標水平線）+ 預警列表（觸發止損/止利/過期）
 
 ### 4.5 多因子選股篩選 (`scan`)
 
@@ -795,7 +797,7 @@ python main.py discover all --skip-sync --export compare.csv
 | Stage 0 | 市場狀態偵測 | 根據 TAIEX 判斷 bull/bear/sideways，動態調整權重 |
 | Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
 | Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名 |
-| Stage 0.5 | MOPS 月營收同步 | （僅 growth 模式）檢查月營收覆蓋率，不足 500 支時自動從 MOPS 同步全市場月營收 |
+| Stage 0.5 | 資料冷啟動補抓 | **growth**：月營收覆蓋 < 500 支時自動從 MOPS 同步；**value/dividend**：估值資料（PE/PB/殖利率）覆蓋 < 500 支時自動從 TWSE/TPEX 同步 |
 | Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
@@ -1172,7 +1174,7 @@ python main.py watch update-status
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表（另含 `stock_valuation` 估值表）：
 
 ### daily_price（日K線）
 
@@ -1389,6 +1391,56 @@ python main.py watch update-status
 | updated_at | DateTime | 更新時間 |
 
 唯一鍵：`(stock_id)`
+
+### discovery_record（Discover 推薦歷史）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| stock_name | String | 股票名稱 |
+| scan_date | Date | 掃描日期 |
+| mode | String | 掃描模式（momentum/swing/value/dividend/growth） |
+| rank | Integer | 本次掃描排名 |
+| composite_score | Float | 綜合評分 |
+| entry_price | Float | 建議進場價（ATR-based） |
+| stop_loss | Float | 建議止損價（entry - 1.5×ATR14） |
+| take_profit | Float | 建議目標價（entry + 3.0×ATR14） |
+| entry_trigger | String | 進場觸發說明（站上均線等） |
+| valid_until | Date | 建議有效日期（scan_date + 5 工作日） |
+
+唯一鍵：`(stock_id, scan_date, mode)`
+
+### watch_entry（持倉監控）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| id | Integer | 自增主鍵 |
+| stock_id | String | 股票代號 |
+| stock_name | String | 股票名稱 |
+| entry_price | Float | 進場價格 |
+| stop_loss | Float | 止損價格 |
+| take_profit | Float | 目標價格 |
+| qty | Integer | 持倉股數（可選） |
+| status | String | 狀態：active/stopped_loss/taken_profit/expired/closed |
+| added_date | Date | 加入日期 |
+| valid_until | Date | 有效截止日 |
+| close_price | Float | 平倉價格（手動平倉時記錄） |
+| close_date | Date | 平倉日期 |
+| source_mode | String | 來源模式（discover 模式或 manual） |
+| notes | String | 備註 |
+| created_at | DateTime | 建立時間 |
+
+### stock_valuation（估值資料 — TWSE/TPEX 官方）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 資料日期 |
+| pe_ratio | Float | 本益比（P/E） |
+| pb_ratio | Float | 股價淨值比（P/B） |
+| dividend_yield | Float | 殖利率 (%) |
+
+唯一鍵：`(stock_id, date)`
 
 ---
 
