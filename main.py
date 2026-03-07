@@ -126,6 +126,30 @@ def _init_db() -> None:
     init_db()
 
 
+def _ensure_sync_market_data(sync_days: int, args: argparse.Namespace) -> None:
+    """共用全市場資料同步流程（cmd_discover / _cmd_discover_all 共用）。
+
+    依序執行：stock_info → TAIEX → daily_price + institutional + margin，並印出筆數。
+    若 args.skip_sync 為 True 則直接跳過。
+    """
+    if args.skip_sync:
+        return
+
+    from src.data.pipeline import sync_market_data, sync_stock_info, sync_taiex_index
+
+    print("正在同步股票基本資料...")
+    sync_stock_info(force_refresh=False)
+    print("正在同步 TAIEX 加權指數（Regime 偵測用）...")
+    sync_taiex_index()
+    print(f"正在同步全市場資料（{sync_days} 天，TWSE/TPEX 官方資料）...")
+    counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
+    print(
+        f"  日K線: {counts['daily_price']:,} 筆 | "
+        f"法人: {counts['institutional']:,} 筆 | "
+        f"融資融券: {counts['margin']:,} 筆"
+    )
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
     """執行資料同步。"""
     from src.data.pipeline import sync_taiex_index, sync_watchlist
@@ -738,7 +762,6 @@ def cmd_industry(args: argparse.Namespace) -> None:
 def cmd_discover(args: argparse.Namespace) -> None:
     """執行全市場選股掃描（momentum / swing / value 模式）。"""
 
-    from src.data.pipeline import sync_market_data, sync_stock_info, sync_taiex_index
     from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
 
     _init_db()
@@ -766,19 +789,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         sync_days = 25
         print(f"  [{mode_label}] 自動擴展同步天數至 {sync_days} 天（ATR14 / SMA20 需要）")
 
-    # 同步全市場資料（除非 --skip-sync）
-    if not args.skip_sync:
-        print("正在同步股票基本資料...")
-        sync_stock_info(force_refresh=False)
-        print("正在同步 TAIEX 加權指數（Regime 偵測用）...")
-        sync_taiex_index()
-        print("正在同步全市場資料（TWSE/TPEX 官方資料）...")
-        counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
-        print(
-            f"  日K線: {counts['daily_price']:,} 筆 | "
-            f"法人: {counts['institutional']:,} 筆 | "
-            f"融資融券: {counts['margin']:,} 筆"
-        )
+    _ensure_sync_market_data(sync_days, args)
 
     # 選擇 scanner
     scanner_map = {
@@ -1031,26 +1042,13 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     """執行五個 Scanner 並輸出多模式綜合比較表。"""
     import datetime
 
-    from src.data.pipeline import sync_market_data, sync_stock_info, sync_taiex_index
     from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
 
     _init_db()
 
     # Swing 模式需要至少 80 天資料
     sync_days = max(args.sync_days, 80)
-
-    if not args.skip_sync:
-        print("正在同步股票基本資料...")
-        sync_stock_info(force_refresh=False)
-        print("正在同步 TAIEX 加權指數（Regime 偵測用）...")
-        sync_taiex_index()
-        print(f"正在同步全市場資料（{sync_days} 天）...")
-        counts = sync_market_data(days=sync_days, max_stocks=args.max_stocks)
-        print(
-            f"  日K線: {counts['daily_price']:,} 筆 | "
-            f"法人: {counts['institutional']:,} 筆 | "
-            f"融資融券: {counts['margin']:,} 筆"
-        )
+    _ensure_sync_market_data(sync_days, args)
 
     scanner_classes = {
         "momentum": MomentumScanner,

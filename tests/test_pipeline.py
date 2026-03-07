@@ -323,18 +323,20 @@ class TestSyncValuationAllMarket:
         monkeypatch.setattr(pipeline_mod, "init_db", lambda: None)
 
         # 在 DB 中插入 501 筆 StockValuation 使 count >= 500
+        # 使用 _find_last_trading_day() 與 pipeline 函數對齊日期（避免週末日期不符）
         from datetime import date as _date
 
         from src.data.database import get_session
         from src.data.schema import StockValuation
+        from src.data.twse_fetcher import _find_last_trading_day
 
-        today = _date.today()
+        target_date = _find_last_trading_day(_date.today())
         with get_session() as session:
             for i in range(501):
                 session.execute(
                     __import__("sqlalchemy.dialects.sqlite", fromlist=["insert"])
                     .insert(StockValuation)
-                    .values(stock_id=f"{1000 + i}", date=today, pe_ratio=15.0, pb_ratio=1.5, dividend_yield=3.0)
+                    .values(stock_id=f"{1000 + i}", date=target_date, pe_ratio=15.0, pb_ratio=1.5, dividend_yield=3.0)
                     .on_conflict_do_nothing(index_elements=["stock_id", "date"])
                 )
             session.commit()

@@ -648,9 +648,12 @@ class MarketScanner:
         scan_date = getattr(self, "scan_date", date.today())
         valid_until = (pd.Timestamp(scan_date) + pd.offsets.BDay(5)).date()
 
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        price_grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
         rows = []
         for sid in stock_ids:
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date").tail(30)
+            stock_data = price_grouped.get_group(sid).tail(30) if sid in price_grouped.groups else pd.DataFrame()
 
             if stock_data.empty:
                 rows.append(
@@ -722,8 +725,11 @@ class MarketScanner:
         """從原始 OHLCV 計算技術面分數（6 因子：SMA + 動能 + 價格位置 + 量能比 + 波動收斂 + 量價背離）。"""
         results = []
 
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
         for sid in stock_ids:
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
+            stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
             if len(stock_data) < 3:
                 results.append({"stock_id": sid, "technical_score": 0.5})
                 continue
@@ -1351,15 +1357,17 @@ class MomentumScanner(MarketScanner):
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
         """動能模式基本面：僅做過濾 — YoY > 0 加分(0.7)，≤ 0 中性(0.3)，無資料 fallback 0.5。"""
+        if df_revenue.empty:
+            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        rev_grouped = df_revenue.groupby("stock_id", sort=False)
         result_rows = []
         for sid in stock_ids:
-            if df_revenue.empty:
-                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
-                continue
-            rev = df_revenue[df_revenue["stock_id"] == sid]
-            if rev.empty:
+            if sid not in rev_grouped.groups:
                 result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
             else:
+                rev = rev_grouped.get_group(sid)
                 yoy = rev.iloc[0].get("yoy_growth", None)
                 if yoy is not None and not pd.isna(yoy):
                     result_rows.append({"stock_id": sid, "fundamental_score": 0.7 if yoy > 0 else 0.3})
@@ -1453,9 +1461,11 @@ class SwingScanner(MarketScanner):
             return pd.DataFrame()
 
         # 額外條件：close > SMA60
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        swing_price_grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
         sma60_data = {}
         for sid in filtered["stock_id"].unique():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
+            stock_data = swing_price_grouped.get_group(sid) if sid in swing_price_grouped.groups else pd.DataFrame()
             if len(stock_data) >= 60:
                 sma60_data[sid] = stock_data["close"].values[-60:].mean()
 
