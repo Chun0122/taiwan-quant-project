@@ -18,16 +18,61 @@ def daily_sync_job() -> None:
     logger.info("開始每日自動同步")
     logger.info("=" * 60)
 
+    # Step 1: 同步日K + TAIEX
     try:
         sync_taiex_index()
         sync_watchlist()
-        sync_indicators()
-        logger.info("每日同步完成")
+        logger.info("日K + TAIEX 同步完成")
     except Exception:
-        logger.exception("每日同步失敗")
+        logger.exception("日K 同步失敗")
         return
 
-    # 同步完成後執行篩選 + 通知
+    # Step 2: 同步借券賣出（全市場，前一交易日）
+    try:
+        from src.data.pipeline import sync_sbl_all_market
+
+        logger.info("開始同步借券賣出資料")
+        sync_sbl_all_market(days=3)
+        logger.info("借券賣出同步完成")
+    except Exception:
+        logger.exception("借券賣出同步失敗，繼續後續流程")
+
+    # Step 3: 同步分點進出（上次 discover 推薦標的 + watchlist）
+    try:
+        from sqlalchemy import func, select
+
+        from src.config import settings
+        from src.data.database import get_session
+        from src.data.pipeline import sync_broker_trades
+        from src.data.schema import DiscoveryRecord
+
+        with get_session() as session:
+            latest_date = session.execute(select(func.max(DiscoveryRecord.scan_date))).scalar()
+            discover_stocks: list[str] = []
+            if latest_date:
+                rows = session.execute(
+                    select(DiscoveryRecord.stock_id).where(DiscoveryRecord.scan_date == latest_date).distinct()
+                ).all()
+                discover_stocks = [r[0] for r in rows]
+
+        watchlist = list(settings.fetcher.watchlist)
+        broker_stocks = list(set(watchlist + discover_stocks))
+
+        logger.info("開始同步分點資料（%d 支股票）", len(broker_stocks))
+        sync_broker_trades(stock_ids=broker_stocks, days=5)
+        logger.info("分點資料同步完成")
+    except Exception:
+        logger.exception("分點資料同步失敗，繼續後續流程")
+
+    # Step 4: 重算技術指標
+    try:
+        sync_indicators()
+        logger.info("技術指標重算完成")
+    except Exception:
+        logger.exception("技術指標計算失敗")
+        return
+
+    # Step 5: watchlist 多因子篩選
     try:
         from src.config import settings
         from src.notification.line_notify import send_scan_results
@@ -70,7 +115,7 @@ def daily_sync_job() -> None:
     except Exception:
         logger.exception("每日報告生成/通知失敗")
 
-    # 全市場選股掃描
+    # Step 6: 全市場選股掃描（SBL + 分點資料已就緒）
     try:
         from src.config import settings
         from src.data.pipeline import sync_market_data, sync_stock_info
@@ -98,11 +143,33 @@ def daily_sync_job() -> None:
         logger.exception("全市場掃描/通知失敗")
 
 
-def run_scheduler() -> None:
-    """啟動排程器（阻塞式，每日 23:00 執行）。"""
-    schedule.every().day.at("23:00").do(daily_sync_job)
+def weekly_holding_job() -> None:
+    """每週四同步大戶持股分級週資料。"""
+    logger.info("=" * 60)
+    logger.info("開始每週大戶持股分級同步")
+    logger.info("=" * 60)
 
-    print("排程器已啟動，每日 23:00 自動同步")
+    try:
+        from src.data.pipeline import sync_holding_distribution
+
+        sync_holding_distribution(weeks=4)
+        logger.info("大戶持股分級同步完成")
+    except Exception:
+        logger.exception("大戶持股分級同步失敗")
+
+
+def run_scheduler() -> None:
+    """啟動排程器（阻塞式）。
+
+    每日任務：23:00 執行（sync → sync-sbl → sync-broker → compute → scan → discover）
+    週四任務：23:30 執行（sync-holding，TWSE 大戶資料通常週四更新）
+    """
+    schedule.every().day.at("23:00").do(daily_sync_job)
+    schedule.every().thursday.at("23:30").do(weekly_holding_job)
+
+    print("排程器已啟動")
+    print("  每日 23:00  — sync / sync-sbl / sync-broker / compute / scan / discover")
+    print("  每週四 23:30 — sync-holding（大戶持股週資料）")
     print("按 Ctrl+C 停止")
 
     try:
