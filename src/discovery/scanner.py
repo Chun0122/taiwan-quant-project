@@ -254,6 +254,7 @@ class MarketScanner:
     """
 
     mode_name: str = "base"
+    _auto_sync_broker: bool = False  # 子類設為 True 以在 Stage 2.5 自動補抓分點資料
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(
@@ -326,6 +327,18 @@ class MarketScanner:
             df_revenue = self._load_revenue_data(candidate_ids)
         except Exception:
             logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
+
+        # Stage 2.5: 補抓候選股分點資料（僅 MomentumScanner 啟用）
+        # 新出現的候選股（不在上次推薦或 watchlist 中）也能取得分點評分，避免因無資料而降級
+        if self._auto_sync_broker:
+            try:
+                from src.data.pipeline import sync_broker_for_stocks
+
+                logger.info("Stage 2.5: 補抓 %d 支候選股分點資料（DB 已有近期資料者跳過）...", len(candidate_ids))
+                broker_count = sync_broker_for_stocks(candidate_ids)
+                logger.info("Stage 2.5: 分點補抓完成，新增 %d 筆", broker_count)
+            except Exception:
+                logger.warning("Stage 2.5: 分點資料補抓失敗（可能無 FinMind token），使用既有資料")
 
         # Stage 2.7: 載入候選股近期 MOPS 公告
         df_ann = self._load_announcement_data(candidate_ids)
@@ -1361,6 +1374,7 @@ class MomentumScanner(MarketScanner):
     """
 
     mode_name = "momentum"
+    _auto_sync_broker = True  # Stage 2.5 自動補抓候選股分點資料
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:

@@ -1,10 +1,13 @@
 """分點交易資料（Broker Trade）整合測試。
 
 測試項目：
-- fetch_broker_trades:       FinMind TaiwanStockTradingDailyReport 欄位映射 + 數值清洗（mock HTTP）
-- BrokerTrade ORM:           寫入 + 唯一鍵衝突（in-memory SQLite）
-- compute_broker_score:      HHI 集中度計算 + 連續天數（純函數）
-- MomentumScanner 7-factor:  7-factor 啟用、降級、集中度/連續天影響（_compute_chip_scores 單元）
+- fetch_broker_trades:           FinMind TaiwanStockTradingDailyReport 欄位映射 + 數值清洗（mock HTTP）
+- BrokerTrade ORM:               寫入 + 唯一鍵衝突（in-memory SQLite）
+- compute_broker_score:          HHI 集中度計算 + 連續天數（純函數）
+- MomentumScanner 7-factor:      7-factor 啟用、降級、集中度/連續天影響（_compute_chip_scores 單元）
+- Stage 2.5 自動補抓:            MomentumScanner._auto_sync_broker=True 觸發 sync_broker_for_stocks()；
+                                 SwingScanner._auto_sync_broker=False 不觸發
+- sync_broker_for_stocks:        pipeline 包裝函數（days=7 透傳）
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 # 模組層級 ORM import：確保 Base.metadata 在 in_memory_engine.create_all() 前已包含全表
 from src.data.schema import BrokerTrade  # noqa: F401
-from src.discovery.scanner import MomentumScanner, compute_broker_score
+from src.discovery.scanner import MomentumScanner, SwingScanner, compute_broker_score
 
 # ------------------------------------------------------------------ #
 #  TestFetchBrokerTrades — mock HTTP 測試
@@ -498,3 +501,147 @@ class TestMomentumScannerBrokerFactor:
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         assert len(result) == 1
         assert 0.0 <= result.iloc[0]["chip_score"] <= 1.0
+
+
+# ------------------------------------------------------------------ #
+#  TestSyncBrokerForStocks — pipeline 包裝函數測試
+# ------------------------------------------------------------------ #
+
+
+class TestSyncBrokerForStocks:
+    """sync_broker_for_stocks() 包裝函數測試。"""
+
+    def test_delegates_to_sync_broker_trades_with_days_7(self, monkeypatch):
+        """sync_broker_for_stocks() 應以 days=7 呼叫 sync_broker_trades()。"""
+        from src.data.pipeline import sync_broker_for_stocks
+
+        calls = []
+
+        def fake_sync(stock_ids, days):
+            calls.append({"stock_ids": stock_ids, "days": days})
+            return 42
+
+        monkeypatch.setattr("src.data.pipeline.sync_broker_trades", fake_sync)
+
+        result = sync_broker_for_stocks(["2330", "2317"])
+
+        assert len(calls) == 1
+        assert calls[0]["stock_ids"] == ["2330", "2317"]
+        assert calls[0]["days"] == 7
+        assert result == 42
+
+
+# ------------------------------------------------------------------ #
+#  TestStage25AutoFetch — Stage 2.5 自動補抓觸發測試
+# ------------------------------------------------------------------ #
+
+
+class TestStage25AutoFetch:
+    """Stage 2.5 分點自動補抓觸發機制測試。"""
+
+    def test_momentum_scanner_has_auto_sync_broker_true(self):
+        """MomentumScanner._auto_sync_broker 應為 True。"""
+        assert MomentumScanner._auto_sync_broker is True
+
+    def test_swing_scanner_has_auto_sync_broker_false(self):
+        """SwingScanner._auto_sync_broker 應為 False（不需分點因子）。"""
+        assert SwingScanner._auto_sync_broker is False
+
+    def test_stage25_calls_sync_broker_for_stocks_in_momentum(self, monkeypatch):
+        """MomentumScanner.run() Stage 2.5 應呼叫 sync_broker_for_stocks()，且傳入候選股 ID。"""
+        from src.discovery.scanner import MomentumScanner
+
+        scanner = MomentumScanner(top_n_candidates=5, top_n_results=3)
+        broker_sync_calls = []
+
+        # 模擬完整 run() 所需的 DB 資料
+        dummy_price = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "date": [date.today()] * 3,
+                "open": [100.0] * 3,
+                "high": [105.0] * 3,
+                "low": [98.0] * 3,
+                "close": [103.0] * 3,
+                "volume": [5_000_000] * 3,
+                "turnover": [500_000_000] * 3,
+                "spread": [0.0] * 3,
+            }
+        )
+        dummy_inst = pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date.today(), "name": "外資買賣超", "net": 100}
+                for sid in ["1000", "1001", "1002"]
+            ]
+        )
+        dummy_margin = pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date.today(), "margin_balance": 1000, "short_balance": 100}
+                for sid in ["1000", "1001", "1002"]
+            ]
+        )
+
+        monkeypatch.setattr(
+            scanner, "_load_market_data", lambda: (dummy_price, dummy_inst, dummy_margin, pd.DataFrame())
+        )
+        monkeypatch.setattr(scanner, "_coarse_filter", lambda p, i: dummy_price[["stock_id"]].drop_duplicates())
+
+        # 攔截 sync_broker_for_stocks
+
+        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+        def mock_sync_broker_for_stocks(stock_ids):
+            broker_sync_calls.append(list(stock_ids))
+            return 0
+
+        monkeypatch.setattr("src.data.pipeline.sync_broker_for_stocks", mock_sync_broker_for_stocks, raising=False)
+
+        # patch sync_revenue_for_stocks 和其他 Stage 方法，避免 DB 依賴
+        monkeypatch.setattr("src.data.pipeline.sync_revenue_for_stocks", lambda ids: 0, raising=False)
+        monkeypatch.setattr(scanner, "_load_revenue_data", lambda ids, months=2: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_announcement_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(
+            scanner,
+            "_score_candidates",
+            lambda *a, **kw: pd.DataFrame(
+                {
+                    "stock_id": ["1000"],
+                    "composite_score": [0.8],
+                    "chip_score": [0.7],
+                    "technical_score": [0.7],
+                    "fundamental_score": [0.5],
+                    "news_score": [0.5],
+                    "sector_bonus": [0.0],
+                }
+            ),
+        )
+        monkeypatch.setattr(scanner, "_apply_sector_bonus", lambda df: df)
+        monkeypatch.setattr(scanner, "_apply_risk_filter", lambda df, p: df)
+        monkeypatch.setattr(
+            scanner,
+            "_rank_and_enrich",
+            lambda df: df.assign(
+                close=100.0,
+                stock_name="測試",
+                industry_category="電子",
+                entry_price=None,
+                stop_loss=None,
+                take_profit=None,
+                entry_trigger=None,
+                valid_until=None,
+            ),
+        )
+        monkeypatch.setattr(scanner, "_compute_sector_summary", lambda df: pd.DataFrame())
+
+        # 模擬 Regime 偵測（避免 DB 依賴）
+        import src.regime.detector as regime_module
+
+        monkeypatch.setattr(
+            regime_module.MarketRegimeDetector, "detect", lambda self: {"regime": "bull", "taiex_close": 20000.0}
+        )
+
+        scanner.run()
+
+        # 驗證 sync_broker_for_stocks 被呼叫，且傳入候選股 ID
+        assert len(broker_sync_calls) == 1
+        assert set(broker_sync_calls[0]) == {"1000", "1001", "1002"}

@@ -564,6 +564,22 @@ def sync_broker_trades(
     return total
 
 
+def sync_broker_for_stocks(stock_ids: list[str]) -> int:
+    """為指定股票補抓最新分點交易資料（跳過 DB 已有近期資料的）。
+
+    用於 discover momentum 模式：粗篩後候選股約 150 支，
+    在細評前自動從 FinMind 補抓分點資料，讓籌碼面分點因子能正確評分。
+    使用 days=7 覆蓋 _load_broker_data() 所需的 7 天查詢窗口。
+
+    Args:
+        stock_ids: 要補抓的股票代號清單
+
+    Returns:
+        新增的分點交易筆數
+    """
+    return sync_broker_trades(stock_ids=stock_ids, days=7)
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,
