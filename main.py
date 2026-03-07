@@ -95,6 +95,12 @@ Usage:
     python main.py validate --gap-threshold 3 --streak-threshold 3
     python main.py validate --no-freshness
     python main.py validate --export issues.csv
+
+    # 每日早晨例行流程（一鍵執行）
+    python main.py morning-routine --notify         # 完整流程 + Discord 摘要
+    python main.py morning-routine --skip-sync --notify  # 跳過借券/分點同步（資料已新鮮時）
+    python main.py morning-routine --dry-run        # 預覽步驟與摘要（不實際執行）
+    python main.py morning-routine --top 30 --notify     # discover Top 30
 """
 
 from __future__ import annotations
@@ -2250,6 +2256,241 @@ def cmd_import_data(args: argparse.Namespace) -> None:
         print(f"匯入完成：{count:,} 筆 → {args.table}（重複資料自動略過）")
 
 
+def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
+    """建立早晨例行報告的 Discord 訊息摘要。
+
+    查詢今日 DiscoveryRecord、近3日 Announcement、以及 WatchEntry 狀態，
+    組合成一則 Discord 推播訊息（≤ 1900 字元）。
+    """
+    import datetime
+    from collections import defaultdict
+
+    from sqlalchemy import and_, func, select
+
+    from src.data.database import get_session
+    from src.data.schema import Announcement, DiscoveryRecord, WatchEntry
+
+    lines: list[str] = [f"🌅 **早晨例行報告** ({today_str})", ""]
+    today = datetime.date.fromisoformat(today_str)
+
+    # ── 1. 多模式選股（今日 DiscoveryRecord，出現 2+ 模式）──────────────
+    with get_session() as session:
+        disc_rows = session.execute(
+            select(
+                DiscoveryRecord.stock_id,
+                DiscoveryRecord.stock_name,
+                DiscoveryRecord.mode,
+                DiscoveryRecord.rank,
+            ).where(DiscoveryRecord.scan_date == today)
+        ).all()
+
+    if disc_rows:
+        mode_labels = {"momentum": "動", "swing": "波", "value": "值", "dividend": "息", "growth": "長"}
+        stock_modes: dict = defaultdict(list)
+        stock_names: dict = {}
+        for r in disc_rows:
+            stock_modes[r.stock_id].append((r.mode, r.rank))
+            stock_names[r.stock_id] = r.stock_name or r.stock_id
+
+        multi = {sid: modes for sid, modes in stock_modes.items() if len(modes) >= 2}
+        multi_sorted = sorted(multi.items(), key=lambda x: -len(x[1]))
+
+        if multi_sorted:
+            lines.append(f"📊 **多模式選股** (出現 2+ 模式，共 {len(multi)} 支)")
+            for sid, modes in multi_sorted[:5]:
+                name = str(stock_names.get(sid) or "")[:6]
+                mode_str = " ".join(f"{mode_labels.get(m, '?')}#{r}" for m, r in sorted(modes, key=lambda x: x[1]))
+                lines.append(f"  {'★' * len(modes)} {sid} {name} ({mode_str})")
+            if len(multi) > 5:
+                lines.append(f"  …共 {len(multi)} 支")
+            lines.append("")
+        else:
+            lines.append(
+                f"📊 **多模式選股**：今日無出現 2+ 模式的股票（共掃描 {len(set(r.stock_id for r in disc_rows))} 支）"
+            )
+            lines.append("")
+    else:
+        lines.append("📊 **多模式選股**：今日無掃描記錄（請確認 discover all 是否已執行）")
+        lines.append("")
+
+    # ── 2. 重大事件（近3日，非 general）────────────────────────────────
+    since = today - datetime.timedelta(days=3)
+    alert_rows = []
+    try:
+        with get_session() as session:
+            alert_rows = session.execute(
+                select(
+                    Announcement.date,
+                    Announcement.stock_id,
+                    Announcement.event_type,
+                    Announcement.subject,
+                )
+                .where(and_(Announcement.date >= since, Announcement.event_type != "general"))
+                .order_by(Announcement.date.desc())
+                .limit(10)
+            ).all()
+    except Exception:
+        # event_type 欄位可能尚未 migrate，跳過重大事件區塊
+        pass
+
+    _EVENT_SHORT = {
+        "earnings_call": "📣法說",
+        "investor_day": "🏢投資日",
+        "filing": "📋財報",
+        "revenue": "💰營收",
+    }
+    if alert_rows:
+        lines.append(f"📣 **重大事件** (近3日，{len(alert_rows)} 件)")
+        for r in alert_rows[:4]:
+            label = _EVENT_SHORT.get(r.event_type, r.event_type)
+            subj = str(r.subject or "")[:20]
+            lines.append(f"  {r.date} {r.stock_id} {label} {subj}")
+        if len(alert_rows) > 4:
+            lines.append(f"  …共 {len(alert_rows)} 件")
+        lines.append("")
+
+    # ── 3. 持倉監控狀態 ──────────────────────────────────────────────
+    with get_session() as session:
+        watch_counts: dict[str, int] = {}
+        for st in ("active", "stopped_loss", "taken_profit", "expired"):
+            cnt = session.execute(select(func.count()).select_from(WatchEntry).where(WatchEntry.status == st)).scalar()
+            watch_counts[st] = cnt or 0
+
+    total_watch = sum(watch_counts.values())
+    if total_watch > 0:
+        parts = []
+        if watch_counts["active"]:
+            parts.append(f"監控中 {watch_counts['active']} 支")
+        if watch_counts["stopped_loss"]:
+            parts.append(f"⛔止損 {watch_counts['stopped_loss']} 支")
+        if watch_counts["taken_profit"]:
+            parts.append(f"✅止利 {watch_counts['taken_profit']} 支")
+        if watch_counts["expired"]:
+            parts.append(f"⏰過期 {watch_counts['expired']} 支")
+        lines.append(f"👁 **持倉監控**：{' | '.join(parts)}")
+        lines.append("")
+
+    msg = "\n".join(lines)
+    # Discord 單訊息上限 2000 字元，保留緩衝
+    return msg[:1900] if len(msg) > 1900 else msg
+
+
+def cmd_morning_routine(args: argparse.Namespace) -> None:
+    """每日早晨例行流程。
+
+    依序執行：
+      Step 1  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
+      Step 2  sync-broker         補抓 discover 推薦分點資料（5日）
+      Step 3  discover all        五模式全市場掃描（--skip-sync，不重複同步）
+      Step 4  alert-check         MOPS 重大事件警報（近3日）
+      Step 5  watch update-status 批次更新持倉止損/止利/過期狀態
+      Step 6  revenue-scan        高成長掃描（YoY≥10%，Top 5）
+      最終     Discord 推播綜合摘要（需加 --notify）
+
+    Flags:
+      --dry-run     只顯示步驟與摘要，不執行任何操作
+      --skip-sync   跳過 Step 1–2（借券/分點同步），適合資料已新鮮時使用
+      --top N       discover 的 Top N（預設 20）
+      --notify      執行完畢後推播 Discord 摘要
+    """
+    import datetime
+
+    _init_db()
+
+    dry_run: bool = getattr(args, "dry_run", False)
+    skip_sync: bool = getattr(args, "skip_sync", False)
+    top_n: int = getattr(args, "top", 20)
+    notify: bool = getattr(args, "notify", False)
+
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    TOTAL = 6
+
+    def _step(n: int, title: str) -> None:
+        print(f"\n{'═' * 64}")
+        print(f"  [Step {n}/{TOTAL}] {title}")
+        print(f"{'═' * 64}")
+
+    def _skip(reason: str) -> None:
+        print(f"  >> 跳過（{reason}）")
+
+    # ── Step 1: sync-sbl ─────────────────────────────────────────
+    _step(1, "同步借券賣出資料（sync-sbl --days 3）")
+    if dry_run or skip_sync:
+        _skip("dry-run" if dry_run else "--skip-sync")
+    else:
+        cmd_sync_sbl(argparse.Namespace(days=3))
+
+    # ── Step 2: sync-broker --from-discover ──────────────────────
+    _step(2, "同步分點交易資料（sync-broker --from-discover --days 5）")
+    if dry_run or skip_sync:
+        _skip("dry-run" if dry_run else "--skip-sync")
+    else:
+        cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True))
+
+    # ── Step 3: discover all --skip-sync ─────────────────────────
+    _step(3, f"五模式全市場掃描（discover all --skip-sync --top {top_n}）")
+    if dry_run:
+        _skip("dry-run")
+    else:
+        _cmd_discover_all(
+            argparse.Namespace(
+                skip_sync=True,  # 不重複同步市場資料
+                sync_days=30,
+                top=top_n,
+                min_price=10.0,
+                max_price=None,
+                min_volume=1000,
+                max_stocks=None,
+                min_appearances=1,
+                export=None,
+                notify=False,  # 統一由 morning-routine 推播
+            )
+        )
+
+    # ── Step 4: alert-check --days 3 ─────────────────────────────
+    _step(4, "掃描近期重大事件（alert-check --days 3）")
+    if dry_run:
+        _skip("dry-run")
+    else:
+        cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False))
+
+    # ── Step 5: watch update-status ──────────────────────────────
+    _step(5, "更新持倉狀態（watch update-status）")
+    if dry_run:
+        _skip("dry-run")
+    else:
+        _watch_update_status()
+
+    # ── Step 6: revenue-scan --top 5 ─────────────────────────────
+    _step(6, "高成長掃描（revenue-scan --min-yoy 10 --top 5）")
+    if dry_run:
+        _skip("dry-run")
+    else:
+        cmd_revenue_scan(argparse.Namespace(stocks=None, top=5, min_yoy=10.0, min_margin_improve=0.0, notify=False))
+
+    # ── 完成提示 ─────────────────────────────────────────────────
+    suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""
+    print(f"\n{'═' * 64}")
+    print(f"  [完成] 早晨例行流程完成！{suffix}")
+    print(f"{'═' * 64}\n")
+
+    # ── Discord 摘要推播（或 dry-run 預覽）────────────────────────
+    if notify or dry_run:
+        msg = _build_morning_discord_summary(today_str, top_n)
+        if dry_run:
+            # 使用 UTF-8 輸出，繞過 Windows cp950 對 emoji 的限制
+            print("-- Discord Summary Preview (dry-run) --")
+            sys.stdout.flush()
+            sys.stdout.buffer.write(msg.encode("utf-8"))
+            sys.stdout.buffer.write(b"\n--\n")
+            sys.stdout.buffer.flush()
+        else:
+            from src.notification.line_notify import send_message
+
+            ok = send_message(msg)
+            print(f"Discord 摘要通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
+
+
 def main() -> None:
     setup_logging()
 
@@ -2528,6 +2769,33 @@ def main() -> None:
     # watch update-status
     watch_sub.add_parser("update-status", help="批次更新持倉狀態（比對最新收盤價自動標記止損/止利/過期）")
 
+    # morning-routine 子命令
+    sp_mr = subparsers.add_parser(
+        "morning-routine",
+        help="每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → Discord 摘要）",
+    )
+    sp_mr.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只顯示各步驟與摘要預覽，不實際執行",
+    )
+    sp_mr.add_argument(
+        "--skip-sync",
+        action="store_true",
+        help="跳過 Step 1–2（借券/分點同步），適合資料已是最新時使用",
+    )
+    sp_mr.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        help="discover all 的 Top N（預設 20）",
+    )
+    sp_mr.add_argument(
+        "--notify",
+        action="store_true",
+        help="流程完成後推播 Discord 摘要",
+    )
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -2592,6 +2860,8 @@ def main() -> None:
         cmd_validate(args)
     elif args.command == "suggest":
         cmd_suggest(args)
+    elif args.command == "morning-routine":
+        cmd_morning_routine(args)
     elif args.command == "watch":
         if not args.action:
             sp_watch.print_help()

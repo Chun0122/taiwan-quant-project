@@ -74,6 +74,9 @@ python main.py watch list                    # 列出持倉中的記錄
 python main.py watch list --status all       # 列出全部（含已平倉/止損/止利/過期）
 python main.py watch close 1 --price 595     # 平倉 ID=1 的持倉
 python main.py watch update-status           # 批次更新止損/止利/過期狀態
+python main.py morning-routine --notify      # 每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → Discord 摘要）
+python main.py morning-routine --skip-sync --notify  # 跳過借券/分點同步（資料已新鮮時使用）
+python main.py morning-routine --dry-run     # 預覽步驟與摘要（不實際執行）
 ```
 
 ### 測試
@@ -252,6 +255,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 18 | ✅ | **revenue-scan 高成長掃描命令（P3）** | `_compute_revenue_scan()` 純函數：讀取 MonthlyRevenue（最新月 YoY）+ FinancialStatement（毛利率 QoQ），篩選 YoY ≥ min_yoy 且毛利率改善，revenue_rank = YoY 70% + 毛利率 30%；CLI `revenue-scan`（--stocks / --top / --min-yoy / --min-margin-improve / --notify）；631 測試通過 |
 | 19 | ✅ | **借券賣出整合（P4，TWSE TWT96U）** | 新增 `SecuritiesLending` ORM（schema.py，17 張表）；`fetch_twse_sbl()` 全市場日資料（twse_fetcher.py，免費）；`sync_sbl_all_market(days=3)`（pipeline.py）；`compute_sbl_score()` 純函數 + `_load_sbl_data()` + MomentumScanner 升級為最高 6-factor（外資22%+量比20%+法人20%+券資比13%+大戶15%+借券逆向10%）；CLI `sync-sbl`；649 測試通過 |
 | 20 | ✅ | **分點進出整合（P5，FinMind TaiwanStockTradingDailyReport）** | 新增 `BrokerTrade` ORM（schema.py，18 張表）；`fetch_broker_trades()`（fetcher.py，免費逐股）；`sync_broker_trades(days=5)`（pipeline.py，跳過已有 2 日內資料）；`compute_broker_score()` 純函數計算主力集中度 HHI + 連續進場天數；`_load_broker_data()` + MomentumScanner 升級為最高 7-factor（外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%）；CLI `sync-broker`（含 `--from-discover`）；669 測試通過 |
+| 21 | ✅ | **每日早晨例行流程（morning-routine）** | `cmd_morning_routine()` 依序執行 6 步驟（sync-sbl → sync-broker --from-discover → discover all --skip-sync → alert-check --days 3 → watch update-status → revenue-scan --top 5）；`_build_morning_discord_summary()` 純函數建立 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態）；CLI `morning-routine`（--dry-run / --skip-sync / --top / --notify）；673 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

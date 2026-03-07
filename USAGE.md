@@ -1172,6 +1172,51 @@ python main.py watch update-status
 
 ---
 
+### morning-routine — 每日早晨例行流程
+
+一鍵執行六個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
+
+```bash
+# 完整流程 + Discord 摘要推播
+python main.py morning-routine --notify
+
+# 跳過借券/分點同步（資料已是最新時使用，加快執行）
+python main.py morning-routine --skip-sync --notify
+
+# 預覽各步驟與 Discord 摘要內容（不實際執行）
+python main.py morning-routine --dry-run
+
+# discover 顯示 Top 30（預設 20）
+python main.py morning-routine --top 30 --notify
+```
+
+**六個執行步驟：**
+
+| 步驟 | 動作 | 說明 |
+|------|------|------|
+| Step 1 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
+| Step 2 | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦股票的分點資料 |
+| Step 3 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
+| Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
+| Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
+| Step 6 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
+
+**參數說明：**
+
+| 參數 | 說明 |
+|------|------|
+| `--dry-run` | 只顯示步驟與 Discord 摘要預覽，不實際執行任何操作 |
+| `--skip-sync` | 跳過 Step 1–2（借券/分點同步），適合資料已新鮮時加速執行 |
+| `--top N` | discover all 的 Top N（預設 20） |
+| `--notify` | 執行完畢後推播 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態） |
+
+**Discord 摘要格式：**
+- 📊 多模式選股（出現 2+ 模式的股票，含各模式排名）
+- 📣 重大事件（近3日非一般性公告）
+- 👁 持倉監控（各狀態數量統計）
+
+---
+
 ## 5. 資料庫 Schema
 
 資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表（另含 `stock_valuation` 估值表）：
