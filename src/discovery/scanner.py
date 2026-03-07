@@ -34,6 +34,7 @@ from src.data.schema import (
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
+    SecuritiesLending,
     StockInfo,
     StockValuation,
 )
@@ -136,6 +137,30 @@ def compute_whale_score(df_holding: pd.DataFrame) -> pd.DataFrame:
         whale_latest["whale_change"] = 0.0
 
     return whale_latest[["stock_id", "whale_percent", "whale_change"]]
+
+
+def compute_sbl_score(df_sbl: pd.DataFrame) -> pd.DataFrame:
+    """從最新日借券資料提取 sbl_balance 與 sbl_change（純函數，可獨立測試）。
+
+    借券餘額越低 → 空頭壓力越小 → 後續評分越高（逆向因子）。
+
+    Args:
+        df_sbl: SecuritiesLending 資料，欄位需含
+                [date, stock_id, sbl_balance, sbl_change]
+
+    Returns:
+        DataFrame [stock_id, sbl_balance, sbl_change]（只取最新一日）
+    """
+    if df_sbl.empty:
+        return pd.DataFrame(columns=["stock_id", "sbl_balance", "sbl_change"])
+
+    required = {"date", "stock_id", "sbl_balance", "sbl_change"}
+    if not required.issubset(df_sbl.columns):
+        return pd.DataFrame(columns=["stock_id", "sbl_balance", "sbl_change"])
+
+    latest = df_sbl["date"].max()
+    df = df_sbl[df_sbl["date"] == latest][["stock_id", "sbl_balance", "sbl_change"]].copy()
+    return df.reset_index(drop=True)
 
 
 @dataclass
@@ -1342,11 +1367,12 @@ class MomentumScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股（有資料時）。
+        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股 + 借券（有資料時）。
 
         權重組合（由資料可用性決定）：
-        - 5 因子（含大戶持股）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
-        - 4 因子（含券資比，無大戶）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
+        - 6 因子（含借券）: 外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
+        - 5 因子（含大戶持股，無借券）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
+        - 4 因子（含券資比，無大戶/借券）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
         - 3 因子（基本）: 外資 40% + 量比 30% + 法人 30%
         """
         if df_inst.empty:
@@ -1416,6 +1442,18 @@ class MomentumScanner(MarketScanner):
             # 大戶持股綜合排名：持股比例 60% + 週變化 40%
             whale_rank = whale_pct_rank * 0.60 + whale_chg_rank * 0.40
 
+        # ── 借券賣出因子（空頭壓力逆向評分）────────────────────────
+        df_sbl_raw = self._load_sbl_data(stock_ids)
+        sbl_df = compute_sbl_score(df_sbl_raw)
+        has_sbl = not sbl_df.empty
+        if has_sbl:
+            df = df.merge(sbl_df[["stock_id", "sbl_balance"]], on="stock_id", how="left")
+            df["sbl_balance"] = df["sbl_balance"].fillna(
+                df["sbl_balance"].median() if not df["sbl_balance"].isna().all() else 0.0
+            )
+            # 逆向評分：借券餘額低 → 空頭壓力小 → 評分高
+            sbl_rank = 1.0 - df["sbl_balance"].rank(pct=True)
+
         # ── 融資融券因子 ──────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
@@ -1435,7 +1473,30 @@ class MomentumScanner(MarketScanner):
                 has_margin = False
 
         # ── 加權組合 ─────────────────────────────────────────────────
-        if has_margin and has_whale:
+        if has_sbl and has_margin and has_whale:
+            # 6 因子：外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
+            df["chip_score"] = (
+                consec_rank * 0.22
+                + bvr_rank * 0.20
+                + total_rank * 0.20
+                + smr_rank * 0.13
+                + whale_rank * 0.15
+                + sbl_rank * 0.10
+            )
+        elif has_sbl and has_margin:
+            # 5 因子（有借券、無大戶）：外資 25% + 量比 22% + 法人 22% + 券資比 16% + 借券(逆) 15%
+            df["chip_score"] = (
+                consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.16 + sbl_rank * 0.15
+            )
+        elif has_sbl and has_whale:
+            # 5 因子（有借券、無券資比）：外資 28% + 量比 20% + 法人 20% + 大戶 22% + 借券(逆) 10%
+            df["chip_score"] = (
+                consec_rank * 0.28 + bvr_rank * 0.20 + total_rank * 0.20 + whale_rank * 0.22 + sbl_rank * 0.10
+            )
+        elif has_sbl:
+            # 4 因子（僅借券）：外資 35% + 量比 25% + 法人 25% + 借券(逆) 15%
+            df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + sbl_rank * 0.15
+        elif has_margin and has_whale:
             # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
             df["chip_score"] = (
                 consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.15 + whale_rank * 0.16
@@ -1451,6 +1512,31 @@ class MomentumScanner(MarketScanner):
             df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
 
         return df[["stock_id", "chip_score"]]
+
+    def _load_sbl_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 5 天的借券賣出彙總資料。
+
+        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
+        """
+        cutoff = date.today() - timedelta(days=5)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        SecuritiesLending.stock_id,
+                        SecuritiesLending.date,
+                        SecuritiesLending.sbl_balance,
+                        SecuritiesLending.sbl_change,
+                    ).where(
+                        SecuritiesLending.stock_id.in_(stock_ids),
+                        SecuritiesLending.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "sbl_balance", "sbl_change"])
+        except Exception:
+            return pd.DataFrame()
 
     def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
         """從 DB 載入最近 2 週的大戶持股分級資料。

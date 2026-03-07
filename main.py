@@ -1405,6 +1405,29 @@ def cmd_sync_holding(args: argparse.Namespace) -> None:
         print(f"持股分級資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def cmd_sync_sbl(args: argparse.Namespace) -> None:
+    """同步 TWSE 全市場借券賣出彙總資料（TWT96U）。"""
+    from src.data.pipeline import sync_sbl_all_market
+
+    days = getattr(args, "days", 3)
+    print(f"同步全市場借券賣出資料（最近 {days} 個交易日）...")
+    count = sync_sbl_all_market(days=days)
+    print(f"\n借券資料同步完成: {count:,} 筆")
+
+    if count > 0:
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import SecuritiesLending
+
+        with get_session() as session:
+            total = session.execute(select(func.count()).select_from(SecuritiesLending)).scalar()
+            distinct_stocks = session.execute(select(func.count(func.distinct(SecuritiesLending.stock_id)))).scalar()
+            max_date = session.execute(select(func.max(SecuritiesLending.date))).scalar()
+
+        print(f"借券資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
+
+
 def cmd_alert_check(args: argparse.Namespace) -> None:
     """掃描近期 MOPS 重大事件警報（法說會、財報、高關注公告）。
 
@@ -2379,6 +2402,10 @@ def main() -> None:
     sp_hold.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_hold.add_argument("--weeks", type=int, default=4, help="同步最近幾週（預設 4）")
 
+    # sync-sbl 子命令
+    sp_sbl = subparsers.add_parser("sync-sbl", help="同步全市場借券賣出資料（TWSE TWT96U）")
+    sp_sbl.add_argument("--days", type=int, default=3, help="同步最近幾個交易日（預設 3）")
+
     # alert-check 子命令
     sp_alert = subparsers.add_parser("alert-check", help="掃描近期 MOPS 重大事件警報（法說會/財報/月營收）")
     sp_alert.add_argument("--days", type=int, default=7, help="查詢最近幾天（預設 7）")
@@ -2510,6 +2537,8 @@ def main() -> None:
         cmd_sync_financial(args)
     elif args.command == "sync-holding":
         cmd_sync_holding(args)
+    elif args.command == "sync-sbl":
+        cmd_sync_sbl(args)
     elif args.command == "alert-check":
         cmd_alert_check(args)
     elif args.command == "revenue-scan":

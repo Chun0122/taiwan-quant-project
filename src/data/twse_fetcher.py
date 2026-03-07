@@ -573,6 +573,106 @@ def fetch_market_margin(target_date: date | None = None) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ #
+#  借券賣出彙總（SBL — Securities Borrowing and Lending）
+# ------------------------------------------------------------------ #
+
+
+def fetch_twse_sbl(target_date: date | None = None) -> pd.DataFrame:
+    """抓取 TWSE 全市場借券賣出彙總（日資料，TWT96U）。
+
+    每日一次更新，TWSE 免費開放資料，無需 Token。
+    借券餘額高 → 空頭壓力大，可用作 MomentumScanner 負向因子。
+
+    回傳欄位: date, stock_id, sbl_sell_volume, sbl_balance, sbl_prev_balance, sbl_change
+        - sbl_sell_volume:  當日借券賣出成交量（股）
+        - sbl_balance:      借券餘額（股，當日結算後）
+        - sbl_prev_balance: 前日借券餘額（股）
+        - sbl_change:       借券餘額日變化（sbl_balance - sbl_prev_balance）
+    """
+    if target_date is None:
+        target_date = _find_last_trading_day(date.today())
+
+    date_str = target_date.strftime("%Y%m%d")
+    url = "https://www.twse.com.tw/rwd/zh/sbl/TWT96U"
+    params = {"date": date_str, "response": "json"}
+
+    logger.info("抓取 TWSE 借券賣出彙總 (TWT96U): %s", target_date.isoformat())
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("TWSE 借券賣出請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if data.get("stat") != "OK":
+        logger.warning("TWSE 借券賣出無資料（可能為假日）: %s", data.get("stat", ""))
+        return pd.DataFrame()
+
+    # TWT96U 回傳格式：資料在頂層 data 陣列（非 tables）
+    # 預期欄位順序（TWSE 可能調整，實作時加防護）：
+    # [0] 證券代號  [1] 證券名稱  [2] 當日借券成交量  [3] 次一交易日可回補
+    # [4] 借券餘額  [5] 前日借券餘額
+    raw_data = data.get("data", [])
+
+    # 若資料在 tables 結構中（API 版本差異）則嘗試取得
+    if not raw_data:
+        for table in data.get("tables", []):
+            candidate = table.get("data", [])
+            if candidate:
+                raw_data = candidate
+                break
+
+    if not raw_data:
+        logger.warning("TWSE 借券賣出: 無資料列")
+        return pd.DataFrame()
+
+    # 欄位結構防護：記錄 fields 以便追蹤 API 改版
+    fields = data.get("fields", [])
+    if fields and len(fields) >= 4:
+        logger.debug("TWSE TWT96U fields: %s", fields[:6])
+
+    rows = []
+    for item in raw_data:
+        if len(item) < 5:
+            continue
+
+        stock_id = item[0].strip()
+        # 只保留 4 碼純數字股票
+        if not (stock_id.isdigit() and len(stock_id) == 4):
+            continue
+
+        # 欄位對應（依 TWT96U 標準格式）
+        # item[1] = 證券名稱（跳過）
+        sbl_sell_volume = _parse_number(item[2]) if len(item) > 2 else None  # 當日借券成交量
+        sbl_balance = _parse_number(item[4]) if len(item) > 4 else None  # 借券餘額
+        sbl_prev_balance = _parse_number(item[5]) if len(item) > 5 else None  # 前日借券餘額
+
+        # 計算日變化
+        if sbl_balance is not None and sbl_prev_balance is not None:
+            sbl_change = int(sbl_balance) - int(sbl_prev_balance)
+        else:
+            sbl_change = None
+
+        rows.append(
+            {
+                "date": target_date,
+                "stock_id": stock_id,
+                "sbl_sell_volume": int(sbl_sell_volume) if sbl_sell_volume is not None else None,
+                "sbl_balance": int(sbl_balance) if sbl_balance is not None else None,
+                "sbl_prev_balance": int(sbl_prev_balance) if sbl_prev_balance is not None else None,
+                "sbl_change": sbl_change,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.info("TWSE 借券賣出: %d 支股票", len(df))
+    time.sleep(_REQUEST_DELAY)
+    return df
+
+
+# ------------------------------------------------------------------ #
 #  整合：全市場 (TWSE + TPEX)
 # ------------------------------------------------------------------ #
 

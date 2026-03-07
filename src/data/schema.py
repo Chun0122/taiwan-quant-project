@@ -250,6 +250,28 @@ class HoldingDistribution(Base):
         return f"<HoldingDist {self.stock_id} {self.date} {self.level} {self.percent:.2f}%>"
 
 
+class SecuritiesLending(Base):
+    """借券賣出彙總（日資料，TWSE TWT96U）。
+
+    來源：TWSE 官方開放資料（免費）。
+    每日更新，借券餘額高代表空頭壓力大，用於 MomentumScanner 負向因子。
+    """
+
+    __tablename__ = "securities_lending"
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_securities_lending"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    sbl_sell_volume: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 當日借券賣出成交量（股）
+    sbl_balance: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 借券餘額（股）
+    sbl_prev_balance: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 前日借券餘額（股）
+    sbl_change: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # 餘額日變化（正 = 增空壓力）
+
+    def __repr__(self) -> str:
+        return f"<SecuritiesLending {self.stock_id} {self.date} bal={self.sbl_balance}>"
+
+
 class BacktestResult(Base):
     """回測結果摘要。"""
 

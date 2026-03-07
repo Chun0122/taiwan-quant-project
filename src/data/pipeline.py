@@ -24,6 +24,7 @@ from src.data.schema import (
     MonthlyRevenue,
     PortfolioBacktestResult,
     PortfolioTrade,
+    SecuritiesLending,
     StockInfo,
     StockValuation,
     TechnicalIndicator,
@@ -99,6 +100,11 @@ def _upsert_dividend(df: pd.DataFrame) -> int:
 def _upsert_valuation(df: pd.DataFrame) -> int:
     """將估值 DataFrame 寫入 stock_valuation 表。"""
     return _upsert_batch(StockValuation, df, ["stock_id", "date"])
+
+
+def _upsert_sbl(df: pd.DataFrame) -> int:
+    """將借券賣出 DataFrame 寫入 securities_lending 表。"""
+    return _upsert_batch(SecuritiesLending, df, ["stock_id", "date"])
 
 
 def _upsert_announcement(df: pd.DataFrame) -> int:
@@ -458,6 +464,50 @@ def sync_valuation_all_market() -> int:
     n = _upsert_valuation(df)
     logger.info("[全市場估值] 寫入 %d 筆估值資料", n)
     return n
+
+
+def sync_sbl_all_market(days: int = 3) -> int:
+    """從 TWSE 同步全市場借券賣出彙總（日資料，TWT96U）。
+
+    最近 days 個交易日逐日抓取，若 DB 當日已有 >= 500 筆則跳過。
+
+    Args:
+        days: 同步最近幾個交易日（預設 3）
+
+    Returns:
+        新增的借券筆數
+    """
+    from src.data.twse_fetcher import _find_last_trading_day, fetch_twse_sbl
+
+    init_db()
+    total = 0
+    target = _find_last_trading_day(date.today())
+
+    for i in range(days):
+        d = target - timedelta(days=i)
+        # 跳過週末
+        if d.weekday() >= 5:
+            continue
+
+        with get_session() as session:
+            count = session.execute(
+                select(func.count()).select_from(SecuritiesLending).where(SecuritiesLending.date == d)
+            ).scalar()
+
+        if count and count >= 500:
+            logger.info("[全市場借券] %s 已有 %d 筆（跳過）", d.isoformat(), count)
+            continue
+
+        df = fetch_twse_sbl(d)
+        if df.empty:
+            logger.warning("[全市場借券] %s 無資料", d.isoformat())
+            continue
+
+        n = _upsert_sbl(df)
+        logger.info("[全市場借券] %s 寫入 %d 筆", d.isoformat(), n)
+        total += n
+
+    return total
 
 
 def sync_stock(
