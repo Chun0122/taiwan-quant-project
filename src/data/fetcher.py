@@ -10,6 +10,7 @@
 - TaiwanStockFinancialStatements:              綜合損益表
 - TaiwanStockBalanceSheet:                     資產負債表
 - TaiwanStockCashFlowsStatement:               現金流量表
+- TaiwanStockHoldingSharesPer:                 大戶持股分級（週資料）
 """
 
 from __future__ import annotations
@@ -314,6 +315,34 @@ class FinMindFetcher(DataFetcher):
             df["year"] = df["year"].astype(str)
             # 將 'nan' 字符串或空字符串替換為 None（保持 nullable=False 的資料品質）
             df.loc[df["year"].isin(["nan", ""]), "year"] = None
+        return df
+
+    def fetch_holding_distribution(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
+        """抓取大戶持股分級資料（週資料）。
+
+        來源：FinMind TaiwanStockHoldingSharesPer
+        回傳欄位: date, stock_id, level, count, percent
+        大戶定義：持股區間下限 >= 400,000 股（約 400 張）。
+        """
+        if end is None:
+            end = date.today().isoformat()
+
+        df = self._request("TaiwanStockHoldingSharesPer", stock_id, start, end)
+        if df.empty:
+            return df
+
+        rename_map = {
+            "HoldingSharesLevel": "level",
+            "HoldingSharesCount": "count",
+            "HoldingSharesPercent": "percent",
+        }
+        df = df.rename(columns=rename_map)
+
+        keep = ["date", "stock_id", "level", "count", "percent"]
+        df = df[[c for c in keep if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0).astype(int)
+        df["percent"] = pd.to_numeric(df["percent"], errors="coerce").fillna(0.0)
         return df
 
     def fetch_all_daily_price(self, start: str, end: str | None = None) -> pd.DataFrame:

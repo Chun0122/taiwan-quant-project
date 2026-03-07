@@ -1,7 +1,7 @@
 """MOPS 公開資訊觀測站抓取器。
 
 功能：
-- 每日重大訊息公告（消息面評分）
+- 每日重大訊息公告（消息面評分 + 事件類型分類）
 - 全市場月營收（GrowthScanner 粗篩）
 
 資料來源：
@@ -54,6 +54,10 @@ _POSITIVE_KEYWORDS = [
     "處分不動產",
     "處分有價證券",
     "處分資產",
+    # 法說會 / 財報相關（與機構投資人溝通，正面意涵）
+    "法說會",
+    "投資人日",
+    "法人說明會",
 ]
 
 _NEGATIVE_KEYWORDS = [
@@ -78,6 +82,45 @@ _NEGATIVE_KEYWORDS = [
     "糾正",
     "現金增資",
     "警示",
+]
+
+# --- 事件類型分類關鍵字 --- #
+# 優先序：earnings_call → investor_day → filing → revenue → general
+
+_EVENT_EARNINGS_CALL = [
+    "法說會",
+    "法人說明會",
+    "業績說明會",
+    "分析師說明會",
+]
+
+_EVENT_INVESTOR_DAY = [
+    "投資人日",
+    "Investor Day",
+    "investor day",
+    "股東說明會",
+    "股東會",
+]
+
+_EVENT_FILING = [
+    "年報",
+    "季報",
+    "半年報",
+    "財務報告",
+    "財報",
+    "EPS",
+    "每股盈餘",
+    "Q1財報",
+    "Q2財報",
+    "Q3財報",
+    "Q4財報",
+]
+
+_EVENT_REVENUE = [
+    "月營收",
+    "營收",
+    "合併營收",
+    "自結營收",
 ]
 
 
@@ -107,6 +150,44 @@ def classify_sentiment(subject: str) -> int:
             return 1
 
     return 0
+
+
+def classify_event_type(subject: str) -> str:
+    """依公告主旨關鍵字分類事件類型。
+
+    優先序：earnings_call → investor_day → filing → revenue → general
+
+    Args:
+        subject: 公告主旨文字
+
+    Returns:
+        事件類型字串：
+        - "earnings_call"  法說會 / 法人說明會
+        - "investor_day"   投資人日 / 股東說明會
+        - "filing"         年報 / 季報 / 財務報告 / EPS
+        - "revenue"        月營收
+        - "general"        一般公告
+    """
+    if not subject:
+        return "general"
+
+    for kw in _EVENT_EARNINGS_CALL:
+        if kw in subject:
+            return "earnings_call"
+
+    for kw in _EVENT_INVESTOR_DAY:
+        if kw in subject:
+            return "investor_day"
+
+    for kw in _EVENT_FILING:
+        if kw in subject:
+            return "filing"
+
+    for kw in _EVENT_REVENUE:
+        if kw in subject:
+            return "revenue"
+
+    return "general"
 
 
 def _find_last_trading_day(target: date, max_lookback: int = 7) -> date:
@@ -265,6 +346,7 @@ def _parse_announcement_html(html: str) -> list[dict]:
                     "subject": subject,
                     "spoke_time": spoke_time,
                     "sentiment": classify_sentiment(subject),
+                    "event_type": classify_event_type(subject),
                 }
             )
 

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -29,6 +30,7 @@ from src.data.database import get_session
 from src.data.schema import (
     Announcement,
     DailyPrice,
+    HoldingDistribution,
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
@@ -69,6 +71,71 @@ def _calc_atr14(stock_data: pd.DataFrame) -> float:
         return 0.0
 
     return float(np.mean(trs[-14:]))
+
+
+def _extract_level_lower_bound(level: str) -> int:
+    """從持股分級字串中提取下限股數。
+
+    範例：
+      "400,001-600,000 Shares" → 400001
+      "over 1,000,000"         → 1000000
+      "1-999 shares"           → 1
+    """
+    nums = re.findall(r"\d+", level.replace(",", ""))
+    return int(nums[0]) if nums else 0
+
+
+def compute_whale_score(df_holding: pd.DataFrame) -> pd.DataFrame:
+    """計算大戶持股集中度分數（純函數，可獨立測試）。
+
+    大戶定義：持股區間下限 >= 400,000 股（約 400 張）。
+
+    Args:
+        df_holding: HoldingDistribution 資料，欄位需包含
+                    [date, stock_id, level, percent]
+
+    Returns:
+        DataFrame 包含欄位 [stock_id, whale_percent, whale_change]
+        - whale_percent: 最新週大戶持股比例 (%)
+        - whale_change:  與前一週的差值（正值 = 大戶增持）
+    """
+    if df_holding.empty:
+        return pd.DataFrame(columns=["stock_id", "whale_percent", "whale_change"])
+
+    df = df_holding.copy()
+    df["_lower"] = df["level"].apply(_extract_level_lower_bound)
+    df["is_whale"] = df["_lower"] >= 400_000
+
+    dates = sorted(df["date"].unique())
+    if not dates:
+        return pd.DataFrame(columns=["stock_id", "whale_percent", "whale_change"])
+
+    latest_date = dates[-1]
+    df_latest = df[df["date"] == latest_date]
+
+    whale_latest = (
+        df_latest.groupby("stock_id")
+        .apply(lambda g: g.loc[g["is_whale"], "percent"].sum(), include_groups=False)
+        .reset_index()
+    )
+    whale_latest.columns = ["stock_id", "whale_percent"]
+
+    # 週環比變化（大戶增持 = 正訊號）
+    if len(dates) >= 2:
+        prev_date = dates[-2]
+        df_prev = df[df["date"] == prev_date]
+        whale_prev = (
+            df_prev.groupby("stock_id")
+            .apply(lambda g: g.loc[g["is_whale"], "percent"].sum(), include_groups=False)
+            .reset_index()
+        )
+        whale_prev.columns = ["stock_id", "whale_prev_percent"]
+        whale_latest = whale_latest.merge(whale_prev, on="stock_id", how="left")
+        whale_latest["whale_change"] = whale_latest["whale_percent"] - whale_latest["whale_prev_percent"].fillna(0.0)
+    else:
+        whale_latest["whale_change"] = 0.0
+
+    return whale_latest[["stock_id", "whale_percent", "whale_change"]]
 
 
 @dataclass
@@ -1275,7 +1342,13 @@ class MomentumScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比（有資料時）。"""
+        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股（有資料時）。
+
+        權重組合（由資料可用性決定）：
+        - 5 因子（含大戶持股）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
+        - 4 因子（含券資比，無大戶）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
+        - 3 因子（基本）: 外資 40% + 量比 30% + 法人 30%
+        """
         if df_inst.empty:
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
 
@@ -1328,10 +1401,24 @@ class MomentumScanner(MarketScanner):
         bvr_rank = df["buy_vol_ratio"].rank(pct=True)
         total_rank = df["total_net"].rank(pct=True)
 
-        # 有融資融券資料時加入券資比因子（4 因子加權），否則 3 因子
+        # ── 大戶持股因子（從 DB 查詢最近 2 週資料）──────────────────
+        df_whale = self._load_holding_data(stock_ids)
+        whale_df = compute_whale_score(df_whale)
+        has_whale = not whale_df.empty
+        if has_whale:
+            df = df.merge(whale_df, on="stock_id", how="left")
+            df["whale_percent"] = df["whale_percent"].fillna(
+                df["whale_percent"].median() if not df["whale_percent"].isna().all() else 0.0
+            )
+            df["whale_change"] = df["whale_change"].fillna(0.0)
+            whale_pct_rank = df["whale_percent"].rank(pct=True)
+            whale_chg_rank = df["whale_change"].rank(pct=True)
+            # 大戶持股綜合排名：持股比例 60% + 週變化 40%
+            whale_rank = whale_pct_rank * 0.60 + whale_chg_rank * 0.40
+
+        # ── 融資融券因子 ──────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
-            # 券資比 = short_balance / margin_balance（越高代表看空情緒越重）
             margin_latest = df_margin[df_margin["date"] == df_margin["date"].max()]
             margin_data = margin_latest[margin_latest["stock_id"].isin(stock_ids)][
                 ["stock_id", "margin_balance", "short_balance"]
@@ -1344,16 +1431,51 @@ class MomentumScanner(MarketScanner):
                 df = df.merge(margin_data[["stock_id", "short_margin_ratio"]], on="stock_id", how="left")
                 df["short_margin_ratio"] = df["short_margin_ratio"].fillna(0.0)
                 smr_rank = df["short_margin_ratio"].rank(pct=True)
-                # 外資連續 30% + 買超佔量比 25% + 三大法人合計 25% + 券資比 20%
-                df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
             else:
                 has_margin = False
 
-        if not has_margin:
-            # 外資連續買超 40% + 買超佔量比 30% + 三大法人合計 30%
+        # ── 加權組合 ─────────────────────────────────────────────────
+        if has_margin and has_whale:
+            # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
+            df["chip_score"] = (
+                consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.15 + whale_rank * 0.16
+            )
+        elif has_margin:
+            # 4 因子：外資 30% + 量比 25% + 法人 25% + 券資比 20%
+            df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
+        elif has_whale:
+            # 4 因子：外資 35% + 量比 25% + 法人 25% + 大戶 15%
+            df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + whale_rank * 0.15
+        else:
+            # 3 因子：外資 40% + 量比 30% + 法人 30%
             df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
 
         return df[["stock_id", "chip_score"]]
+
+    def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 2 週的大戶持股分級資料。
+
+        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
+        """
+        cutoff = date.today() - timedelta(days=21)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        HoldingDistribution.stock_id,
+                        HoldingDistribution.date,
+                        HoldingDistribution.level,
+                        HoldingDistribution.percent,
+                    ).where(
+                        HoldingDistribution.stock_id.in_(stock_ids),
+                        HoldingDistribution.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "level", "percent"])
+        except Exception:
+            return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
         """動能模式基本面：僅做過濾 — YoY > 0 加分(0.7)，≤ 0 中性(0.3)，無資料 fallback 0.5。"""
@@ -1586,7 +1708,12 @@ class SwingScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """波段模式籌碼面 2 因子：投信淨買超 50% + 三大法人 20 日累積買超 50%。"""
+        """波段模式籌碼面：投信淨買超 + 三大法人 20 日累積買超 + 大戶持股（有資料時）。
+
+        權重組合：
+        - 3 因子（含大戶）: 投信 40% + 累積 40% + 大戶 20%
+        - 2 因子（基本）:   投信 50% + 累積 50%
+        """
         if df_inst.empty:
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
 
@@ -1619,10 +1746,50 @@ class SwingScanner(MarketScanner):
         trust_rank = df["trust_net"].rank(pct=True)
         cum_rank = df["cum_20_net"].rank(pct=True)
 
-        # 投信 50% + 累積買超 50%
-        df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
+        # ── 大戶持股因子 ──────────────────────────────────────────────
+        df_whale = self._load_holding_data(stock_ids)
+        whale_df = compute_whale_score(df_whale)
+        has_whale = not whale_df.empty
+        if has_whale:
+            df = df.merge(whale_df, on="stock_id", how="left")
+            df["whale_percent"] = df["whale_percent"].fillna(
+                df["whale_percent"].median() if not df["whale_percent"].isna().all() else 0.0
+            )
+            df["whale_change"] = df["whale_change"].fillna(0.0)
+            whale_pct_rank = df["whale_percent"].rank(pct=True)
+            whale_chg_rank = df["whale_change"].rank(pct=True)
+            whale_rank = whale_pct_rank * 0.60 + whale_chg_rank * 0.40
+
+        if has_whale:
+            # 3 因子：投信 40% + 累積 40% + 大戶 20%
+            df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + whale_rank * 0.20
+        else:
+            # 2 因子：投信 50% + 累積 50%
+            df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
 
         return df[["stock_id", "chip_score"]]
+
+    def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 2 週的大戶持股分級資料（波段模式）。"""
+        cutoff = date.today() - timedelta(days=21)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        HoldingDistribution.stock_id,
+                        HoldingDistribution.date,
+                        HoldingDistribution.level,
+                        HoldingDistribution.percent,
+                    ).where(
+                        HoldingDistribution.stock_id.in_(stock_ids),
+                        HoldingDistribution.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "level", "percent"])
+        except Exception:
+            return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
         """波段模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%（排名百分位）。"""

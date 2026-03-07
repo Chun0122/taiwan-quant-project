@@ -1381,6 +1381,255 @@ def cmd_sync_financial(args: argparse.Namespace) -> None:
         print(f"財報資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def cmd_sync_holding(args: argparse.Namespace) -> None:
+    """同步 watchlist 大戶持股分級資料（週資料，FinMind TaiwanStockHoldingSharesPer）。"""
+    from src.data.pipeline import sync_holding_distribution
+
+    stocks = args.stocks if args.stocks else None
+    weeks = getattr(args, "weeks", 4)
+    print(f"同步大戶持股分級資料（最近 {weeks} 週）...")
+    count = sync_holding_distribution(watchlist=stocks, weeks=weeks)
+    print(f"\n持股分級同步完成: {count:,} 筆")
+
+    if count > 0:
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import HoldingDistribution
+
+        with get_session() as session:
+            total = session.execute(select(func.count()).select_from(HoldingDistribution)).scalar()
+            distinct_stocks = session.execute(select(func.count(func.distinct(HoldingDistribution.stock_id)))).scalar()
+            max_date = session.execute(select(func.max(HoldingDistribution.date))).scalar()
+
+        print(f"持股分級資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
+
+
+def cmd_alert_check(args: argparse.Namespace) -> None:
+    """掃描近期 MOPS 重大事件警報（法說會、財報、高關注公告）。
+
+    查詢 Announcement 表，篩選指定天數內的非一般性事件，
+    以事件類型分組顯示，並可選擇推播 Discord。
+    """
+    from sqlalchemy import and_, select
+
+    from src.data.database import get_session, init_db
+    from src.data.schema import Announcement
+
+    _init_db()
+    init_db()
+
+    days = getattr(args, "days", 7)
+    event_types = getattr(args, "types", None)  # None = 顯示全部非 general
+    stocks = getattr(args, "stocks", None)
+    notify = getattr(args, "notify", False)
+
+    from datetime import date, timedelta
+
+    since = date.today() - timedelta(days=days)
+
+    with get_session() as session:
+        conditions = [Announcement.date >= since]
+        if event_types:
+            conditions.append(Announcement.event_type.in_(event_types))
+        else:
+            conditions.append(Announcement.event_type != "general")
+        if stocks:
+            conditions.append(Announcement.stock_id.in_(stocks))
+
+        rows = session.execute(
+            select(
+                Announcement.date,
+                Announcement.stock_id,
+                Announcement.event_type,
+                Announcement.sentiment,
+                Announcement.subject,
+            )
+            .where(and_(*conditions))
+            .order_by(Announcement.date.desc(), Announcement.event_type)
+        ).all()
+
+    if not rows:
+        print(f"最近 {days} 天內無特殊事件公告")
+        return
+
+    # 分類顯示
+    _EVENT_LABELS = {
+        "earnings_call": "📣 法說會",
+        "investor_day": "🏢 投資人日",
+        "filing": "📋 財報發布",
+        "revenue": "💰 營收公告",
+        "general": "📰 一般公告",
+    }
+    _SENTIMENT_LABELS = {1: "▲", 0: "─", -1: "▼"}
+
+    print(f"\n=== MOPS 重大事件警報（近 {days} 天）共 {len(rows)} 筆 ===\n")
+    current_type = None
+    lines = []
+    for row in rows:
+        if row.event_type != current_type:
+            current_type = row.event_type
+            label = _EVENT_LABELS.get(current_type, current_type)
+            print(f"【{label}】")
+            lines.append(f"【{label}】")
+        sentiment_sym = _SENTIMENT_LABELS.get(row.sentiment, "─")
+        line = f"  {row.date} [{row.stock_id}] {sentiment_sym} {row.subject[:60]}"
+        print(line)
+        lines.append(line)
+
+    if notify:
+        from src.notification.line_notify import send_message
+
+        msg = f"📡 MOPS 事件警報（近 {days} 天，共 {len(rows)} 筆）\n" + "\n".join(lines[:40])
+        ok = send_message(msg)
+        print(f"\nDiscord 通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
+
+
+def _compute_revenue_scan(
+    watchlist: list[str],
+    min_yoy: float,
+    min_margin_improve: float,
+) -> "pd.DataFrame":
+    """掃描 watchlist 中 YoY 高成長 + 毛利率改善的個股（純函數）。
+
+    Args:
+        watchlist:           要掃描的股票代號清單
+        min_yoy:             最低 YoY 門檻（%，例 10.0）
+        min_margin_improve:  毛利率 QoQ 最低改善幅度（百分點，例 0.0 = 正向即可）
+
+    Returns:
+        DataFrame 含欄位：stock_id, yoy_growth, mom_growth, gross_margin,
+                          margin_change, revenue_rank
+    """
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import FinancialStatement, MonthlyRevenue
+
+    # ── 月營收（取每支股票最新一筆）──────────────────────────────────
+    with get_session() as session:
+        rev_rows = session.execute(
+            select(
+                MonthlyRevenue.stock_id,
+                MonthlyRevenue.date,
+                MonthlyRevenue.revenue,
+                MonthlyRevenue.yoy_growth,
+                MonthlyRevenue.mom_growth,
+            ).where(MonthlyRevenue.stock_id.in_(watchlist))
+        ).all()
+
+    if not rev_rows:
+        return pd.DataFrame()
+
+    df_rev = pd.DataFrame(rev_rows, columns=["stock_id", "date", "revenue", "yoy_growth", "mom_growth"])
+    # 每支股票只取最新一筆
+    df_rev = df_rev.sort_values("date").groupby("stock_id", sort=False).last().reset_index()
+
+    # ── 財報毛利率（取最新兩季，計算 QoQ 趨勢）─────────────────────
+    with get_session() as session:
+        fin_rows = session.execute(
+            select(
+                FinancialStatement.stock_id,
+                FinancialStatement.date,
+                FinancialStatement.gross_margin,
+            )
+            .where(FinancialStatement.stock_id.in_(watchlist))
+            .order_by(FinancialStatement.stock_id, FinancialStatement.date.desc())
+        ).all()
+
+    df_fin = pd.DataFrame(fin_rows, columns=["stock_id", "date", "gross_margin"])
+    df_fin = df_fin.dropna(subset=["gross_margin"])
+
+    # 計算毛利率 QoQ 變化（最新季 - 前一季）
+    margin_rows = []
+    for sid, grp in df_fin.groupby("stock_id", sort=False):
+        grp = grp.sort_values("date", ascending=False)
+        latest_gm = grp["gross_margin"].iloc[0] if len(grp) >= 1 else None
+        prev_gm = grp["gross_margin"].iloc[1] if len(grp) >= 2 else None
+        margin_change = (latest_gm - prev_gm) if (latest_gm is not None and prev_gm is not None) else None
+        margin_rows.append({"stock_id": sid, "gross_margin": latest_gm, "margin_change": margin_change})
+
+    df_margin = (
+        pd.DataFrame(margin_rows)
+        if margin_rows
+        else pd.DataFrame(columns=["stock_id", "gross_margin", "margin_change"])
+    )
+
+    # ── 合併 + 篩選 ───────────────────────────────────────────────────
+    df = df_rev.merge(df_margin, on="stock_id", how="left")
+    df["yoy_growth"] = pd.to_numeric(df["yoy_growth"], errors="coerce")
+    df["mom_growth"] = pd.to_numeric(df["mom_growth"], errors="coerce")
+
+    # 條件篩選
+    mask = df["yoy_growth"] >= min_yoy
+    if min_margin_improve is not None:
+        mask_margin = df["margin_change"].isna() | (df["margin_change"] >= min_margin_improve)
+        mask = mask & mask_margin
+
+    df = df[mask].copy()
+    if df.empty:
+        return df
+
+    # 排名分數：YoY 70% + 毛利率改善 30%
+    df["yoy_rank"] = df["yoy_growth"].rank(pct=True)
+    df["margin_rank"] = df["margin_change"].fillna(0).rank(pct=True)
+    df["revenue_rank"] = df["yoy_rank"] * 0.70 + df["margin_rank"] * 0.30
+    df = df.sort_values("revenue_rank", ascending=False)
+
+    return df[["stock_id", "yoy_growth", "mom_growth", "gross_margin", "margin_change", "revenue_rank"]]
+
+
+def cmd_revenue_scan(args: argparse.Namespace) -> None:
+    """掃描 watchlist 中 YoY 高成長 + 毛利率改善的個股。
+
+    資料直接從 DB 讀取（需先執行 sync-revenue + sync-financial）。
+    """
+    import pandas as pd
+
+    from src.config import settings
+
+    _init_db()
+
+    watchlist = args.stocks if args.stocks else settings.fetcher.watchlist
+    top_n = getattr(args, "top", 20)
+    min_yoy = getattr(args, "min_yoy", 10.0)
+    min_margin = getattr(args, "min_margin_improve", 0.0)
+    notify = getattr(args, "notify", False)
+
+    print(f"掃描 {len(watchlist)} 支股票（YoY ≥ {min_yoy}%，毛利率 QoQ ≥ {min_margin:.1f} pp）...")
+
+    df = _compute_revenue_scan(watchlist, min_yoy=min_yoy, min_margin_improve=min_margin)
+
+    if df.empty:
+        print("無符合條件的個股")
+        return
+
+    df_show = df.head(top_n).copy()
+    print(f"\n=== 營收成長掃描結果 Top {min(top_n, len(df_show))} ===\n")
+    print(f"{'排名':>4}  {'股票':>6}  {'YoY%':>7}  {'MoM%':>7}  {'毛利率%':>8}  {'毛利率 QoQ':>10}")
+    print("-" * 55)
+    for rank, (_, row) in enumerate(df_show.iterrows(), 1):
+        yoy = f"{row['yoy_growth']:+.1f}%" if pd.notna(row["yoy_growth"]) else "  N/A "
+        mom = f"{row['mom_growth']:+.1f}%" if pd.notna(row["mom_growth"]) else "  N/A "
+        gm = f"{row['gross_margin']:.1f}%" if pd.notna(row["gross_margin"]) else "  N/A "
+        mc = f"{row['margin_change']:+.1f}pp" if pd.notna(row["margin_change"]) else "   N/A  "
+        print(f"{rank:>4}  {row['stock_id']:>6}  {yoy:>7}  {mom:>7}  {gm:>8}  {mc:>10}")
+
+    print(f"\n共 {len(df)} 支符合條件（{len(watchlist)} 支中）")
+
+    if notify:
+        from src.notification.line_notify import send_message
+
+        lines = [f"📈 營收成長掃描（YoY≥{min_yoy:.0f}%，共 {len(df)} 支）"]
+        for rank, (_, row) in enumerate(df_show.iterrows(), 1):
+            yoy = f"{row['yoy_growth']:+.1f}%" if pd.notna(row["yoy_growth"]) else "N/A"
+            mc = f"{row['margin_change']:+.1f}pp" if pd.notna(row["margin_change"]) else "N/A"
+            lines.append(f"#{rank} {row['stock_id']} YoY={yoy} 毛利率QoQ={mc}")
+        ok = send_message("\n".join(lines[:30]))
+        print(f"\nDiscord 通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -2125,6 +2374,31 @@ def main() -> None:
     sp_fin.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_fin.add_argument("--quarters", type=int, default=4, help="同步最近幾季（預設 4）")
 
+    # sync-holding 子命令
+    sp_hold = subparsers.add_parser("sync-holding", help="同步大戶持股分級資料（週資料）")
+    sp_hold.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_hold.add_argument("--weeks", type=int, default=4, help="同步最近幾週（預設 4）")
+
+    # alert-check 子命令
+    sp_alert = subparsers.add_parser("alert-check", help="掃描近期 MOPS 重大事件警報（法說會/財報/月營收）")
+    sp_alert.add_argument("--days", type=int, default=7, help="查詢最近幾天（預設 7）")
+    sp_alert.add_argument(
+        "--types",
+        nargs="+",
+        choices=["earnings_call", "investor_day", "filing", "revenue"],
+        help="篩選事件類型（預設全部）",
+    )
+    sp_alert.add_argument("--stocks", nargs="+", help="指定股票代號（預設全部）")
+    sp_alert.add_argument("--notify", action="store_true", help="推播 Discord")
+
+    # revenue-scan 子命令
+    sp_rscan = subparsers.add_parser("revenue-scan", help="掃描 watchlist 營收高成長 + 毛利率改善個股")
+    sp_rscan.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
+    sp_rscan.add_argument("--top", type=int, default=20, help="顯示前 N 支（預設 20）")
+    sp_rscan.add_argument("--min-yoy", type=float, default=10.0, help="最低 YoY 門檻 %%（預設 10.0）")
+    sp_rscan.add_argument("--min-margin-improve", type=float, default=0.0, help="毛利率 QoQ 最低改善 pp（預設 0.0）")
+    sp_rscan.add_argument("--notify", action="store_true", help="推播 Discord")
+
     # validate 子命令
     sp_val = subparsers.add_parser("validate", help="資料品質檢查（缺漏、異常值、新鮮度）")
     sp_val.add_argument("--stocks", nargs="+", help="指定股票代號（預設檢查全部）")
@@ -2234,6 +2508,12 @@ def main() -> None:
         cmd_sync_revenue(args)
     elif args.command == "sync-financial":
         cmd_sync_financial(args)
+    elif args.command == "sync-holding":
+        cmd_sync_holding(args)
+    elif args.command == "alert-check":
+        cmd_alert_check(args)
+    elif args.command == "revenue-scan":
+        cmd_revenue_scan(args)
     elif args.command == "migrate":
         cmd_migrate(args)
     elif args.command == "export":

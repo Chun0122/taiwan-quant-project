@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十五張核心表：
+十六張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -10,6 +10,7 @@
 - TechnicalIndicator:      技術指標（EAV 長表）
 - Announcement:            MOPS 重大訊息公告
 - FinancialStatement:      季報財務資料（損益表+資產負債表+現金流量表）
+- HoldingDistribution:     大戶持股分級（週資料，FinMind TaiwanStockHoldingSharesPer）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類）
@@ -173,9 +174,12 @@ class Announcement(Base):
     subject: Mapped[str] = mapped_column(String(500), nullable=False)  # 公告主旨
     spoke_time: Mapped[str | None] = mapped_column(String(10), nullable=True)  # 發言時間
     sentiment: Mapped[int] = mapped_column(Integer, default=0)  # +1 正面 / 0 中性 / -1 負面
+    event_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="general"
+    )  # earnings_call / investor_day / filing / revenue / general
 
     def __repr__(self) -> str:
-        return f"<Announcement {self.stock_id} {self.date} seq={self.seq}>"
+        return f"<Announcement {self.stock_id} {self.date} seq={self.seq} [{self.event_type}]>"
 
 
 class FinancialStatement(Base):
@@ -222,6 +226,28 @@ class FinancialStatement(Base):
 
     def __repr__(self) -> str:
         return f"<FinancialStatement {self.stock_id} {self.date} Q{self.quarter} EPS={self.eps}>"
+
+
+class HoldingDistribution(Base):
+    """大戶持股分級資料（週資料）。
+
+    來源：FinMind API（TaiwanStockHoldingSharesPer）。
+    每週一次，記錄各持股區間的持有人數與持股比例。
+    大戶定義：持股區間下限 >= 400,000 股（約 400 張）。
+    """
+
+    __tablename__ = "holding_distribution"
+    __table_args__ = (UniqueConstraint("stock_id", "date", "level", name="uq_holding_dist"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)  # 週資料日期
+    level: Mapped[str] = mapped_column(String(80), nullable=False)  # 持股分級區間描述
+    count: Mapped[int] = mapped_column(Integer, nullable=False)  # 持有人數
+    percent: Mapped[float] = mapped_column(Float, nullable=False)  # 持股比例 (%)
+
+    def __repr__(self) -> str:
+        return f"<HoldingDist {self.stock_id} {self.date} {self.level} {self.percent:.2f}%>"
 
 
 class BacktestResult(Base):

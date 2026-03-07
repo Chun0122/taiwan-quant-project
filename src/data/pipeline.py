@@ -18,6 +18,7 @@ from src.data.schema import (
     DailyPrice,
     Dividend,
     FinancialStatement,
+    HoldingDistribution,
     InstitutionalInvestor,
     MarginTrading,
     MonthlyRevenue,
@@ -254,6 +255,57 @@ def sync_financial_for_stocks(stock_ids: list[str], quarters: int = 4) -> int:
 
     if skipped:
         logger.info("[財報補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+    return total
+
+
+def _upsert_holding(df: pd.DataFrame) -> int:
+    """將持股分級 DataFrame 寫入 holding_distribution 表。"""
+    return _upsert_batch(HoldingDistribution, df, ["stock_id", "date", "level"])
+
+
+def sync_holding_distribution(
+    watchlist: list[str] | None = None,
+    weeks: int = 4,
+) -> int:
+    """同步 watchlist 大戶持股分級資料（最近 N 週）。
+
+    資料來源：FinMind TaiwanStockHoldingSharesPer（每週更新一次）。
+    若 DB 已有 7 天內的資料，自動跳過，避免重複抓取。
+
+    Args:
+        watchlist: 股票代號清單（預設使用 settings.fetcher.watchlist）
+        weeks:     抓取最近幾週（預設 4 週）
+
+    Returns:
+        新增的持股分級筆數
+    """
+    if watchlist is None:
+        watchlist = settings.fetcher.watchlist
+
+    init_db()
+    fetcher = FinMindFetcher()
+
+    # 多抓兩週緩衝，確保資料完整
+    start = (date.today() - timedelta(days=weeks * 7 + 14)).isoformat()
+    end = date.today().isoformat()
+    total = 0
+    skipped = 0
+
+    for sid in watchlist:
+        last = _get_last_date(HoldingDistribution, sid)
+        # 週資料：7 天內已有資料則跳過
+        if last and (date.today() - date.fromisoformat(last)).days < 7:
+            skipped += 1
+            continue
+        try:
+            df = fetcher.fetch_holding_distribution(sid, last or start, end)
+            total += _upsert_holding(df)
+        except Exception:
+            logger.warning("[%s] 持股分級資料補抓失敗，跳過", sid)
+
+    if skipped:
+        logger.info("[持股分級] 跳過 %d 支（DB 已有近期資料）", skipped)
+    logger.info("[持股分級] 完成，共寫入 %d 筆", total)
     return total
 
 
