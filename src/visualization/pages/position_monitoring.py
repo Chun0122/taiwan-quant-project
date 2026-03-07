@@ -96,6 +96,12 @@ def _render_overview_tab(df: pd.DataFrame) -> None:
     display = df.copy()
     display["狀態"] = display["computed_status"].map(STATUS_ZH).fillna(display["computed_status"])
 
+    # 移動止損標記欄
+    if "trailing_stop_enabled" in display.columns:
+        display["類型"] = display["trailing_stop_enabled"].map(lambda v: "[T]移動" if v else "靜態")
+    else:
+        display["類型"] = "靜態"
+
     col_map = {
         "id": "ID",
         "stock_id": "代號",
@@ -106,10 +112,11 @@ def _render_overview_tab(df: pd.DataFrame) -> None:
         "unrealized_pnl_pct": "損益%",
         "stop_loss": "止損",
         "take_profit": "目標",
+        "類型": "類型",
         "狀態": "狀態",
         "valid_until": "有效期",
     }
-    show_cols = [c for c in col_map if c in display.columns or c == "狀態"]
+    show_cols = [c for c in col_map if c in display.columns or c in ("狀態", "類型")]
     display = display[show_cols].rename(columns=col_map)
 
     def _color_pnl(val):
@@ -171,6 +178,8 @@ def _render_chart_tab(df: pd.DataFrame) -> None:
     entry_price = entry_row["entry_price"]
     stop_loss = entry_row.get("stop_loss")
     take_profit = entry_row.get("take_profit")
+    is_trailing = bool(entry_row.get("trailing_stop_enabled", False))
+    trailing_mult = entry_row.get("trailing_atr_multiplier")
 
     days_back = st.slider("顯示天數", 30, 120, 60)
 
@@ -216,23 +225,26 @@ def _render_chart_tab(df: pd.DataFrame) -> None:
         font={"color": "#1E88E5", "size": 11},
     )
 
-    # 止損（紅色虛線）
+    # 止損（移動止損為橙色虛線，靜態止損為紅色虛線）
     if stop_loss and pd.notna(stop_loss):
+        stop_color = "#FF8C00" if is_trailing else "#EF5350"
+        mult_str = f" ×{trailing_mult:.1f}" if is_trailing and trailing_mult else ""
+        stop_label = f"移動止損{mult_str} {stop_loss:.2f}" if is_trailing else f"止損 {stop_loss:.2f}"
         fig.add_shape(
             type="line",
             x0=x_range[0],
             x1=x_range[1],
             y0=stop_loss,
             y1=stop_loss,
-            line={"color": "#EF5350", "width": 1.5, "dash": "dash"},
+            line={"color": stop_color, "width": 1.5, "dash": "dash"},
         )
         fig.add_annotation(
             x=x_range[1],
             y=stop_loss,
-            text=f"止損 {stop_loss:.2f}",
+            text=stop_label,
             showarrow=False,
             xanchor="left",
-            font={"color": "#EF5350", "size": 11},
+            font={"color": stop_color, "size": 11},
         )
 
     # 目標（綠色虛線）
@@ -265,17 +277,27 @@ def _render_chart_tab(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
     # 顯示持倉資訊小卡
-    cols = st.columns(4)
+    highest = entry_row.get("highest_price_since_entry")
     cur = entry_row.get("current_price")
     pnl = entry_row.get("unrealized_pnl_pct")
+
+    if is_trailing:
+        cols = st.columns(5)
+    else:
+        cols = st.columns(4)
+
     with cols[0]:
         st.metric("進場價", f"{entry_price:.2f}")
     with cols[1]:
         st.metric("現價", f"{cur:.2f}" if cur else "—", delta=f"{pnl:+.2%}" if pnl is not None else None)
     with cols[2]:
-        st.metric("止損", f"{stop_loss:.2f}" if stop_loss and pd.notna(stop_loss) else "—")
+        stop_label = "移動止損" if is_trailing else "止損"
+        st.metric(stop_label, f"{stop_loss:.2f}" if stop_loss and pd.notna(stop_loss) else "—")
     with cols[3]:
         st.metric("目標", f"{take_profit:.2f}" if take_profit and pd.notna(take_profit) else "—")
+    if is_trailing and len(cols) > 4:
+        with cols[4]:
+            st.metric("追蹤最高", f"{highest:.2f}" if highest and pd.notna(highest) else "—")
 
 
 # ──────────────────────────────────────────────────────────────────── #

@@ -179,3 +179,133 @@ def test_watch_entry_default_status(db_session):
 
     assert fetched is not None
     assert fetched.status == "active"
+
+
+# ──────────────────────────────────────────────
+#  P3：移動止損（Trailing Stop）純函數測試
+# ──────────────────────────────────────────────
+
+
+def _trailing_stop(highest_price, atr14, multiplier):
+    """代理呼叫 main._compute_trailing_stop。"""
+    from main import _compute_trailing_stop
+
+    return _compute_trailing_stop(highest_price, atr14, multiplier)
+
+
+def test_compute_trailing_stop_basic():
+    """stop = highest - atr14 * mult，四捨五入至小數點後兩位。"""
+    result = _trailing_stop(highest_price=100.0, atr14=5.0, multiplier=1.5)
+    assert result == pytest.approx(92.5)
+
+
+def test_compute_trailing_stop_rounding():
+    """結果應四捨五入至小數點後兩位。"""
+    result = _trailing_stop(highest_price=100.0, atr14=3.333, multiplier=1.5)
+    # 100 - 3.333 * 1.5 = 100 - 4.9995 = 95.0005 → 95.0
+    assert result == pytest.approx(95.0, abs=0.01)
+
+
+def test_compute_trailing_stop_multiplier_2():
+    """ATR 倍數 2.0 的計算。"""
+    result = _trailing_stop(highest_price=850.0, atr14=10.0, multiplier=2.0)
+    assert result == pytest.approx(830.0)
+
+
+def test_compute_trailing_stop_rises_with_price():
+    """價格上漲時，移動止損應隨之上移。"""
+    atr14 = 5.0
+    mult = 1.5
+    # 進場時最高 = 100 → stop = 92.5
+    stop1 = _trailing_stop(100.0, atr14, mult)
+    # 價格漲到 110 → highest = 110 → stop = 102.5
+    stop2 = _trailing_stop(110.0, atr14, mult)
+    assert stop2 > stop1
+    assert stop2 == pytest.approx(102.5)
+
+
+# ──────────────────────────────────────────────
+#  P3：WatchEntry ORM 移動止損欄位測試
+# ──────────────────────────────────────────────
+
+
+def test_watch_entry_trailing_stop_fields(db_session):
+    """WatchEntry 支援 trailing_stop 相關欄位的存取。"""
+    entry = WatchEntry(
+        stock_id="2330",
+        stock_name="台積電",
+        entry_date=date(2026, 3, 1),
+        entry_price=850.0,
+        stop_loss=837.5,
+        take_profit=1000.0,
+        trailing_stop_enabled=True,
+        trailing_atr_multiplier=1.5,
+        highest_price_since_entry=850.0,
+    )
+    db_session.add(entry)
+    db_session.flush()
+
+    fetched = db_session.execute(select(WatchEntry).where(WatchEntry.stock_id == "2330")).scalars().first()
+
+    assert fetched is not None
+    assert fetched.trailing_stop_enabled is True
+    assert fetched.trailing_atr_multiplier == pytest.approx(1.5)
+    assert fetched.highest_price_since_entry == pytest.approx(850.0)
+
+
+def test_watch_entry_trailing_stop_default_false(db_session):
+    """未指定 trailing_stop_enabled 時，預設為 False。"""
+    entry = WatchEntry(
+        stock_id="2454",
+        entry_date=date(2026, 3, 1),
+        entry_price=200.0,
+    )
+    db_session.add(entry)
+    db_session.flush()
+
+    fetched = db_session.execute(select(WatchEntry).where(WatchEntry.stock_id == "2454")).scalars().first()
+
+    assert fetched is not None
+    assert fetched.trailing_stop_enabled is False
+    assert fetched.trailing_atr_multiplier is None
+    assert fetched.highest_price_since_entry is None
+
+
+def test_watch_entry_trailing_highest_price_update(db_session):
+    """highest_price_since_entry 可以被更新（模擬 update-status 邏輯）。"""
+    entry = WatchEntry(
+        stock_id="2317",
+        entry_date=date(2026, 3, 1),
+        entry_price=100.0,
+        trailing_stop_enabled=True,
+        trailing_atr_multiplier=1.5,
+        highest_price_since_entry=100.0,
+    )
+    db_session.add(entry)
+    db_session.flush()
+
+    # 模擬價格上漲 → 更新最高價與止損
+    fetched = db_session.execute(select(WatchEntry).where(WatchEntry.stock_id == "2317")).scalars().first()
+    fetched.highest_price_since_entry = 115.0
+    fetched.stop_loss = _trailing_stop(115.0, 5.0, 1.5)  # = 107.5
+    db_session.flush()
+
+    updated = db_session.execute(select(WatchEntry).where(WatchEntry.stock_id == "2317")).scalars().first()
+    assert updated.highest_price_since_entry == pytest.approx(115.0)
+    assert updated.stop_loss == pytest.approx(107.5)
+
+
+def test_trailing_stop_only_moves_up():
+    """移動止損只升不降：new_stop > current_stop 才更新。"""
+    # 純函數層面：只要在外部做 max(new_stop, current_stop) 即可
+    current_stop = 92.5
+    atr14 = 5.0
+    mult = 1.5
+
+    # 價格下跌，highest 不變 → new_stop 不超過 current_stop
+    new_stop_same_high = _trailing_stop(100.0, atr14, mult)  # = 92.5（等於）
+    assert new_stop_same_high <= current_stop or new_stop_same_high == pytest.approx(current_stop)
+
+    # 價格上漲，highest 更新 → new_stop 上升
+    new_stop_higher = _trailing_stop(110.0, atr14, mult)  # = 102.5
+    assert new_stop_higher > current_stop

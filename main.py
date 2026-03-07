@@ -989,6 +989,23 @@ def _compute_watch_status(
     return "active"
 
 
+def _compute_trailing_stop(highest_price: float, atr14: float, multiplier: float) -> float:
+    """計算移動止損價（純函數）。
+
+    公式：stop = highest_price - atr14 * multiplier
+    僅在外部確認 new_stop > current_stop 時才更新（只升不降）。
+
+    Args:
+        highest_price: 進場後追蹤的最高收盤價
+        atr14:        最近 14 日平均真實波幅
+        multiplier:   ATR 倍數（如 1.5）
+
+    Returns:
+        移動止損價，四捨五入至小數點後兩位。
+    """
+    return round(highest_price - atr14 * multiplier, 2)
+
+
 def _assess_timing(
     rsi14: float,
     close: float,
@@ -2028,6 +2045,10 @@ def _watch_add(args: argparse.Namespace) -> None:
         source_val = "manual"
         mode_val = None
 
+    # ── 移動止損參數 ────────────────────────────────────────────────
+    trailing_enabled: bool = getattr(args, "trailing", False)
+    trailing_mult: float = float(getattr(args, "trailing_multiplier", 1.5) or 1.5)
+
     entry = WatchEntry(
         stock_id=stock_id,
         stock_name=stock_name,
@@ -2042,6 +2063,9 @@ def _watch_add(args: argparse.Namespace) -> None:
         valid_until=valid_until_val,
         status="active",
         notes=args.notes or None,
+        trailing_stop_enabled=trailing_enabled,
+        trailing_atr_multiplier=trailing_mult if trailing_enabled else None,
+        highest_price_since_entry=entry_price_val if trailing_enabled else None,
     )
 
     with get_session() as session:
@@ -2051,7 +2075,8 @@ def _watch_add(args: argparse.Namespace) -> None:
 
     sl_str = f"{stop_loss_val:.2f}" if stop_loss_val else "—"
     tp_str = f"{take_profit_val:.2f}" if take_profit_val else "—"
-    print(f"\n已加入持倉監控 #{entry_id}：{stock_id} {stock_name}")
+    trailing_str = f"  [移動止損 ×{trailing_mult}]" if trailing_enabled else ""
+    print(f"\n已加入持倉監控 #{entry_id}：{stock_id} {stock_name}{trailing_str}")
     print(f"  進場價：{entry_price_val:.2f}  止損：{sl_str}  目標：{tp_str}")
     if valid_until_val:
         print(f"  有效至：{valid_until_val}  來源：{source_val}")
@@ -2085,15 +2110,19 @@ def _watch_list(args: argparse.Namespace) -> None:
         "closed": "⚪ 已平倉",
     }
 
-    print(f"\n{'ID':>4}  {'代號':<8} {'名稱':<12} {'進場日':<12} {'進場價':>8} {'止損':>8} {'目標':>8}  {'狀態'}")
-    print("─" * 75)
+    print(
+        f"\n{'ID':>4}  {'代號':<8} {'名稱':<12} {'進場日':<12} {'進場價':>8} {'止損':>8} {'目標':>8}  {'類型':<6}  {'狀態'}"
+    )
+    print("─" * 83)
     for e in entries:
         sl_s = f"{e.stop_loss:.2f}" if e.stop_loss else "  —"
         tp_s = f"{e.take_profit:.2f}" if e.take_profit else "  —"
         st_s = STATUS_ZH.get(e.status, e.status)
         name_s = (e.stock_name or "")[:10]
+        # 移動止損標記（[T] = Trailing）
+        type_s = f"[T×{e.trailing_atr_multiplier:.1f}]" if e.trailing_stop_enabled else "靜態"
         print(
-            f"{e.id:>4}  {e.stock_id:<8} {name_s:<12} {str(e.entry_date):<12} {e.entry_price:>8.2f} {sl_s:>8} {tp_s:>8}  {st_s}"
+            f"{e.id:>4}  {e.stock_id:<8} {name_s:<12} {str(e.entry_date):<12} {e.entry_price:>8.2f} {sl_s:>8} {tp_s:>8}  {type_s:<6}  {st_s}"
         )
     print()
 
@@ -2129,13 +2158,20 @@ def _watch_close(args: argparse.Namespace) -> None:
 
 
 def _watch_update_status() -> None:
-    """watch update-status：批次更新止損/止利/過期狀態。"""
+    """watch update-status：批次更新止損/止利/過期狀態（含移動止損）。
+
+    對 trailing_stop_enabled=True 的持倉，先依最新收盤價更新
+    highest_price_since_entry 與 stop_loss（只升不降），
+    再統一檢查止損/止利/過期狀態。
+    """
     import datetime
 
+    import pandas as pd
     from sqlalchemy import select
 
     from src.data.database import get_session
     from src.data.schema import DailyPrice, WatchEntry
+    from src.discovery.scanner import _calc_atr14
 
     today = datetime.date.today()
 
@@ -2147,6 +2183,8 @@ def _watch_update_status() -> None:
         return
 
     stock_ids = list({e.stock_id for e in active_entries})
+
+    # ── 1. 取得最新收盤價 ─────────────────────────────────────────────
     latest_prices: dict[str, float] = {}
     with get_session() as session:
         for sid in stock_ids:
@@ -2156,15 +2194,70 @@ def _watch_update_status() -> None:
             if row is not None:
                 latest_prices[sid] = float(row)
 
+    # ── 2. 預先計算有移動止損的股票 ATR14 ────────────────────────────
+    trailing_ids = {e.stock_id for e in active_entries if e.trailing_stop_enabled}
+    atr14_cache: dict[str, float] = {}
+    if trailing_ids:
+        with get_session() as session:
+            for sid in trailing_ids:
+                rows = (
+                    session.execute(
+                        select(DailyPrice).where(DailyPrice.stock_id == sid).order_by(DailyPrice.date.desc()).limit(30)
+                    )
+                    .scalars()
+                    .all()
+                )
+                if rows:
+                    df = (
+                        pd.DataFrame(
+                            [
+                                {
+                                    "date": r.date,
+                                    "high": float(r.high),
+                                    "low": float(r.low),
+                                    "close": float(r.close),
+                                }
+                                for r in reversed(rows)
+                            ]
+                        )
+                        .sort_values("date")
+                        .reset_index(drop=True)
+                    )
+                    atr14_cache[sid] = _calc_atr14(df)
+
+    # ── 3. 批次更新（移動止損 → 狀態判斷）────────────────────────────
     updated = 0
+    trailing_updated = 0
     with get_session() as session:
         for e in active_entries:
+            latest_price = latest_prices.get(e.stock_id)
+            effective_stop = e.stop_loss  # 預設使用目前止損
+
+            # ── 移動止損更新（只升不降）──────────────────────────
+            if e.trailing_stop_enabled and latest_price is not None:
+                atr14 = atr14_cache.get(e.stock_id, 0.0)
+                if atr14 > 0:
+                    mult = e.trailing_atr_multiplier or 1.5
+                    curr_highest = e.highest_price_since_entry or e.entry_price
+                    new_highest = max(curr_highest, latest_price)
+                    new_stop = _compute_trailing_stop(new_highest, atr14, mult)
+
+                    # 只在移動止損往上移動時才更新
+                    if new_stop > (effective_stop or 0.0):
+                        obj = session.execute(select(WatchEntry).where(WatchEntry.id == e.id)).scalars().first()
+                        if obj:
+                            obj.highest_price_since_entry = new_highest
+                            obj.stop_loss = new_stop
+                            effective_stop = new_stop
+                            trailing_updated += 1
+
+            # ── 狀態判斷（使用更新後的 effective_stop）───────────
             new_status = _compute_watch_status(
                 entry_price=e.entry_price,
-                stop_loss=e.stop_loss,
+                stop_loss=effective_stop,
                 take_profit=e.take_profit,
                 valid_until=e.valid_until,
-                latest_price=latest_prices.get(e.stock_id),
+                latest_price=latest_price,
                 today=today,
             )
             if new_status != "active":
@@ -2174,7 +2267,8 @@ def _watch_update_status() -> None:
                     updated += 1
         session.commit()
 
-    print(f"\n更新完成：{len(active_entries)} 筆持倉，觸發狀態變更 {updated} 筆。\n")
+    trailing_msg = f"移動止損更新 {trailing_updated} 筆，" if trailing_ids else ""
+    print(f"\n更新完成：{len(active_entries)} 筆持倉，{trailing_msg}觸發狀態變更 {updated} 筆。\n")
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
@@ -2749,6 +2843,14 @@ def main() -> None:
         metavar="MODE",
         default=None,
         help="從最新 discover 推薦記錄匯入（MODE: momentum/swing/value/dividend/growth）",
+    )
+    sp_wa.add_argument("--trailing", action="store_true", help="啟用移動止損（隨最高價自動上移止損位置）")
+    sp_wa.add_argument(
+        "--trailing-multiplier",
+        type=float,
+        default=1.5,
+        metavar="MULT",
+        help="移動止損 ATR 倍數（預設 1.5，即止損 = 最高價 - 1.5×ATR14）",
     )
     sp_wa.add_argument("--notes", default=None, help="備註")
 

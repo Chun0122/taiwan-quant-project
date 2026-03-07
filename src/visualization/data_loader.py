@@ -794,6 +794,10 @@ def load_watch_entries_with_status(status_filter: str | None = "active") -> pd.D
                 "current_price": cur_price,
                 "unrealized_pnl_pct": pnl_pct,
                 "computed_status": computed,
+                # 移動止損欄位
+                "trailing_stop_enabled": getattr(e, "trailing_stop_enabled", False),
+                "trailing_atr_multiplier": getattr(e, "trailing_atr_multiplier", None),
+                "highest_price_since_entry": getattr(e, "highest_price_since_entry", None),
             }
         )
 

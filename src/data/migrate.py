@@ -30,6 +30,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("trade", "stop_price", "REAL"),
     ("trade", "target_price", "REAL"),
     ("announcement", "event_type", "VARCHAR(20)"),
+    # P3: WatchEntry 移動止損欄位
+    ("watch_entry", "trailing_stop_enabled", "INTEGER DEFAULT 0"),  # SQLite 用 INTEGER 表示 bool
+    ("watch_entry", "trailing_atr_multiplier", "REAL"),
+    ("watch_entry", "highest_price_since_entry", "REAL"),
 ]
 
 

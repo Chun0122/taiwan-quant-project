@@ -1133,7 +1133,13 @@ python main.py watch add 2330 --price 580 --stop 555 --target 635 --qty 1000
 # 從最新 discover 記錄匯入
 python main.py watch add 2330 --from-discover momentum
 
-# 列出持倉中記錄
+# 啟用移動止損（ATR×1.5，預設倍數）
+python main.py watch add 2330 --trailing
+
+# 啟用移動止損並自訂 ATR 倍數
+python main.py watch add 2330 --trailing --trailing-multiplier 2.0
+
+# 列出持倉中記錄（[T×1.5] 標記代表移動止損類型）
 python main.py watch list
 
 # 列出全部記錄（含已平倉/止損/止利/過期）
@@ -1142,7 +1148,7 @@ python main.py watch list --status all
 # 平倉（標記 closed，記錄平倉價）
 python main.py watch close 1 --price 595
 
-# 批次更新狀態（比對最新收盤價自動標記）
+# 批次更新狀態（比對最新收盤價；移動止損自動向上追蹤最高價）
 python main.py watch update-status
 ```
 
@@ -1157,6 +1163,8 @@ python main.py watch update-status
 | `--qty Q` | 股數（選填）|
 | `--from-discover MODE` | 從最新 discover 記錄匯入（MODE: momentum/swing/value/dividend/growth）|
 | `--notes TEXT` | 備註（選填）|
+| `--trailing` | 啟用移動止損（Trailing Stop），每次 update-status 自動上移 |
+| `--trailing-multiplier M` | ATR 倍數（預設 1.5）；止損 = 歷史最高價 - ATR14 × M |
 
 **狀態說明：**
 
@@ -1168,7 +1176,17 @@ python main.py watch update-status
 | `expired` | 今日 > valid_until |
 | `closed` | 手動執行 `watch close` 平倉 |
 
-> **Dashboard 整合**：啟動儀表板後，側邊欄選擇「👁️ 持倉監控」可視覺化持倉狀態，含 K 線圖（進場/止損/目標水平線）及預警列表。
+**移動止損（Trailing Stop）說明：**
+
+- 新增持倉時加上 `--trailing` 旗標即啟用移動止損模式
+- 每次執行 `watch update-status` 時，系統會：
+  1. 從 DB 讀取最新日 K 資料，計算 ATR14
+  2. 若最新收盤價 > `highest_price_since_entry`，更新歷史最高價
+  3. 計算新止損 = `highest_price_since_entry` - ATR14 × `trailing_atr_multiplier`
+  4. 只有「新止損 > 當前止損」時才更新（保證止損只升不降）
+- Dashboard「個股走勢」Tab 以橙色虛線顯示移動止損，並顯示「追蹤最高」指標卡
+
+> **Dashboard 整合**：啟動儀表板後，側邊欄選擇「👁️ 持倉監控」可視覺化持倉狀態，含 K 線圖（進場/止損/目標水平線）及預警列表。移動止損以橙色顯示，靜態止損以紅色顯示。
 
 ---
 

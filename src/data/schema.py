@@ -23,7 +23,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.data.database import Base
@@ -486,6 +486,12 @@ class WatchEntry(Base):
     close_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     close_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ── 移動止損（Trailing Stop）欄位 ─────────────────────────────────
+    trailing_stop_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 移動止損 ATR 倍數（預設 1.5，即止損 = 最高價 - 1.5 × ATR14）
+    trailing_atr_multiplier: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 進場後追蹤的最高收盤價（用於計算移動止損位置，只升不降）
+    highest_price_since_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
