@@ -98,6 +98,7 @@ class MarketScanner:
     """
 
     mode_name: str = "base"
+    _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(
         self,
@@ -551,9 +552,9 @@ class MarketScanner:
             filtered["momentum"] = 0
             filtered["mom_rank"] = 0.5
 
-        # 粗篩綜合分 = 成交量 30% + 法人 40% + 動能 30%
-        filtered["coarse_score"] = (
-            filtered["vol_rank"] * 0.30 + filtered["inst_rank"] * 0.40 + filtered["mom_rank"] * 0.30
+        # 粗篩綜合分（依 _COARSE_WEIGHTS 類別屬性動態計算）
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
 
         # 取 top N
@@ -821,11 +822,18 @@ class MarketScanner:
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
 
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
+        price_grouped = (
+            df_price[df_price["stock_id"].isin(stock_ids)].groupby("stock_id", sort=False)
+            if df_price is not None and not df_price.empty
+            else None
+        )
+
         # 計算每支股票的外資、投信、合計淨買超 + 連續買超天數 + 買超佔量比
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append(
                     {
                         "stock_id": sid,
@@ -838,6 +846,7 @@ class MarketScanner:
                 )
                 continue
 
+            stock_inst = inst_grouped.get_group(sid)
             foreign_data = stock_inst[stock_inst["name"].str.contains("外資", na=False)]
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
             total_net = stock_inst["net"].sum()
@@ -853,12 +862,11 @@ class MarketScanner:
 
             # 買超佔成交量比例：合計淨買超 / 最新日成交量
             buy_vol_ratio = 0.0
-            if df_price is not None and not df_price.empty:
-                stock_price = df_price[df_price["stock_id"] == sid]
-                if not stock_price.empty:
-                    latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
-                    if latest_vol > 0:
-                        buy_vol_ratio = total_net / latest_vol
+            if price_grouped is not None and sid in price_grouped.groups:
+                stock_price = price_grouped.get_group(sid)
+                latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
+                if latest_vol > 0:
+                    buy_vol_ratio = total_net / latest_vol
 
             rows.append(
                 {
@@ -915,6 +923,196 @@ class MarketScanner:
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """風險過濾（基底類別不做任何過濾，子類覆寫）。"""
         return scored
+
+    # ------------------------------------------------------------------ #
+    #  共用風險過濾 helpers（子類呼叫，不須覆寫整個方法）
+    # ------------------------------------------------------------------ #
+
+    def _apply_atr_risk_filter(
+        self, scored: pd.DataFrame, df_price: pd.DataFrame, percentile: int = 80
+    ) -> pd.DataFrame:
+        """ATR-based 風險過濾：ATR(14)/close > N-th percentile 的股票剔除。"""
+        if scored.empty or df_price.empty:
+            return scored
+
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+        atr_ratios = []
+        for sid in scored["stock_id"].tolist():
+            stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
+            atr = _calc_atr14(stock_data)
+            current_close = stock_data["close"].values[-1] if not stock_data.empty else 1.0
+            ratio = atr / current_close if current_close > 0 else 0.0
+            atr_ratios.append({"stock_id": sid, "atr_ratio": ratio})
+
+        df_atr = pd.DataFrame(atr_ratios)
+        threshold = df_atr["atr_ratio"].quantile(percentile / 100)
+        high_vol_ids = df_atr[df_atr["atr_ratio"] > threshold]["stock_id"].tolist()
+
+        before_count = len(scored)
+        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
+        removed = before_count - len(scored)
+        if removed > 0:
+            logger.info("Stage 3.5: ATR 風險過濾剔除 %d 支高波動股", removed)
+        return scored
+
+    def _apply_vol_risk_filter(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+        percentile: int,
+        window: int = 20,
+        annualize: bool = False,
+    ) -> pd.DataFrame:
+        """波動率-based 風險過濾：N 日波動率 > M-th percentile 的股票剔除。
+
+        Args:
+            percentile: 剔除閾值（80 表示剔除波動率超過第 80 百分位數的股票）
+            window: 計算波動率的回溯天數（預設 20）
+            annualize: 是否年化（乘以 sqrt(252)）
+        """
+        if scored.empty or df_price.empty:
+            return scored
+
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+        vol_data = []
+        for sid in scored["stock_id"].tolist():
+            stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
+            if len(stock_data) < 10:
+                vol_data.append({"stock_id": sid, "vol": 0.0})
+                continue
+
+            closes = (
+                stock_data["close"].values[-(window + 1) :]
+                if len(stock_data) >= window + 1
+                else stock_data["close"].values
+            )
+            returns = np.diff(closes) / closes[:-1]
+            vol = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
+            if annualize:
+                vol = vol * np.sqrt(252)
+            vol_data.append({"stock_id": sid, "vol": vol})
+
+        df_vol = pd.DataFrame(vol_data)
+        threshold = df_vol["vol"].quantile(percentile / 100)
+        high_vol_ids = df_vol[df_vol["vol"] > threshold]["stock_id"].tolist()
+
+        before_count = len(scored)
+        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
+        removed = before_count - len(scored)
+        if removed > 0:
+            logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
+        return scored
+
+    def _reload_valuation(self, stock_ids: list[str]) -> None:
+        """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
+        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        with get_session() as session:
+            rows = session.execute(
+                select(
+                    StockValuation.stock_id,
+                    StockValuation.date,
+                    StockValuation.pe_ratio,
+                    StockValuation.pb_ratio,
+                    StockValuation.dividend_yield,
+                )
+                .where(StockValuation.date >= cutoff)
+                .where(StockValuation.stock_id.in_(stock_ids))
+            ).all()
+            self._df_valuation = pd.DataFrame(
+                rows,
+                columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
+            )
+
+    def _maybe_sync_valuation(self) -> None:
+        """Stage 0.5：估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值。
+        供 ValueScanner / DividendScanner 的 run() 呼叫。
+        """
+        try:
+            from sqlalchemy import func as sa_func
+
+            with get_session() as session:
+                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
+            if not val_count or val_count < 500:
+                logger.info(
+                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
+                    val_count or 0,
+                )
+                from src.data.pipeline import sync_valuation_all_market
+
+                val_synced = sync_valuation_all_market()
+                logger.info("Stage 0.5: 全市場估值同步完成，新增 %d 筆", val_synced)
+        except Exception:
+            logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
+
+    def _compute_momentum_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """動能風格技術面 5 因子：5日動能 + 10日動能 + 20日突破 + 量比 + 成交量加速。
+        供 MomentumScanner 與 GrowthScanner 共用。
+        """
+        results = []
+        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
+        for sid in stock_ids:
+            if sid not in grouped.groups:
+                results.append({"stock_id": sid, "technical_score": 0.5})
+                continue
+            stock_data = grouped.get_group(sid)
+            if len(stock_data) < 3:
+                results.append({"stock_id": sid, "technical_score": 0.5})
+                continue
+
+            closes = stock_data["close"].values
+            volumes = stock_data["volume"].values.astype(float)
+
+            score = 0.0
+            n_factors = 0
+
+            # 1) 5 日動能
+            if len(closes) >= 6:
+                ret_5d = (closes[-1] - closes[-6]) / closes[-6]
+                score += max(0.0, min(1.0, 0.5 + ret_5d * 5))
+                n_factors += 1
+
+            # 2) 10 日動能
+            if len(closes) >= 11:
+                ret_10d = (closes[-1] - closes[-11]) / closes[-11]
+                score += max(0.0, min(1.0, 0.5 + ret_10d * 5))
+                n_factors += 1
+
+            # 3) 20 日突破：close / max(close[-20:])
+            if len(closes) >= 20:
+                max_20 = closes[-20:].max()
+                if max_20 > 0:
+                    score += closes[-1] / max_20
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            # 4) 量比：volume[-1] / mean(volume[-20:])
+            if len(volumes) >= 20:
+                avg_vol_20 = volumes[-20:].mean()
+                if avg_vol_20 > 0:
+                    ratio = min(2.0, volumes[-1] / avg_vol_20)
+                    score += ratio / 2.0
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            # 5) 成交量加速：mean(vol[-3:]) / mean(vol[-10:])
+            if len(volumes) >= 10:
+                avg_vol_3 = volumes[-3:].mean()
+                avg_vol_10 = volumes[-10:].mean()
+                if avg_vol_10 > 0:
+                    ratio = min(2.0, avg_vol_3 / avg_vol_10)
+                    score += ratio / 2.0
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            tech_score = score / max(n_factors, 1)
+            results.append({"stock_id": sid, "technical_score": tech_score})
+
+        return pd.DataFrame(results)
 
     # ------------------------------------------------------------------ #
     #  Stage 4: 排名 + 產業標籤
@@ -1001,6 +1199,7 @@ class MomentumScanner(MarketScanner):
     """
 
     mode_name = "momentum"
+    _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
@@ -1051,76 +1250,17 @@ class MomentumScanner(MarketScanner):
             filtered["momentum"] = 0
             filtered["mom_rank"] = 0.5
 
-        # 粗篩綜合分 = 成交量 30% + 法人 40% + 動能 30%
-        filtered["coarse_score"] = (
-            filtered["vol_rank"] * 0.30 + filtered["inst_rank"] * 0.40 + filtered["mom_rank"] * 0.30
+        # 粗篩綜合分（依 _COARSE_WEIGHTS 類別屬性動態計算）
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
 
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """動能模式技術面 5 因子：5日動能 + 10日動能 + 20日突破 + 量比 + 成交量加速。"""
-        results = []
-
-        for sid in stock_ids:
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 3:
-                results.append({"stock_id": sid, "technical_score": 0.5})
-                continue
-
-            closes = stock_data["close"].values
-            volumes = stock_data["volume"].values.astype(float)
-
-            score = 0.0
-            n_factors = 0
-
-            # 1) 5 日動能
-            if len(closes) >= 6:
-                ret_5d = (closes[-1] - closes[-6]) / closes[-6]
-                score += max(0.0, min(1.0, 0.5 + ret_5d * 5))
-                n_factors += 1
-
-            # 2) 10 日動能
-            if len(closes) >= 11:
-                ret_10d = (closes[-1] - closes[-11]) / closes[-11]
-                score += max(0.0, min(1.0, 0.5 + ret_10d * 5))
-                n_factors += 1
-
-            # 3) 20 日突破：close / max(close[-20:])
-            if len(closes) >= 20:
-                max_20 = closes[-20:].max()
-                if max_20 > 0:
-                    score += closes[-1] / max_20
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            # 4) 量比：volume[-1] / mean(volume[-20:])
-            if len(volumes) >= 20:
-                avg_vol_20 = volumes[-20:].mean()
-                if avg_vol_20 > 0:
-                    ratio = min(2.0, volumes[-1] / avg_vol_20)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            # 5) 成交量加速：mean(vol[-3:]) / mean(vol[-10:])
-            if len(volumes) >= 10:
-                avg_vol_3 = volumes[-3:].mean()
-                avg_vol_10 = volumes[-10:].mean()
-                if avg_vol_10 > 0:
-                    ratio = min(2.0, avg_vol_3 / avg_vol_10)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            tech_score = score / max(n_factors, 1)
-            results.append({"stock_id": sid, "technical_score": tech_score})
-
-        return pd.DataFrame(results)
+        """動能模式技術面 5 因子（委派至 base class 共用實作）。"""
+        return self._compute_momentum_style_technical_scores(stock_ids, df_price)
 
     def _compute_chip_scores(
         self,
@@ -1134,13 +1274,19 @@ class MomentumScanner(MarketScanner):
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
+        price_grouped = (
+            df_price[df_price["stock_id"].isin(stock_ids)].groupby("stock_id", sort=False)
+            if df_price is not None and not df_price.empty
+            else None
+        )
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append({"stock_id": sid, "consec_foreign_days": 0, "buy_vol_ratio": 0.0, "total_net": 0})
                 continue
 
+            stock_inst = inst_grouped.get_group(sid)
             # 外資連續買超天數
             foreign_data = stock_inst[stock_inst["name"].str.contains("外資", na=False)]
             consec_foreign = 0
@@ -1155,12 +1301,11 @@ class MomentumScanner(MarketScanner):
             # 法人買超/成交量比例
             total_net = stock_inst["net"].sum()
             buy_vol_ratio = 0.0
-            if df_price is not None and not df_price.empty:
-                stock_price = df_price[df_price["stock_id"] == sid]
-                if not stock_price.empty:
-                    latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
-                    if latest_vol > 0:
-                        buy_vol_ratio = total_net / latest_vol
+            if price_grouped is not None and sid in price_grouped.groups:
+                stock_price = price_grouped.get_group(sid)
+                latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
+                if latest_vol > 0:
+                    buy_vol_ratio = total_net / latest_vol
 
             rows.append(
                 {
@@ -1225,28 +1370,7 @@ class MomentumScanner(MarketScanner):
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """動能模式風險過濾：ATR(14)/close > 80th percentile 剔除。"""
-        if scored.empty or df_price.empty:
-            return scored
-
-        atr_ratios = []
-        for sid in scored["stock_id"].tolist():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            atr = _calc_atr14(stock_data)
-            current_close = stock_data["close"].values[-1] if not stock_data.empty else 1.0
-            ratio = atr / current_close if current_close > 0 else 0.0
-            atr_ratios.append({"stock_id": sid, "atr_ratio": ratio})
-
-        df_atr = pd.DataFrame(atr_ratios)
-        threshold = df_atr["atr_ratio"].quantile(0.80)
-        high_vol_ids = df_atr[df_atr["atr_ratio"] > threshold]["stock_id"].tolist()
-
-        before_count = len(scored)
-        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
-        removed = before_count - len(scored)
-        if removed > 0:
-            logger.info("Stage 3.5: ATR 風險過濾剔除 %d 支高波動股", removed)
-
-        return scored
+        return self._apply_atr_risk_filter(scored, df_price, percentile=80)
 
 
 # ====================================================================== #
@@ -1263,6 +1387,7 @@ class SwingScanner(MarketScanner):
     """
 
     mode_name = "swing"
+    _COARSE_WEIGHTS: dict[str, float] = {"inst_rank": 0.40, "trend_rank": 0.30, "vol_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)
@@ -1379,9 +1504,9 @@ class SwingScanner(MarketScanner):
         else:
             filtered["momentum"] = 0
 
-        # 粗篩綜合分 = 法人累積 40% + 趨勢強度 30% + 成交量 30%
-        filtered["coarse_score"] = (
-            filtered["inst_rank"] * 0.40 + filtered["trend_rank"] * 0.30 + filtered["vol_rank"] * 0.30
+        # 粗篩綜合分（依 _COARSE_WEIGHTS 類別屬性動態計算）
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
 
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
@@ -1390,9 +1515,13 @@ class SwingScanner(MarketScanner):
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """波段模式技術面 4 因子：趨勢確認 + 均線排列 + 60日動能 + 量價齊揚。"""
         results = []
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
 
         for sid in stock_ids:
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
+            if sid not in grouped.groups:
+                results.append({"stock_id": sid, "technical_score": 0.5})
+                continue
+            stock_data = grouped.get_group(sid)
             if len(stock_data) < 3:
                 results.append({"stock_id": sid, "technical_score": 0.5})
                 continue
@@ -1455,15 +1584,16 @@ class SwingScanner(MarketScanner):
 
         # 20 日期間
         dates = sorted(df_inst["date"].unique())
-        recent_20_dates = dates[-20:] if len(dates) >= 20 else dates
+        recent_20_dates = set(dates[-20:] if len(dates) >= 20 else dates)
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
 
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append({"stock_id": sid, "trust_net": 0, "cum_20_net": 0})
                 continue
 
+            stock_inst = inst_grouped.get_group(sid)
             # 投信淨買超（全期間合計）
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
             trust_net = trust_data["net"].sum() if not trust_data.empty else 0
@@ -1514,32 +1644,7 @@ class SwingScanner(MarketScanner):
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """波段模式風險過濾：近 60 日年化波動率 > 85th percentile 剔除。"""
-        if scored.empty or df_price.empty:
-            return scored
-
-        vol_data = []
-        for sid in scored["stock_id"].tolist():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 20:
-                vol_data.append({"stock_id": sid, "annual_vol": 0.0})
-                continue
-
-            closes = stock_data["close"].values[-61:] if len(stock_data) >= 61 else stock_data["close"].values
-            returns = np.diff(closes) / closes[:-1]
-            annual_vol = np.std(returns, ddof=1) * np.sqrt(252) if len(returns) > 1 else 0.0
-            vol_data.append({"stock_id": sid, "annual_vol": annual_vol})
-
-        df_vol = pd.DataFrame(vol_data)
-        threshold = df_vol["annual_vol"].quantile(0.85)
-        high_vol_ids = df_vol[df_vol["annual_vol"] > threshold]["stock_id"].tolist()
-
-        before_count = len(scored)
-        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
-        removed = before_count - len(scored)
-        if removed > 0:
-            logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
-
-        return scored
+        return self._apply_vol_risk_filter(scored, df_price, percentile=85, window=60, annualize=True)
 
 
 # ====================================================================== #
@@ -1557,6 +1662,7 @@ class ValueScanner(MarketScanner):
     """
 
     mode_name = "value"
+    _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.50, "inst_rank": 0.50}
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
@@ -1631,7 +1737,7 @@ class ValueScanner(MarketScanner):
         return df_price, df_inst, df_margin, df_revenue
 
     def run(self) -> DiscoveryResult:
-        """覆寫 run()：在 Stage 2.5 補抓估值資料。"""
+        """覆寫 run()：在 Stage 0.5 自動補抓估值、Stage 2.5 補抓候選股估值。"""
         # Stage 0: Regime 偵測
         try:
             from src.regime.detector import MarketRegimeDetector
@@ -1644,22 +1750,7 @@ class ValueScanner(MarketScanner):
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
 
         # Stage 0.5: 估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值
-        try:
-            from sqlalchemy import func as sa_func
-
-            with get_session() as session:
-                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
-            if not val_count or val_count < 500:
-                logger.info(
-                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
-                    val_count or 0,
-                )
-                from src.data.pipeline import sync_valuation_all_market
-
-                val_synced = sync_valuation_all_market()
-                logger.info("Stage 0.5: 全市場估值同步完成，新增 %d 筆", val_synced)
-        except Exception:
-            logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
+        self._maybe_sync_valuation()
 
         # Stage 1
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
@@ -1725,26 +1816,6 @@ class ValueScanner(MarketScanner):
             mode=self.mode_name,
         )
 
-    def _reload_valuation(self, stock_ids: list[str]) -> None:
-        """重新載入估值資料（補抓後 DB 已更新）。"""
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
-        with get_session() as session:
-            rows = session.execute(
-                select(
-                    StockValuation.stock_id,
-                    StockValuation.date,
-                    StockValuation.pe_ratio,
-                    StockValuation.pb_ratio,
-                    StockValuation.dividend_yield,
-                )
-                .where(StockValuation.date >= cutoff)
-                .where(StockValuation.stock_id.in_(stock_ids))
-            ).all()
-            self._df_valuation = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
-            )
-
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """價值模式粗篩：基本過濾 + PE/殖利率門檻。"""
         filtered = self._base_filter(df_price)
@@ -1799,7 +1870,9 @@ class ValueScanner(MarketScanner):
         else:
             filtered["momentum"] = 0
 
-        filtered["coarse_score"] = filtered["vol_rank"] * 0.50 + filtered["inst_rank"] * 0.50
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
+        )
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
 
@@ -1876,15 +1949,16 @@ class ValueScanner(MarketScanner):
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         dates = sorted(df_inst["date"].unique())
-        recent_20_dates = dates[-20:] if len(dates) >= 20 else dates
+        recent_20_dates = set(dates[-20:] if len(dates) >= 20 else dates)
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
 
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append({"stock_id": sid, "trust_net": 0, "cum_net": 0})
                 continue
 
+            stock_inst = inst_grouped.get_group(sid)
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
             trust_net = trust_data["net"].sum() if not trust_data.empty else 0
 
@@ -1902,32 +1976,7 @@ class ValueScanner(MarketScanner):
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """價值模式風險過濾：近 20 日波動率 > 90th percentile 剔除。"""
-        if scored.empty or df_price.empty:
-            return scored
-
-        vol_data = []
-        for sid in scored["stock_id"].tolist():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 10:
-                vol_data.append({"stock_id": sid, "vol_20d": 0.0})
-                continue
-
-            closes = stock_data["close"].values[-21:] if len(stock_data) >= 21 else stock_data["close"].values
-            returns = np.diff(closes) / closes[:-1]
-            vol_20d = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
-            vol_data.append({"stock_id": sid, "vol_20d": vol_20d})
-
-        df_vol = pd.DataFrame(vol_data)
-        threshold = df_vol["vol_20d"].quantile(0.90)
-        high_vol_ids = df_vol[df_vol["vol_20d"] > threshold]["stock_id"].tolist()
-
-        before_count = len(scored)
-        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
-        removed = before_count - len(scored)
-        if removed > 0:
-            logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
-
-        return scored
+        return self._apply_vol_risk_filter(scored, df_price, percentile=90)
 
 
 # ====================================================================== #
@@ -1945,6 +1994,7 @@ class DividendScanner(MarketScanner):
     """
 
     mode_name = "dividend"
+    _COARSE_WEIGHTS: dict[str, float] = {"dy_rank": 0.50, "vol_rank": 0.30, "inst_rank": 0.20}
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
@@ -2018,7 +2068,7 @@ class DividendScanner(MarketScanner):
         return df_price, df_inst, df_margin, df_revenue
 
     def run(self) -> DiscoveryResult:
-        """覆寫 run()：在 Stage 2.5 補抓估值資料。"""
+        """覆寫 run()：在 Stage 0.5 自動補抓估值、Stage 2.5 補抓候選股估值。"""
         # Stage 0: Regime 偵測
         try:
             from src.regime.detector import MarketRegimeDetector
@@ -2031,22 +2081,7 @@ class DividendScanner(MarketScanner):
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
 
         # Stage 0.5: 估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值
-        try:
-            from sqlalchemy import func as sa_func
-
-            with get_session() as session:
-                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
-            if not val_count or val_count < 500:
-                logger.info(
-                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
-                    val_count or 0,
-                )
-                from src.data.pipeline import sync_valuation_all_market
-
-                val_synced = sync_valuation_all_market()
-                logger.info("Stage 0.5: 全市場估值同步完成，新增 %d 筆", val_synced)
-        except Exception:
-            logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
+        self._maybe_sync_valuation()
 
         # Stage 1
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
@@ -2111,26 +2146,6 @@ class DividendScanner(MarketScanner):
             mode=self.mode_name,
         )
 
-    def _reload_valuation(self, stock_ids: list[str]) -> None:
-        """重新載入估值資料（補抓後 DB 已更新）。"""
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
-        with get_session() as session:
-            rows = session.execute(
-                select(
-                    StockValuation.stock_id,
-                    StockValuation.date,
-                    StockValuation.pe_ratio,
-                    StockValuation.pb_ratio,
-                    StockValuation.dividend_yield,
-                )
-                .where(StockValuation.date >= cutoff)
-                .where(StockValuation.stock_id.in_(stock_ids))
-            ).all()
-            self._df_valuation = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
-            )
-
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """高息模式粗篩：基本過濾 + 殖利率 > 3% + PE > 0。"""
         filtered = self._base_filter(df_price)
@@ -2182,8 +2197,8 @@ class DividendScanner(MarketScanner):
         else:
             filtered["momentum"] = 0
 
-        filtered["coarse_score"] = (
-            filtered["dy_rank"] * 0.50 + filtered["vol_rank"] * 0.30 + filtered["inst_rank"] * 0.20
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
@@ -2260,15 +2275,16 @@ class DividendScanner(MarketScanner):
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         dates = sorted(df_inst["date"].unique())
-        recent_20_dates = dates[-20:] if len(dates) >= 20 else dates
+        recent_20_dates = set(dates[-20:] if len(dates) >= 20 else dates)
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
 
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append({"stock_id": sid, "trust_net": 0, "cum_net": 0})
                 continue
 
+            stock_inst = inst_grouped.get_group(sid)
             trust_data = stock_inst[stock_inst["name"].str.contains("投信", na=False)]
             trust_net = trust_data["net"].sum() if not trust_data.empty else 0
 
@@ -2286,32 +2302,7 @@ class DividendScanner(MarketScanner):
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """高息模式風險過濾：近 20 日波動率 > 90th percentile 剔除。"""
-        if scored.empty or df_price.empty:
-            return scored
-
-        vol_data = []
-        for sid in scored["stock_id"].tolist():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 10:
-                vol_data.append({"stock_id": sid, "vol_20d": 0.0})
-                continue
-
-            closes = stock_data["close"].values[-21:] if len(stock_data) >= 21 else stock_data["close"].values
-            returns = np.diff(closes) / closes[:-1]
-            vol_20d = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
-            vol_data.append({"stock_id": sid, "vol_20d": vol_20d})
-
-        df_vol = pd.DataFrame(vol_data)
-        threshold = df_vol["vol_20d"].quantile(0.90)
-        high_vol_ids = df_vol[df_vol["vol_20d"] > threshold]["stock_id"].tolist()
-
-        before_count = len(scored)
-        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
-        removed = before_count - len(scored)
-        if removed > 0:
-            logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
-
-        return scored
+        return self._apply_vol_risk_filter(scored, df_price, percentile=90)
 
 
 # ====================================================================== #
@@ -2329,6 +2320,7 @@ class GrowthScanner(MarketScanner):
     """
 
     mode_name = "growth"
+    _COARSE_WEIGHTS: dict[str, float] = {"yoy_rank": 0.40, "vol_rank": 0.30, "inst_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
@@ -2534,74 +2526,15 @@ class GrowthScanner(MarketScanner):
         else:
             filtered["momentum"] = 0
 
-        filtered["coarse_score"] = (
-            filtered["yoy_rank"] * 0.40 + filtered["vol_rank"] * 0.30 + filtered["inst_rank"] * 0.30
+        filtered["coarse_score"] = sum(
+            filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
         filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """高成長模式技術面 5 因子：5日動能 + 10日動能 + 20日突破 + 量比 + 成交量加速。"""
-        results = []
-
-        for sid in stock_ids:
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 3:
-                results.append({"stock_id": sid, "technical_score": 0.5})
-                continue
-
-            closes = stock_data["close"].values
-            volumes = stock_data["volume"].values.astype(float)
-
-            score = 0.0
-            n_factors = 0
-
-            # 1) 5 日動能
-            if len(closes) >= 6:
-                ret_5d = (closes[-1] - closes[-6]) / closes[-6]
-                score += max(0.0, min(1.0, 0.5 + ret_5d * 5))
-                n_factors += 1
-
-            # 2) 10 日動能
-            if len(closes) >= 11:
-                ret_10d = (closes[-1] - closes[-11]) / closes[-11]
-                score += max(0.0, min(1.0, 0.5 + ret_10d * 5))
-                n_factors += 1
-
-            # 3) 20 日突破：close / max(close[-20:])
-            if len(closes) >= 20:
-                max_20 = closes[-20:].max()
-                if max_20 > 0:
-                    score += closes[-1] / max_20
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            # 4) 量比：volume[-1] / mean(volume[-20:])
-            if len(volumes) >= 20:
-                avg_vol_20 = volumes[-20:].mean()
-                if avg_vol_20 > 0:
-                    ratio = min(2.0, volumes[-1] / avg_vol_20)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            # 5) 成交量加速：mean(vol[-3:]) / mean(vol[-10:])
-            if len(volumes) >= 10:
-                avg_vol_3 = volumes[-3:].mean()
-                avg_vol_10 = volumes[-10:].mean()
-                if avg_vol_10 > 0:
-                    ratio = min(2.0, avg_vol_3 / avg_vol_10)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
-
-            tech_score = score / max(n_factors, 1)
-            results.append({"stock_id": sid, "technical_score": tech_score})
-
-        return pd.DataFrame(results)
+        """高成長模式技術面 5 因子（委派至 base class 共用動能評分實作）。"""
+        return self._compute_momentum_style_technical_scores(stock_ids, df_price)
 
     def _compute_chip_scores(
         self,
@@ -2615,12 +2548,18 @@ class GrowthScanner(MarketScanner):
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
+        inst_grouped = inst_filtered.groupby("stock_id", sort=False)
+        price_grouped = (
+            df_price[df_price["stock_id"].isin(stock_ids)].groupby("stock_id", sort=False)
+            if df_price is not None and not df_price.empty
+            else None
+        )
         rows = []
         for sid in stock_ids:
-            stock_inst = inst_filtered[inst_filtered["stock_id"] == sid]
-            if stock_inst.empty:
+            if sid not in inst_grouped.groups:
                 rows.append({"stock_id": sid, "consec_foreign_days": 0, "buy_vol_ratio": 0.0, "total_net": 0})
                 continue
+            stock_inst = inst_grouped.get_group(sid)
 
             foreign_data = stock_inst[stock_inst["name"].str.contains("外資", na=False)]
             consec_foreign = 0
@@ -2634,12 +2573,11 @@ class GrowthScanner(MarketScanner):
 
             total_net = stock_inst["net"].sum()
             buy_vol_ratio = 0.0
-            if df_price is not None and not df_price.empty:
-                stock_price = df_price[df_price["stock_id"] == sid]
-                if not stock_price.empty:
-                    latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
-                    if latest_vol > 0:
-                        buy_vol_ratio = total_net / latest_vol
+            if price_grouped is not None and sid in price_grouped.groups:
+                stock_price = price_grouped.get_group(sid)
+                latest_vol = stock_price.loc[stock_price["date"].idxmax(), "volume"]
+                if latest_vol > 0:
+                    buy_vol_ratio = total_net / latest_vol
 
             rows.append(
                 {
@@ -2705,45 +2643,4 @@ class GrowthScanner(MarketScanner):
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """高成長模式風險過濾：ATR(14)/close > 80th percentile 剔除。"""
-        if scored.empty or df_price.empty:
-            return scored
-
-        atr_ratios = []
-        for sid in scored["stock_id"].tolist():
-            stock_data = df_price[df_price["stock_id"] == sid].sort_values("date")
-            if len(stock_data) < 14:
-                atr_ratios.append({"stock_id": sid, "atr_ratio": 0.0})
-                continue
-
-            highs = stock_data["high"].values[-14:]
-            lows = stock_data["low"].values[-14:]
-            closes = stock_data["close"].values[-15:]
-
-            trs = []
-            for i in range(1, len(highs) + 1):
-                if i < len(closes):
-                    tr = max(
-                        highs[i - 1] - lows[i - 1],
-                        abs(highs[i - 1] - closes[i - 1]),
-                        abs(lows[i - 1] - closes[i - 1]),
-                    )
-                else:
-                    tr = highs[i - 1] - lows[i - 1]
-                trs.append(tr)
-
-            atr = np.mean(trs)
-            current_close = stock_data["close"].values[-1]
-            ratio = atr / current_close if current_close > 0 else 0.0
-            atr_ratios.append({"stock_id": sid, "atr_ratio": ratio})
-
-        df_atr = pd.DataFrame(atr_ratios)
-        threshold = df_atr["atr_ratio"].quantile(0.80)
-        high_vol_ids = df_atr[df_atr["atr_ratio"] > threshold]["stock_id"].tolist()
-
-        before_count = len(scored)
-        scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
-        removed = before_count - len(scored)
-        if removed > 0:
-            logger.info("Stage 3.5: ATR 風險過濾剔除 %d 支高波動股", removed)
-
-        return scored
+        return self._apply_atr_risk_filter(scored, df_price, percentile=80)

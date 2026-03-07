@@ -13,6 +13,13 @@ from src.discovery.scanner import (
     SwingScanner,
     ValueScanner,
 )
+from tests.scanner_helpers import (
+    make_entry_exit_price_df,
+    make_inst_df,
+    make_momentum_price_df,
+    make_price_df,
+    make_swing_price_df,
+)
 
 
 @pytest.fixture()
@@ -26,51 +33,9 @@ def scanner():
     )
 
 
-def _make_price_df(n_stocks: int = 20, n_days: int = 20) -> pd.DataFrame:
-    """建立模擬市場日 K 資料（n_days 天，預設 20 天，供 ATR14 計算使用）。"""
-    rows = []
-    base_date = date(2025, 1, 2)
-    for i in range(n_stocks):
-        sid = f"{1000 + i}"
-        base_close = 50 + i * 10
-        for d in range(n_days):
-            day = base_date + timedelta(days=d)
-            close = base_close + d * 0.5 + (i - n_stocks // 2) * 0.1
-            rows.append(
-                {
-                    "stock_id": sid,
-                    "date": day,
-                    "open": close - 1,
-                    "high": close + 2,
-                    "low": close - 2,
-                    "close": close,
-                    "volume": 200_000 + i * 50_000,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def _make_inst_df(stock_ids: list[str], target_date: date) -> pd.DataFrame:
-    rows = []
-    for sid in stock_ids:
-        rows.append(
-            {
-                "stock_id": sid,
-                "date": target_date,
-                "name": "Foreign_Investor",
-                "net": int(sid) % 3 * 1000 - 500,
-            }
-        )
-        rows.append(
-            {
-                "stock_id": sid,
-                "date": target_date,
-                "name": "Investment_Trust",
-                "net": int(sid) % 5 * 200 - 200,
-            }
-        )
-    return pd.DataFrame(rows)
-
+# 向後相容別名（內部測試使用舊命名）
+_make_price_df = make_price_df
+_make_inst_df = make_inst_df
 
 # ─── _coarse_filter ───────────────────────────────────────
 
@@ -363,30 +328,7 @@ class TestBaseFilter:
 # ====================================================================== #
 
 
-def _make_momentum_price_df(n_days: int = 25, n_stocks: int = 5) -> pd.DataFrame:
-    """建立動能模式所需的多日市場資料。"""
-    rows = []
-    base_date = date(2025, 1, 1)
-    for i in range(n_stocks):
-        sid = f"{2000 + i}"
-        for d in range(n_days):
-            day = date(2025, 1, 1) + timedelta(days=d)
-            # 股票 2004 最強動能（每天漲 1%），2000 最弱
-            base_close = 100 + i * 20
-            close = base_close * (1 + 0.002 * i) ** d
-            vol = 500_000 + i * 100_000 + d * 10_000 * (i + 1)
-            rows.append(
-                {
-                    "stock_id": sid,
-                    "date": day,
-                    "open": close * 0.99,
-                    "high": close * 1.02,
-                    "low": close * 0.98,
-                    "close": close,
-                    "volume": int(vol),
-                }
-            )
-    return pd.DataFrame(rows)
+_make_momentum_price_df = make_momentum_price_df
 
 
 @pytest.fixture()
@@ -522,37 +464,48 @@ class TestMomentumFundamentalScores:
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
 
 
-class TestMomentumRiskFilter:
-    def test_removes_high_volatility(self, momentum_scanner):
-        """ATR 過濾應剔除前 20% 高波動股。"""
-        rows = []
-        sids = [f"{3000 + i}" for i in range(10)]
-        for i, sid in enumerate(sids):
-            for d in range(15):
-                day = date(2025, 1, 1) + timedelta(days=d)
-                base = 100 + i * 10
-                # 最後一支股票波動極大
-                spread = 20 if i == 9 else 1
-                rows.append(
-                    {
-                        "stock_id": sid,
-                        "date": day,
-                        "open": base,
-                        "high": base + spread,
-                        "low": base - spread,
-                        "close": base + (spread if d % 2 == 0 else -spread),
-                        "volume": 1_000_000,
-                    }
-                )
-        df_price = pd.DataFrame(rows)
-        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
-        result = momentum_scanner._apply_risk_filter(scored, df_price)
-        # 至少應剔除 1 支（前 20%）
-        assert len(result) < len(scored)
+@pytest.mark.parametrize(
+    "scanner_name,n_days,sid_base,spread_low,spread_high",
+    [
+        ("momentum_scanner", 15, 3000, 1, 20),
+        ("swing_scanner", 25, 6000, 0.5, 15),
+        ("value_scanner", 15, 7000, 0.5, 20),
+        ("dividend_scanner", 15, 8000, 0.5, 20),
+        ("growth_scanner", 15, 9000, 1, 20),
+    ],
+)
+def test_risk_filter_removes_high_volatility(request, scanner_name, n_days, sid_base, spread_low, spread_high):
+    """各 Scanner risk filter 應剔除高波動外圍股。"""
+    scanner = request.getfixturevalue(scanner_name)
+    rows = []
+    sids = [f"{sid_base + i}" for i in range(10)]
+    for i, sid in enumerate(sids):
+        for d in range(n_days):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            spread = spread_high if i == 9 else spread_low
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": 100,
+                    "high": 100 + spread,
+                    "low": 100 - spread,
+                    "close": 100 + (spread if d % 2 == 0 else -spread),
+                    "volume": 1_000_000,
+                }
+            )
+    df_price = pd.DataFrame(rows)
+    scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+    result = scanner._apply_risk_filter(scored, df_price)
+    assert len(result) < len(scored)
 
-    def test_empty_scored_returns_empty(self, momentum_scanner):
-        result = momentum_scanner._apply_risk_filter(pd.DataFrame(columns=["stock_id"]), pd.DataFrame())
-        assert result.empty
+
+@pytest.mark.parametrize("scanner_name", ["momentum_scanner", "growth_scanner"])
+def test_risk_filter_empty_returns_empty(request, scanner_name):
+    """空輸入應回傳空 DataFrame。"""
+    scanner = request.getfixturevalue(scanner_name)
+    result = scanner._apply_risk_filter(pd.DataFrame(columns=["stock_id"]), pd.DataFrame())
+    assert result.empty
 
 
 class TestMomentumCompositeWeights:
@@ -583,29 +536,7 @@ class TestMomentumCompositeWeights:
 # ====================================================================== #
 
 
-def _make_swing_price_df(n_days: int = 80, n_stocks: int = 5) -> pd.DataFrame:
-    """建立波段模式所需的長期市場資料。"""
-    rows = []
-    for i in range(n_stocks):
-        sid = f"{4000 + i}"
-        for d in range(n_days):
-            day = date(2025, 1, 1) + timedelta(days=d)
-            base_close = 80 + i * 30
-            # 上升趨勢，i 越大越強
-            close = base_close * (1 + 0.001 * (i + 1)) ** d
-            vol = 300_000 + i * 50_000 + d * 5_000
-            rows.append(
-                {
-                    "stock_id": sid,
-                    "date": day,
-                    "open": close * 0.995,
-                    "high": close * 1.01,
-                    "low": close * 0.99,
-                    "close": close,
-                    "volume": int(vol),
-                }
-            )
-    return pd.DataFrame(rows)
+_make_swing_price_df = make_swing_price_df
 
 
 @pytest.fixture()
@@ -831,34 +762,6 @@ class TestSwingCompositeWeights:
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 
-class TestSwingRiskFilter:
-    def test_removes_high_volatility(self, swing_scanner):
-        """波動率過濾應剔除前 15% 高波動股。"""
-        rows = []
-        sids = [f"{6000 + i}" for i in range(10)]
-        for i, sid in enumerate(sids):
-            for d in range(25):
-                day = date(2025, 1, 1) + timedelta(days=d)
-                base = 100
-                # 最後一支波動極大
-                spread = 15 if i == 9 else 0.5
-                rows.append(
-                    {
-                        "stock_id": sid,
-                        "date": day,
-                        "open": base,
-                        "high": base + spread,
-                        "low": base - spread,
-                        "close": base + (spread if d % 2 == 0 else -spread),
-                        "volume": 1_000_000,
-                    }
-                )
-        df_price = pd.DataFrame(rows)
-        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
-        result = swing_scanner._apply_risk_filter(scored, df_price)
-        assert len(result) < len(scored)
-
-
 # ====================================================================== #
 #  ValueScanner 測試
 # ====================================================================== #
@@ -1043,33 +946,6 @@ class TestApplySectorBonus:
         assert result.iloc[0]["composite_score"] == pytest.approx(0.75, abs=1e-6)
 
 
-class TestValueRiskFilter:
-    def test_removes_high_volatility(self, value_scanner):
-        """波動率過濾應剔除前 10% 高波動股。"""
-        rows = []
-        sids = [f"{7000 + i}" for i in range(10)]
-        for i, sid in enumerate(sids):
-            for d in range(15):
-                day = date(2025, 1, 1) + timedelta(days=d)
-                base = 100
-                spread = 20 if i == 9 else 0.5
-                rows.append(
-                    {
-                        "stock_id": sid,
-                        "date": day,
-                        "open": base,
-                        "high": base + spread,
-                        "low": base - spread,
-                        "close": base + (spread if d % 2 == 0 else -spread),
-                        "volume": 1_000_000,
-                    }
-                )
-        df_price = pd.DataFrame(rows)
-        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
-        result = value_scanner._apply_risk_filter(scored, df_price)
-        assert len(result) < len(scored)
-
-
 # ====================================================================== #
 #  DividendScanner 測試
 # ====================================================================== #
@@ -1198,33 +1074,6 @@ class TestDividendFundamentalScores:
             ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
         )
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
-
-
-class TestDividendRiskFilter:
-    def test_removes_high_volatility(self, dividend_scanner):
-        """波動率過濾應剔除前 10% 高波動股。"""
-        rows = []
-        sids = [f"{8000 + i}" for i in range(10)]
-        for i, sid in enumerate(sids):
-            for d in range(15):
-                day = date(2025, 1, 1) + timedelta(days=d)
-                base = 100
-                spread = 20 if i == 9 else 0.5
-                rows.append(
-                    {
-                        "stock_id": sid,
-                        "date": day,
-                        "open": base,
-                        "high": base + spread,
-                        "low": base - spread,
-                        "close": base + (spread if d % 2 == 0 else -spread),
-                        "volume": 1_000_000,
-                    }
-                )
-        df_price = pd.DataFrame(rows)
-        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
-        result = dividend_scanner._apply_risk_filter(scored, df_price)
-        assert len(result) < len(scored)
 
 
 class TestDividendRegimeWeights:
@@ -1414,37 +1263,6 @@ class TestGrowthChipScores:
         assert scores["1001"] > scores["1000"]
 
 
-class TestGrowthRiskFilter:
-    def test_removes_high_atr(self, growth_scanner):
-        """ATR 過濾應剔除前 20% 高波動股。"""
-        rows = []
-        sids = [f"{9000 + i}" for i in range(10)]
-        for i, sid in enumerate(sids):
-            for d in range(15):
-                day = date(2025, 1, 1) + timedelta(days=d)
-                base = 100 + i * 10
-                spread = 20 if i == 9 else 1
-                rows.append(
-                    {
-                        "stock_id": sid,
-                        "date": day,
-                        "open": base,
-                        "high": base + spread,
-                        "low": base - spread,
-                        "close": base + (spread if d % 2 == 0 else -spread),
-                        "volume": 1_000_000,
-                    }
-                )
-        df_price = pd.DataFrame(rows)
-        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
-        result = growth_scanner._apply_risk_filter(scored, df_price)
-        assert len(result) < len(scored)
-
-    def test_empty_scored_returns_empty(self, growth_scanner):
-        result = growth_scanner._apply_risk_filter(pd.DataFrame(columns=["stock_id"]), pd.DataFrame())
-        assert result.empty
-
-
 class TestGrowthRegimeWeights:
     def test_weights_exist_for_all_regimes(self):
         """確認 growth 模式在三種 regime 下都有權重。"""
@@ -1484,24 +1302,7 @@ class TestGrowthRegimeWeights:
 # ====================================================================== #
 
 
-def _make_entry_exit_price_df(sid: str = "1000", n_days: int = 20) -> pd.DataFrame:
-    """建立供進出場計算用的 20 天模擬價格資料。"""
-    rows = []
-    for d in range(n_days):
-        day = date(2025, 1, 1) + timedelta(days=d)
-        close = 100.0 + d * 0.5
-        rows.append(
-            {
-                "stock_id": sid,
-                "date": day,
-                "open": close - 1,
-                "high": close + 2,
-                "low": close - 2,
-                "close": close,
-                "volume": 500_000,
-            }
-        )
-    return pd.DataFrame(rows)
+_make_entry_exit_price_df = make_entry_exit_price_df
 
 
 class TestCalcAtr14:
@@ -1644,137 +1445,51 @@ class TestRankAndEnrichHasEntryExitCols:
 # ================================================================
 
 
-class TestValueScannerStage05:
-    """ValueScanner Stage 0.5: 估值 Cold-Start 自動補抓機制。"""
+@pytest.mark.parametrize(
+    "ScannerCls",
+    [pytest.param(ValueScanner, id="value"), pytest.param(DividendScanner, id="dividend")],
+)
+class TestScannerStage05:
+    """Stage 0.5 估值 Cold-Start 自動補抓機制（Value / Dividend 共用）。"""
 
-    def _make_mocked_scanner(self, monkeypatch, val_count: int):
-        """回傳一個 Stage 0.5 完整 mock 的 ValueScanner。"""
+    def _make_mocked_scanner(self, monkeypatch, ScannerCls, val_count: int):
         from unittest.mock import MagicMock
 
-        scanner = ValueScanner(top_n_candidates=5, top_n_results=3)
-
-        # Mock _load_market_data 回傳空，讓 run() 在 Stage 1 後就提早返回
+        scanner = ScannerCls(top_n_candidates=5, top_n_results=3)
         scanner._load_market_data = MagicMock(
             return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
         )
-
-        # Mock get_session → 回傳 val_count（Stage 0.5 查詢用）
-        # Stage 0 (Regime 偵測) 有 try/except，失敗時自動 fallback，無需 mock
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session.execute.return_value.scalar.return_value = val_count
-
         monkeypatch.setattr("src.discovery.scanner.get_session", lambda: mock_session)
-
         return scanner
 
-    def test_stage05_triggers_when_no_valuation_data(self, monkeypatch):
+    def test_stage05_triggers_when_no_valuation_data(self, monkeypatch, ScannerCls):
         """val_count = 0 時，應呼叫 sync_valuation_all_market。"""
         import src.data.pipeline as pipeline_mod
 
         sync_calls = []
-
-        def fake_sync():
-            sync_calls.append(1)
-            return 1200
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
-        scanner.run()
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", lambda: sync_calls.append(1) or 1200)
+        self._make_mocked_scanner(monkeypatch, ScannerCls, val_count=0).run()
         assert len(sync_calls) == 1, "Stage 0.5 應觸發一次 sync_valuation_all_market"
 
-    def test_stage05_skips_when_sufficient_data(self, monkeypatch):
+    def test_stage05_skips_when_sufficient_data(self, monkeypatch, ScannerCls):
         """val_count >= 500 時，不應呼叫 sync_valuation_all_market。"""
         import src.data.pipeline as pipeline_mod
 
         sync_calls = []
-
-        def fake_sync():
-            sync_calls.append(1)
-            return 0
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=1200)
-        scanner.run()
+        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", lambda: sync_calls.append(1) or 0)
+        self._make_mocked_scanner(monkeypatch, ScannerCls, val_count=1200).run()
         assert len(sync_calls) == 0, "估值充足時不應觸發補抓"
 
-    def test_stage05_does_not_crash_on_sync_failure(self, monkeypatch):
+    def test_stage05_does_not_crash_on_sync_failure(self, monkeypatch, ScannerCls):
         """sync_valuation_all_market 拋例外時，掃描應繼續（不崩潰）。"""
         import src.data.pipeline as pipeline_mod
 
-        def fake_sync():
-            raise RuntimeError("網路錯誤")
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
-        # 不應拋例外
-        result = scanner.run()
-        assert result is not None
-
-
-class TestDividendScannerStage05:
-    """DividendScanner Stage 0.5: 估值 Cold-Start 自動補抓機制。"""
-
-    def _make_mocked_scanner(self, monkeypatch, val_count: int):
-        """回傳一個 Stage 0.5 完整 mock 的 DividendScanner。"""
-        from unittest.mock import MagicMock
-
-        scanner = DividendScanner(top_n_candidates=5, top_n_results=3)
-
-        scanner._load_market_data = MagicMock(
-            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        monkeypatch.setattr(
+            pipeline_mod, "sync_valuation_all_market", lambda: (_ for _ in ()).throw(RuntimeError("網路錯誤"))
         )
-
-        # Mock get_session → 回傳 val_count（Stage 0.5 查詢用）
-        # Stage 0 (Regime 偵測) 有 try/except，失敗時自動 fallback，無需 mock
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-        mock_session.execute.return_value.scalar.return_value = val_count
-
-        monkeypatch.setattr("src.discovery.scanner.get_session", lambda: mock_session)
-
-        return scanner
-
-    def test_stage05_triggers_when_no_valuation_data(self, monkeypatch):
-        """val_count = 0 時，應呼叫 sync_valuation_all_market。"""
-        import src.data.pipeline as pipeline_mod
-
-        sync_calls = []
-
-        def fake_sync():
-            sync_calls.append(1)
-            return 1200
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
-        scanner.run()
-        assert len(sync_calls) == 1, "Stage 0.5 應觸發一次 sync_valuation_all_market"
-
-    def test_stage05_skips_when_sufficient_data(self, monkeypatch):
-        """val_count >= 500 時，不應呼叫 sync_valuation_all_market。"""
-        import src.data.pipeline as pipeline_mod
-
-        sync_calls = []
-
-        def fake_sync():
-            sync_calls.append(1)
-            return 0
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=1200)
-        scanner.run()
-        assert len(sync_calls) == 0, "估值充足時不應觸發補抓"
-
-    def test_stage05_does_not_crash_on_sync_failure(self, monkeypatch):
-        """sync_valuation_all_market 拋例外時，掃描應繼續（不崩潰）。"""
-        import src.data.pipeline as pipeline_mod
-
-        def fake_sync():
-            raise RuntimeError("網路錯誤")
-
-        monkeypatch.setattr(pipeline_mod, "sync_valuation_all_market", fake_sync)
-        scanner = self._make_mocked_scanner(monkeypatch, val_count=0)
-        result = scanner.run()
+        result = self._make_mocked_scanner(monkeypatch, ScannerCls, val_count=0).run()
         assert result is not None

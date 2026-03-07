@@ -137,3 +137,35 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
     result["bb_lower"] = bb.bollinger_lband()
 
     return result
+
+
+def calc_rsi14_from_series(closes: pd.Series) -> float:
+    """從收盤價序列計算 RSI14（取最後一個有效值）。
+
+    使用 Wilder's smoothing（alpha=1/14 EWM）。
+    長度不足 15 時回傳 50.0（中性值）。
+
+    Args:
+        closes: 收盤價序列（pd.Series，已按日期升序排列）
+
+    Returns:
+        RSI14 值（0.0 ~ 100.0），資料不足時回傳 50.0
+    """
+    if len(closes) < 15:
+        return 50.0
+
+    delta = closes.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+
+    last_gain = float(avg_gain.iloc[-1])
+    last_loss = float(avg_loss.iloc[-1])
+
+    if last_loss == 0.0:
+        return 100.0 if last_gain > 0 else 50.0
+
+    rs = last_gain / last_loss
+    return round(100.0 - 100.0 / (1.0 + rs), 2)

@@ -114,3 +114,43 @@ def send_scan_results(df) -> bool:
     """
     text = format_scan_results(df)
     return send_message(text)
+
+
+def format_suggest_discord(
+    stock_id: str,
+    stock_name: str,
+    today: object,
+    close: float,
+    sma20: float,
+    rsi14: float,
+    atr_str: str,
+    regime_zh: str,
+    taiex_close: float,
+    entry_price: float,
+    sl_str: str,
+    tp_str: str,
+    rr_str: str,
+    trigger: str,
+    timing: str,
+    valid_until: object,
+) -> str:
+    """將 suggest 結果格式化為 Discord 訊息（純函數，≤ 2000 字元）。"""
+    sep = "─" * 40
+    lines = [
+        f"**進出場建議 — {stock_id} {stock_name}**",
+        f"分析日期：{today}  ｜  市場：{regime_zh}（TAIEX {taiex_close:,.0f}）",
+        "```",
+        f"收盤  ：{close:.2f}   SMA20：{sma20:.2f}   RSI：{rsi14:.1f}",
+        f"ATR14 ：{atr_str}",
+        sep,
+        f"進場參考：{entry_price:.2f}",
+        f"止  損  ：{sl_str}",
+        f"目  標  ：{tp_str}",
+        f"風險報酬：{rr_str}",
+        sep,
+        f"觸發條件：{trigger}",
+        f"時機評估：{timing}",
+        f"有效至  ：{valid_until}",
+        "```",
+    ]
+    return "\n".join(lines)[:2000]

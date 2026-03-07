@@ -1,4 +1,4 @@
-"""測試 suggest 命令的純函數：_calc_rsi14_from_series、_assess_timing、_format_suggest_discord。
+"""測試 suggest 命令的純函數：calc_rsi14_from_series、_assess_timing、format_suggest_discord。
 
 所有測試皆為純函數測試（零 mock），不需要 DB 或外部服務。
 """
@@ -10,7 +10,9 @@ import datetime
 import numpy as np
 import pandas as pd
 
-from main import _assess_timing, _calc_rsi14_from_series, _format_suggest_discord
+from main import _assess_timing
+from src.features.indicators import calc_rsi14_from_series as _calc_rsi14_from_series
+from src.notification.line_notify import format_suggest_discord as _format_suggest_discord
 
 # ============================================================
 # _calc_rsi14_from_series
