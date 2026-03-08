@@ -76,14 +76,18 @@ python main.py watch list                    # 列出持倉中的記錄
 python main.py watch list --status all       # 列出全部（含已平倉/止損/止利/過期）
 python main.py watch close 1 --price 595     # 平倉 ID=1 的持倉
 python main.py watch update-status           # 批次更新止損/止利/過期狀態（含移動止損自動上移）
-python main.py morning-routine --notify      # 每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → Discord 摘要）
+python main.py anomaly-scan                  # 掃描 watchlist 籌碼異動（量能暴增/外資大買超/借券激增/主力集中）
+python main.py anomaly-scan --stocks 2330 2317  # 指定股票
+python main.py anomaly-scan --vol-mult 3.0 --inst-threshold 5000000  # 自訂門檻
+python main.py anomaly-scan --notify         # 掃描並推播 Discord
+python main.py morning-routine --notify      # 每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → anomaly-scan → Discord 摘要）
 python main.py morning-routine --skip-sync --notify  # 跳過借券/分點同步（資料已新鮮時使用）
 python main.py morning-routine --dry-run     # 預覽步驟與摘要（不實際執行）
 ```
 
 ### 測試
 
-使用 pytest 測試框架，681 個測試覆蓋核心模組：
+使用 pytest 測試框架，693 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -131,6 +135,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_broker.py`         | `fetch_broker_trades` 欄位映射 + `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 | 純函數 + in-memory SQLite + mock HTTP |
+| `tests/test_anomaly.py`        | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數（量能暴增/外資大買超/借券激增/主力集中）| 純函數 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。測試用資料建構函數（`make_price_df` 等 5 個）集中於 `tests/scanner_helpers.py`（因 `tests/` 有 `__init__.py`，conftest 不可直接 import）。
 
@@ -205,7 +210,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
 | `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history, position_monitoring） |
-| `main.py`                           | CLI 調度器（argparse 子命令，29 個子命令）；`_compute_revenue_scan()` 純函數（YoY + 毛利率掃描）；`_compute_trailing_stop()` 純函數（highest - ATR×mult）；`cmd_morning_routine()` 早晨例行流程；`cmd_alert_check()` MOPS 事件警報；`cmd_revenue_scan()` 高成長掃描 |
+| `main.py`                           | CLI 調度器（argparse 子命令，30 個子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan） |
 
 ### 設定
 
@@ -259,6 +264,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 20 | ✅ | **分點進出整合（P5，FinMind TaiwanStockTradingDailyReport）** | 新增 `BrokerTrade` ORM（schema.py，18 張表）；`fetch_broker_trades()`（fetcher.py，免費逐股）；`sync_broker_trades(days=5)`（pipeline.py，跳過已有 2 日內資料）；`compute_broker_score()` 純函數計算主力集中度 HHI + 連續進場天數；`_load_broker_data()` + MomentumScanner 升級為最高 7-factor（外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%）；CLI `sync-broker`（含 `--from-discover`）；669 測試通過 |
 | 21 | ✅ | **每日早晨例行流程（morning-routine）** | `cmd_morning_routine()` 依序執行 6 步驟（sync-sbl → sync-broker --from-discover → discover all --skip-sync → alert-check --days 3 → watch update-status → revenue-scan --top 5）；`_build_morning_discord_summary()` 純函數建立 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態）；CLI `morning-routine`（--dry-run / --skip-sync / --top / --notify）；673 測試通過 |
 | 22 | ✅ | **動態止損追蹤（P3，Watch 升級）** | `WatchEntry` ORM 新增 `trailing_stop_enabled`/`trailing_atr_multiplier`/`highest_price_since_entry` 三欄（含 migration）；`_compute_trailing_stop()` 純函數（stop = highest - ATR14 × mult，只升不降）；`watch update-status` 每次執行時自動更新移動止損；`watch add --trailing --trailing-multiplier` CLI 旗標；Dashboard 持倉監控頁顯示移動止損類型/顏色/追蹤最高價；681 測試通過 |
+| 23 | ✅ | **成交量/籌碼異動即時警報（P5）** | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數；`_compute_anomaly_scan()` 從 DailyPrice/InstitutionalInvestor/SecuritiesLending/BrokerTrade 四表讀取並偵測；`cmd_anomaly_scan()` + CLI `anomaly-scan`（--stocks/--lookback/--vol-mult/--inst-threshold/--sbl-sigma/--hhi-threshold/--notify）；整合進 `morning-routine` Step 7 + Discord 摘要；`tests/test_anomaly.py` 12 個純函數測試；693 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

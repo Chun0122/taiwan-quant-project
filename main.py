@@ -1657,6 +1657,395 @@ def _compute_revenue_scan(
     return df[["stock_id", "yoy_growth", "mom_growth", "gross_margin", "margin_change", "revenue_rank"]]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# P5 籌碼異動警報 — 四個純函數（零 mock 可測試）
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def detect_volume_spike(
+    df_price: "pd.DataFrame",
+    lookback: int = 10,
+    threshold: float = 2.0,
+) -> "pd.DataFrame":
+    """量能暴增偵測：今日量 > 近 lookback 天均量 × threshold（純函數）。
+
+    輸入欄位: stock_id, date, volume（股）
+    輸出欄位: stock_id, today_vol, avg_vol, vol_ratio
+    需至少 2 天資料（1 天歷史 + 1 天今日）；不足回傳空 DataFrame。
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame(columns=["stock_id", "today_vol", "avg_vol", "vol_ratio"])
+    if df_price.empty:
+        return empty
+
+    results = []
+    for stock_id, grp in df_price.groupby("stock_id"):
+        grp = grp.sort_values("date")
+        latest_date = grp["date"].max()
+        today_row = grp[grp["date"] == latest_date]
+        hist = grp[grp["date"] < latest_date].tail(lookback)
+        if hist.empty or today_row.empty:
+            continue
+        today_vol = int(today_row["volume"].iloc[0])
+        avg_vol = float(hist["volume"].mean())
+        if avg_vol <= 0:
+            continue
+        ratio = today_vol / avg_vol
+        if ratio >= threshold:
+            results.append(
+                {
+                    "stock_id": stock_id,
+                    "today_vol": today_vol,
+                    "avg_vol": round(avg_vol),
+                    "vol_ratio": round(ratio, 2),
+                }
+            )
+
+    if not results:
+        return empty
+    return pd.DataFrame(results).sort_values("vol_ratio", ascending=False).reset_index(drop=True)
+
+
+def detect_institutional_buy(
+    df_inst: "pd.DataFrame",
+    threshold: float = 3_000_000,
+) -> "pd.DataFrame":
+    """外資大買超偵測：最新日外資 net > threshold（股）（純函數）。
+
+    輸入欄位: stock_id, date, name, net
+    name 用 str.contains("外資") 篩選（容納多種命名格式）。
+    輸出欄位: stock_id, inst_net（股）
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame(columns=["stock_id", "inst_net"])
+    if df_inst.empty:
+        return empty
+
+    foreign = df_inst[df_inst["name"].str.contains("外資", na=False)].copy()
+    if foreign.empty:
+        return empty
+
+    latest_date = foreign["date"].max()
+    today_foreign = foreign[foreign["date"] == latest_date]
+
+    # 同一股票可能有多筆外資記錄（外資 + 外資自營商），合計
+    summed = today_foreign.groupby("stock_id")["net"].sum().reset_index()
+    summed.columns = ["stock_id", "inst_net"]
+
+    result = summed[summed["inst_net"] > threshold]
+    return result.sort_values("inst_net", ascending=False).reset_index(drop=True)
+
+
+def detect_sbl_spike(
+    df_sbl: "pd.DataFrame",
+    lookback: int = 10,
+    sigma: float = 2.0,
+) -> "pd.DataFrame":
+    """借券賣出激增偵測：最新日 sbl_change > mean + sigma × std（純函數）。
+
+    需至少 3 筆歷史資料才計算（含今日），不足回傳空 DataFrame。
+    只偵測 sbl_change > 0（借券增加）的情況。
+    輸入欄位: stock_id, date, sbl_change
+    輸出欄位: stock_id, sbl_change, sbl_mean, sbl_std
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame(columns=["stock_id", "sbl_change", "sbl_mean", "sbl_std"])
+    if df_sbl.empty:
+        return empty
+
+    results = []
+    for stock_id, grp in df_sbl.groupby("stock_id"):
+        grp = grp.sort_values("date")
+        if len(grp) < 3:
+            continue
+        latest_date = grp["date"].max()
+        today_row = grp[grp["date"] == latest_date]
+        if today_row.empty:
+            continue
+        today_change = today_row["sbl_change"].iloc[0]
+        if pd.isna(today_change):
+            continue
+        today_change = float(today_change)
+
+        hist_changes = grp[grp["date"] < latest_date]["sbl_change"].dropna()
+        if len(hist_changes) < 2:
+            continue
+        mean_c = float(hist_changes.tail(lookback).mean())
+        std_c = float(hist_changes.tail(lookback).std())
+        if std_c <= 0:
+            continue
+        z = (today_change - mean_c) / std_c
+        if today_change > 0 and z >= sigma:
+            results.append(
+                {
+                    "stock_id": stock_id,
+                    "sbl_change": int(today_change),
+                    "sbl_mean": round(mean_c, 1),
+                    "sbl_std": round(std_c, 1),
+                }
+            )
+
+    if not results:
+        return empty
+    return pd.DataFrame(results).sort_values("sbl_change", ascending=False).reset_index(drop=True)
+
+
+def detect_broker_concentration(
+    df_broker: "pd.DataFrame",
+    hhi_threshold: float = 0.4,
+) -> "pd.DataFrame":
+    """主力分點集中買進：最新日 HHI(淨買超分點) > hhi_threshold AND 總淨買 > 0（純函數）。
+
+    輸入欄位: stock_id, date, broker_id, buy, sell
+    輸出欄位: stock_id, broker_hhi, net_buy_total（股）
+    """
+    import pandas as pd
+
+    empty = pd.DataFrame(columns=["stock_id", "broker_hhi", "net_buy_total"])
+    if df_broker.empty:
+        return empty
+
+    latest_date = df_broker["date"].max()
+    today = df_broker[df_broker["date"] == latest_date].copy()
+    today["net"] = (today["buy"].fillna(0) - today["sell"].fillna(0)).astype(int)
+
+    results = []
+    for stock_id, grp in today.groupby("stock_id"):
+        net_buy_total = int(grp["net"].sum())
+        if net_buy_total <= 0:
+            continue
+        buyers = grp[grp["net"] > 0]
+        if buyers.empty:
+            continue
+        total = buyers["net"].sum()
+        shares = buyers["net"] / total
+        hhi = float((shares**2).sum())
+        if hhi >= hhi_threshold:
+            results.append(
+                {
+                    "stock_id": stock_id,
+                    "broker_hhi": round(hhi, 3),
+                    "net_buy_total": net_buy_total,
+                }
+            )
+
+    if not results:
+        return empty
+    return pd.DataFrame(results).sort_values("broker_hhi", ascending=False).reset_index(drop=True)
+
+
+def _compute_anomaly_scan(
+    watchlist: list[str],
+    lookback: int = 10,
+    vol_mult: float = 2.0,
+    inst_threshold: float = 3_000_000,
+    sbl_sigma: float = 2.0,
+    hhi_threshold: float = 0.4,
+) -> "dict[str, pd.DataFrame]":
+    """從 DB 讀取四類資料，呼叫四個純函數，回傳異常偵測結果（純函數）。
+
+    Keys: "volume_spike", "inst_buy", "sbl_spike", "broker_conc"
+    各值為 DataFrame；無資料時為空 DataFrame。
+    """
+    import datetime
+
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import BrokerTrade, DailyPrice, InstitutionalInvestor, SecuritiesLending
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=lookback + 5)
+    inst_cutoff = datetime.date.today() - datetime.timedelta(days=5)
+
+    # ── A. 量能暴增 ──────────────────────────────────────────────────
+    try:
+        with get_session() as session:
+            price_rows = session.execute(
+                select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.volume).where(
+                    DailyPrice.stock_id.in_(watchlist),
+                    DailyPrice.date >= cutoff,
+                )
+            ).all()
+        df_price = pd.DataFrame(price_rows, columns=["stock_id", "date", "volume"]) if price_rows else pd.DataFrame()
+    except Exception:
+        df_price = pd.DataFrame()
+
+    # ── B. 外資大買超 ─────────────────────────────────────────────────
+    try:
+        with get_session() as session:
+            inst_rows = session.execute(
+                select(
+                    InstitutionalInvestor.stock_id,
+                    InstitutionalInvestor.date,
+                    InstitutionalInvestor.name,
+                    InstitutionalInvestor.net,
+                ).where(
+                    InstitutionalInvestor.stock_id.in_(watchlist),
+                    InstitutionalInvestor.date >= inst_cutoff,
+                )
+            ).all()
+        df_inst = pd.DataFrame(inst_rows, columns=["stock_id", "date", "name", "net"]) if inst_rows else pd.DataFrame()
+    except Exception:
+        df_inst = pd.DataFrame()
+
+    # ── C. 借券賣出激增 ───────────────────────────────────────────────
+    try:
+        with get_session() as session:
+            sbl_rows = session.execute(
+                select(
+                    SecuritiesLending.stock_id,
+                    SecuritiesLending.date,
+                    SecuritiesLending.sbl_change,
+                ).where(
+                    SecuritiesLending.stock_id.in_(watchlist),
+                    SecuritiesLending.date >= cutoff,
+                )
+            ).all()
+        df_sbl = pd.DataFrame(sbl_rows, columns=["stock_id", "date", "sbl_change"]) if sbl_rows else pd.DataFrame()
+    except Exception:
+        df_sbl = pd.DataFrame()
+
+    # ── D. 主力分點集中買進 ───────────────────────────────────────────
+    try:
+        with get_session() as session:
+            broker_rows = session.execute(
+                select(
+                    BrokerTrade.stock_id,
+                    BrokerTrade.date,
+                    BrokerTrade.broker_id,
+                    BrokerTrade.buy,
+                    BrokerTrade.sell,
+                ).where(
+                    BrokerTrade.stock_id.in_(watchlist),
+                    BrokerTrade.date >= inst_cutoff,
+                )
+            ).all()
+        df_broker = (
+            pd.DataFrame(broker_rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
+            if broker_rows
+            else pd.DataFrame()
+        )
+    except Exception:
+        df_broker = pd.DataFrame()
+
+    return {
+        "volume_spike": detect_volume_spike(df_price, lookback=lookback, threshold=vol_mult),
+        "inst_buy": detect_institutional_buy(df_inst, threshold=inst_threshold),
+        "sbl_spike": detect_sbl_spike(df_sbl, lookback=lookback, sigma=sbl_sigma),
+        "broker_conc": detect_broker_concentration(df_broker, hhi_threshold=hhi_threshold),
+    }
+
+
+def cmd_anomaly_scan(args: argparse.Namespace) -> None:
+    """掃描 watchlist 中成交量/籌碼異動的即時警報。
+
+    偵測四類異常：量能暴增、外資大買超、借券賣出激增、主力分點集中買進。
+    資料直接從 DB 讀取（需先執行 sync / sync-sbl / sync-broker）。
+    """
+    import datetime
+
+    from src.config import settings
+
+    _init_db()
+
+    watchlist = args.stocks if args.stocks else settings.fetcher.watchlist
+    lookback: int = getattr(args, "lookback", 10)
+    vol_mult: float = getattr(args, "vol_mult", 2.0)
+    inst_threshold: float = getattr(args, "inst_threshold", 3_000_000)
+    sbl_sigma: float = getattr(args, "sbl_sigma", 2.0)
+    hhi_threshold: float = getattr(args, "hhi_threshold", 0.4)
+    notify: bool = getattr(args, "notify", False)
+
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    print(f"\n掃描 {len(watchlist)} 支股票的籌碼異動（{today_str}）...")
+
+    results = _compute_anomaly_scan(
+        watchlist=watchlist,
+        lookback=lookback,
+        vol_mult=vol_mult,
+        inst_threshold=inst_threshold,
+        sbl_sigma=sbl_sigma,
+        hhi_threshold=hhi_threshold,
+    )
+
+    df_vol = results["volume_spike"]
+    df_inst = results["inst_buy"]
+    df_sbl = results["sbl_spike"]
+    df_broker = results["broker_conc"]
+
+    total = len(df_vol) + len(df_inst) + len(df_sbl) + len(df_broker)
+    print(f"\n=== 籌碼異動警報（{today_str}，共 {total} 筆）===")
+
+    if not df_vol.empty:
+        print(f"\n【📊 量能暴增】（今日量 > {lookback}MA × {vol_mult}x，共 {len(df_vol)} 支）")
+        for _, row in df_vol.iterrows():
+            today_lot = int(row["today_vol"]) // 1000
+            avg_lot = int(row["avg_vol"]) // 1000
+            print(f"  {row['stock_id']}  今日量 {today_lot:,} 張  均量 {avg_lot:,} 張  倍率 {row['vol_ratio']:.2f}x")
+    else:
+        print(f"\n【📊 量能暴增】無（門檻: > {lookback}MA × {vol_mult}x）")
+
+    if not df_inst.empty:
+        thresh_lot = int(inst_threshold) // 1000
+        print(f"\n【🏦 外資大買超】（淨買超 > {thresh_lot:,} 張，共 {len(df_inst)} 支）")
+        for _, row in df_inst.iterrows():
+            lots = int(row["inst_net"]) // 1000
+            print(f"  {row['stock_id']}  外資淨買 +{lots:,} 張（+{int(row['inst_net']):,} 股）")
+    else:
+        print(f"\n【🏦 外資大買超】無（門檻: > {int(inst_threshold) // 1000:,} 張）")
+
+    if not df_sbl.empty:
+        print(f"\n【🔴 借券賣出激增】（sbl_change > mean + {sbl_sigma}σ，共 {len(df_sbl)} 支）")
+        for _, row in df_sbl.iterrows():
+            chg_lot = int(row["sbl_change"]) // 1000
+            print(
+                f"  {row['stock_id']}  借券增加 +{chg_lot:,} 張（均值 {row['sbl_mean']:.0f}  std {row['sbl_std']:.0f}）"
+            )
+    else:
+        print(f"\n【🔴 借券賣出激增】無（門檻: > mean + {sbl_sigma}σ）")
+
+    if not df_broker.empty:
+        print(f"\n【🎯 主力分點集中買進】（HHI > {hhi_threshold:.2f}，共 {len(df_broker)} 支）")
+        for _, row in df_broker.iterrows():
+            net_lot = int(row["net_buy_total"]) // 1000
+            print(f"  {row['stock_id']}  HHI={row['broker_hhi']:.3f}  淨買超 +{net_lot:,} 張")
+    else:
+        print(f"\n【🎯 主力分點集中買進】無（門檻: HHI > {hhi_threshold:.2f}）")
+
+    if notify:
+        from src.notification.line_notify import send_message
+
+        lines = [f"📡 **籌碼異動警報** ({today_str})，共 {total} 筆"]
+        if not df_vol.empty:
+            lines.append(f"\n📊 量能暴增 ({len(df_vol)} 支)")
+            for _, row in df_vol.head(5).iterrows():
+                lots = int(row["today_vol"]) // 1000
+                lines.append(f"  {row['stock_id']} 今日 {lots:,}張 倍率 {row['vol_ratio']:.1f}x")
+        if not df_inst.empty:
+            lines.append(f"\n🏦 外資大買超 ({len(df_inst)} 支)")
+            for _, row in df_inst.head(5).iterrows():
+                lots = int(row["inst_net"]) // 1000
+                lines.append(f"  {row['stock_id']} +{lots:,}張")
+        if not df_sbl.empty:
+            lines.append(f"\n🔴 借券激增 ({len(df_sbl)} 支)")
+            for _, row in df_sbl.head(3).iterrows():
+                lots = int(row["sbl_change"]) // 1000
+                lines.append(f"  {row['stock_id']} +{lots:,}張")
+        if not df_broker.empty:
+            lines.append(f"\n🎯 主力集中買進 ({len(df_broker)} 支)")
+            for _, row in df_broker.head(3).iterrows():
+                net_lot = int(row["net_buy_total"]) // 1000
+                lines.append(f"  {row['stock_id']} HHI={row['broker_hhi']:.2f} +{net_lot:,}張")
+        if total == 0:
+            lines.append("（今日無異常訊號）")
+        ok = send_message("\n".join(lines[:40]))
+        print(f"\nDiscord 通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
+
+
 def cmd_revenue_scan(args: argparse.Namespace) -> None:
     """掃描 watchlist 中 YoY 高成長 + 毛利率改善的個股。
 
@@ -2464,6 +2853,31 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
         lines.append(f"👁 **持倉監控**：{' | '.join(parts)}")
         lines.append("")
 
+    # ── 4. 籌碼異動警報（快速摘要）──────────────────────────────────
+    try:
+        from src.config import settings as _cfg
+
+        _anomaly = _compute_anomaly_scan(_cfg.fetcher.watchlist)
+        _total_anomaly = sum(len(df) for df in _anomaly.values())
+        if _total_anomaly > 0:
+            parts_a = []
+            if not _anomaly["volume_spike"].empty:
+                sids = ", ".join(_anomaly["volume_spike"]["stock_id"].head(3).tolist())
+                parts_a.append(f"📊量增{len(_anomaly['volume_spike'])}({sids})")
+            if not _anomaly["inst_buy"].empty:
+                sids = ", ".join(_anomaly["inst_buy"]["stock_id"].head(3).tolist())
+                parts_a.append(f"🏦外資{len(_anomaly['inst_buy'])}({sids})")
+            if not _anomaly["sbl_spike"].empty:
+                sids = ", ".join(_anomaly["sbl_spike"]["stock_id"].head(3).tolist())
+                parts_a.append(f"🔴借券{len(_anomaly['sbl_spike'])}({sids})")
+            if not _anomaly["broker_conc"].empty:
+                sids = ", ".join(_anomaly["broker_conc"]["stock_id"].head(3).tolist())
+                parts_a.append(f"🎯主力{len(_anomaly['broker_conc'])}({sids})")
+            lines.append(f"🚨 **籌碼異動** ({_total_anomaly}筆)  " + "  ".join(parts_a))
+            lines.append("")
+    except Exception:
+        pass
+
     msg = "\n".join(lines)
     # Discord 單訊息上限 2000 字元，保留緩衝
     return msg[:1900] if len(msg) > 1900 else msg
@@ -2497,7 +2911,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 6
+    TOTAL = 7
 
     def _step(n: int, title: str) -> None:
         print(f"\n{'═' * 64}")
@@ -2561,6 +2975,23 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         _skip("dry-run")
     else:
         cmd_revenue_scan(argparse.Namespace(stocks=None, top=5, min_yoy=10.0, min_margin_improve=0.0, notify=False))
+
+    # ── Step 7: anomaly-scan ──────────────────────────────────────
+    _step(7, "籌碼異動掃描（anomaly-scan）")
+    if dry_run:
+        _skip("dry-run")
+    else:
+        cmd_anomaly_scan(
+            argparse.Namespace(
+                stocks=None,
+                lookback=10,
+                vol_mult=2.0,
+                inst_threshold=3_000_000,
+                sbl_sigma=2.0,
+                hhi_threshold=0.4,
+                notify=False,  # 統一由 morning-routine 推播
+            )
+        )
 
     # ── 完成提示 ─────────────────────────────────────────────────
     suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""
@@ -2871,10 +3302,36 @@ def main() -> None:
     # watch update-status
     watch_sub.add_parser("update-status", help="批次更新持倉狀態（比對最新收盤價自動標記止損/止利/過期）")
 
+    # anomaly-scan 子命令
+    sp_anomaly = subparsers.add_parser(
+        "anomaly-scan", help="掃描 watchlist 成交量/籌碼異動警報（量能暴增/外資大買超/借券激增/主力集中）"
+    )
+    sp_anomaly.add_argument("--stocks", nargs="+", help="指定股票代號（預設使用 watchlist）")
+    sp_anomaly.add_argument("--lookback", type=int, default=10, help="計算均量/均值的天數（預設 10）")
+    sp_anomaly.add_argument("--vol-mult", type=float, default=2.0, dest="vol_mult", help="量能倍數門檻（預設 2.0）")
+    sp_anomaly.add_argument(
+        "--inst-threshold",
+        type=float,
+        default=3_000_000,
+        dest="inst_threshold",
+        help="外資淨買超股數門檻（預設 3,000,000 股 = 3,000 張）",
+    )
+    sp_anomaly.add_argument(
+        "--sbl-sigma", type=float, default=2.0, dest="sbl_sigma", help="借券激增標準差倍數（預設 2.0σ）"
+    )
+    sp_anomaly.add_argument(
+        "--hhi-threshold",
+        type=float,
+        default=0.4,
+        dest="hhi_threshold",
+        help="主力分點集中度 HHI 門檻（預設 0.4）",
+    )
+    sp_anomaly.add_argument("--notify", action="store_true", help="推播 Discord 通知")
+
     # morning-routine 子命令
     sp_mr = subparsers.add_parser(
         "morning-routine",
-        help="每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → Discord 摘要）",
+        help="每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → anomaly-scan → Discord 摘要）",
     )
     sp_mr.add_argument(
         "--dry-run",
@@ -2962,6 +3419,8 @@ def main() -> None:
         cmd_validate(args)
     elif args.command == "suggest":
         cmd_suggest(args)
+    elif args.command == "anomaly-scan":
+        cmd_anomaly_scan(args)
     elif args.command == "morning-routine":
         cmd_morning_routine(args)
     elif args.command == "watch":

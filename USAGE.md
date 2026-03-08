@@ -1190,9 +1190,52 @@ python main.py watch update-status
 
 ---
 
+### 4.25 籌碼異動警報 (`anomaly-scan`)
+
+從 DB 現有資料（DailyPrice、InstitutionalInvestor、SecuritiesLending、BrokerTrade）偵測四類量化異常訊號，無需額外 API 呼叫。
+
+```bash
+# 掃描 watchlist 中所有股票
+python main.py anomaly-scan
+
+# 指定股票清單
+python main.py anomaly-scan --stocks 2330 2317 2454
+
+# 自訂門檻
+python main.py anomaly-scan --vol-mult 3.0 --inst-threshold 5000000 --sbl-sigma 3.0 --hhi-threshold 0.5
+
+# 掃描並推播 Discord
+python main.py anomaly-scan --notify
+```
+
+**四類異常訊號：**
+
+| 訊號 | 資料來源 | 邏輯 | 預設門檻 |
+|------|---------|------|---------|
+| 📊 量能暴增 | `DailyPrice.volume` | 今日量 > 近 N 天均量 × 倍數 | lookback=10, vol-mult=2.0 |
+| 🏦 外資大買超 | `InstitutionalInvestor` (外資) | 最新日外資淨買超 > 門檻 | inst-threshold=3,000,000 股（≈3,000張）|
+| 🔴 借券賣出激增 | `SecuritiesLending.sbl_change` | 最新日 sbl_change > mean + σ×std | sbl-sigma=2.0 |
+| 🎯 主力分點集中買進 | `BrokerTrade` | 最新日 HHI(淨買超分點) > 門檻 AND 淨買 > 0 | hhi-threshold=0.4 |
+
+**參數說明：**
+
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--stocks SID ...` | watchlist | 掃描股票清單 |
+| `--lookback N` | 10 | 計算均量/均值的天數 |
+| `--vol-mult F` | 2.0 | 量能倍數門檻 |
+| `--inst-threshold N` | 3000000 | 外資淨買超股數門檻（股）|
+| `--sbl-sigma F` | 2.0 | 借券激增標準差倍數 |
+| `--hhi-threshold F` | 0.4 | 主力集中度 HHI 門檻（0~1）|
+| `--notify` | False | 掃描完成後推播 Discord |
+
+> **資料準備**：需先執行 `python main.py sync`（DailyPrice/InstitutionalInvestor）、`python main.py sync-sbl`（借券）、`python main.py sync-broker`（分點）。`morning-routine` 已自動包含 Step 7 anomaly-scan。
+
+---
+
 ### morning-routine — 每日早晨例行流程
 
-一鍵執行六個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
+一鍵執行七個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
 
 ```bash
 # 完整流程 + Discord 摘要推播
@@ -1208,7 +1251,7 @@ python main.py morning-routine --dry-run
 python main.py morning-routine --top 30 --notify
 ```
 
-**六個執行步驟：**
+**七個執行步驟：**
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
@@ -1218,6 +1261,7 @@ python main.py morning-routine --top 30 --notify
 | Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
 | Step 6 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
+| Step 7 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力） |
 
 **參數說明：**
 
@@ -1232,6 +1276,7 @@ python main.py morning-routine --top 30 --notify
 - 📊 多模式選股（出現 2+ 模式的股票，含各模式排名）
 - 📣 重大事件（近3日非一般性公告）
 - 👁 持倉監控（各狀態數量統計）
+- 🚨 籌碼異動警報（量能暴增/外資大買超/借券激增/主力集中，各列前3支）
 
 ---
 
