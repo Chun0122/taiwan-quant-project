@@ -83,11 +83,16 @@ python main.py anomaly-scan --notify         # 掃描並推播 Discord
 python main.py morning-routine --notify      # 每日早晨例行流程（sync-sbl → sync-broker → discover all → alert-check → watch update-status → revenue-scan → anomaly-scan → Discord 摘要）
 python main.py morning-routine --skip-sync --notify  # 跳過借券/分點同步（資料已新鮮時使用）
 python main.py morning-routine --dry-run     # 預覽步驟與摘要（不實際執行）
+python main.py watchlist list                # 列出 DB watchlist 清單（DB 空時顯示 YAML fallback）
+python main.py watchlist add 2330            # 新增股票至 DB watchlist
+python main.py watchlist add 2330 --name 台積電 --note 核心持倉  # 含名稱與備註
+python main.py watchlist remove 2330        # 從 DB watchlist 移除股票
+python main.py watchlist import              # 從 settings.yaml 一次性匯入所有股票至 DB
 ```
 
 ### 測試
 
-使用 pytest 測試框架，693 個測試覆蓋核心模組：
+使用 pytest 測試框架，700 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -115,7 +120,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
 | `tests/test_discover_performance.py` | `src/discovery/performance.py` 推薦績效回測    | in-memory SQLite       |
-| `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord        | in-memory SQLite       |
+| `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord + Watchlist ORM CRUD + `get_effective_watchlist()` DB優先/YAML fallback | in-memory SQLite       |
 | `tests/test_indicators.py`     | `src/features/indicators.py` compute_indicators_from_df() | 純函數           |
 | `tests/test_strategies.py`     | 6 個策略 generate_signals() + 除權息調整          | 純函數                 |
 | `tests/test_formatter.py`      | `src/report/formatter.py` 4 個格式化函數          | 純函數                 |
@@ -163,7 +168,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 **除權息還原回測** (`--adjust-dividend`)：兩層架構 — Layer 1 在 `Strategy.load_data()` 回溯調整 OHLC 價格並從調整後價格重算技術指標（避免除權息日產生假訊號），保留 `raw_*` 原始價格；Layer 2 在 `BacktestEngine.run()` 使用原始價格交易，並在除權息日將現金股利入帳、股票股利增加持股。預設關閉（`adjust_dividend=False`），透過 CLI `--adjust-dividend` 旗標啟用。
 
-**SQLAlchemy Session** (`src/data/database.py`)：一律使用 `with get_session() as session:` 上下文管理器。批次寫入使用 `sqlite_upsert().on_conflict_do_nothing()`。DB 操作前需呼叫 `init_db()`。
+**SQLAlchemy Session** (`src/data/database.py`)：一律使用 `with get_session() as session:` 上下文管理器。批次寫入使用 `sqlite_upsert().on_conflict_do_nothing()`。DB 操作前需呼叫 `init_db()`。新增 `get_db_watchlist()` 從 DB 查 Watchlist 表、`get_effective_watchlist()` 實作「DB 優先，settings.yaml fallback」邏輯，供所有需要 watchlist 的模組統一呼叫。
 
 **三層資料來源策略**（`src/data/pipeline.py:sync_market_data`）：
 
@@ -179,7 +184,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）；`fetch_twse_sbl()` 借券賣出彙總（TWT96U）                                     |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）；`classify_event_type()` 純函數（earnings_call / investor_day / filing / revenue / general） |
-| `src/data/schema.py`                | 18 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、HoldingDistribution、SecuritiesLending、BrokerTrade、WatchEntry）  |
+| `src/data/schema.py`                | 19 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、HoldingDistribution、SecuritiesLending、BrokerTrade、WatchEntry、Watchlist）  |
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
@@ -210,7 +215,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
 | `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history, position_monitoring） |
-| `main.py`                           | CLI 調度器（argparse 子命令，30 個子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan） |
+| `main.py`                           | CLI 調度器（argparse 子命令，31 個子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan）；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import） |
 
 ### 設定
 
@@ -265,6 +270,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 21 | ✅ | **每日早晨例行流程（morning-routine）** | `cmd_morning_routine()` 依序執行 6 步驟（sync-sbl → sync-broker --from-discover → discover all --skip-sync → alert-check --days 3 → watch update-status → revenue-scan --top 5）；`_build_morning_discord_summary()` 純函數建立 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態）；CLI `morning-routine`（--dry-run / --skip-sync / --top / --notify）；673 測試通過 |
 | 22 | ✅ | **動態止損追蹤（P3，Watch 升級）** | `WatchEntry` ORM 新增 `trailing_stop_enabled`/`trailing_atr_multiplier`/`highest_price_since_entry` 三欄（含 migration）；`_compute_trailing_stop()` 純函數（stop = highest - ATR14 × mult，只升不降）；`watch update-status` 每次執行時自動更新移動止損；`watch add --trailing --trailing-multiplier` CLI 旗標；Dashboard 持倉監控頁顯示移動止損類型/顏色/追蹤最高價；681 測試通過 |
 | 23 | ✅ | **成交量/籌碼異動即時警報（P5）** | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數；`_compute_anomaly_scan()` 從 DailyPrice/InstitutionalInvestor/SecuritiesLending/BrokerTrade 四表讀取並偵測；`cmd_anomaly_scan()` + CLI `anomaly-scan`（--stocks/--lookback/--vol-mult/--inst-threshold/--sbl-sigma/--hhi-threshold/--notify）；整合進 `morning-routine` Step 7 + Discord 摘要；`tests/test_anomaly.py` 12 個純函數測試；693 測試通過 |
+| 24 | ✅ | **動態 Watchlist 管理（P1，DB-based）** | 新增 `Watchlist` ORM（schema.py，第 19 張表，UniqueConstraint: stock_id）；`get_db_watchlist()` + `get_effective_watchlist()`（database.py，DB 優先、YAML fallback）；所有用到 `settings.fetcher.watchlist` 的模組（pipeline×4、screener/engine、report/engine、strategy_rank/engine、industry/analyzer、scheduler）全部改為呼叫 `get_effective_watchlist()`；CLI `watchlist add/remove/list/import`（cmd_watchlist()）；Watchlist ORM CRUD + GetEffectiveWatchlist 邏輯共 7 個測試新增至 test_db_integration.py；700 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

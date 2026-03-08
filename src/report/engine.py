@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import settings
-from src.data.database import init_db
+from src.data.database import get_effective_watchlist, init_db
 from src.screener.engine import MultiFactorScreener
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class DailyReportEngine:
         ml_enabled: bool = True,
         start_date: str | None = None,
     ) -> None:
-        self.watchlist = watchlist or settings.fetcher.watchlist
+        self.watchlist = watchlist or get_effective_watchlist()
         self.weights = weights or DEFAULT_WEIGHTS.copy()
         self.lookback_days = lookback_days
         self.ml_enabled = ml_enabled

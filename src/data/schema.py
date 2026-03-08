@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十八張核心表：
+十九張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -19,6 +19,7 @@
 - PortfolioBacktestResult: 投資組合回測結果
 - DiscoveryRecord:         Discover 推薦記錄（歷史追蹤）
 - WatchEntry:              持倉監控表（進出場追蹤 + 止損止利狀態）
+- Watchlist:               使用者自訂觀察清單（DB 驅動，取代 settings.yaml watchlist）
 """
 
 from datetime import date, datetime
@@ -496,3 +497,25 @@ class WatchEntry(Base):
 
     def __repr__(self) -> str:
         return f"<WatchEntry #{self.id} {self.stock_id} entry={self.entry_price} status={self.status}>"
+
+
+class Watchlist(Base):
+    """使用者自訂觀察清單（DB 驅動，取代 settings.yaml watchlist）。
+
+    透過 CLI `watchlist add/remove/list/import` 管理。
+    `get_effective_watchlist()`（database.py）優先讀取此表，
+    若表為空則 fallback 至 settings.fetcher.watchlist（YAML 設定）。
+    """
+
+    __tablename__ = "watchlist"
+    __table_args__ = (UniqueConstraint("stock_id", name="uq_watchlist_stock_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    added_date: Mapped[date] = mapped_column(Date, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<Watchlist {self.stock_id} added={self.added_date}>"

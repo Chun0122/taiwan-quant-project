@@ -137,7 +137,19 @@ logging:
   level: "INFO"
 ```
 
-若要新增關注股票，在 `watchlist` 下加入股票代號即可。
+若要新增關注股票，在 `watchlist` 下加入股票代號，或使用 DB-based watchlist 管理（推薦）：
+
+```bash
+# 一次性從 YAML 匯入至 DB
+python main.py watchlist import
+
+# 之後使用 CLI 動態管理
+python main.py watchlist add 2330 --name 台積電
+python main.py watchlist remove 2330
+python main.py watchlist list
+```
+
+> **DB 優先**：若 DB watchlist 非空，所有指令（sync、discover、anomaly-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `settings.yaml` 中的 watchlist。
 
 ---
 
@@ -1230,6 +1242,39 @@ python main.py anomaly-scan --notify
 | `--notify` | False | 掃描完成後推播 Discord |
 
 > **資料準備**：需先執行 `python main.py sync`（DailyPrice/InstitutionalInvestor）、`python main.py sync-sbl`（借券）、`python main.py sync-broker`（分點）。`morning-routine` 已自動包含 Step 7 anomaly-scan。
+
+---
+
+### 4.26 DB-based 觀察清單管理 (`watchlist`)
+
+將觀察清單從 `settings.yaml` 遷移至資料庫，支援動態新增/移除，無需手動編輯 YAML 檔案。
+
+**DB 優先邏輯**：若 DB watchlist 非空，所有命令（sync、discover、anomaly-scan、revenue-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `settings.yaml` 的 watchlist。
+
+```bash
+# 列出目前有效 watchlist（DB 非空顯示 DB，DB 空顯示 YAML）
+python main.py watchlist list
+
+# 新增股票（可選名稱與備註）
+python main.py watchlist add 2330
+python main.py watchlist add 2330 --name 台積電 --note 核心持倉
+
+# 移除股票
+python main.py watchlist remove 2330
+
+# 從 settings.yaml 一次性匯入（首次使用時執行）
+python main.py watchlist import
+```
+
+**參數說明（watchlist add）：**
+
+| 參數 | 說明 |
+|------|------|
+| `stock_id` | 股票代號（必填，例：2330）|
+| `--name TEXT` | 股票名稱（可選，例：台積電）|
+| `--note TEXT` | 備註（可選，例：核心持倉）|
+
+> **遷移建議**：首次使用執行 `python main.py watchlist import` 將 YAML 清單匯入 DB，之後即可完全透過 CLI 管理，無需再修改 `settings.yaml`。
 
 ---
 

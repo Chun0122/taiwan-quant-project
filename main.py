@@ -1471,9 +1471,9 @@ def cmd_sync_broker(args: argparse.Namespace) -> None:
                     select(DiscoveryRecord.stock_id).where(DiscoveryRecord.scan_date == latest_date).distinct()
                 ).all()
                 discover_stocks = [r[0] for r in rows]
-                from src.config import settings
+                from src.data.database import get_effective_watchlist
 
-                watchlist = list(settings.fetcher.watchlist)
+                watchlist = get_effective_watchlist()
                 stock_ids = list(set((stock_ids or watchlist) + discover_stocks))
                 print(f"從最近 discover（{latest_date}）補抓 {len(discover_stocks)} 支，合計 {len(stock_ids)} 支")
 
@@ -1948,11 +1948,11 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
     """
     import datetime
 
-    from src.config import settings
-
     _init_db()
 
-    watchlist = args.stocks if args.stocks else settings.fetcher.watchlist
+    from src.data.database import get_effective_watchlist
+
+    watchlist = args.stocks if args.stocks else get_effective_watchlist()
     lookback: int = getattr(args, "lookback", 10)
     vol_mult: float = getattr(args, "vol_mult", 2.0)
     inst_threshold: float = getattr(args, "inst_threshold", 3_000_000)
@@ -2053,11 +2053,11 @@ def cmd_revenue_scan(args: argparse.Namespace) -> None:
     """
     import pandas as pd
 
-    from src.config import settings
-
     _init_db()
 
-    watchlist = args.stocks if args.stocks else settings.fetcher.watchlist
+    from src.data.database import get_effective_watchlist
+
+    watchlist = args.stocks if args.stocks else get_effective_watchlist()
     top_n = getattr(args, "top", 20)
     min_yoy = getattr(args, "min_yoy", 10.0)
     min_margin = getattr(args, "min_margin_improve", 0.0)
@@ -2660,6 +2660,99 @@ def _watch_update_status() -> None:
     print(f"\n更新完成：{len(active_entries)} 筆持倉，{trailing_msg}觸發狀態變更 {updated} 筆。\n")
 
 
+def cmd_watchlist(args: argparse.Namespace) -> None:
+    """觀察清單管理（add / remove / list / import）。
+
+    DB-based watchlist 取代 settings.yaml watchlist：
+    - add：新增股票至 DB watchlist
+    - remove：從 DB watchlist 移除股票
+    - list：列出 DB watchlist 清單
+    - import：從 settings.yaml 一次性匯入所有股票
+    """
+    import datetime
+
+    from sqlalchemy import select
+
+    from src.config import settings
+    from src.data.database import get_effective_watchlist, get_session, init_db
+    from src.data.schema import Watchlist
+
+    init_db()
+    action: str | None = getattr(args, "wl_action", None)
+
+    if action == "list" or action is None:
+        with get_session() as session:
+            rows = session.execute(select(Watchlist).order_by(Watchlist.added_date, Watchlist.stock_id)).scalars().all()
+        if not rows:
+            # DB 為空時顯示 YAML fallback
+            yaml_wl = list(settings.fetcher.watchlist)
+            print(f"DB watchlist 為空，目前使用 settings.yaml 清單（{len(yaml_wl)} 支）：")
+            for sid in yaml_wl:
+                print(f"  {sid}")
+            print("\n使用 'watchlist import' 將 YAML 清單匯入 DB，或用 'watchlist add <stock_id>' 逐筆新增。")
+            return
+        print(f"{'股票ID':<8} {'股票名稱':<14} {'加入日期':<12} 備註")
+        print("-" * 55)
+        for row in rows:
+            print(f"{row.stock_id:<8} {row.stock_name or '':<14} {str(row.added_date):<12} {row.note or ''}")
+        print(f"\n共 {len(rows)} 支")
+
+    elif action == "add":
+        stock_id: str = args.stock_id
+        with get_session() as session:
+            existing = session.execute(select(Watchlist).where(Watchlist.stock_id == stock_id)).scalar_one_or_none()
+            if existing:
+                print(f"⚠️  {stock_id} 已在觀察清單中（加入日期：{existing.added_date}）")
+                return
+            session.add(
+                Watchlist(
+                    stock_id=stock_id,
+                    stock_name=getattr(args, "name", None),
+                    added_date=datetime.date.today(),
+                    note=getattr(args, "note", None),
+                )
+            )
+            session.commit()
+        print(f"✅ 已新增 {stock_id} 至觀察清單")
+        print(f"   目前有效 watchlist：{len(get_effective_watchlist())} 支")
+
+    elif action == "remove":
+        stock_id = args.stock_id
+        with get_session() as session:
+            existing = session.execute(select(Watchlist).where(Watchlist.stock_id == stock_id)).scalar_one_or_none()
+            if not existing:
+                print(f"⚠️  {stock_id} 不在觀察清單中")
+                return
+            session.delete(existing)
+            session.commit()
+        print(f"✅ 已從觀察清單移除 {stock_id}")
+        print(f"   目前有效 watchlist：{len(get_effective_watchlist())} 支")
+
+    elif action == "import":
+        yaml_watchlist = list(settings.fetcher.watchlist)
+        added = 0
+        skipped = 0
+        with get_session() as session:
+            for sid in yaml_watchlist:
+                existing = session.execute(select(Watchlist).where(Watchlist.stock_id == sid)).scalar_one_or_none()
+                if existing:
+                    skipped += 1
+                else:
+                    session.add(
+                        Watchlist(
+                            stock_id=sid,
+                            added_date=datetime.date.today(),
+                        )
+                    )
+                    added += 1
+            session.commit()
+        print(f"✅ 從 settings.yaml 匯入完成：新增 {added} 支，已存在 {skipped} 支跳過")
+        print(f"   DB watchlist 共 {added + skipped} 支")
+
+    else:
+        print(f"未知動作：{action}。可用動作：add / remove / list / import")
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     """持倉監控管理（add / list / close / update-status）。"""
     _init_db()
@@ -3258,6 +3351,26 @@ def main() -> None:
     sp_suggest.add_argument("stock_id", help="股票代號（例：2330）")
     sp_suggest.add_argument("--notify", action="store_true", help="發送 Discord 通知")
 
+    # watchlist 子命令（DB-based 觀察清單管理）
+    sp_wlcmd = subparsers.add_parser("watchlist", help="DB-based 觀察清單管理（新增/移除/列出/從YAML匯入）")
+    wlcmd_sub = sp_wlcmd.add_subparsers(dest="wl_action")
+
+    # watchlist list
+    wlcmd_sub.add_parser("list", help="列出 DB watchlist 清單")
+
+    # watchlist add
+    sp_wla = wlcmd_sub.add_parser("add", help="新增股票至 DB watchlist")
+    sp_wla.add_argument("stock_id", help="股票代號（例：2330）")
+    sp_wla.add_argument("--name", help="股票名稱（例：台積電）")
+    sp_wla.add_argument("--note", help="備註")
+
+    # watchlist remove
+    sp_wlr = wlcmd_sub.add_parser("remove", help="從 DB watchlist 移除股票")
+    sp_wlr.add_argument("stock_id", help="股票代號")
+
+    # watchlist import（從 settings.yaml 一次性匯入）
+    wlcmd_sub.add_parser("import", help="從 settings.yaml watchlist 一次性匯入所有股票至 DB")
+
     # watch 子命令
     sp_watch = subparsers.add_parser("watch", help="持倉監控管理（新增/列出/平倉/更新狀態）")
     watch_sub = sp_watch.add_subparsers(dest="action")
@@ -3423,6 +3536,8 @@ def main() -> None:
         cmd_anomaly_scan(args)
     elif args.command == "morning-routine":
         cmd_morning_routine(args)
+    elif args.command == "watchlist":
+        cmd_watchlist(args)
     elif args.command == "watch":
         if not args.action:
             sp_watch.print_help()

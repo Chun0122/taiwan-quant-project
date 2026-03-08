@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
-from src.data.database import get_session, init_db
+from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
     Announcement,
@@ -208,7 +208,7 @@ def sync_financial_statements(
         新增的財報筆數
     """
     if watchlist is None:
-        watchlist = settings.fetcher.watchlist
+        watchlist = get_effective_watchlist()
 
     init_db()
     fetcher = FinMindFetcher()
@@ -293,7 +293,7 @@ def sync_holding_distribution(
         新增的持股分級筆數
     """
     if watchlist is None:
-        watchlist = settings.fetcher.watchlist
+        watchlist = get_effective_watchlist()
 
     init_db()
     fetcher = FinMindFetcher()
@@ -533,7 +533,7 @@ def sync_broker_trades(
         新增的分點交易筆數
     """
     if stock_ids is None:
-        stock_ids = list(settings.fetcher.watchlist)
+        stock_ids = get_effective_watchlist()
 
     init_db()
     fetcher = FinMindFetcher(api_token=settings.finmind.api_token)
@@ -658,7 +658,7 @@ def sync_watchlist(
 ) -> dict[str, dict[str, int]]:
     """批次同步關注清單中所有股票的資料。"""
     if watchlist is None:
-        watchlist = settings.fetcher.watchlist
+        watchlist = get_effective_watchlist()
 
     init_db()
     fetcher = FinMindFetcher()
@@ -939,7 +939,7 @@ def sync_indicators(
     from src.features.indicators import compute_indicators
 
     if watchlist is None:
-        watchlist = settings.fetcher.watchlist
+        watchlist = get_effective_watchlist()
 
     init_db()
 

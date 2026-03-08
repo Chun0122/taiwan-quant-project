@@ -14,8 +14,7 @@ from datetime import date, timedelta
 import pandas as pd
 from sqlalchemy import func, select
 
-from src.config import settings
-from src.data.database import get_session, init_db
+from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
 
 logger = logging.getLogger(__name__)
@@ -30,7 +29,7 @@ class IndustryRotationAnalyzer:
         lookback_days: int = 20,
         momentum_days: int = 60,
     ) -> None:
-        self.watchlist = watchlist or settings.fetcher.watchlist
+        self.watchlist = watchlist or get_effective_watchlist()
         self.lookback_days = lookback_days
         self.momentum_days = momentum_days
         init_db()

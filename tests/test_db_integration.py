@@ -6,9 +6,9 @@ import pandas as pd
 import pytest
 from sqlalchemy import select
 
-from src.data.database import init_db
+from src.data.database import get_effective_watchlist, init_db
 from src.data.pipeline import _get_last_date, _upsert_batch
-from src.data.schema import DailyPrice, DiscoveryRecord, InstitutionalInvestor, StockInfo
+from src.data.schema import DailyPrice, DiscoveryRecord, InstitutionalInvestor, StockInfo, Watchlist
 
 
 class TestInitDb:
@@ -58,6 +58,91 @@ class TestUpsertBatch:
         # 驗證資料寫入
         rows = db_session.execute(select(DailyPrice).where(DailyPrice.stock_id == "2330")).scalars().all()
         assert len(rows) == 2
+
+
+class TestWatchlistOrm:
+    """Watchlist ORM 基本 CRUD 測試。"""
+
+    def test_insert_and_query(self, db_session):
+        """新增股票至 watchlist 後可正確查詢。"""
+        w = Watchlist(
+            stock_id="2330",
+            stock_name="台積電",
+            added_date=date(2026, 3, 1),
+            note="核心持倉",
+        )
+        db_session.add(w)
+        db_session.flush()
+
+        rows = db_session.execute(select(Watchlist).where(Watchlist.stock_id == "2330")).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].stock_name == "台積電"
+        assert rows[0].note == "核心持倉"
+
+    def test_unique_constraint(self, db_session):
+        """同一股票代號不可重複加入。"""
+        from sqlalchemy.exc import IntegrityError
+
+        db_session.add(Watchlist(stock_id="2317", added_date=date(2026, 3, 1)))
+        db_session.flush()
+        db_session.add(Watchlist(stock_id="2317", added_date=date(2026, 3, 2)))
+        try:
+            db_session.flush()
+            assert False, "應觸發 IntegrityError"
+        except IntegrityError:
+            db_session.rollback()
+
+    def test_multiple_stocks_ordered_by_date(self, db_session):
+        """多支股票依加入日期排序。"""
+        db_session.add_all(
+            [
+                Watchlist(stock_id="2454", added_date=date(2026, 1, 1)),
+                Watchlist(stock_id="2330", added_date=date(2026, 2, 1)),
+                Watchlist(stock_id="2317", added_date=date(2026, 3, 1)),
+            ]
+        )
+        db_session.flush()
+
+        rows = db_session.execute(select(Watchlist.stock_id).order_by(Watchlist.added_date)).all()
+        stock_ids = [r[0] for r in rows]
+        assert stock_ids == ["2454", "2330", "2317"]
+
+    def test_nullable_fields(self, db_session):
+        """stock_name 與 note 可為 None。"""
+        db_session.add(Watchlist(stock_id="2382", added_date=date(2026, 3, 1)))
+        db_session.flush()
+
+        row = db_session.execute(select(Watchlist).where(Watchlist.stock_id == "2382")).scalar_one()
+        assert row.stock_name is None
+        assert row.note is None
+
+
+class TestGetEffectiveWatchlist:
+    """get_effective_watchlist() DB 優先 + YAML fallback 邏輯測試。"""
+
+    def test_falls_back_to_yaml_when_db_empty(self, monkeypatch):
+        """DB watchlist 為空時應回傳 YAML 設定清單。"""
+        monkeypatch.setattr("src.data.database.get_db_watchlist", lambda: [])
+        result = get_effective_watchlist()
+        # 預設 YAML watchlist 至少包含一支股票
+        assert isinstance(result, list)
+        assert len(result) >= 1
+
+    def test_db_priority_over_yaml(self, monkeypatch):
+        """DB watchlist 非空時應優先使用 DB 清單。"""
+        monkeypatch.setattr(
+            "src.data.database.get_db_watchlist",
+            lambda: ["3008", "6505"],
+        )
+        result = get_effective_watchlist()
+        assert result == ["3008", "6505"]
+
+    def test_returns_list(self, monkeypatch):
+        """回傳值必須為 list[str]。"""
+        monkeypatch.setattr("src.data.database.get_db_watchlist", lambda: ["2330"])
+        result = get_effective_watchlist()
+        assert isinstance(result, list)
+        assert all(isinstance(s, str) for s in result)
 
     def test_conflict_does_nothing(self, db_session):
         df = pd.DataFrame(

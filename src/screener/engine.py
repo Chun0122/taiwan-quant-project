@@ -14,8 +14,7 @@ from datetime import date, timedelta
 import pandas as pd
 from sqlalchemy import select
 
-from src.config import settings
-from src.data.database import get_session
+from src.data.database import get_effective_watchlist, get_session
 from src.data.schema import (
     DailyPrice,
     InstitutionalInvestor,
@@ -42,7 +41,7 @@ class MultiFactorScreener:
             watchlist: 掃描的股票清單，None 時使用設定檔 watchlist
             lookback_days: 回溯天數，用於計算需要時間序列的因子
         """
-        self.watchlist = watchlist or settings.fetcher.watchlist
+        self.watchlist = watchlist or get_effective_watchlist()
         self.lookback_days = lookback_days
 
     def _load_snapshot(self, stock_id: str) -> pd.DataFrame:

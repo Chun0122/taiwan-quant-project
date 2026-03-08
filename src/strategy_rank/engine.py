@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 
 from src.backtest.engine import BacktestEngine, RiskConfig
 from src.config import settings
-from src.data.database import get_session, init_db
+from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.schema import DailyPrice
 from src.strategy import STRATEGY_REGISTRY
 
@@ -76,7 +76,7 @@ class StrategyRankEngine:
         end_date: str | None = None,
         min_trades: int = 3,
     ) -> None:
-        self.watchlist = watchlist or settings.fetcher.watchlist
+        self.watchlist = watchlist or get_effective_watchlist()
         self.strategy_names = strategy_names or FAST_STRATEGIES
         self.metric = metric
         self.start_date = start_date or settings.fetcher.default_start_date

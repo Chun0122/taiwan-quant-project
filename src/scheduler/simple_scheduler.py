@@ -41,8 +41,7 @@ def daily_sync_job() -> None:
     try:
         from sqlalchemy import func, select
 
-        from src.config import settings
-        from src.data.database import get_session
+        from src.data.database import get_effective_watchlist, get_session
         from src.data.pipeline import sync_broker_trades
         from src.data.schema import DiscoveryRecord
 
@@ -55,7 +54,7 @@ def daily_sync_job() -> None:
                 ).all()
                 discover_stocks = [r[0] for r in rows]
 
-        watchlist = list(settings.fetcher.watchlist)
+        watchlist = get_effective_watchlist()
         broker_stocks = list(set(watchlist + discover_stocks))
 
         logger.info("開始同步分點資料（%d 支股票）", len(broker_stocks))
