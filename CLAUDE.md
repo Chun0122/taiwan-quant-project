@@ -220,7 +220,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
-| `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, screener_results, ml_analysis, industry_rotation, discovery_history, position_monitoring） |
+| `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, discovery_history, position_monitoring） |
 | `main.py`                           | CLI 調度器（argparse 子命令，32 個子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan）；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新） |
 
 ### 設定
@@ -282,7 +282,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 27 | ✅ | **P8 sync-info 獨立 CLI 命令** | `cmd_sync_info()` + `sync-info` subparser（`--force` 旗標強制更新）；呼叫 `sync_stock_info(force_refresh=...)` 同步 StockInfo 表（產業分類 + 上市/上櫃別）；726 測試通過 |
 | 28 | ✅ | **策略績效歸因分析（Factor Attribution）** | 新建 `src/backtest/attribution.py`（`FactorAttribution` 類別）；`compute(backtest_result, data)` 計算 momentum/reversal/quality/size/liquidity 五因子暴露與期間報酬相關係數；`backtest` 子命令新增 `--attribution` 旗標；Dashboard `backtest_review.py` 新增因子貢獻長條圖（Plotly）；740 測試通過 |
 | 29 | ⬜ | **Claude API 整合 — AI 選股報告** | 新建 `src/report/ai_report.py`（`generate_ai_summary(discover_result, regime, top_stocks)` 函數）；呼叫 Claude API（`claude-sonnet-4-6`），傳入結構化量化數據，生成約 300 字繁體中文摘要（市場狀態 + 推薦邏輯 + 風險提示）；`discover` 子命令新增 `--ai-summary` 旗標；`requirements.txt` 新增 `anthropic`；`config/settings.yaml.example` 新增 `anthropic.api_key` |
-| 30 | ⬜ | **Dashboard 策略比較頁** | 新建 `src/visualization/pages/strategy_comparison.py`（第 10 個 Dashboard 頁面）；左側多選框（1~5 個策略/Discover 模式）+ 股票/時間範圍；右側多線折線圖（各策略累積報酬率曲線）+ 績效指標比較表（Sharpe/MaxDD/WinRate/年化報酬）；`src/visualization/app.py` 新增 sidebar 入口 |
+| 30 | ✅ | **Dashboard 策略比較頁** | 新建 `src/visualization/pages/strategy_comparison.py`（第 10 個 Dashboard 頁面）；左側多選框（1~5 個策略）+ 股票選擇；3 Tab（績效指標比較 + 累積報酬率多線折線圖 + 進階指標長條圖）；`app.py` 新增「⚖️ 策略比較」sidebar 入口；`charts.py` 新增 `plot_strategy_comparison_curves()` + `plot_strategy_metrics_bar()`；740 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

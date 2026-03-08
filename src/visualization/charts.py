@@ -601,6 +601,99 @@ def plot_per_stock_returns(per_stock_returns: dict[str, float]) -> go.Figure:
     return fig
 
 
+def plot_strategy_comparison_curves(
+    curves: dict[str, tuple[list, list]],
+    title: str = "各策略累積報酬率比較",
+) -> go.Figure:
+    """多策略累積報酬率多線折線圖。
+
+    Parameters
+    ----------
+    curves:
+        {策略標籤: (dates_list, equity_pct_list)} 的字典。
+        equity_pct 為以百分比表示的累積報酬率（0 = 初始資金）。
+    title:
+        圖表標題。
+    """
+    # 策略顏色池
+    _COLORS = [
+        "#2196F3",  # blue
+        "#FF9800",  # orange
+        "#9C27B0",  # purple
+        "#F44336",  # red
+        "#4CAF50",  # green
+    ]
+
+    fig = go.Figure()
+
+    for i, (label, (dates, pct)) in enumerate(curves.items()):
+        color = _COLORS[i % len(_COLORS)]
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=pct,
+                name=label,
+                mode="lines",
+                line=dict(color=color, width=2),
+            )
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+
+    fig.update_layout(
+        title=title,
+        yaxis_title="累積報酬率 (%)",
+        height=420,
+        margin=dict(l=60, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def plot_strategy_metrics_bar(
+    metrics_df: pd.DataFrame,
+    metric_col: str,
+    label_col: str = "策略",
+    title: str = "",
+) -> go.Figure:
+    """單一指標多策略長條圖（正負色區分）。
+
+    Parameters
+    ----------
+    metrics_df:
+        包含 label_col 與 metric_col 的 DataFrame。
+    metric_col:
+        要繪製的數值欄位名稱。
+    label_col:
+        各 bar 的標籤欄位。
+    title:
+        圖表標題。
+    """
+    labels = metrics_df[label_col].tolist()
+    values = metrics_df[metric_col].tolist()
+    colors = ["#26A69A" if v >= 0 else "#EF5350" for v in values]
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=labels,
+                y=values,
+                marker_color=colors,
+                text=[f"{v:+.2f}" for v in values],
+                textposition="outside",
+            )
+        ]
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.update_layout(
+        title=title,
+        height=320,
+        margin=dict(l=60, r=20, t=50, b=40),
+    )
+    return fig
+
+
 def plot_factor_attribution_bar(
     correlations: dict[str, float | None],
     factor_labels: dict[str, str] | None = None,

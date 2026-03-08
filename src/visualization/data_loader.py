@@ -6,6 +6,7 @@ import pandas as pd
 from sqlalchemy import case, func, select
 
 from src.data.database import get_session, init_db
+from src.data.migrate import run_migrations
 from src.data.schema import (
     BacktestResult,
     DailyPrice,
@@ -21,6 +22,7 @@ from src.data.schema import (
 )
 
 init_db()
+run_migrations()
 
 
 def get_stock_list() -> list[str]:

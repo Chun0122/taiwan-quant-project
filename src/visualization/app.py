@@ -16,6 +16,7 @@ page = st.sidebar.radio(
         "📈 個股分析",
         "🔄 回測結果",
         "📊 投資組合",
+        "⚖️ 策略比較",
         "🔍 選股篩選",
         "🤖 ML 策略分析",
         "🏭 產業輪動",
@@ -38,6 +39,10 @@ elif page == "🔄 回測結果":
     render()
 elif page == "📊 投資組合":
     from src.visualization.pages.portfolio_review import render
+
+    render()
+elif page == "⚖️ 策略比較":
+    from src.visualization.pages.strategy_comparison import render
 
     render()
 elif page == "🔍 選股篩選":
