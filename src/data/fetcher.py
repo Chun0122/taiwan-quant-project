@@ -362,10 +362,11 @@ class FinMindFetcher(DataFetcher):
         if (end_dt - start_dt).days <= chunk_days:
             df = self._request("TaiwanStockTradingDailyReport", stock_id, start, end)
         else:
+            # 從最新往最舊分批查詢；遇到 400 即停止（免費帳號歷史深度限制）
             chunks = []
-            chunk_start = start_dt
-            while chunk_start <= end_dt:
-                chunk_end = min(chunk_start + timedelta(days=chunk_days - 1), end_dt)
+            chunk_end = end_dt
+            while chunk_end >= start_dt:
+                chunk_start = max(chunk_end - timedelta(days=chunk_days - 1), start_dt)
                 try:
                     chunk_df = self._request(
                         "TaiwanStockTradingDailyReport",
@@ -376,8 +377,15 @@ class FinMindFetcher(DataFetcher):
                     if not chunk_df.empty:
                         chunks.append(chunk_df)
                 except Exception as exc:
-                    logger.warning("分點分批查詢失敗 %s %s~%s: %s", stock_id, chunk_start, chunk_end, exc)
-                chunk_start = chunk_end + timedelta(days=1)
+                    logger.warning(
+                        "分點分批查詢失敗 %s %s~%s: %s，停止回溯（已達免費帳號歷史深度限制）",
+                        stock_id,
+                        chunk_start,
+                        chunk_end,
+                        exc,
+                    )
+                    break
+                chunk_end = chunk_start - timedelta(days=1)
             df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         if df.empty:
             return pd.DataFrame()
