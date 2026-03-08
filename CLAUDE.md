@@ -278,7 +278,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 26 | ✅ | **P6 進階回測指標測試補齊** | `test_backtest_engine.py` + `test_portfolio.py` 各新增 8 個 TestComputeMetrics 測試（Sortino/Calmar/VaR/CVaR 四指標：正常計算、None 邊界、下跌驗證、CVaR ≤ VaR 關係）；726 測試通過 |
 | 27 | ✅ | **P8 sync-info 獨立 CLI 命令** | `cmd_sync_info()` + `sync-info` subparser（`--force` 旗標強制更新）；呼叫 `sync_stock_info(force_refresh=...)` 同步 StockInfo 表（產業分類 + 上市/上櫃別）；726 測試通過 |
 | 28 | ⬜ | **策略績效歸因分析（Factor Attribution）** | 新建 `src/backtest/attribution.py`（`FactorAttribution` 類別）；`compute(backtest_result, data)` 計算 momentum/reversal/quality/size/liquidity 五因子暴露與期間報酬相關係數；`backtest` 子命令新增 `--attribution` 旗標；Dashboard `backtest_review.py` 新增因子貢獻長條圖（Plotly） |
-| 29 | ⬜ | **Dashboard 策略比較頁** | 新建 `src/visualization/pages/strategy_comparison.py`（第 10 個 Dashboard 頁面）；左側多選框（1~5 個策略/Discover 模式）+ 股票/時間範圍；右側多線折線圖（各策略累積報酬率曲線）+ 績效指標比較表（Sharpe/MaxDD/WinRate/年化報酬）；`src/visualization/app.py` 新增 sidebar 入口 |
+| 29 | ⬜ | **Claude API 整合 — AI 選股報告** | 新建 `src/report/ai_report.py`（`generate_ai_summary(discover_result, regime, top_stocks)` 函數）；呼叫 Claude API（`claude-sonnet-4-6`），傳入結構化量化數據，生成約 300 字繁體中文摘要（市場狀態 + 推薦邏輯 + 風險提示）；`discover` 子命令新增 `--ai-summary` 旗標；`requirements.txt` 新增 `anthropic`；`config/settings.yaml.example` 新增 `anthropic.api_key` |
+| 30 | ⬜ | **Dashboard 策略比較頁** | 新建 `src/visualization/pages/strategy_comparison.py`（第 10 個 Dashboard 頁面）；左側多選框（1~5 個策略/Discover 模式）+ 股票/時間範圍；右側多線折線圖（各策略累積報酬率曲線）+ 績效指標比較表（Sharpe/MaxDD/WinRate/年化報酬）；`src/visualization/app.py` 新增 sidebar 入口 |
 
 ## 已確認事項（規劃時勿重複提出）
 
