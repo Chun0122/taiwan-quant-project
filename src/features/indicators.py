@@ -5,6 +5,9 @@
 - RSI(14)
 - MACD(12, 26, 9) → macd, macd_signal, macd_hist
 - Bollinger Bands(20, 2) → bb_upper, bb_middle, bb_lower
+
+週線聚合：
+- aggregate_to_weekly() → 日K聚合為週K + 週線 SMA13 / RSI14 / MACD
 """
 
 from __future__ import annotations
@@ -137,6 +140,62 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
     result["bb_lower"] = bb.bollinger_lband()
 
     return result
+
+
+def aggregate_to_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """將日K線 DataFrame 聚合為週K線，並計算週線技術指標。
+
+    Args:
+        daily_df: 含 open/high/low/close/volume 欄位的日K DataFrame。
+                  index 為 datetime 或 date 型別，或含 'date' 欄位。
+
+    Returns:
+        週K DataFrame（DatetimeIndex，以週五為錨點），含原始 OHLCV 欄位及：
+          sma_13（13 週均線）、rsi_14（週 RSI14）、
+          macd / macd_signal / macd_hist（週線 MACD）。
+        資料不足（< 3 週）或輸入為空時回傳空 DataFrame。
+    """
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    df = daily_df.copy()
+
+    # 確保 index 為 DatetimeIndex
+    if "date" in df.columns:
+        df = df.set_index("date")
+    df.index = pd.to_datetime(df.index)
+
+    # 聚合為週K（W-FRI：以週五為錨點，台灣股市週一至週五交易）
+    weekly = (
+        df.resample("W-FRI")
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        )
+        .dropna(subset=["close"])
+    )
+
+    if len(weekly) < 3:
+        return pd.DataFrame()
+
+    close = weekly["close"]
+
+    # 週線 SMA(13 週 ≈ 季線)
+    weekly["sma_13"] = SMAIndicator(close=close, n=13).sma_indicator()
+
+    # 週線 RSI(14 週)
+    weekly["rsi_14"] = RSIIndicator(close=close, n=14).rsi()
+
+    # 週線 MACD(12, 26, 9)
+    macd_ind = MACD(close=close, n_slow=26, n_fast=12, n_sign=9)
+    weekly["macd"] = macd_ind.macd()
+    weekly["macd_signal"] = macd_ind.macd_signal()
+    weekly["macd_hist"] = macd_ind.macd_diff()
+
+    return weekly
 
 
 def calc_rsi14_from_series(closes: pd.Series) -> float:

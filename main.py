@@ -812,6 +812,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         max_price=args.max_price,
         min_volume=args.min_volume,
         top_n_results=args.top,
+        weekly_confirm=getattr(args, "weekly_confirm", False),
     )
     result = scanner.run()
 
@@ -1099,6 +1100,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
             max_price=args.max_price,
             min_volume=args.min_volume,
             top_n_results=args.top,
+            weekly_confirm=getattr(args, "weekly_confirm", False),
         )
         result = scanner.run()
         results[mode_key] = result
@@ -3262,6 +3264,12 @@ def main() -> None:
         type=int,
         default=1,
         help="[all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示）",
+    )
+    sp_disc.add_argument(
+        "--weekly-confirm",
+        action="store_true",
+        default=False,
+        help="啟用週線多時框確認（週線多頭 +5%%，週線空頭 -5%%，預設關閉）",
     )
 
     # discover-backtest 子命令

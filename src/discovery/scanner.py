@@ -265,6 +265,7 @@ class MarketScanner:
         top_n_candidates: int = 150,
         top_n_results: int = 30,
         lookback_days: int = 5,
+        weekly_confirm: bool = False,
     ) -> None:
         self.min_price = min_price
         self.max_price = max_price
@@ -272,6 +273,7 @@ class MarketScanner:
         self.top_n_candidates = top_n_candidates
         self.top_n_results = top_n_results
         self.lookback_days = lookback_days
+        self.weekly_confirm = weekly_confirm
 
     def run(self) -> DiscoveryResult:
         """執行四階段漏斗掃描。"""
@@ -353,6 +355,10 @@ class MarketScanner:
 
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
+
+        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
+        if self.weekly_confirm:
+            scored = self._apply_weekly_trend_bonus(scored)
 
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
@@ -660,6 +666,127 @@ class MarketScanner:
         scored["composite_score"] = scored["composite_score"] * (1 + scored["sector_bonus"])
         logger.info(
             "Stage 3.3: 產業加成已套用（範圍 %.3f ~ %.3f）", scored["sector_bonus"].min(), scored["sector_bonus"].max()
+        )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  週線趨勢加成
+    # ------------------------------------------------------------------ #
+
+    def _compute_weekly_trend_bonus(self, stock_ids: list[str]) -> pd.DataFrame:
+        """計算候選股的週線趨勢加成分數（±5%）。
+
+        從 DB 讀取近 90 天日K，聚合為週K，依下列兩個週線信號判斷趨勢：
+          - SMA13（13 週均線）：收盤 > SMA13 → 多頭信號
+          - RSI14（週 RSI14）：RSI > 50 → 多頭，< 50 → 空頭
+
+        兩信號均多頭 → +0.05；兩信號均空頭 → -0.05；其餘 → 0.0。
+        資料不足（< 13 週）時信號以 NaN 填補，該方向的信號直接略過。
+
+        Returns:
+            DataFrame(stock_id, weekly_bonus)  值域 {-0.05, 0.0, +0.05}
+        """
+        from src.features.indicators import aggregate_to_weekly
+
+        default = pd.DataFrame({"stock_id": stock_ids, "weekly_bonus": [0.0] * len(stock_ids)})
+
+        try:
+            cutoff = date.today() - timedelta(days=90)
+
+            with get_session() as session:
+                rows = (
+                    session.execute(
+                        select(DailyPrice)
+                        .where(DailyPrice.stock_id.in_(stock_ids))
+                        .where(DailyPrice.date >= cutoff)
+                        .order_by(DailyPrice.stock_id, DailyPrice.date)
+                    )
+                    .scalars()
+                    .all()
+                )
+
+            if not rows:
+                return default
+
+            df_all = pd.DataFrame(
+                [
+                    {
+                        "stock_id": r.stock_id,
+                        "date": r.date,
+                        "open": r.open,
+                        "high": r.high,
+                        "low": r.low,
+                        "close": r.close,
+                        "volume": r.volume,
+                    }
+                    for r in rows
+                ]
+            )
+
+            results: list[dict] = []
+            for sid in stock_ids:
+                stock_df = df_all[df_all["stock_id"] == sid].drop(columns=["stock_id"])
+                if stock_df.empty:
+                    results.append({"stock_id": sid, "weekly_bonus": 0.0})
+                    continue
+
+                weekly = aggregate_to_weekly(stock_df)
+                if weekly.empty:
+                    results.append({"stock_id": sid, "weekly_bonus": 0.0})
+                    continue
+
+                last = weekly.iloc[-1]
+                last_close = float(last["close"])
+                sma13 = last["sma_13"]
+                rsi14 = last["rsi_14"]
+
+                bullish = 0
+                bearish = 0
+
+                if pd.notna(sma13):
+                    if last_close > float(sma13):
+                        bullish += 1
+                    else:
+                        bearish += 1
+
+                if pd.notna(rsi14):
+                    if float(rsi14) > 50:
+                        bullish += 1
+                    else:
+                        bearish += 1
+
+                if bullish == 2:
+                    bonus = 0.05
+                elif bearish == 2:
+                    bonus = -0.05
+                else:
+                    bonus = 0.0
+
+                results.append({"stock_id": sid, "weekly_bonus": bonus})
+
+            return pd.DataFrame(results) if results else default
+
+        except Exception:
+            logger.warning("週線趨勢加成計算失敗，跳過")
+            return default
+
+    def _apply_weekly_trend_bonus(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """將週線趨勢加成套用到 composite_score。
+
+        final_score = composite_score × (1 + weekly_bonus)
+        """
+        if scored.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        bonus_df = self._compute_weekly_trend_bonus(stock_ids)
+        scored = scored.merge(bonus_df, on="stock_id", how="left")
+        scored["weekly_bonus"] = scored["weekly_bonus"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["weekly_bonus"])
+        logger.info(
+            "Stage 3.4: 週線趨勢加成已套用（範圍 %.3f ~ %.3f）",
+            scored["weekly_bonus"].min(),
+            scored["weekly_bonus"].max(),
         )
         return scored
 
@@ -2209,6 +2336,10 @@ class ValueScanner(MarketScanner):
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
 
+        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
+        if self.weekly_confirm:
+            scored = self._apply_weekly_trend_bonus(scored)
+
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
 
@@ -2539,6 +2670,10 @@ class DividendScanner(MarketScanner):
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
 
+        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
+        if self.weekly_confirm:
+            scored = self._apply_weekly_trend_bonus(scored)
+
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
 
@@ -2812,6 +2947,10 @@ class GrowthScanner(MarketScanner):
 
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
+
+        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
+        if self.weekly_confirm:
+            scored = self._apply_weekly_trend_bonus(scored)
 
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)

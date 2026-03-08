@@ -726,6 +726,10 @@ python main.py discover all --skip-sync --min-appearances 2
 
 # 匯出交叉比較表 CSV
 python main.py discover all --skip-sync --export compare.csv
+
+# 啟用週線多時框確認（週線多頭 +5%，週線空頭 -5%）
+python main.py discover momentum --weekly-confirm
+python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 ```
 
 每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。`all` 模式會將五個模式分別存入 DB。
@@ -743,6 +747,7 @@ python main.py discover all --skip-sync --export compare.csv
 | `--notify` | 發送 Discord 通知 |
 | `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名，單模式有效） |
 | `--min-appearances N` | [all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示） |
+| `--weekly-confirm` | 啟用週線多時框確認：從 DB 讀取近 90 天日K 聚合週K，SMA13 + RSI14 週線信號同為多頭 → composite_score ×1.05（+5%），同為空頭 → ×0.95（-5%），預設關閉 |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 
@@ -814,6 +819,7 @@ python main.py discover all --skip-sync --export compare.csv
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
 | Stage 3.3 | 產業加成 | 用 IndustryRotationAnalyzer 計算產業排名，熱門產業 +5%、冷門產業 -5% 線性加成到 composite_score |
+| Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 

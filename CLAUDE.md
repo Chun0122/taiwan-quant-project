@@ -32,6 +32,7 @@ python main.py discover --compare            # 顯示與上次推薦的差異比
 python main.py discover all --skip-sync --top 20           # 五模式綜合比較
 python main.py discover all --skip-sync --min-appearances 2 # 只顯示出現 2+ 模式的股票
 python main.py discover all --skip-sync --export compare.csv # 匯出交叉比較表
+python main.py discover momentum --weekly-confirm           # 啟用週線多時框確認（週線多頭 +5%，週線空頭 -5%）
 python main.py discover-backtest --mode momentum  # 推薦績效回測（預設 5,10,20 天）
 python main.py sync-mops                     # 同步 MOPS 重大訊息（預設 7 天）
 python main.py sync-mops --days 30           # 同步最近 30 天
@@ -92,7 +93,7 @@ python main.py watchlist import              # 從 settings.yaml 一次性匯入
 
 ### 測試
 
-使用 pytest 測試框架，700 個測試覆蓋核心模組：
+使用 pytest 測試框架，710 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -121,7 +122,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
 | `tests/test_discover_performance.py` | `src/discovery/performance.py` 推薦績效回測    | in-memory SQLite       |
 | `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord + Watchlist ORM CRUD + `get_effective_watchlist()` DB優先/YAML fallback | in-memory SQLite       |
-| `tests/test_indicators.py`     | `src/features/indicators.py` compute_indicators_from_df() | 純函數           |
+| `tests/test_indicators.py`     | `src/features/indicators.py` compute_indicators_from_df() + aggregate_to_weekly() | 純函數           |
 | `tests/test_strategies.py`     | 6 個策略 generate_signals() + 除權息調整          | 純函數                 |
 | `tests/test_formatter.py`      | `src/report/formatter.py` 4 個格式化函數          | 純函數                 |
 | `tests/test_notification.py`   | `src/notification/line_notify.py` 通知模組        | 純函數 + mock HTTP     |
@@ -189,7 +190,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
-| `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）+ `calc_rsi14_from_series()` 純函數（從 main.py 遷移） |
+| `src/features/indicators.py`        | SMA/RSI/MACD/BB → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用）+ `calc_rsi14_from_series()` 純函數（從 main.py 遷移）+ `aggregate_to_weekly()` 純函數（日K聚合週K + 週線 SMA13/RSI14/MACD） |
 | `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）                                                                                 |
 | `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()` + 除權息調整（`_apply_dividend_adjustment`）                |
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
@@ -201,7 +202,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/optimization/grid_search.py`   | Grid Search 參數優化器                                                                                            |
 | `src/screener/factors.py`           | 8 個篩選因子（技術面/籌碼面/基本面）                                                                              |
 | `src/screener/engine.py`            | 多因子篩選引擎（watchlist 內掃描）                                                                                |
-| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value / Dividend / Growth 五模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%），權重依 Regime 動態調整。MomentumScanner 籌碼面支援最高 7-factor（分點 HHI + 連續天因子）。`compute_broker_score()` 計算主力集中度（HHI）+ 連續進場天數。Value/Dividend 模式粗篩為嚴格模式：必須有估值資料。Growth 模式粗篩需 YoY > 10% |
+| `src/discovery/scanner.py`          | 全市場四階段漏斗（含風險過濾），支援 Momentum / Swing / Value / Dividend / Growth 五模式，四維度評分（技術+籌碼+基本面+消息面）+ 產業熱度加成（±5%）+ 週線趨勢加成（±5%，`--weekly-confirm` 啟用），權重依 Regime 動態調整。MomentumScanner 籌碼面支援最高 7-factor（分點 HHI + 連續天因子）。`compute_broker_score()` 計算主力集中度（HHI）+ 連續進場天數。Value/Dividend 模式粗篩為嚴格模式：必須有估值資料。Growth 模式粗篩需 YoY > 10%。`_compute_weekly_trend_bonus()` / `_apply_weekly_trend_bonus()` 週線趨勢信號加成（Stage 3.4） |
 | `src/discovery/performance.py`      | Discover 推薦績效回測（讀取歷史推薦 vs DailyPrice，計算 N 日報酬率、勝率、三層聚合統計）                           |
 | `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出五模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用               |
@@ -270,6 +271,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 21 | ✅ | **每日早晨例行流程（morning-routine）** | `cmd_morning_routine()` 依序執行 6 步驟（sync-sbl → sync-broker --from-discover → discover all --skip-sync → alert-check --days 3 → watch update-status → revenue-scan --top 5）；`_build_morning_discord_summary()` 純函數建立 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態）；CLI `morning-routine`（--dry-run / --skip-sync / --top / --notify）；673 測試通過 |
 | 22 | ✅ | **動態止損追蹤（P3，Watch 升級）** | `WatchEntry` ORM 新增 `trailing_stop_enabled`/`trailing_atr_multiplier`/`highest_price_since_entry` 三欄（含 migration）；`_compute_trailing_stop()` 純函數（stop = highest - ATR14 × mult，只升不降）；`watch update-status` 每次執行時自動更新移動止損；`watch add --trailing --trailing-multiplier` CLI 旗標；Dashboard 持倉監控頁顯示移動止損類型/顏色/追蹤最高價；681 測試通過 |
 | 23 | ✅ | **成交量/籌碼異動即時警報（P5）** | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數；`_compute_anomaly_scan()` 從 DailyPrice/InstitutionalInvestor/SecuritiesLending/BrokerTrade 四表讀取並偵測；`cmd_anomaly_scan()` + CLI `anomaly-scan`（--stocks/--lookback/--vol-mult/--inst-threshold/--sbl-sigma/--hhi-threshold/--notify）；整合進 `morning-routine` Step 7 + Discord 摘要；`tests/test_anomaly.py` 12 個純函數測試；693 測試通過 |
+| 24 | ✅ | **動態 Watchlist 管理（P1）** | `Watchlist` ORM（schema.py，第 19 張表）；`get_db_watchlist()` + `get_effective_watchlist()`（DB 優先，YAML fallback）；CLI `watchlist add/remove/list/import`；所有呼叫 `settings.fetcher.watchlist` 的模組（pipeline/screener/report/strategy_rank/industry/scheduler/main.py）改為 `get_effective_watchlist()`；`tests/test_db_integration.py` 新增 7 個測試；700 測試通過 |
+| 25 | ✅ | **週線多時框確認（P4）** | `aggregate_to_weekly()` 純函數（indicators.py）：日K聚合週K + 週線 SMA13/RSI14/MACD；`_compute_weekly_trend_bonus()` / `_apply_weekly_trend_bonus()` 方法（scanner.py，Stage 3.4）：SMA13 + RSI14 週線信號 → ±5% 加成；`--weekly-confirm` CLI 旗標（discover 子命令）；`tests/test_indicators.py` 新增 10 個 `TestAggregateToWeekly` 純函數測試；710 測試通過 |
 | 24 | ✅ | **動態 Watchlist 管理（P1，DB-based）** | 新增 `Watchlist` ORM（schema.py，第 19 張表，UniqueConstraint: stock_id）；`get_db_watchlist()` + `get_effective_watchlist()`（database.py，DB 優先、YAML fallback）；所有用到 `settings.fetcher.watchlist` 的模組（pipeline×4、screener/engine、report/engine、strategy_rank/engine、industry/analyzer、scheduler）全部改為呼叫 `get_effective_watchlist()`；CLI `watchlist add/remove/list/import`（cmd_watchlist()）；Watchlist ORM CRUD + GetEffectiveWatchlist 邏輯共 7 個測試新增至 test_db_integration.py；700 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）

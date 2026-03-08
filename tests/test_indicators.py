@@ -163,3 +163,110 @@ class TestComputeIndicatorsFromDf:
         df = _make_ohlcv(1)
         result = compute_indicators_from_df(df)
         assert len(result) == 1
+
+
+class TestAggregateToWeekly:
+    """aggregate_to_weekly() 純函數測試。"""
+
+    def test_output_columns(self):
+        """應有 OHLCV + sma_13 / rsi_14 / macd 系列欄位。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)
+        result = aggregate_to_weekly(df)
+        assert not result.empty
+        expected_cols = {
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "sma_13",
+            "rsi_14",
+            "macd",
+            "macd_signal",
+            "macd_hist",
+        }
+        assert expected_cols.issubset(set(result.columns))
+
+    def test_index_is_datetime(self):
+        """週K index 應為 DatetimeIndex（W-FRI 錨點）。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)
+        result = aggregate_to_weekly(df)
+        assert isinstance(result.index, pd.DatetimeIndex)
+
+    def test_weekly_rows_less_than_daily(self):
+        """週K筆數應遠少於日K（約 1/5）。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)
+        result = aggregate_to_weekly(df)
+        assert len(result) < len(df)
+        # 90 個交易日 ≈ 18 週
+        assert len(result) >= 15
+
+    def test_weekly_volume_is_sum(self):
+        """週成交量為週內日成交量加總，應 ≥ 單日最大成交量。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)
+        result = aggregate_to_weekly(df)
+        assert not result.empty
+        # 週成交量必然 >= 某單日的成交量（因為是加總）
+        assert result["volume"].iloc[-1] >= df["volume"].iloc[-1]
+
+    def test_insufficient_data_returns_empty(self):
+        """少於 3 週資料（10 個交易日 = 2 週）應回傳空 DataFrame。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(10)  # 2 週
+        result = aggregate_to_weekly(df)
+        assert result.empty
+
+    def test_empty_input_returns_empty(self):
+        """空 DataFrame 應回傳空 DataFrame。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        result = aggregate_to_weekly(pd.DataFrame())
+        assert result.empty
+
+    def test_sma13_nan_for_early_weeks(self):
+        """SMA13 前 12 週應為 NaN（資料不足以計算 13 週均線）。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)
+        result = aggregate_to_weekly(df)
+        if len(result) >= 13:
+            assert result["sma_13"].iloc[:12].isna().all()
+
+    def test_uptrend_rsi_above_50(self):
+        """持續上漲序列的週線 RSI 最終值應 > 50。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)  # _make_ohlcv 產生單調遞增收盤價
+        result = aggregate_to_weekly(df)
+        rsi_vals = result["rsi_14"].dropna()
+        if not rsi_vals.empty:
+            assert rsi_vals.iloc[-1] > 50
+
+    def test_date_column_accepted(self):
+        """接受含 'date' 欄位（非 index）的 DataFrame。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90).reset_index()  # 把 date index 轉為 column
+        assert "date" in df.columns
+        result = aggregate_to_weekly(df)
+        assert not result.empty
+
+    def test_close_last_of_week(self):
+        """週收盤應為週內最後一個交易日的收盤價（單調遞增時週收盤 > 週開盤）。"""
+        from src.features.indicators import aggregate_to_weekly
+
+        df = _make_ohlcv(90)  # 單調遞增序列，週內最後一日收盤 > 第一日開盤
+        result = aggregate_to_weekly(df)
+        assert not result.empty
+        # 所有週（除第一週外）的收盤應 >= 開盤（因為序列單調遞增）
+        valid = result.dropna(subset=["open", "close"])
+        assert (valid["close"] >= valid["open"]).all()
