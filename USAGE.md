@@ -754,9 +754,29 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 | 維度 | 權重 | 因子 |
 |------|------|------|
 | 技術面 | 45% | 5日動能、10日動能、20日突破、量比、成交量加速 |
-| 籌碼面 | 45% | 外資連續買超天數 + 法人買超/成交量 + 合計買超 + 券資比（有資料時） |
+| 籌碼面 | 45% | 最高 8 因子，依資料可用性自動升降級（詳見下方「籌碼面因子分級」） |
 | 基本面 | 10% | 營收 YoY > 0 過濾（加分/不加分） |
 | 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
+
+**籌碼面因子分級（MomentumScanner，依資料可用性自動選擇最高 Tier）：**
+
+| Tier | 啟用條件 | 外資 | 量比 | 法人 | 券資比 | 大戶 | 借券 | 分點HHI | 智慧分點 |
+|------|---------|:----:|:----:|:----:|:------:|:----:|:----:|:-------:|:-------:|
+| **8F** | 120天分點歷史（buy_price/sell_price）+ 全部 7F 條件 | 18% | 16% | 16% | 10% | 12% | 7% | 11% | **10%** |
+| 7F | 分點HHI + 借券 + 融資券 + 大戶 | 20% | 18% | 18% | 11% | 13% | 8% | 12% | — |
+| 6F | 分點HHI + 借券 + 融資券（無大戶） | 22% | 20% | 20% | 14% | — | 12% | 12% | — |
+| 5F | 分點HHI + 借券（無融資券） | 28% | 22% | 22% | — | — | 14% | 14% | — |
+| 4F | 僅分點HHI | 32% | 24% | 24% | — | — | — | 20% | — |
+| 3F | 基本（無分點資料） | 40% | 30% | 30% | — | — | — | — | — |
+
+**智慧分點因子（8F 第 8 因子）說明：**
+
+| 子因子 | 權重 | 說明 |
+|--------|------|------|
+| Smart Broker Score | 60% | 歷史精準分點（win_rate ≥ 0.60、Profit Factor ≥ 1.50、sell_events ≥ 3、買入總額 ≥ 500 萬）的近期加碼評分。Smart_Score = Σ(歷史損益 × 近3日淨買超)，賺錢贏家近期加碼貢獻更大 |
+| Accumulation Broker Score | 40% | 純蓄積型地緣分點（sell_ratio ≤ 10%、淨持倉 > 0、後60天倉位 > 前60天），成本線具底撐效果 |
+
+> **資料前提**：8F 需要 120 天分點歷史（含 buy_price/sell_price）。首次建議執行 `python main.py sync-broker --days 120`；後續 daily 5 天增量更新即可維持 rolling 120 天窗口。資料不足時自動降回 7F，不影響選股執行。
 
 **Swing 模式：**
 
@@ -812,18 +832,19 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 | 階段 | 動作 | 說明 |
 |------|------|------|
 | Stage 0 | 市場狀態偵測 | 根據 TAIEX 判斷 bull/bear/sideways，動態調整權重 |
-| Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
-| Stage 2 | 粗篩 | 模式專屬條件篩選，取前 150 名 |
 | Stage 0.5 | 資料冷啟動補抓 | **growth**：月營收覆蓋 < 500 支時自動從 MOPS 同步；**value/dividend**：估值資料（PE/PB/殖利率）覆蓋 < 500 支時自動從 TWSE/TPEX 同步 |
-| Stage 2.5 | 營收/估值補抓 | 從 FinMind 逐股補抓候選股月營收（value 模式另補抓 PE/PB/殖利率） |
+| Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
+| Stage 2 | 粗篩 | 模式專屬條件篩選，取前 ~150 名 |
+| Stage 2.5 | 補抓候選股資料 | **MomentumScanner**：自動從 FinMind 補抓月營收 + 最近 5 天分點交易資料（`sync_broker_for_stocks`）。其他模式僅補抓月營收/估值 |
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
+| ↳ 籌碼面（Momentum） | 智慧分點計算 | 從 DB 載入候選股 120 天分點歷史（`buy_price`/`sell_price`），識別 Smart Broker（高勝率+高獲利因子）與 Accumulation Broker（蓄積型地緣分點），有資料時升級至 8-Factor |
 | Stage 3.3 | 產業加成 | 用 IndustryRotationAnalyzer 計算產業排名，熱門產業 +5%、冷門產業 -5% 線性加成到 composite_score |
 | Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
-> **注意**：Stage 2.5 需要 FinMind API Token 才能補抓月營收與估值資料。若無 Token，基本面/估值分數會 fallback 到 0.5（中性值），不影響其他維度評分。
+> **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）需要 120 天分點歷史資料，資料不足時自動降回 7F。
 
 ### 4.14 Discover 推薦績效回測 (`discover-backtest`)
 
