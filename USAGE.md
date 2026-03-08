@@ -762,7 +762,7 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 
 | Tier | 啟用條件 | 外資 | 量比 | 法人 | 券資比 | 大戶 | 借券 | 分點HHI | 智慧分點 |
 |------|---------|:----:|:----:|:----:|:------:|:----:|:----:|:-------:|:-------:|
-| **8F** | 120天分點歷史（buy_price/sell_price）+ 全部 7F 條件 | 18% | 16% | 16% | 10% | 12% | 7% | 11% | **10%** |
+| **8F** | 分點歷史 ≥ 20 交易日（buy_price/sell_price）+ 全部 7F 條件 | 18% | 16% | 16% | 10% | 12% | 7% | 11% | **10%** |
 | 7F | 分點HHI + 借券 + 融資券 + 大戶 | 20% | 18% | 18% | 11% | 13% | 8% | 12% | — |
 | 6F | 分點HHI + 借券 + 融資券（無大戶） | 22% | 20% | 20% | 14% | — | 12% | 12% | — |
 | 5F | 分點HHI + 借券（無融資券） | 28% | 22% | 22% | — | — | 14% | 14% | — |
@@ -776,7 +776,11 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 | Smart Broker Score | 60% | 歷史精準分點（win_rate ≥ 0.60、Profit Factor ≥ 1.50、sell_events ≥ 3、買入總額 ≥ 500 萬）的近期加碼評分。Smart_Score = Σ(歷史損益 × 近3日淨買超)，賺錢贏家近期加碼貢獻更大 |
 | Accumulation Broker Score | 40% | 純蓄積型地緣分點（sell_ratio ≤ 10%、淨持倉 > 0、後60天倉位 > 前60天），成本線具底撐效果 |
 
-> **資料前提**：8F 需要 120 天分點歷史（含 buy_price/sell_price）。首次建議執行 `python main.py sync-broker --days 120`；後續 daily 5 天增量更新即可維持 rolling 120 天窗口。資料不足時自動降回 7F，不影響選股執行。
+> **資料前提（自適應累積設計）**：8F 採用「自然累積」策略，`_load_broker_data_extended()` 查詢最近 365 天 DB 歷史，並要求每股 **≥ 20 個交易日**的資料才啟用 Smart Broker（不足自動降回 7F）。
+>
+> - **首次部署（一次性）**：執行 `python main.py sync-broker --watchlist-bootstrap` 補齊 watchlist 所有股票的最大可用歷史資料（FinMind 免費帳號約 30–60 日），約 20 交易日後即可觸發 8F。
+> - **日常運作**：`morning-routine` Step 2 每日同步 watchlist（5 日），歷史資料自然累積，120 天後準確度最高。
+> - **新股加入 watchlist**：累積約 1 個月後自動升級至 8F，無需手動操作。
 
 **Swing 模式：**
 
@@ -838,13 +842,13 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 | Stage 2.5 | 補抓候選股資料 | **MomentumScanner**：自動從 FinMind 補抓月營收 + 最近 5 天分點交易資料（`sync_broker_for_stocks`）。其他模式僅補抓月營收/估值 |
 | Stage 2.7 | 公告載入 | 從 DB 載入候選股近期 MOPS 重大訊息 |
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
-| ↳ 籌碼面（Momentum） | 智慧分點計算 | 從 DB 載入候選股 120 天分點歷史（`buy_price`/`sell_price`），識別 Smart Broker（高勝率+高獲利因子）與 Accumulation Broker（蓄積型地緣分點），有資料時升級至 8-Factor |
+| ↳ 籌碼面（Momentum） | 智慧分點計算 | 從 DB 載入候選股最近 365 天分點歷史（`buy_price`/`sell_price`），需 ≥ 20 個交易日才識別 Smart Broker（高勝率+高獲利因子）與 Accumulation Broker（蓄積型地緣分點），有資料時升級至 8-Factor |
 | Stage 3.3 | 產業加成 | 用 IndustryRotationAnalyzer 計算產業排名，熱門產業 +5%、冷門產業 -5% 線性加成到 composite_score |
 | Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
-> **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）需要 120 天分點歷史資料，資料不足時自動降回 7F。
+> **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）採自適應累積設計，需 ≥ 20 個交易日分點歷史資料（由 `morning-routine` 每日自動累積），資料不足時自動降回 7F。
 
 ### 4.14 Discover 推薦績效回測 (`discover-backtest`)
 
@@ -1328,7 +1332,8 @@ python main.py morning-routine --top 30 --notify
 | 步驟 | 動作 | 說明 |
 |------|------|------|
 | Step 1 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
-| Step 2 | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦股票的分點資料 |
+| Step 2a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
+| Step 2b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
 | Step 3 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |

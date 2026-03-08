@@ -1,13 +1,14 @@
 """分點交易資料（Broker Trade）整合測試。
 
 測試項目：
-- fetch_broker_trades:           FinMind TaiwanStockTradingDailyReport 欄位映射 + 數值清洗（mock HTTP）
-- BrokerTrade ORM:               寫入 + 唯一鍵衝突（in-memory SQLite）
-- compute_broker_score:          HHI 集中度計算 + 連續天數（純函數）
-- MomentumScanner 7-factor:      7-factor 啟用、降級、集中度/連續天影響（_compute_chip_scores 單元）
-- Stage 2.5 自動補抓:            MomentumScanner._auto_sync_broker=True 觸發 sync_broker_for_stocks()；
-                                 SwingScanner._auto_sync_broker=False 不觸發
-- sync_broker_for_stocks:        pipeline 包裝函數（days=7 透傳）
+- fetch_broker_trades:                FinMind TaiwanStockTradingDailyReport 欄位映射 + 數值清洗（mock HTTP）
+- BrokerTrade ORM:                    寫入 + 唯一鍵衝突（in-memory SQLite）
+- compute_broker_score:               HHI 集中度計算 + 連續天數（純函數）
+- MomentumScanner 7-factor:           7-factor 啟用、降級、集中度/連續天影響（_compute_chip_scores 單元）
+- Stage 2.5 自動補抓:                 MomentumScanner._auto_sync_broker=True 觸發 sync_broker_for_stocks()；
+                                      SwingScanner._auto_sync_broker=False 不觸發
+- sync_broker_for_stocks:             pipeline 包裝函數（days=7 透傳）
+- LoadBrokerDataExtendedAdaptive:     _load_broker_data_extended() 自適應門檻（min_trading_days 過濾）
 """
 
 from __future__ import annotations
@@ -1141,3 +1142,87 @@ class TestComputeSmartBrokerScore:
         # 空輸入
         empty_result = compute_smart_broker_score(pd.DataFrame(), {})
         assert empty_result.empty
+
+
+# ------------------------------------------------------------------ #
+#  TestLoadBrokerDataExtendedAdaptive — _load_broker_data_extended 門檻
+# ------------------------------------------------------------------ #
+
+
+class TestLoadBrokerDataExtendedAdaptive:
+    """_load_broker_data_extended() 自適應 min_trading_days 過濾行為（in-memory SQLite）。"""
+
+    def _write_broker_rows(self, session, stock_id: str, n_days: int, base: date | None = None) -> None:
+        """在 in-memory DB 寫入指定天數的 BrokerTrade 測試資料。"""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+
+        _base = base or date(2026, 1, 1)
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": _base + timedelta(days=i),
+                "broker_id": "X001",
+                "broker_name": "測試券商",
+                "buy": 1000,
+                "sell": 500,
+                "buy_price": 100.0,
+                "sell_price": 102.0,
+            }
+            for i in range(n_days)
+        ]
+        stmt = sqlite_upsert(BrokerTrade).values(rows).on_conflict_do_nothing()
+        session.execute(stmt)
+        session.commit()
+
+    def test_min_trading_days_filters_insufficient_data(self, db_session):
+        """歷史天數不足 min_trading_days 的股票應被過濾排除。"""
+        # 寫入：A 有 25 天、B 只有 10 天
+        self._write_broker_rows(db_session, "A", 25)
+        self._write_broker_rows(db_session, "B", 10)
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        # 設定 min_trading_days=20：A 留下，B 排除
+        result = scanner._load_broker_data_extended(["A", "B"], days=365, min_trading_days=20)
+
+        assert not result.empty
+        stocks_in_result = result["stock_id"].unique()
+        assert "A" in stocks_in_result
+        assert "B" not in stocks_in_result
+
+    def test_min_trading_days_zero_disables_filter(self, db_session):
+        """min_trading_days=0 時不過濾，所有股票均回傳。"""
+        self._write_broker_rows(db_session, "C", 5)
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["C"], days=365, min_trading_days=0)
+
+        assert not result.empty
+        assert "C" in result["stock_id"].values
+
+    def test_all_stocks_meet_threshold(self, db_session):
+        """所有股票均達門檻時，全部回傳。"""
+        self._write_broker_rows(db_session, "D", 30)
+        self._write_broker_rows(db_session, "E", 25)
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["D", "E"], days=365, min_trading_days=20)
+
+        stocks_in_result = set(result["stock_id"].unique())
+        assert stocks_in_result == {"D", "E"}
+
+    def test_default_days_is_365(self, db_session):
+        """預設 days=365 確保查詢到足夠歷史範圍（不再使用 120 天固定上限）。"""
+        import inspect
+
+        from src.discovery.scanner import MomentumScanner
+
+        sig = inspect.signature(MomentumScanner._load_broker_data_extended)
+        params = sig.parameters
+        assert params["days"].default == 365, "days 預設值應為 365（不再是 120）"
+        assert params["min_trading_days"].default == 20, "min_trading_days 預設值應為 20"
+
+    def test_empty_result_when_no_data_in_window(self, db_session):
+        """DB 內無資料或超出窗口時，回傳空 DataFrame。"""
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["Z999"], days=365, min_trading_days=1)
+        assert result.empty

@@ -2088,12 +2088,24 @@ class MomentumScanner(MarketScanner):
         except Exception:
             return pd.DataFrame()
 
-    def _load_broker_data_extended(self, stock_ids: list[str], days: int = 120) -> pd.DataFrame:
-        """從 DB 載入最近 N 天的分點交易資料（含 buy_price / sell_price）。
+    def _load_broker_data_extended(
+        self,
+        stock_ids: list[str],
+        days: int = 365,
+        min_trading_days: int = 20,
+    ) -> pd.DataFrame:
+        """從 DB 載入所有可用的分點交易資料（含 buy_price / sell_price）。
 
-        供 compute_smart_broker_score() 使用，窗口較長（預設 120 天）。
+        查詢窗口改為 days=365，充分利用 daily sync 累積的歷史資料。
+        min_trading_days：每支股票至少需有 N 個交易日資料，否則排除（避免假信號）。
+
         計算僅針對 Stage 2 粗篩後的候選股（~150 支），不涉及全市場。
         若表不存在或無資料則回傳空 DataFrame（呼叫端自動降級）。
+
+        資料累積說明：
+          - morning-routine Step 2 每日同步 watchlist 分點資料（5日）
+          - 連續執行 20 天後即可觸發 Smart Broker 8F 計算
+          - 資料越豐富（60~120 天），勝率/PF 估算越準確
         """
         cutoff = date.today() - timedelta(days=days)
         try:
@@ -2114,10 +2126,16 @@ class MomentumScanner(MarketScanner):
                 ).all()
             if not rows:
                 return pd.DataFrame()
-            return pd.DataFrame(
+            df = pd.DataFrame(
                 rows,
                 columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
             )
+            # 過濾掉歷史資料不足的股票，避免以少量資料誤判分點行為
+            if min_trading_days > 0 and not df.empty:
+                day_counts = df.groupby("stock_id")["date"].nunique()
+                valid_stocks = day_counts[day_counts >= min_trading_days].index
+                df = df[df["stock_id"].isin(valid_stocks)]
+            return df
         except Exception:
             return pd.DataFrame()
 

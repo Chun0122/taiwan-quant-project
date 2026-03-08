@@ -1515,11 +1515,29 @@ def cmd_sync_sbl(args: argparse.Namespace) -> None:
 
 
 def cmd_sync_broker(args: argparse.Namespace) -> None:
-    """同步分點交易資料（FinMind TaiwanStockTradingDailyReport）。"""
+    """同步分點交易資料（FinMind TaiwanStockTradingDailyReport）。
+
+    --watchlist-bootstrap：一次性對所有 watchlist 股票補齊最大可用歷史資料。
+      FinMind 免費帳號約可取得近 30~60 天；付費帳號可取更長歷史。
+      建議在首次部署或新增股票到 watchlist 後執行一次。
+    """
     from src.data.pipeline import sync_broker_trades
 
     stock_ids = args.stocks if args.stocks else None
     days = getattr(args, "days", 5)
+
+    # --watchlist-bootstrap：以最大天數（120天）補齊 watchlist 全部股票
+    if getattr(args, "watchlist_bootstrap", False):
+        from src.data.database import get_effective_watchlist
+
+        bootstrap_days = getattr(args, "days", 120)
+        watchlist = get_effective_watchlist()
+        target_ids = stock_ids if stock_ids else watchlist
+        print(f"[Bootstrap] 對 {len(target_ids)} 支 watchlist 股票補齊最近 {bootstrap_days} 天分點歷史...")
+        print("  （FinMind 免費帳號約可取得 30~60 天，付費帳號可取更長歷史）")
+        count = sync_broker_trades(stock_ids=target_ids, days=bootstrap_days)
+        print(f"\n分點 Bootstrap 完成: {count:,} 筆")
+        return
 
     if getattr(args, "from_discover", False):
         from sqlalchemy import func, select
@@ -1537,8 +1555,14 @@ def cmd_sync_broker(args: argparse.Namespace) -> None:
                 from src.data.database import get_effective_watchlist
 
                 watchlist = get_effective_watchlist()
-                stock_ids = list(set((stock_ids or watchlist) + discover_stocks))
-                print(f"從最近 discover（{latest_date}）補抓 {len(discover_stocks)} 支，合計 {len(stock_ids)} 支")
+                # 排除已在 watchlist 中的股票（morning-routine 2a 已同步）
+                non_watchlist = [s for s in discover_stocks if s not in watchlist]
+                stock_ids = list(set((stock_ids or []) + non_watchlist))
+                if stock_ids:
+                    print(f"從最近 discover（{latest_date}）補抓非 watchlist 股票 {len(stock_ids)} 支")
+                else:
+                    print(f"從最近 discover（{latest_date}）無需補抓（全在 watchlist 中）")
+                    return
 
     print(f"同步分點交易資料（最近 {days} 日）...")
     count = sync_broker_trades(stock_ids=stock_ids, days=days)
@@ -3044,7 +3068,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     依序執行：
       Step 1  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
-      Step 2  sync-broker         補抓 discover 推薦分點資料（5日）
+      Step 2  sync-broker         同步 watchlist 分點資料（5日）+ 補抓 discover 推薦（累積歷史）
       Step 3  discover all        五模式全市場掃描（--skip-sync，不重複同步）
       Step 4  alert-check         MOPS 重大事件警報（近3日）
       Step 5  watch update-status 批次更新持倉止損/止利/過期狀態
@@ -3056,6 +3080,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
       --skip-sync   跳過 Step 1–2（借券/分點同步），適合資料已新鮮時使用
       --top N       discover 的 Top N（預設 20）
       --notify      執行完畢後推播 Discord 摘要
+
+    Step 2 說明：
+      每日同步 watchlist 分點資料，使 Smart Broker（8F）所需的歷史勝率資料自然累積。
+      約 20 個交易日後，watchlist 股票即可觸發 Smart Broker 計算；60~120 天後準確度最高。
     """
     import datetime
 
@@ -3084,11 +3112,14 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     else:
         cmd_sync_sbl(argparse.Namespace(days=3))
 
-    # ── Step 2: sync-broker --from-discover ──────────────────────
-    _step(2, "同步分點交易資料（sync-broker --from-discover --days 5）")
+    # ── Step 2: sync-broker（watchlist 累積 + discover 補抓）────────
+    _step(2, "同步分點交易資料（watchlist 歷史累積 + discover 補抓）")
     if dry_run or skip_sync:
         _skip("dry-run" if dry_run else "--skip-sync")
     else:
+        # 2a: 同步 watchlist 全部股票（5 日），每日累積歷史資料供 Smart Broker 使用
+        cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=False))
+        # 2b: 補抓最近 discover 推薦的股票（跳過 2a 已同步的 watchlist 股票，僅補非 watchlist 候選）
         cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True))
 
     # ── Step 3: discover all --skip-sync ─────────────────────────
@@ -3380,6 +3411,11 @@ def main() -> None:
     sp_broker.add_argument("--stocks", nargs="+", help="指定股票代號（預設使用 watchlist）")
     sp_broker.add_argument("--days", type=int, default=5, help="同步最近幾個交易日（預設 5）")
     sp_broker.add_argument("--from-discover", action="store_true", help="補抓最近一次 discover 推薦結果的分點資料")
+    sp_broker.add_argument(
+        "--watchlist-bootstrap",
+        action="store_true",
+        help="一次性補齊 watchlist 所有股票最大可用歷史分點資料（預設 120 日，受 FinMind 帳號限制）",
+    )
 
     # alert-check 子命令
     sp_alert = subparsers.add_parser("alert-check", help="掃描近期 MOPS 重大事件警報（法說會/財報/月營收）")
