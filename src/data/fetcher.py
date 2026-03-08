@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import requests
@@ -350,11 +350,35 @@ class FinMindFetcher(DataFetcher):
 
         回傳欄位: date, stock_id, broker_id, broker_name, buy, sell, buy_price, sell_price
         免費帳號支援逐股查詢，速率控制由 _request() 內部處理（0.5 秒間隔）。
+        日期範圍超過 30 天時自動分批查詢（每批 30 天），避免 400 錯誤。
         """
         if end is None:
             end = date.today().isoformat()
 
-        df = self._request("TaiwanStockTradingDailyReport", stock_id, start, end)
+        start_dt = date.fromisoformat(start)
+        end_dt = date.fromisoformat(end)
+        chunk_days = 30
+
+        if (end_dt - start_dt).days <= chunk_days:
+            df = self._request("TaiwanStockTradingDailyReport", stock_id, start, end)
+        else:
+            chunks = []
+            chunk_start = start_dt
+            while chunk_start <= end_dt:
+                chunk_end = min(chunk_start + timedelta(days=chunk_days - 1), end_dt)
+                try:
+                    chunk_df = self._request(
+                        "TaiwanStockTradingDailyReport",
+                        stock_id,
+                        chunk_start.isoformat(),
+                        chunk_end.isoformat(),
+                    )
+                    if not chunk_df.empty:
+                        chunks.append(chunk_df)
+                except Exception as exc:
+                    logger.warning("分點分批查詢失敗 %s %s~%s: %s", stock_id, chunk_start, chunk_end, exc)
+                chunk_start = chunk_end + timedelta(days=1)
+            df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         if df.empty:
             return pd.DataFrame()
 
