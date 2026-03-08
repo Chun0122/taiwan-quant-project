@@ -1406,6 +1406,30 @@ def cmd_sync_financial(args: argparse.Namespace) -> None:
         print(f"財報資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def cmd_sync_info(args: argparse.Namespace) -> None:
+    """同步全市場股票基本資料（產業分類、上市/上櫃別）到 stock_info 表。"""
+    from src.data.pipeline import sync_stock_info
+
+    _init_db()
+    force = getattr(args, "force", False)
+    print("正在同步全市場股票基本資料（StockInfo）...")
+    count = sync_stock_info(force_refresh=force)
+    if count > 0:
+        from sqlalchemy import func, select
+
+        from src.data.database import get_session
+        from src.data.schema import StockInfo
+
+        with get_session() as session:
+            total = session.execute(select(func.count()).select_from(StockInfo)).scalar()
+            max_updated = session.execute(select(func.max(StockInfo.updated_at))).scalar()
+
+        print(f"\nStockInfo 同步完成: 本次更新 {count:,} 筆")
+        print(f"資料庫合計: {total:,} 支股票，最後更新 {max_updated}")
+    else:
+        print("\nStockInfo 無需更新（DB 已有資料，使用 --force 強制重新同步）")
+
+
 def cmd_sync_holding(args: argparse.Namespace) -> None:
     """同步 watchlist 大戶持股分級資料（週資料，FinMind TaiwanStockHoldingSharesPer）。"""
     from src.data.pipeline import sync_holding_distribution
@@ -3295,6 +3319,15 @@ def main() -> None:
     sp_fin.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_fin.add_argument("--quarters", type=int, default=4, help="同步最近幾季（預設 4）")
 
+    # sync-info 子命令
+    sp_info = subparsers.add_parser("sync-info", help="同步全市場股票基本資料（產業分類 + 上市/上櫃別）")
+    sp_info.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="強制重新同步（即使 DB 已有資料，預設跳過）",
+    )
+
     # sync-holding 子命令
     sp_hold = subparsers.add_parser("sync-holding", help="同步大戶持股分級資料（週資料）")
     sp_hold.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
@@ -3520,6 +3553,8 @@ def main() -> None:
         cmd_sync_revenue(args)
     elif args.command == "sync-financial":
         cmd_sync_financial(args)
+    elif args.command == "sync-info":
+        cmd_sync_info(args)
     elif args.command == "sync-holding":
         cmd_sync_holding(args)
     elif args.command == "sync-sbl":

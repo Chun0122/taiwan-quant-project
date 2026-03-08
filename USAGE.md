@@ -1331,6 +1331,33 @@ python main.py morning-routine --top 30 --notify
 
 ---
 
+### 4.27 同步股票基本資料（`sync-info`）
+
+同步全市場股票基本資料（StockInfo 表）到 DB，包含股票名稱、產業分類、上市/上櫃別。
+
+```bash
+# 同步股票基本資料（DB 若已有資料則自動跳過）
+python main.py sync-info
+
+# 強制重新同步（覆蓋 DB 現有資料）
+python main.py sync-info --force
+```
+
+**參數說明：**
+
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--force` | False | 強制重新抓取，即使 DB 已有資料 |
+
+**使用時機：**
+- 初次部署後，執行 `sync-info --force` 一次性建立完整基礎資料
+- 定期更新（每月一次），確保新上市/更名股票資訊正確
+- `industry` / `discover` 命令需仰賴 StockInfo 的產業分類資料
+
+> **注意**：`sync` 命令在同步主流程前也會自動調用 `sync_stock_info(force_refresh=False)`，若 DB 已有資料則不重複拉取。`sync-info` 提供獨立的控制入口，適合需要手動強制更新時使用。
+
+---
+
 ## 5. 資料庫 Schema
 
 資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表（另含 `stock_valuation` 估值表）：

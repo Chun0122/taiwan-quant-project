@@ -103,6 +103,79 @@ class TestComputeMetrics:
         metrics = engine._compute_metrics(equity, trades, date(2024, 1, 1), date(2024, 12, 31))
         assert metrics["profit_factor"] == pytest.approx(2.0, abs=0.01)
 
+    def test_sortino_ratio_with_mixed_returns(self):
+        """含漲跌天數的 equity curve 應計算出正的 Sortino Ratio。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        # 交替漲跌，確保有多個下跌日（neg_returns not empty，std > 0）
+        equity = [1_000_000, 1_010_000, 1_005_000, 1_015_000, 1_008_000, 1_020_000, 1_012_000, 1_025_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["sortino_ratio"] is not None
+        assert metrics["sortino_ratio"] > 0
+
+    def test_sortino_ratio_none_when_no_down_days(self):
+        """單調遞增（無下跌日）的 equity curve → sortino_ratio 為 None。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 1_010_000, 1_020_000, 1_030_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["sortino_ratio"] is None
+
+    def test_calmar_ratio_computed_with_drawdown(self):
+        """有最大回撤時應計算 Calmar Ratio > 0。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        # Peak 1.2M → trough 0.9M → final 1.1M → max_drawdown = 25%，年化報酬 > 0
+        equity = [1_000_000, 1_200_000, 900_000, 1_100_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["calmar_ratio"] is not None
+        assert metrics["calmar_ratio"] > 0
+
+    def test_calmar_ratio_none_when_no_drawdown(self):
+        """無最大回撤（單調遞增）時 calmar_ratio 為 None。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 1_100_000, 1_200_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["calmar_ratio"] is None
+
+    def test_var_cvar_computed_with_sufficient_data(self):
+        """有多個資料點時 var_95 與 cvar_95 應不為 None。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 1_010_000, 1_005_000, 1_020_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["var_95"] is not None
+        assert metrics["cvar_95"] is not None
+
+    def test_cvar_is_worse_than_or_equal_to_var(self):
+        """CVaR（尾部期望損失）應 <= VaR（第 5 百分位數）。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 1_010_000, 1_005_000, 1_015_000, 1_008_000, 1_020_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["cvar_95"] is not None
+        assert metrics["var_95"] is not None
+        assert metrics["cvar_95"] <= metrics["var_95"]
+
+    def test_var_negative_for_downtrend(self):
+        """持續下跌的 equity curve → var_95 應為負值。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 990_000, 980_000, 970_000, 960_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["var_95"] is not None
+        assert metrics["var_95"] < 0
+
+    def test_var_cvar_none_for_single_point(self):
+        """只有 1 筆資料點時 var_95 與 cvar_95 應為 None。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["var_95"] is None
+        assert metrics["cvar_95"] is None
+
 
 # ─── _compute_kelly_fraction ──────────────────────────────
 
