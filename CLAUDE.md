@@ -21,6 +21,7 @@ python main.py [command] [options]
 python main.py sync                          # 從 FinMind 同步觀察清單資料（含 TAIEX）
 python main.py compute                       # 計算技術指標
 python main.py backtest --stock 2330 --strategy sma_cross
+python main.py backtest --stock 2330 --strategy sma_cross --attribution  # 含五因子歸因分析
 python main.py discover --top 20             # 全市場掃描（預設 momentum 模式）
 python main.py discover momentum --top 20   # 短線動能掃描
 python main.py discover swing --top 20      # 中期波段掃描
@@ -144,6 +145,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_broker.py`         | `fetch_broker_trades` 欄位映射 + `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_anomaly.py`        | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數（量能暴增/外資大買超/借券激增/主力集中）| 純函數 |
+| `tests/test_attribution.py`    | `FactorAttribution.compute()` / `compute_from_df()` 五因子歸因（momentum/reversal/quality/size/liquidity）純函數測試 | 純函數 |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。測試用資料建構函數（`make_price_df` 等 5 個）集中於 `tests/scanner_helpers.py`（因 `tests/` 有 `__init__.py`，conftest 不可直接 import）。
 
@@ -197,6 +199,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()` + 除權息調整（`_apply_dividend_adjustment`）                |
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
 | `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
+| `src/backtest/attribution.py`       | 五因子歸因分析（`FactorAttribution` 類別）：momentum/reversal/quality/size/liquidity 因子暴露 × Pearson 相關係數；`compute(BacktestResultData, data)` + `compute_from_df(trades_df, data)` 雙接口 |
 | `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管、除權息股利入帳                                                                      |
 | `src/backtest/allocator.py`         | 投資組合配置計算（risk_parity / mean_variance），scipy 優化純函數                                                 |
 | `src/backtest/portfolio.py`         | 多股票組合回測，支援 equal_weight / custom / risk_parity / mean_variance 四種配置                                 |
@@ -277,7 +280,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 25 | ✅ | **週線多時框確認（P4）** | `aggregate_to_weekly()` 純函數（indicators.py）：日K聚合週K + 週線 SMA13/RSI14/MACD；`_compute_weekly_trend_bonus()` / `_apply_weekly_trend_bonus()` 方法（scanner.py，Stage 3.4）：SMA13 + RSI14 週線信號 → ±5% 加成；`--weekly-confirm` CLI 旗標（discover 子命令）；`tests/test_indicators.py` 新增 10 個 `TestAggregateToWeekly` 純函數測試；710 測試通過 |
 | 26 | ✅ | **P6 進階回測指標測試補齊** | `test_backtest_engine.py` + `test_portfolio.py` 各新增 8 個 TestComputeMetrics 測試（Sortino/Calmar/VaR/CVaR 四指標：正常計算、None 邊界、下跌驗證、CVaR ≤ VaR 關係）；726 測試通過 |
 | 27 | ✅ | **P8 sync-info 獨立 CLI 命令** | `cmd_sync_info()` + `sync-info` subparser（`--force` 旗標強制更新）；呼叫 `sync_stock_info(force_refresh=...)` 同步 StockInfo 表（產業分類 + 上市/上櫃別）；726 測試通過 |
-| 28 | ⬜ | **策略績效歸因分析（Factor Attribution）** | 新建 `src/backtest/attribution.py`（`FactorAttribution` 類別）；`compute(backtest_result, data)` 計算 momentum/reversal/quality/size/liquidity 五因子暴露與期間報酬相關係數；`backtest` 子命令新增 `--attribution` 旗標；Dashboard `backtest_review.py` 新增因子貢獻長條圖（Plotly） |
+| 28 | ✅ | **策略績效歸因分析（Factor Attribution）** | 新建 `src/backtest/attribution.py`（`FactorAttribution` 類別）；`compute(backtest_result, data)` 計算 momentum/reversal/quality/size/liquidity 五因子暴露與期間報酬相關係數；`backtest` 子命令新增 `--attribution` 旗標；Dashboard `backtest_review.py` 新增因子貢獻長條圖（Plotly）；740 測試通過 |
 | 29 | ⬜ | **Claude API 整合 — AI 選股報告** | 新建 `src/report/ai_report.py`（`generate_ai_summary(discover_result, regime, top_stocks)` 函數）；呼叫 Claude API（`claude-sonnet-4-6`），傳入結構化量化數據，生成約 300 字繁體中文摘要（市場狀態 + 推薦邏輯 + 風險提示）；`discover` 子命令新增 `--ai-summary` 旗標；`requirements.txt` 新增 `anthropic`；`config/settings.yaml.example` 新增 `anthropic.api_key` |
 | 30 | ⬜ | **Dashboard 策略比較頁** | 新建 `src/visualization/pages/strategy_comparison.py`（第 10 個 Dashboard 頁面）；左側多選框（1~5 個策略/Discover 模式）+ 股票/時間範圍；右側多線折線圖（各策略累積報酬率曲線）+ 績效指標比較表（Sharpe/MaxDD/WinRate/年化報酬）；`src/visualization/app.py` 新增 sidebar 入口 |
 

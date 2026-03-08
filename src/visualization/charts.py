@@ -601,6 +601,75 @@ def plot_per_stock_returns(per_stock_returns: dict[str, float]) -> go.Figure:
     return fig
 
 
+def plot_factor_attribution_bar(
+    correlations: dict[str, float | None],
+    factor_labels: dict[str, str] | None = None,
+    title: str = "因子歸因分析（Pearson 相關係數）",
+) -> go.Figure:
+    """五因子歸因長條圖 — 顯示各因子暴露與交易報酬的相關係數。
+
+    Parameters
+    ----------
+    correlations:
+        因子名稱 → Pearson 相關係數（None 代表資料不足）。
+    factor_labels:
+        因子英文名 → 中文顯示名稱。預設使用 FactorAttribution.FACTOR_LABELS。
+    title:
+        圖表標題。
+    """
+    if factor_labels is None:
+        factor_labels = {
+            "momentum": "動能(20d)",
+            "reversal": "反轉(5d)",
+            "quality": "品質(RSI)",
+            "size": "規模(對數量)",
+            "liquidity": "流動性(相對量)",
+        }
+
+    labels = []
+    values = []
+    colors = []
+    texts = []
+
+    for fname in factor_labels:
+        label = factor_labels.get(fname, fname)
+        corr = correlations.get(fname)
+        labels.append(label)
+        if corr is None:
+            values.append(0.0)
+            colors.append("#9E9E9E")
+            texts.append("N/A")
+        else:
+            values.append(corr)
+            colors.append("#26A69A" if corr >= 0 else "#EF5350")
+            texts.append(f"{corr:+.3f}")
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=labels,
+                y=values,
+                marker_color=colors,
+                text=texts,
+                textposition="outside",
+            )
+        ]
+    )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_hline(y=0.2, line_dash="dot", line_color="#26A69A", opacity=0.4, annotation_text="正向門檻")
+    fig.add_hline(y=-0.2, line_dash="dot", line_color="#EF5350", opacity=0.4, annotation_text="負向門檻")
+
+    fig.update_layout(
+        title=title,
+        yaxis_title="相關係數",
+        yaxis_range=[-1.1, 1.1],
+        height=380,
+        margin=dict(l=60, r=20, t=50, b=40),
+    )
+    return fig
+
+
 # ------------------------------------------------------------------ #
 #  Discover 推薦歷史圖表
 # ------------------------------------------------------------------ #

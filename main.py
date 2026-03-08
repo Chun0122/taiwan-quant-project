@@ -215,6 +215,32 @@ def _build_risk_config(args: argparse.Namespace):
     )
 
 
+def _print_attribution(attr: object) -> None:
+    """印出五因子歸因分析摘要表。"""
+    from src.backtest.attribution import FactorAttributionResult
+
+    if not isinstance(attr, FactorAttributionResult) or attr.n_trades == 0:
+        print("  因子歸因：交易筆數不足（至少需 3 筆）")
+        return
+
+    print(f"\n因子歸因分析（{attr.n_trades} 筆交易）")
+    print(f"{'因子':<16} {'相關係數':>8}  解讀")
+    print("─" * 40)
+    for fname, label in attr.factor_labels.items():
+        corr = attr.correlations.get(fname)
+        if corr is None:
+            print(f"  {label:<14} {'N/A':>8}  資料不足")
+        else:
+            if corr > 0.2:
+                interpretation = "正向貢獻"
+            elif corr < -0.2:
+                interpretation = "負向貢獻"
+            else:
+                interpretation = "中性"
+            print(f"  {label:<14} {corr:>+8.3f}  {interpretation}")
+    print()
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
     """執行回測（單股或投資組合）。"""
     from datetime import date
@@ -323,6 +349,17 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print(f"  CVaR (95%):   {result.cvar_95 or 'N/A':>13}")
     print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
     print(f"  (結果已儲存, id={bt_id})")
+
+    # --- 因子歸因分析 ---
+    if getattr(args, "attribution", False):
+        from src.backtest.attribution import FactorAttribution
+
+        data = strategy._data
+        if data is not None and not data.empty:
+            attr = FactorAttribution().compute(result, data)
+            _print_attribution(attr)
+        else:
+            print("  因子歸因：無法取得策略資料")
 
 
 def cmd_dashboard() -> None:
@@ -3176,6 +3213,7 @@ def main() -> None:
     sp_bt.add_argument(
         "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
     )
+    sp_bt.add_argument("--attribution", action="store_true", default=False, help="回測結束後計算五因子歸因分析")
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")

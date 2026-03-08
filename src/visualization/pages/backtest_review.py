@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from src.visualization.charts import plot_equity_curve
+from src.visualization.charts import plot_equity_curve, plot_factor_attribution_bar
 from src.visualization.data_loader import (
     load_backtest_by_id,
     load_backtest_list,
@@ -106,6 +106,51 @@ def render() -> None:
     if not prices.empty:
         fig_eq = plot_equity_curve(trades, prices, bt["initial_capital"])
         st.plotly_chart(fig_eq, width="stretch")
+
+    # --- 因子歸因分析 ---
+    with st.expander("🧮 因子歸因分析", expanded=False):
+        if trades.empty or prices.empty:
+            st.info("需要交易記錄與價格資料才能計算因子歸因。")
+        else:
+            from src.backtest.attribution import FactorAttribution
+
+            fa = FactorAttribution()
+            attr = fa.compute_from_df(trades, prices)
+
+            if attr.n_trades < FactorAttribution.MIN_TRADES:
+                st.warning(
+                    f"交易筆數不足（{attr.n_trades} 筆），至少需 {FactorAttribution.MIN_TRADES} 筆才能計算相關係數。"
+                )
+            else:
+                st.caption(
+                    f"基於 {attr.n_trades} 筆交易計算各因子進場暴露值與交易報酬的 Pearson 相關係數。"
+                    " 正值代表該因子方向與獲利正相關，負值代表反向。"
+                )
+                fig_attr = plot_factor_attribution_bar(
+                    attr.correlations,
+                    factor_labels=attr.factor_labels,
+                )
+                st.plotly_chart(fig_attr, use_container_width=True)
+
+                # 因子暴露明細表
+                import numpy as np
+                import pandas as pd
+
+                exposure_rows = []
+                for fname, label in attr.factor_labels.items():
+                    vals = attr.factor_exposures.get(fname, [])
+                    corr = attr.correlations.get(fname)
+                    arr = [v for v in vals if not (isinstance(v, float) and (v != v))]  # 排除 nan
+                    exposure_rows.append(
+                        {
+                            "因子": label,
+                            "相關係數": f"{corr:+.3f}" if corr is not None else "N/A",
+                            "平均暴露": f"{np.mean(arr):.3f}" if arr else "N/A",
+                            "暴露標準差": f"{np.std(arr):.3f}" if arr else "N/A",
+                            "有效筆數": len(arr),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(exposure_rows), hide_index=True, use_container_width=True)
 
     # --- 交易明細 ---
     if not trades.empty:
