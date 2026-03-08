@@ -227,6 +227,231 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def compute_smart_broker_score(
+    df_broker: pd.DataFrame,
+    current_prices: dict[str, float],
+    min_win_rate: float = 0.60,
+    min_profit_factor: float = 1.50,
+    min_sell_events: int = 3,
+    min_buy_value: float = 5_000_000.0,
+    recent_days: int = 3,
+) -> pd.DataFrame:
+    """識別「高勝率+高獲利因子」Smart Broker 與「純蓄積型」Accumulation Broker（純函數）。
+
+    Smart Broker 判定（同時滿足）：
+    - win_rate >= min_win_rate：有獲利賣出比例
+    - profit_factor >= min_profit_factor：Σ獲利金額 / Σ虧損金額（防多小贏/一大虧陷阱）
+    - sell_events >= min_sell_events：至少 N 次賣出（降低運氣成分）
+    - total_buy_value >= min_buy_value：排除散單雜訊（TWD）
+
+    Accumulation Broker 判定（同時滿足）：
+    - sell_ratio <= 0.10：幾乎不賣（地緣/公司派大戶）
+    - net_position > 0：持有淨部位
+    - total_buy_value >= min_buy_value：排除散單
+    - position_trend_up：後半段倉位 > 前半段（持續蓄積中）
+
+    計算僅針對 Stage 2 粗篩後的候選股（~150 支），不涉及全市場。
+
+    Args:
+        df_broker: BrokerTrade 資料，欄位需含
+                   [date, stock_id, broker_id, buy, sell, buy_price, sell_price]
+        current_prices: {stock_id: close_price} 當日收盤字典
+        min_win_rate: Smart Broker 最低勝率門檻（預設 0.60）
+        min_profit_factor: Smart Broker 最低獲利因子門檻（預設 1.50）
+        min_sell_events: Smart Broker 最低賣出次數（預設 3）
+        min_buy_value: 最低買入總金額（TWD，預設 500 萬）
+        recent_days: 「近期活躍」的交易日天數（預設 3）
+
+    Returns:
+        DataFrame [stock_id, smart_broker_score, accum_broker_score, smart_broker_factor]
+        - smart_broker_score:   高勝率+高獲利分點的活躍加權評分 [0, 1]
+        - accum_broker_score:   蓄積型分點的底撐評分 [0, 1]
+        - smart_broker_factor:  合成因子 = 0.60 × smart + 0.40 × accum [0, 1]
+    """
+    _EMPTY = pd.DataFrame(columns=["stock_id", "smart_broker_score", "accum_broker_score", "smart_broker_factor"])
+    required = {"date", "stock_id", "broker_id", "buy", "sell", "buy_price", "sell_price"}
+    if df_broker.empty or not required.issubset(df_broker.columns):
+        return _EMPTY
+
+    df = df_broker.copy()
+    df["buy"] = pd.to_numeric(df["buy"], errors="coerce").fillna(0.0)
+    df["sell"] = pd.to_numeric(df["sell"], errors="coerce").fillna(0.0)
+    df["buy_price"] = pd.to_numeric(df["buy_price"], errors="coerce").fillna(0.0)
+    df["sell_price"] = pd.to_numeric(df["sell_price"], errors="coerce").fillna(0.0)
+    df["net_buy"] = df["buy"] - df["sell"]
+
+    broker_metrics: list[dict] = []
+    for (stock_id, broker_id), grp in df.groupby(["stock_id", "broker_id"], sort=False):
+        grp = grp.sort_values("date").reset_index(drop=True)
+        all_dates = sorted(grp["date"].unique())
+
+        avg_cost = 0.0
+        net_position = 0.0
+        total_profit = 0.0
+        total_loss = 0.0
+        wins = 0
+        sell_events = 0
+        total_buy_value = 0.0
+
+        for _, row in grp.iterrows():
+            buy_sh = float(row["buy"])
+            sell_sh = float(row["sell"])
+            bp = float(row["buy_price"])
+            sp = float(row["sell_price"])
+
+            if buy_sh > 0 and bp > 0:
+                total_buy_value += buy_sh * bp
+                new_pos = net_position + buy_sh
+                if new_pos > 0:
+                    avg_cost = (avg_cost * net_position + bp * buy_sh) / new_pos
+                net_position = new_pos
+
+            if sell_sh > 0 and sp > 0 and avg_cost > 0:
+                sell_events += 1
+                pnl = (sp - avg_cost) * sell_sh
+                if pnl > 0:
+                    wins += 1
+                    total_profit += pnl
+                else:
+                    total_loss += abs(pnl)
+                net_position = max(0.0, net_position - sell_sh)
+
+        win_rate = wins / sell_events if sell_events > 0 else 0.0
+        if total_loss > 0:
+            profit_factor = total_profit / total_loss
+        elif total_profit > 0:
+            profit_factor = 999.0
+        else:
+            profit_factor = 0.0
+        hist_pnl = total_profit - total_loss
+
+        # 近期活躍度（最後 recent_days 個交易日的淨買超）
+        recent_dates = set(all_dates[-recent_days:] if len(all_dates) >= recent_days else all_dates)
+        recent_net = float(grp[grp["date"].isin(recent_dates)]["net_buy"].sum())
+
+        # 倉位趨勢（前後半段比較）
+        mid = len(all_dates) // 2
+        first_half = set(all_dates[:mid])
+        last_half = set(all_dates[mid:])
+        first_net = float(grp[grp["date"].isin(first_half)]["net_buy"].sum())
+        last_net = float(grp[grp["date"].isin(last_half)]["net_buy"].sum())
+        position_trend_up = last_net > first_net
+
+        # 賣出比例
+        total_buy_sh = float(grp["buy"].sum())
+        total_sell_sh = float(grp["sell"].sum())
+        sell_ratio = total_sell_sh / total_buy_sh if total_buy_sh > 0 else 1.0
+
+        broker_metrics.append(
+            {
+                "stock_id": stock_id,
+                "broker_id": broker_id,
+                "win_rate": win_rate,
+                "profit_factor": profit_factor,
+                "sell_events": sell_events,
+                "total_buy_value": total_buy_value,
+                "hist_pnl": hist_pnl,
+                "recent_net": recent_net,
+                "net_position": net_position,
+                "avg_cost": avg_cost,
+                "sell_ratio": sell_ratio,
+                "position_trend_up": position_trend_up,
+            }
+        )
+
+    if not broker_metrics:
+        return _EMPTY
+
+    bm = pd.DataFrame(broker_metrics)
+
+    # ── Smart Broker 篩選 ──────────────────────────────────────────────
+    smart_mask = (
+        (bm["win_rate"] >= min_win_rate)
+        & (bm["profit_factor"] >= min_profit_factor)
+        & (bm["sell_events"] >= min_sell_events)
+        & (bm["total_buy_value"] >= min_buy_value)
+    )
+    smart_brokers = bm[smart_mask].copy()
+
+    # ── Accumulation Broker 篩選 ──────────────────────────────────────
+    accum_mask = (
+        (bm["sell_ratio"] <= 0.10)
+        & (bm["net_position"] > 0)
+        & (bm["total_buy_value"] >= min_buy_value)
+        & bm["position_trend_up"]
+    )
+    accum_brokers = bm[accum_mask].copy()
+
+    # ── 各股彙總 ──────────────────────────────────────────────────────
+    results_smart: list[dict] = []
+    for stock_id in bm["stock_id"].unique():
+        # Smart Broker 彙總
+        sb = smart_brokers[smart_brokers["stock_id"] == stock_id]
+        active_sb = sb[sb["recent_net"] > 0] if not sb.empty else sb
+        smart_score_raw = float((active_sb["hist_pnl"] * active_sb["recent_net"]).sum()) if not active_sb.empty else 0.0
+        avg_win_rate = float(sb["win_rate"].mean()) if not sb.empty else 0.0
+        avg_pf = float(sb["profit_factor"].clip(upper=10.0).mean()) if not sb.empty else 0.0
+
+        # Smart Broker 未實現損益
+        holding_sb = sb[sb["net_position"] > 0].copy() if not sb.empty else sb
+        curr_price = current_prices.get(str(stock_id), 0.0)
+        if not holding_sb.empty and curr_price > 0:
+            holding_sb["unrealized"] = holding_sb["avg_cost"].apply(lambda c: (curr_price - c) / c if c > 0 else 0.0)
+            avg_unrealized = float(holding_sb["unrealized"].mean())
+        else:
+            avg_unrealized = 0.0
+
+        # Accumulation Broker 彙總
+        ab = accum_brokers[accum_brokers["stock_id"] == stock_id]
+        accum_count = len(ab)
+        if accum_count > 0 and curr_price > 0:
+            ab = ab.copy()
+            ab["proximity"] = ab["avg_cost"].apply(lambda c: (curr_price - c) / c if c > 0 else 0.0)
+            avg_proximity = float(ab["proximity"].mean())
+            avg_trend_strength = float(ab["position_trend_up"].mean())
+        else:
+            avg_proximity = 0.0
+            avg_trend_strength = 0.0
+
+        results_smart.append(
+            {
+                "stock_id": stock_id,
+                "smart_score_raw": smart_score_raw,
+                "avg_win_rate": avg_win_rate,
+                "avg_pf": avg_pf,
+                "avg_unrealized": avg_unrealized,
+                "accum_count": accum_count,
+                "avg_proximity": avg_proximity,
+                "avg_trend_strength": avg_trend_strength,
+            }
+        )
+
+    if not results_smart:
+        return _EMPTY
+
+    res = pd.DataFrame(results_smart)
+
+    def _rank(s: pd.Series) -> pd.Series:
+        if len(s) <= 1:
+            return pd.Series([0.5] * len(s), index=s.index)
+        return s.rank(pct=True)
+
+    res["smart_broker_score"] = (
+        _rank(res["smart_score_raw"]) * 0.40
+        + _rank(res["avg_win_rate"]) * 0.25
+        + _rank(res["avg_pf"]) * 0.25
+        + _rank(res["avg_unrealized"]) * 0.10
+    )
+
+    res["accum_broker_score"] = (
+        _rank(res["accum_count"]) * 0.40 + _rank(res["avg_proximity"]) * 0.35 + _rank(res["avg_trend_strength"]) * 0.25
+    )
+
+    res["smart_broker_factor"] = res["smart_broker_score"] * 0.60 + res["accum_broker_score"] * 0.40
+
+    return res[["stock_id", "smart_broker_score", "accum_broker_score", "smart_broker_factor"]].reset_index(drop=True)
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""
@@ -1575,6 +1800,7 @@ class MomentumScanner(MarketScanner):
         """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
 
         權重組合（由資料可用性決定）：
+        - 8 因子（含智慧分點）: 外資18%+量比16%+法人16%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
         - 7 因子（含分點）: 外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
         - 6 因子（含借券）: 外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
         - 5 因子（含大戶持股，無借券）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
@@ -1672,6 +1898,20 @@ class MomentumScanner(MarketScanner):
             broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
             broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
 
+        # ── 智慧分點因子（120 天歷史勝率 + 蓄積型分點，需 buy_price / sell_price）──
+        _close_map: dict[str, float] = {}
+        if df_price is not None and not df_price.empty:
+            _close_map = df_price.sort_values("date").groupby("stock_id")["close"].last().to_dict()
+        df_broker_ext = self._load_broker_data_extended(stock_ids)
+        has_smart_broker = False
+        if not df_broker_ext.empty:
+            smart_df = compute_smart_broker_score(df_broker_ext, _close_map)
+            has_smart_broker = not smart_df.empty and float(smart_df["smart_broker_factor"].sum()) > 0
+            if has_smart_broker:
+                df = df.merge(smart_df[["stock_id", "smart_broker_factor"]], on="stock_id", how="left")
+                df["smart_broker_factor"] = df["smart_broker_factor"].fillna(0.0)
+                smart_broker_rank = df["smart_broker_factor"].rank(pct=True)
+
         # ── 融資融券因子 ──────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
@@ -1691,7 +1931,19 @@ class MomentumScanner(MarketScanner):
                 has_margin = False
 
         # ── 加權組合 ─────────────────────────────────────────────────
-        if has_broker and has_sbl and has_margin and has_whale:
+        if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
+            # 8 因子：外資18%+量比16%+法人16%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
+            df["chip_score"] = (
+                consec_rank * 0.18
+                + bvr_rank * 0.16
+                + total_rank * 0.16
+                + smr_rank * 0.10
+                + whale_rank * 0.12
+                + sbl_rank * 0.07
+                + broker_rank * 0.11
+                + smart_broker_rank * 0.10
+            )
+        elif has_broker and has_sbl and has_margin and has_whale:
             # 7 因子：外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
             df["chip_score"] = (
                 consec_rank * 0.20
@@ -1833,6 +2085,39 @@ class MomentumScanner(MarketScanner):
             if not rows:
                 return pd.DataFrame()
             return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
+        except Exception:
+            return pd.DataFrame()
+
+    def _load_broker_data_extended(self, stock_ids: list[str], days: int = 120) -> pd.DataFrame:
+        """從 DB 載入最近 N 天的分點交易資料（含 buy_price / sell_price）。
+
+        供 compute_smart_broker_score() 使用，窗口較長（預設 120 天）。
+        計算僅針對 Stage 2 粗篩後的候選股（~150 支），不涉及全市場。
+        若表不存在或無資料則回傳空 DataFrame（呼叫端自動降級）。
+        """
+        cutoff = date.today() - timedelta(days=days)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        BrokerTrade.stock_id,
+                        BrokerTrade.date,
+                        BrokerTrade.broker_id,
+                        BrokerTrade.buy,
+                        BrokerTrade.sell,
+                        BrokerTrade.buy_price,
+                        BrokerTrade.sell_price,
+                    ).where(
+                        BrokerTrade.stock_id.in_(stock_ids),
+                        BrokerTrade.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                rows,
+                columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
+            )
         except Exception:
             return pd.DataFrame()
 

@@ -21,7 +21,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 # 模組層級 ORM import：確保 Base.metadata 在 in_memory_engine.create_all() 前已包含全表
 from src.data.schema import BrokerTrade  # noqa: F401
-from src.discovery.scanner import MomentumScanner, SwingScanner, compute_broker_score
+from src.discovery.scanner import MomentumScanner, SwingScanner, compute_broker_score, compute_smart_broker_score
 
 # ------------------------------------------------------------------ #
 #  TestFetchBrokerTrades — mock HTTP 測試
@@ -645,3 +645,499 @@ class TestStage25AutoFetch:
         # 驗證 sync_broker_for_stocks 被呼叫，且傳入候選股 ID
         assert len(broker_sync_calls) == 1
         assert set(broker_sync_calls[0]) == {"1000", "1001", "1002"}
+
+
+# ------------------------------------------------------------------ #
+#  TestComputeSmartBrokerScore — compute_smart_broker_score() 純函數測試
+# ------------------------------------------------------------------ #
+
+
+def _make_smart_rows(stock_id: str, broker_id: str, base: date) -> list[dict]:
+    """建立符合 Smart Broker 條件的交易資料（3 贏 1 小虧，win_rate=0.75, PF=12.0, buy_val=6M）。"""
+    return [
+        # Day -10：買入 60000 股 at 100 → avg_cost=100, total_buy_value=6M
+        {
+            "date": base - timedelta(days=10),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 60000,
+            "sell": 0,
+            "buy_price": 100.0,
+            "sell_price": 0.0,
+        },
+        # Day -8：賣 5000 at 115 → profit 75,000（win）
+        {
+            "date": base - timedelta(days=8),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 0,
+            "sell": 5000,
+            "buy_price": 0.0,
+            "sell_price": 115.0,
+        },
+        # Day -6：賣 5000 at 120 → profit 100,000（win）
+        {
+            "date": base - timedelta(days=6),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 0,
+            "sell": 5000,
+            "buy_price": 0.0,
+            "sell_price": 120.0,
+        },
+        # Day -4：賣 5000 at 95 → loss 25,000（lose）
+        {
+            "date": base - timedelta(days=4),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 0,
+            "sell": 5000,
+            "buy_price": 0.0,
+            "sell_price": 95.0,
+        },
+        # Day -2：賣 5000 at 125 → profit 125,000（win）
+        {
+            "date": base - timedelta(days=2),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 0,
+            "sell": 5000,
+            "buy_price": 0.0,
+            "sell_price": 125.0,
+        },
+        # Day -1（近期）：再買 10000 → recent_net > 0
+        {
+            "date": base - timedelta(days=1),
+            "stock_id": stock_id,
+            "broker_id": broker_id,
+            "buy": 10000,
+            "sell": 0,
+            "buy_price": 105.0,
+            "sell_price": 0.0,
+        },
+    ]
+
+
+class TestComputeSmartBrokerScore:
+    """compute_smart_broker_score() 純函數測試。"""
+
+    def test_empty_input_returns_correct_columns(self):
+        """空 DF 回傳空 DataFrame，欄位正確。"""
+        result = compute_smart_broker_score(pd.DataFrame(), {})
+        assert result.empty
+        assert set(result.columns) == {
+            "stock_id",
+            "smart_broker_score",
+            "accum_broker_score",
+            "smart_broker_factor",
+        }
+
+    def test_missing_price_columns_graceful(self):
+        """缺少 buy_price/sell_price 欄位 → 回傳空 DataFrame，不崩潰。"""
+        df = pd.DataFrame([{"date": date(2026, 1, 1), "stock_id": "2330", "broker_id": "A", "buy": 100, "sell": 0}])
+        result = compute_smart_broker_score(df, {})
+        assert result.empty
+        assert set(result.columns) == {
+            "stock_id",
+            "smart_broker_score",
+            "accum_broker_score",
+            "smart_broker_factor",
+        }
+
+    def test_smart_broker_detected_vs_no_smart(self):
+        """Stock A 有 Smart Broker（win_rate=0.75, PF=12）；Stock B 僅 2 次賣出（未達門檻）。
+        A 的 smart_broker_score 應高於 B。"""
+        base = date(2026, 3, 1)
+        rows_a = _make_smart_rows("A", "A001", base)
+        # Stock B：只有 2 次賣出（sell_events < 3）
+        rows_b = [
+            {
+                "date": base - timedelta(days=10),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 60000,
+                "sell": 0,
+                "buy_price": 100.0,
+                "sell_price": 0.0,
+            },
+            {
+                "date": base - timedelta(days=5),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 5000,
+                "buy_price": 0.0,
+                "sell_price": 115.0,
+            },
+            {
+                "date": base - timedelta(days=2),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 5000,
+                "buy_price": 0.0,
+                "sell_price": 120.0,
+            },
+        ]
+        df = pd.DataFrame(rows_a + rows_b)
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_a > score_b
+
+    def test_profit_factor_blocks_low_pf(self):
+        """Stock A：win_rate=0.80，但 1 次大虧導致 PF << 1.5 → NOT Smart Broker。
+        Stock B：win_rate=0.75，PF=12 → Smart Broker。
+        B 的 smart_broker_score 應高於 A。"""
+        base = date(2026, 3, 1)
+        rows_a = [
+            # A001：買 100000 at 100（10M）
+            {
+                "date": base - timedelta(days=15),
+                "stock_id": "A",
+                "broker_id": "A001",
+                "buy": 100000,
+                "sell": 0,
+                "buy_price": 100.0,
+                "sell_price": 0.0,
+            },
+            # 4 次小贏（各 1000 股，+1 至 +4 元）
+            *[
+                {
+                    "date": base - timedelta(days=12 - i),
+                    "stock_id": "A",
+                    "broker_id": "A001",
+                    "buy": 0,
+                    "sell": 1000,
+                    "buy_price": 0.0,
+                    "sell_price": 101.0 + i,
+                }
+                for i in range(4)
+            ],
+            # 1 次大虧：賣 90000 at 72（loss ≈ 2.52M → PF ≈ 0.007）
+            {
+                "date": base - timedelta(days=5),
+                "stock_id": "A",
+                "broker_id": "A001",
+                "buy": 0,
+                "sell": 90000,
+                "buy_price": 0.0,
+                "sell_price": 72.0,
+            },
+        ]
+        rows_b = _make_smart_rows("B", "B001", base)
+        df = pd.DataFrame(rows_a + rows_b)
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_b > score_a
+
+    def test_min_sell_events_threshold(self):
+        """sell_events < 3 的分點不得被標記為 Smart Broker。"""
+        base = date(2026, 3, 1)
+
+        # Stock A：sell_events=3（剛好達門檻） vs Stock B：sell_events=2（未達）
+        def _make_rows(stock_id: str, sell_count: int) -> list[dict]:
+            rows = [
+                {
+                    "date": base - timedelta(days=15),
+                    "stock_id": stock_id,
+                    "broker_id": "X001",
+                    "buy": 60000,
+                    "sell": 0,
+                    "buy_price": 100.0,
+                    "sell_price": 0.0,
+                }
+            ]
+            for i in range(sell_count):
+                rows.append(
+                    {
+                        "date": base - timedelta(days=10 - i * 2),
+                        "stock_id": stock_id,
+                        "broker_id": "X001",
+                        "buy": 0,
+                        "sell": 5000,
+                        "buy_price": 0.0,
+                        "sell_price": 115.0 + i,
+                    }
+                )
+            # 近期買入讓 recent_net > 0
+            rows.append(
+                {
+                    "date": base - timedelta(days=1),
+                    "stock_id": stock_id,
+                    "broker_id": "X001",
+                    "buy": 10000,
+                    "sell": 0,
+                    "buy_price": 105.0,
+                    "sell_price": 0.0,
+                }
+            )
+            return rows
+
+        df = pd.DataFrame(_make_rows("A", 3) + _make_rows("B", 2))
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_a > score_b
+
+    def test_min_buy_value_threshold(self):
+        """總買入金額 < 500 萬的分點不得被標記為 Smart Broker。"""
+        base = date(2026, 3, 1)
+        # Stock A：buy_value = 6M → Smart ✓
+        rows_a = _make_smart_rows("A", "A001", base)
+        # Stock B：買入僅 50 股 at 100（5,000 TWD）→ 遠低於 500 萬
+        rows_b = [
+            {
+                "date": base - timedelta(days=10),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 50,
+                "sell": 0,
+                "buy_price": 100.0,
+                "sell_price": 0.0,
+            },
+            *[
+                {
+                    "date": base - timedelta(days=8 - i * 2),
+                    "stock_id": "B",
+                    "broker_id": "B001",
+                    "buy": 0,
+                    "sell": 10,
+                    "buy_price": 0.0,
+                    "sell_price": 115.0,
+                }
+                for i in range(4)
+            ],
+        ]
+        df = pd.DataFrame(rows_a + rows_b)
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_a > score_b
+
+    def test_smart_score_weighted_by_hist_pnl(self):
+        """Smart_Score = hist_pnl × recent_net：歷史損益越高的分點對排名貢獻越大。
+        Stock A：hist_pnl=300,000；Stock B：hist_pnl=30,000（buy_price 低 10 倍）。
+        A 的 smart_broker_score 應高於 B。"""
+        base = date(2026, 3, 1)
+        rows_a = _make_smart_rows("A", "A001", base)  # hist_pnl ≈ 300,000
+        # Stock B：縮小 10 倍（僅 6000 股 at 100 → buy_val=600k < 500 萬，需調整）
+        # 改成 60000 股 at 10 → buy_val=600k → 不符合，調整成 50000 at 100 = 5M
+        rows_b = [
+            {
+                "date": base - timedelta(days=10),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 50000,
+                "sell": 0,
+                "buy_price": 100.0,
+                "sell_price": 0.0,
+            },
+            # 賣出 sell_price 僅比成本高 1% → hist_pnl 很小
+            {
+                "date": base - timedelta(days=8),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 1000,
+                "buy_price": 0.0,
+                "sell_price": 101.0,
+            },
+            {
+                "date": base - timedelta(days=6),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 1000,
+                "buy_price": 0.0,
+                "sell_price": 102.0,
+            },
+            {
+                "date": base - timedelta(days=4),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 1000,
+                "buy_price": 0.0,
+                "sell_price": 99.0,  # small loss
+            },
+            {
+                "date": base - timedelta(days=1),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 10000,
+                "sell": 0,
+                "buy_price": 100.0,
+                "sell_price": 0.0,
+            },
+        ]
+        df = pd.DataFrame(rows_a + rows_b)
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_a > score_b
+
+    def test_recent_activity_weighted(self):
+        """Smart_Score = hist_pnl × recent_net：近期買超張數越多，貢獻越大。
+        Stock A 近 3 日大量買入；Stock B 近 3 日少量買入（相同 hist_pnl）。
+        A 的 smart_broker_score 應高於 B。"""
+        base = date(2026, 3, 1)
+
+        def _rows_with_recent(stock_id: str, broker_id: str, recent_buy: int) -> list[dict]:
+            rows = _make_smart_rows(stock_id, broker_id, base)
+            # 覆蓋最後一筆（近期買入數量）
+            rows[-1] = {
+                "date": base - timedelta(days=1),
+                "stock_id": stock_id,
+                "broker_id": broker_id,
+                "buy": recent_buy,
+                "sell": 0,
+                "buy_price": 105.0,
+                "sell_price": 0.0,
+            }
+            return rows
+
+        df = pd.DataFrame(_rows_with_recent("A", "A001", 50000) + _rows_with_recent("B", "B001", 100))
+        result = compute_smart_broker_score(df, {})
+        assert len(result) == 2
+        score_a = result[result["stock_id"] == "A"]["smart_broker_score"].iloc[0]
+        score_b = result[result["stock_id"] == "B"]["smart_broker_score"].iloc[0]
+        assert score_a > score_b
+
+    def test_accumulation_broker_detected(self):
+        """純蓄積型分點（sell_ratio < 0.10, position_trend_up）應被標記 → accum_score > 0。
+        Stock A：蓄積型（幾乎不賣，倉位持續增加）；Stock B：無蓄積型分點。
+        A 的 accum_broker_score 應高於 B。"""
+        base = date(2026, 3, 1)
+        # Stock A：10 個交易日，前 5 天買 2000/天，後 5 天買 3000/天（趨勢向上），賣出僅 500（< 10%）
+        # total_buy = 5×2000 + 5×3000 = 25000 股 at 200 = 5M ✓
+        rows_a = []
+        for i in range(5):
+            rows_a.append(
+                {
+                    "date": base - timedelta(days=10 - i),
+                    "stock_id": "A",
+                    "broker_id": "A001",
+                    "buy": 2000,
+                    "sell": 0,
+                    "buy_price": 200.0,
+                    "sell_price": 0.0,
+                }
+            )
+        for i in range(5):
+            rows_a.append(
+                {
+                    "date": base - timedelta(days=5 - i),
+                    "stock_id": "A",
+                    "broker_id": "A001",
+                    "buy": 3000,
+                    "sell": 0,
+                    "buy_price": 200.0,
+                    "sell_price": 0.0,
+                }
+            )
+        # 少量賣出（< 10%）
+        rows_a.append(
+            {
+                "date": base - timedelta(days=3),
+                "stock_id": "A",
+                "broker_id": "A001",
+                "buy": 0,
+                "sell": 500,
+                "buy_price": 0.0,
+                "sell_price": 210.0,
+            }
+        )
+        # Stock B：同規模買入但大量賣出 → 不是蓄積型
+        rows_b = [
+            {
+                "date": base - timedelta(days=10),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 25000,
+                "sell": 0,
+                "buy_price": 200.0,
+                "sell_price": 0.0,
+            },
+            {
+                "date": base - timedelta(days=5),
+                "stock_id": "B",
+                "broker_id": "B001",
+                "buy": 0,
+                "sell": 20000,
+                "buy_price": 0.0,
+                "sell_price": 210.0,
+            },
+        ]
+        df = pd.DataFrame(rows_a + rows_b)
+        result = compute_smart_broker_score(df, {"A": 205.0, "B": 205.0})
+        assert len(result) == 2
+        acc_a = result[result["stock_id"] == "A"]["accum_broker_score"].iloc[0]
+        acc_b = result[result["stock_id"] == "B"]["accum_broker_score"].iloc[0]
+        assert acc_a > acc_b
+
+    def test_accumulation_trend_required(self):
+        """倉位未成長（後半段 ≤ 前半段）的分點不應被標記為 Accumulation Broker。
+        Stock A：前多後少（趨勢向下）；Stock B：前少後多（趨勢向上）。
+        B 的 accum_broker_score 應高於 A。"""
+        base = date(2026, 3, 1)
+
+        def _rows_trend(stock_id: str, first_buy: int, last_buy: int) -> list[dict]:
+            rows = []
+            for i in range(5):
+                rows.append(
+                    {
+                        "date": base - timedelta(days=10 - i),
+                        "stock_id": stock_id,
+                        "broker_id": "X001",
+                        "buy": first_buy,
+                        "sell": 0,
+                        "buy_price": 200.0,
+                        "sell_price": 0.0,
+                    }
+                )
+            for i in range(5):
+                rows.append(
+                    {
+                        "date": base - timedelta(days=5 - i),
+                        "stock_id": stock_id,
+                        "broker_id": "X001",
+                        "buy": last_buy,
+                        "sell": 0,
+                        "buy_price": 200.0,
+                        "sell_price": 0.0,
+                    }
+                )
+            return rows
+
+        # A：前 3000/天，後 1000/天（趨勢下降），B：前 1000/天，後 3000/天（趨勢上升）
+        # 兩者 total_buy = 5×3000 + 5×1000 = 20000 股 at 200 = 4M < 5M
+        # → 調整，乘以 2
+        df = pd.DataFrame(
+            _rows_trend("A", first_buy=6000, last_buy=2000) + _rows_trend("B", first_buy=2000, last_buy=6000)
+        )
+        result = compute_smart_broker_score(df, {"A": 205.0, "B": 205.0})
+        assert len(result) == 2
+        acc_a = result[result["stock_id"] == "A"]["accum_broker_score"].iloc[0]
+        acc_b = result[result["stock_id"] == "B"]["accum_broker_score"].iloc[0]
+        assert acc_b > acc_a
+
+    def test_composite_factor_range(self):
+        """所有輸出欄位均在 [0, 1] 範圍內；空輸入回傳空 DataFrame。"""
+        base = date(2026, 3, 1)
+        rows = _make_smart_rows("A", "A001", base) + _make_smart_rows("B", "B001", base)
+        df = pd.DataFrame(rows)
+        result = compute_smart_broker_score(df, {"A": 110.0, "B": 95.0})
+        assert not result.empty
+        for col in ["smart_broker_score", "accum_broker_score", "smart_broker_factor"]:
+            assert result[col].between(0.0, 1.0).all(), f"{col} 超出 [0, 1] 範圍"
+
+        # 空輸入
+        empty_result = compute_smart_broker_score(pd.DataFrame(), {})
+        assert empty_result.empty
