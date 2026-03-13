@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -521,24 +520,27 @@ def sync_broker_trades(
     stock_ids: list[str] | None = None,
     days: int = 5,
 ) -> int:
-    """同步分點交易資料（FinMind TaiwanStockTradingDailyReport，免費逐股）。
+    """同步分點交易資料（DJ 分點端點，免費，支援日期範圍）。
 
     若 DB 已有 2 天內資料則跳過該股票（避免重複抓取）。
+    每次 API 呼叫取得 start~end 期間彙整，date 欄位統一為 end（今日）。
+    速率控制由 fetch_dj_broker_trades() 內部處理（3 秒間隔）。
 
     Args:
         stock_ids: 指定股票代號清單，預設使用 watchlist
-        days:      同步最近幾個交易日（預設 5）
+        days:      查詢最近幾個交易日的彙整範圍（預設 5）
 
     Returns:
         新增的分點交易筆數
     """
+    from src.data.twse_fetcher import fetch_dj_broker_trades
+
     if stock_ids is None:
         stock_ids = get_effective_watchlist()
 
     init_db()
-    fetcher = FinMindFetcher(api_token=settings.finmind.api_token)
-    end_date = date.today().isoformat()
-    start_date = (date.today() - timedelta(days=days + 3)).isoformat()
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days + 3)
 
     total = 0
     for sid in stock_ids:
@@ -548,18 +550,12 @@ def sync_broker_trades(
             logger.info("[分點] %s 已有最新資料（%s），跳過", sid, latest)
             continue
 
-        try:
-            df = fetcher.fetch_broker_trades(sid, start_date, end_date)
-        except Exception as exc:
-            logger.warning("[分點] %s 抓取失敗: %s", sid, exc)
-            df = None
+        df = fetch_dj_broker_trades(sid, start_date, end_date)
 
-        if df is not None and not df.empty:
+        if not df.empty:
             n = _upsert_broker_trade(df)
             total += n
             logger.info("[分點] %s 寫入 %d 筆", sid, n)
-
-        time.sleep(0.5)  # FinMind 免費帳號速率限制
 
     return total
 

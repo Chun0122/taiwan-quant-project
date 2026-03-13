@@ -151,6 +151,141 @@ class TestFetchBrokerTrades:
 
 
 # ------------------------------------------------------------------ #
+#  TestFetchDJBrokerTrades — DJ 分點端點 HTML 解析測試
+# ------------------------------------------------------------------ #
+
+_DJ_HTML_TWO_PAIRS = (
+    b"<TR>\n"
+    b'<TD class="t4t1" nowrap><a href="/z/zc/zco/zco0/zco0.djhtm?a=2330&b=1360&BHID=1360">BrokerA</a></TD>\n'
+    b'<TD class="t3n1">3,155</TD>\n'
+    b'<TD class="t3n1">1,124</TD>\n'
+    b'<TD class="t3n1">2,031</TD>\n'
+    b'<TD class="t3n1">3.97%</TD>\n'
+    b'<TD class="t4t1" nowrap><a href="/z/zc/zco/zco0/zco0.djhtm?a=2330&b=1480&BHID=1480">BrokerB</a></TD>\n'
+    b'<TD class="t3n1">789</TD>\n'
+    b'<TD class="t3n1">4,182</TD>\n'
+    b'<TD class="t3n1">3,393</TD>\n'
+    b'<TD class="t3n1">6.64%</TD></TR>\n'
+)
+
+_DJ_HTML_MULTI_BRANCH = (
+    b"<TR>\n"
+    b'<TD class="t4t1" nowrap><a href="/z/zc/zco/zco0/zco0.djhtm?a=2330&b=8880&BHID=8880">YuantaMain</a></TD>\n'
+    b'<TD class="t3n1">1,000</TD>\n'
+    b'<TD class="t3n1">200</TD>\n'
+    b'<TD class="t3n1">800</TD>\n'
+    b'<TD class="t3n1">2%</TD>\n'
+    b'<TD class="t4t1" nowrap><a href="/z/zc/zco/zco0/zco0.djhtm?a=2330&b=8888&BHID=8880">YuantaBranch</a></TD>\n'
+    b'<TD class="t3n1">500</TD>\n'
+    b'<TD class="t3n1">100</TD>\n'
+    b'<TD class="t3n1">400</TD>\n'
+    b'<TD class="t3n1">1%</TD></TR>\n'
+)
+
+
+class TestFetchDJBrokerTrades:
+    """fetch_dj_broker_trades() HTML 解析與邊界情況測試。"""
+
+    def _mock_get(self, monkeypatch, response_bytes: bytes):
+        """Mock requests.get 回傳指定 bytes。"""
+        from unittest.mock import MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.content = response_bytes
+        monkeypatch.setattr("src.data.twse_fetcher.requests.get", lambda *a, **kw: mock_resp)
+        monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda x: None)
+
+    def test_basic_parsing_two_brokers(self, monkeypatch):
+        """兩個 broker 條目（左淨買、右淨賣）正確解析。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_TWO_PAIRS)
+        end = date(2025, 3, 10)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), end)
+
+        assert not df.empty
+        assert len(df) == 2
+        assert set(df.columns) >= {"date", "stock_id", "broker_id", "broker_name", "buy", "sell"}
+
+    def test_broker_id_from_bhid(self, monkeypatch):
+        """broker_id 應為 BHID 欄位（公司代號）。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_TWO_PAIRS)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        assert "1360" in df["broker_id"].values
+        assert "1480" in df["broker_id"].values
+
+    def test_units_multiplied_by_1000(self, monkeypatch):
+        """buy/sell 應乘以 1000（張→股）。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_TWO_PAIRS)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        row_a = df[df["broker_id"] == "1360"].iloc[0]
+        assert row_a["buy"] == 3155 * 1000
+        assert row_a["sell"] == 1124 * 1000
+
+    def test_date_set_to_end_date(self, monkeypatch):
+        """date 欄位應統一設為 end 日期（彙整截止日）。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_TWO_PAIRS)
+        end = date(2025, 3, 10)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), end)
+
+        assert all(df["date"] == end)
+
+    def test_multi_branch_same_firm_aggregated(self, monkeypatch):
+        """同一公司（BHID=8880）的主分點+子分點應合計 buy/sell。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_MULTI_BRANCH)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        assert len(df) == 1  # 兩個分點合併為一筆
+        row = df.iloc[0]
+        assert row["broker_id"] == "8880"
+        assert row["buy"] == (1000 + 500) * 1000  # 1500 張 → 1,500,000 股
+        assert row["sell"] == (200 + 100) * 1000  # 300 張 → 300,000 股
+
+    def test_no_buy_price_sell_price(self, monkeypatch):
+        """buy_price / sell_price 應為 None（DJ 端點不提供均價）。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, _DJ_HTML_TWO_PAIRS)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        assert df["buy_price"].isna().all()
+        assert df["sell_price"].isna().all()
+
+    def test_empty_html_returns_empty_df(self, monkeypatch):
+        """HTML 中無 BHID 時回傳空 DataFrame。"""
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        self._mock_get(monkeypatch, b"<html><body>no data</body></html>")
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        assert df.empty
+
+    def test_request_failure_returns_empty_df(self, monkeypatch):
+        """requests.get 拋出異常時回傳空 DataFrame（不向上傳播）。"""
+        from unittest.mock import MagicMock
+
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        mock_get = MagicMock(side_effect=ConnectionError("timeout"))
+        monkeypatch.setattr("src.data.twse_fetcher.requests.get", mock_get)
+        monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda x: None)
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+
+        assert df.empty
+
+
+# ------------------------------------------------------------------ #
 #  TestBrokerTradeORM — in-memory SQLite 測試
 # ------------------------------------------------------------------ #
 

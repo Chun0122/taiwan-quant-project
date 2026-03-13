@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import date, timedelta
 
@@ -748,28 +749,36 @@ def fetch_twse_valuation_all(target_date: date | None = None) -> pd.DataFrame:
         return pd.DataFrame()
 
     # BWIBBU_d 回傳格式：資料在頂層 data 陣列（非 tables）
-    # fields: ["證券代號", "證券名稱", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"]
+    # 2026-03 更新後新格式：
+    # fields: ["證券代號", "證券名稱", "收盤價", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"]
     raw_data = data.get("data", [])
     if not raw_data:
         logger.warning("TWSE 估值: 無資料列")
         return pd.DataFrame()
 
-    # 欄位驗證防護（若 TWSE 改版則 log warning，不拋例外）
+    # 欄位動態偵測：根據 fields 判斷新/舊格式，自動選擇正確 index
     fields = data.get("fields", [])
-    if fields:
-        expected = {2: "殖利率", 4: "本益比", 5: "股價淨值比"}
-        for idx, keyword in expected.items():
-            if idx < len(fields) and keyword not in fields[idx]:
-                logger.warning(
-                    "TWSE BWIBBU_d 欄位結構可能異動！期待含 '%s' 在 index %d，實際: %s",
-                    keyword,
-                    idx,
-                    fields[idx],
-                )
+    # 新格式（含收盤價）：index 2=收盤價, 3=殖利率, 5=本益比, 6=股價淨值比
+    # 舊格式：index 2=殖利率, 4=本益比, 5=股價淨值比
+    if fields and len(fields) > 2 and "收盤價" in fields[2]:
+        idx_dy, idx_pe, idx_pb, min_len = 3, 5, 6, 7
+        logger.debug("TWSE BWIBBU_d 使用新格式（含收盤價），欄位數=%d", len(fields))
+    else:
+        idx_dy, idx_pe, idx_pb, min_len = 2, 4, 5, 6
+        if fields:
+            expected = {2: "殖利率", 4: "本益比", 5: "股價淨值比"}
+            for idx, keyword in expected.items():
+                if idx < len(fields) and keyword not in fields[idx]:
+                    logger.warning(
+                        "TWSE BWIBBU_d 欄位結構可能異動！期待含 '%s' 在 index %d，實際: %s",
+                        keyword,
+                        idx,
+                        fields[idx],
+                    )
 
     rows = []
     for item in raw_data:
-        if len(item) < 6:
+        if len(item) < min_len:
             continue
 
         stock_id = item[0].strip()
@@ -777,9 +786,9 @@ def fetch_twse_valuation_all(target_date: date | None = None) -> pd.DataFrame:
         if not (stock_id.isdigit() and len(stock_id) == 4):
             continue
 
-        dividend_yield = _parse_number(item[2])  # 殖利率(%)
-        pe_ratio = _parse_number(item[4])  # 本益比
-        pb_ratio = _parse_number(item[5])  # 股價淨值比
+        dividend_yield = _parse_number(item[idx_dy])  # 殖利率(%)
+        pe_ratio = _parse_number(item[idx_pe])  # 本益比
+        pb_ratio = _parse_number(item[idx_pb])  # 股價淨值比
 
         # 至少有一項估值資料才寫入
         if dividend_yield is None and pe_ratio is None and pb_ratio is None:
@@ -884,3 +893,77 @@ def fetch_market_valuation_all(target_date: date | None = None) -> pd.DataFrame:
     result = pd.concat(dfs, ignore_index=True)
     logger.info("全市場估值合計: %d 支股票", len(result))
     return result
+
+
+def fetch_dj_broker_trades(stock_id: str, start: date, end: date) -> pd.DataFrame:
+    """從 DJ 分點端點取得分點買賣彙整資料（免費，支援日期範圍）。
+
+    資料來源：富邦 DJ 分點進出端點（fubon-ebrokerdj.fbs.com.tw），免費無需 Token。
+    替代 FinMind TaiwanStockTradingDailyReport（免費帳號已無法取得）。
+
+    回傳欄位: date, stock_id, broker_id, broker_name, buy, sell
+
+    注意事項：
+    - 回傳資料為 start~end 期間的彙整（非每日分拆），date 欄位統一為 end 日期
+    - buy/sell 單位為張（千股），已乘 1000 換算為股後回傳
+    - buy_price / sell_price 不提供（DJ 端點無均價欄位），Smart Broker 因子自動停用
+    - broker_id 使用分點 BHID（公司代號），若同公司有多分點則彙整加總
+    - 僅回傳最活躍的 ~30 個分點（前 15 淨買超 + 前 15 淨賣超）
+    - Big5 編碼，以 content.decode('big5', errors='replace') 解析
+    """
+    url = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm"
+    date_str_start = f"{start.year}-{start.month}-{start.day}"  # YYYY-M-D（月日不補零）
+    date_str_end = f"{end.year}-{end.month}-{end.day}"
+    params = {"a": stock_id, "e": date_str_start, "f": date_str_end}
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=15, verify=False)
+        resp.raise_for_status()
+        html = resp.content.decode("big5", errors="replace")
+    except Exception as exc:
+        logger.warning("[DJ分點] %s 請求失敗: %s", stock_id, exc)
+        return pd.DataFrame()
+
+    # 解析 HTML：每個 broker 條目格式為
+    #   <a href="...b=BRANCH&BHID=FIRM_ID">broker_name</a></TD>
+    #   <TD class="t3n1">buy_qty</TD>
+    #   <TD class="t3n1">sell_qty</TD>
+    # 每個 <TR> 包含兩組 broker（左：淨買超，右：淨賣超）
+    pattern = re.compile(
+        r'<a\s+href="[^"]*[?&]b=[^&"]*&BHID=(\d+)[^"]*">([^<]*)</a></TD>'
+        r"\s*<TD[^>]*>([\d,]+)</TD>"  # buy（張）
+        r"\s*<TD[^>]*>([\d,]+)</TD>",  # sell（張）
+        re.IGNORECASE,
+    )
+
+    # 彙整同一 BHID（公司代號）的所有分點（若同公司有主分點和子分點則合計）
+    firm_data: dict[str, dict] = {}
+    for bhid, bname, buy_str, sell_str in pattern.findall(html):
+        buy = int(buy_str.replace(",", ""))
+        sell = int(sell_str.replace(",", ""))
+        if bhid not in firm_data:
+            firm_data[bhid] = {"broker_name": bname.strip(), "buy": 0, "sell": 0}
+        firm_data[bhid]["buy"] += buy
+        firm_data[bhid]["sell"] += sell
+
+    if not firm_data:
+        logger.debug("[DJ分點] %s %s~%s 無資料", stock_id, date_str_start, date_str_end)
+        return pd.DataFrame()
+
+    rows = [
+        {
+            "date": end,  # 彙整期間的截止日期
+            "stock_id": stock_id,
+            "broker_id": bhid,
+            "broker_name": info["broker_name"],
+            "buy": info["buy"] * 1000,  # 張 → 股（×1000）
+            "sell": info["sell"] * 1000,
+            "buy_price": None,  # DJ 端點不提供均價，Smart Broker 自動降為 7F
+            "sell_price": None,
+        }
+        for bhid, info in firm_data.items()
+    ]
+
+    logger.info("[DJ分點] %s %s~%s 解析到 %d 個分點", stock_id, date_str_start, date_str_end, len(rows))
+    time.sleep(_REQUEST_DELAY)
+    return pd.DataFrame(rows)

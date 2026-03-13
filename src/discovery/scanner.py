@@ -1027,11 +1027,9 @@ class MarketScanner:
         if latest.empty:
             return pd.DataFrame()
 
-        mask = (
-            (latest["close"] >= self.min_price)
-            & (latest["close"] <= self.max_price)
-            & (latest["volume"] >= self.min_volume)
-        )
+        mask = (latest["close"] >= self.min_price) & (latest["volume"] >= self.min_volume)
+        if self.max_price is not None:
+            mask = mask & (latest["close"] <= self.max_price)
         # 排除指數類（如 TAIEX）
         mask = mask & (~latest["stock_id"].str.contains(r"[A-Za-z]", na=False))
         # 排除 ETF（代號 00 開頭，如 0050、00878、009xx）
