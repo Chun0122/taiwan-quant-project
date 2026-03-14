@@ -1527,24 +1527,85 @@ def cmd_sync_sbl(args: argparse.Namespace) -> None:
         print(f"借券資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def _read_stocks_from_file(path: str) -> list[str]:
+    """從文字或 CSV 檔案讀取股票代號清單。
+
+    支援兩種格式：
+    - 純文字：每行一個代號，`#` 開頭為注解行，空白行跳過
+    - CSV：第一欄為代號，第一行若含非數字字元則視為 header 跳過
+
+    Args:
+        path: 檔案路徑（.txt 或 .csv）
+
+    Returns:
+        去重後保序的股票代號清單
+    """
+    import csv
+    import os
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"找不到股票清單檔案：{path}")
+
+    stocks: list[str] = []
+    ext = os.path.splitext(path)[1].lower()
+
+    for encoding in ("utf-8", "big5"):
+        try:
+            with open(path, encoding=encoding, newline="") as f:
+                if ext == ".csv":
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader):
+                        if not row:
+                            continue
+                        val = row[0].strip()
+                        if i == 0 and not val.isdigit():
+                            continue  # 跳過 header
+                        if val:
+                            stocks.append(val)
+                else:
+                    for line in f:
+                        val = line.strip()
+                        if not val or val.startswith("#"):
+                            continue
+                        stocks.append(val)
+            break
+        except UnicodeDecodeError:
+            stocks = []
+            continue
+
+    seen: dict[str, None] = {}
+    for s in stocks:
+        seen[s] = None
+    return list(seen.keys())
+
+
 def cmd_sync_broker(args: argparse.Namespace) -> None:
     """同步分點交易資料（FinMind TaiwanStockTradingDailyReport）。
 
     --watchlist-bootstrap：一次性對所有 watchlist 股票逐日補齊歷史分點資料。
       DJ 端點每次呼叫僅回傳期間彙整（date=end），因此改為逐日查詢（start=d, end=d），
       使每個交易日產生獨立記錄，達到 Smart Broker 8F 所需的 min_trading_days=20。
-      預設補齊最近 30 個交易日（約 45 分鐘），建議首次部署或新增 watchlist 股票後執行。
+      預設補齊最近 120 個交易日（半年），建議首次部署或新增 watchlist 股票後執行。
+    --from-file：從文字/CSV 檔案讀取股票代號清單（可與 --watchlist-bootstrap 合用）。
     """
     from src.data.pipeline import sync_broker_bootstrap, sync_broker_trades
 
     stock_ids = args.stocks if args.stocks else None
     days = getattr(args, "days", 5)
 
+    # --from-file：從外部檔案讀取股票清單，合併 --stocks
+    from_file_path = getattr(args, "from_file", None)
+    if from_file_path:
+        file_stocks = _read_stocks_from_file(from_file_path)
+        stock_ids = list(dict.fromkeys((stock_ids or []) + file_stocks))
+        print(f"從檔案 {from_file_path} 讀入 {len(file_stocks)} 支股票")
+
     # --watchlist-bootstrap：逐日補齊 watchlist 股票的分點歷史（啟用 8F）
     if getattr(args, "watchlist_bootstrap", False):
         from src.data.database import get_effective_watchlist
 
-        bootstrap_days = getattr(args, "days", 30)
+        # 若使用者未明確指定 --days（預設為 5），bootstrap 改用 120 天
+        bootstrap_days = days if days != 5 else 120
         watchlist = get_effective_watchlist()
         target_ids = stock_ids if stock_ids else watchlist
         print(f"[Bootstrap] 對 {len(target_ids)} 支股票逐日補齊最近 {bootstrap_days} 個交易日分點歷史...")
@@ -3438,7 +3499,12 @@ def main() -> None:
     sp_broker.add_argument(
         "--watchlist-bootstrap",
         action="store_true",
-        help="一次性逐日補齊 watchlist 所有股票分點歷史（預設 30 個交易日），啟用 Smart Broker 8F",
+        help="一次性逐日補齊 watchlist 所有股票分點歷史（預設 120 個交易日），啟用 Smart Broker 8F",
+    )
+    sp_broker.add_argument(
+        "--from-file",
+        metavar="PATH",
+        help="從文字/CSV 檔案讀取股票代號清單（每行一筆，或 CSV 第一欄；可與 --watchlist-bootstrap 合用）",
     )
 
     # alert-check 子命令

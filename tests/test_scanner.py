@@ -543,7 +543,7 @@ class TestChipTier:
 
 class TestMomentumFundamentalScores:
     def test_yoy_positive_gets_higher(self, momentum_scanner):
-        """YoY > 0 得 0.7，YoY <= 0 得 0.3。"""
+        """YoY > 0 得 0.7，YoY <= 0 得 0.3（無加速度資料時）。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000", "1001"],
@@ -561,6 +561,32 @@ class TestMomentumFundamentalScores:
             ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
         )
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+    def test_acceleration_bonus_positive(self, momentum_scanner):
+        """YoY > 0 且加速（yoy_3m_ago 較小），基分 0.7 加 0.05 = 0.75。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [20.0],
+                "mom_growth": [5.0],
+                "yoy_3m_ago": [10.0],  # 加速：20 - 10 = +10
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.75)
+
+    def test_acceleration_bonus_negative(self, momentum_scanner):
+        """YoY > 0 但減速（yoy_3m_ago 較大），基分 0.7 減 0.05 = 0.65。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [10.0],
+                "mom_growth": [5.0],
+                "yoy_3m_ago": [30.0],  # 減速：10 - 30 = -20
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.65)
 
 
 @pytest.mark.parametrize(
@@ -1300,14 +1326,13 @@ class TestGrowthTechnicalScores:
 
 class TestGrowthFundamentalScores:
     def test_with_acceleration(self, growth_scanner):
-        """含加速度的 3 因子計算。"""
+        """含 3 個月加速度的 2 因子計算：加速股分數 > 減速股。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000", "1001"],
                 "yoy_growth": [20.0, 20.0],
                 "mom_growth": [5.0, 5.0],
-                "prev_yoy_growth": [10.0, 30.0],  # 1000 加速，1001 減速
-                "prev_mom_growth": [5.0, 5.0],
+                "yoy_3m_ago": [10.0, 30.0],  # 1000 加速(+10)，1001 減速(-10)
             }
         )
         result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
@@ -1319,6 +1344,20 @@ class TestGrowthFundamentalScores:
             ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
         )
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
+
+    def test_no_yoy_3m_ago_fallback(self, growth_scanner):
+        """無 yoy_3m_ago 欄位時，加速度 fallback 0.5，分數 = YoY 排名 × 0.6 + 0.4 × 0.5。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [20.0, 5.0],
+                "mom_growth": [5.0, 5.0],
+            }
+        )
+        result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        # 高 YoY 應得較高分
+        assert scores["1000"] > scores["1001"]
 
 
 class TestGrowthChipScores:

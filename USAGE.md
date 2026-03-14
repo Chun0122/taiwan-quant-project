@@ -783,7 +783,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 
 > **資料前提（自適應累積設計）**：8F 採用「自然累積」策略，`_load_broker_data_extended()` 查詢最近 365 天 DB 歷史，並要求每股 **≥ 20 個交易日**的資料才啟用 Smart Broker（不足自動降回 7F）。
 >
-> - **首次部署（一次性）**：執行 `python main.py sync-broker --watchlist-bootstrap` 補齊 watchlist 所有股票的最大可用歷史資料（FinMind 免費帳號約 30–60 日），約 20 交易日後即可觸發 8F。
+> - **首次部署（一次性）**：執行 `python main.py sync-broker --watchlist-bootstrap` 補齊 watchlist 所有股票的最近 120 個交易日分點歷史（半年），Bootstrap 後即可觸發 8F。若有額外股票清單，可搭配 `--from-file stocks.txt` 一次性補齊任意股票（支援純文字或 CSV 格式，`--days` 可自訂天數）。
 > - **日常運作**：`morning-routine` Step 2 每日同步 watchlist（5 日），歷史資料自然累積，120 天後準確度最高。
 > - **新股加入 watchlist**：累積約 1 個月後自動升級至 8F，無需手動操作。
 

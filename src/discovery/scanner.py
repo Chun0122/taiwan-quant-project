@@ -480,6 +480,7 @@ class MarketScanner:
 
     mode_name: str = "base"
     _auto_sync_broker: bool = False  # 子類設為 True 以在 Stage 2.5 自動補抓分點資料
+    _revenue_months: int = 1  # 子類可設為 4 以啟用「本月 YoY - 3 個月前 YoY」加速度因子
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(
@@ -674,7 +675,7 @@ class MarketScanner:
             )
 
         # 月營收（全部股票）
-        df_revenue = self._load_revenue_data()
+        df_revenue = self._load_revenue_data(months=self._revenue_months)
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -738,35 +739,26 @@ class MarketScanner:
             columns=["stock_id", "date", "yoy_growth", "mom_growth"],
         )
         if df_all.empty:
-            return pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth", "prev_yoy_growth", "prev_mom_growth"])
+            cols = ["stock_id", "yoy_growth", "mom_growth", "prev_yoy_growth", "prev_mom_growth"]
+            if months >= 4:
+                cols.append("yoy_3m_ago")
+            return pd.DataFrame(columns=cols)
 
         # 每支股票取最近 months 筆
         result_rows = []
         for sid, grp in df_all.groupby("stock_id"):
             grp = grp.sort_values("date", ascending=False).head(months)
-            if len(grp) >= 2:
-                latest = grp.iloc[0]
-                prev = grp.iloc[1]
-                result_rows.append(
-                    {
-                        "stock_id": sid,
-                        "yoy_growth": latest["yoy_growth"],
-                        "mom_growth": latest["mom_growth"],
-                        "prev_yoy_growth": prev["yoy_growth"],
-                        "prev_mom_growth": prev["mom_growth"],
-                    }
-                )
-            elif len(grp) == 1:
-                latest = grp.iloc[0]
-                result_rows.append(
-                    {
-                        "stock_id": sid,
-                        "yoy_growth": latest["yoy_growth"],
-                        "mom_growth": latest["mom_growth"],
-                        "prev_yoy_growth": None,
-                        "prev_mom_growth": None,
-                    }
-                )
+            latest = grp.iloc[0]
+            row = {
+                "stock_id": sid,
+                "yoy_growth": latest["yoy_growth"],
+                "mom_growth": latest["mom_growth"],
+                "prev_yoy_growth": grp.iloc[1]["yoy_growth"] if len(grp) >= 2 else None,
+                "prev_mom_growth": grp.iloc[1]["mom_growth"] if len(grp) >= 2 else None,
+            }
+            if months >= 4:
+                row["yoy_3m_ago"] = grp.iloc[3]["yoy_growth"] if len(grp) >= 4 else None
+            result_rows.append(row)
 
         return pd.DataFrame(result_rows)
 
@@ -1730,6 +1722,7 @@ class MomentumScanner(MarketScanner):
 
     mode_name = "momentum"
     _auto_sync_broker = True  # Stage 2.5 自動補抓候選股分點資料
+    _revenue_months = 4  # 載入 4 個月營收，啟用「本月 YoY - 3 個月前 YoY」加速度輕微加成
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
@@ -2183,7 +2176,9 @@ class MomentumScanner(MarketScanner):
             return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：僅做過濾 — YoY > 0 加分(0.7)，≤ 0 中性(0.3)，無資料 fallback 0.5。"""
+        """動能模式基本面：YoY > 0 加分(0.7)，≤ 0 中性(0.3)，無資料 fallback 0.5。
+        有 yoy_3m_ago 資料時，加速度正 +0.05、減速 -0.05（輕微調整，上限 0.8 / 下限 0.2）。
+        """
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
@@ -2197,7 +2192,16 @@ class MomentumScanner(MarketScanner):
                 rev = rev_grouped.get_group(sid)
                 yoy = rev.iloc[0].get("yoy_growth", None)
                 if yoy is not None and not pd.isna(yoy):
-                    result_rows.append({"stock_id": sid, "fundamental_score": 0.7 if yoy > 0 else 0.3})
+                    base = 0.7 if yoy > 0 else 0.3
+                    # 輕微加速度加成：本月 YoY - 3 個月前 YoY > 0 加分，< 0 減分
+                    yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
+                    if yoy_3m is not None and not pd.isna(yoy_3m):
+                        accel = float(yoy) - float(yoy_3m)
+                        if accel > 0:
+                            base = min(0.8, base + 0.05)
+                        elif accel < 0:
+                            base = max(0.2, base - 0.05)
+                    result_rows.append({"stock_id": sid, "fundamental_score": base})
                 else:
                     result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
 
@@ -3289,7 +3293,7 @@ class GrowthScanner(MarketScanner):
             rev_count = sync_revenue_for_stocks(candidate_ids)
             val_count = sync_valuation_for_stocks(candidate_ids)
             logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收, %d 筆估值", rev_count, val_count)
-            df_revenue = self._load_revenue_data(candidate_ids, months=2)
+            df_revenue = self._load_revenue_data(candidate_ids, months=4)
         except Exception:
             logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
 
@@ -3374,8 +3378,8 @@ class GrowthScanner(MarketScanner):
                 columns=["stock_id", "date", "margin_balance", "short_balance"],
             )
 
-        # 載入 2 個月營收（含上月，用於計算加速度）
-        df_revenue = self._load_revenue_data(months=2)
+        # 載入 4 個月營收（含 3 個月前，用於計算加速度）
+        df_revenue = self._load_revenue_data(months=4)
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -3531,7 +3535,7 @@ class GrowthScanner(MarketScanner):
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """高成長模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%。"""
+        """高成長模式基本面 2 因子：YoY 60% + 營收加速度 40%（本月 YoY - 3 個月前 YoY）。"""
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
@@ -3540,15 +3544,14 @@ class GrowthScanner(MarketScanner):
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
         yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
-        mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
 
-        if "prev_yoy_growth" in rev.columns:
-            rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["prev_yoy_growth"].fillna(0)
+        if "yoy_3m_ago" in rev.columns:
+            rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["yoy_3m_ago"].fillna(0)
             accel_rank = rev["acceleration"].rank(pct=True)
         else:
             accel_rank = pd.Series(0.5, index=rev.index)
 
-        rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+        rev["fundamental_score"] = yoy_rank * 0.60 + accel_rank * 0.40
 
         result = pd.DataFrame({"stock_id": stock_ids})
         result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
