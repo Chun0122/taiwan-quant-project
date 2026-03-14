@@ -234,9 +234,10 @@ class FinancialStatement(Base):
 class HoldingDistribution(Base):
     """大戶持股分級資料（週資料）。
 
-    來源：FinMind API（TaiwanStockHoldingSharesPer）。
-    每週一次，記錄各持股區間的持有人數與持股比例。
-    大戶定義：持股區間下限 >= 400,000 股（約 400 張）。
+    來源：TDCC 集保戶股權分散表（免費，fetch_tdcc_holding_all_market，
+          https://smart.tdcc.com.tw/opendata/getOD.ashx?id=1-5）。
+    每週更新一次，記錄各持股區間（1-15 級）的持有人數與持股比例。
+    大戶定義：持股區間下限 >= 400,000 股（約 400 張），對應 level 12~15。
     """
 
     __tablename__ = "holding_distribution"

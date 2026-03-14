@@ -141,26 +141,26 @@ def compute_whale_score(df_holding: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_sbl_score(df_sbl: pd.DataFrame) -> pd.DataFrame:
-    """從最新日借券資料提取 sbl_balance 與 sbl_change（純函數，可獨立測試）。
+    """從最新日借券資料提取 sbl_balance（純函數，可獨立測試）。
 
-    借券餘額越低 → 空頭壓力越小 → 後續評分越高（逆向因子）。
+    可借券賣出股數越低 → 空頭壓力越小 → 後續評分越高（逆向因子）。
+    注意：2026 年 TWSE API 改版後，sbl_change 欄位不再提供，評分僅依 sbl_balance。
 
     Args:
-        df_sbl: SecuritiesLending 資料，欄位需含
-                [date, stock_id, sbl_balance, sbl_change]
+        df_sbl: SecuritiesLending 資料，欄位需含 [date, stock_id, sbl_balance]
 
     Returns:
-        DataFrame [stock_id, sbl_balance, sbl_change]（只取最新一日）
+        DataFrame [stock_id, sbl_balance]（只取最新一日）
     """
     if df_sbl.empty:
-        return pd.DataFrame(columns=["stock_id", "sbl_balance", "sbl_change"])
+        return pd.DataFrame(columns=["stock_id", "sbl_balance"])
 
-    required = {"date", "stock_id", "sbl_balance", "sbl_change"}
+    required = {"date", "stock_id", "sbl_balance"}
     if not required.issubset(df_sbl.columns):
-        return pd.DataFrame(columns=["stock_id", "sbl_balance", "sbl_change"])
+        return pd.DataFrame(columns=["stock_id", "sbl_balance"])
 
     latest = df_sbl["date"].max()
-    df = df_sbl[df_sbl["date"] == latest][["stock_id", "sbl_balance", "sbl_change"]].copy()
+    df = df_sbl[df_sbl["date"] == latest][["stock_id", "sbl_balance"]].copy()
     return df.reset_index(drop=True)
 
 
@@ -2044,7 +2044,6 @@ class MomentumScanner(MarketScanner):
                         SecuritiesLending.stock_id,
                         SecuritiesLending.date,
                         SecuritiesLending.sbl_balance,
-                        SecuritiesLending.sbl_change,
                     ).where(
                         SecuritiesLending.stock_id.in_(stock_ids),
                         SecuritiesLending.date >= cutoff,
@@ -2052,7 +2051,7 @@ class MomentumScanner(MarketScanner):
                 ).all()
             if not rows:
                 return pd.DataFrame()
-            return pd.DataFrame(rows, columns=["stock_id", "date", "sbl_balance", "sbl_change"])
+            return pd.DataFrame(rows, columns=["stock_id", "date", "sbl_balance"])
         except Exception:
             return pd.DataFrame()
 

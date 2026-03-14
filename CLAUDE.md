@@ -46,9 +46,9 @@ python main.py validate --export issues.csv  # 匯出問題清單
 python main.py sync-financial                # 同步 watchlist 財報（預設最近 4 季）
 python main.py sync-financial --stocks 2330  # 指定股票
 python main.py sync-financial --quarters 8   # 最近 8 季
-python main.py sync-holding                  # 同步大戶持股分級（週資料，預設最近 4 週）
-python main.py sync-holding --stocks 2330 2317  # 指定股票
-python main.py sync-holding --weeks 8        # 最近 8 週
+python main.py sync-holding                  # 同步大戶持股分級（週資料，TDCC 全市場一次取）
+python main.py sync-holding --stocks 2330 2317  # 指定股票（仍從全市場篩選）
+python main.py sync-holding --weeks 8        # 保留參數（TDCC 僅提供最新一週，歷史靠每週累積）
 python main.py sync-broker                   # 同步 watchlist 分點交易資料（最近 5 日）
 python main.py sync-broker --stocks 2330 2317  # 指定股票
 python main.py sync-broker --days 10         # 最近 10 個交易日
@@ -142,7 +142,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
 | `tests/test_suggest.py`        | `src/features/indicators.py` `calc_rsi14_from_series` + `main.py` `_assess_timing` + `src/notification/line_notify.py` `format_suggest_discord` | 純函數 |
 | `tests/test_watch.py`          | `main.py` `_compute_watch_status` / `_compute_trailing_stop` 純函數 + `WatchEntry` ORM CRUD（含 trailing stop 欄位） | 純函數 + in-memory SQLite |
-| `tests/test_holding.py`        | `_extract_level_lower_bound` + `compute_whale_score` + `HoldingDistribution` ORM + `fetch_holding_distribution` | 純函數 + in-memory SQLite + mock HTTP |
+| `tests/test_holding.py`        | `_extract_level_lower_bound` + `compute_whale_score` + `HoldingDistribution` ORM + `fetch_holding_distribution`（FinMind mock，舊接口相容） | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_broker.py`         | `fetch_dj_broker_trades` HTML 解析（Big5/BHID/多分點彙整/單位換算）+ `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 + `TestLoadBrokerDataExtendedCloseProxy` 收盤價代理均價（NULL 填補/不覆蓋/無資料降回 7F）+ `TestSyncBrokerBootstrap` 逐日查詢簽名/獨立性/預設值/單日 vs 期間 | 純函數 + in-memory SQLite + mock HTTP |
@@ -188,7 +188,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 模組                                | 角色                                                                                                              |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次 + 財報三表 EAV pivot）                                                              |
-| `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）；`fetch_twse_sbl()` 借券賣出彙總（TWT96U）；`fetch_dj_broker_trades()` 分點進出彙整（DJ 端點，替代 FinMind，Big5 HTML 解析，BHID 彙整，date=end，buy/sell 已換算為股） |
+| `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）；`fetch_twse_sbl()` 借券賣出彙總（TWT96U）；`fetch_dj_broker_trades()` 分點進出彙整（DJ 端點，替代 FinMind，Big5 HTML 解析，BHID 彙整，date=end，buy/sell 已換算為股）；**`fetch_tdcc_holding_all_market()`** TDCC 集保戶股權分散表（全市場，免費，替代 FinMind TaiwanStockHoldingSharesPer，CSV，tier 1-15 → level 字串） |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB                                                                                                 |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）；`classify_event_type()` 純函數（earnings_call / investor_day / filing / revenue / general） |
 | `src/data/schema.py`                | 19 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、HoldingDistribution、SecuritiesLending、BrokerTrade、WatchEntry、Watchlist）  |
@@ -270,7 +270,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 13 | ✅ | **回測引擎 ATR-based 自動止損止利** | RiskConfig 新增 `atr_multiplier_stop/profit`，Engine 進場時計算並固定止損/目標價，TradeRecord 記錄 stop_price/target_price，ATR-based 優先於百分比，Trade ORM 同步新增欄位，545 測試通過 |
 | 14 | ✅ | **持倉監控 Dashboard 頁面** | WatchEntry ORM 表（15 欄）+ CLI `watch add/list/close/update-status` + Dashboard「👁️ 持倉監控」頁（3 Tab：總覽/個股走勢/預警列表），`_compute_watch_status` 純函數自動標記止損/止利/過期狀態，555 測試通過 |
 | 15 | ✅ | **估值 Cold-Start 修正（Value/Dividend Scanner）** | 新增 `fetch_twse_valuation_all / fetch_tpex_valuation_all / fetch_market_valuation_all`（twse_fetcher.py，TWSE BWIBBU_d + TPEX pera，免費）+ `sync_valuation_all_market()`（pipeline.py）+ Stage 0.5 機制插入 ValueScanner.run() 和 DividendScanner.run()（閾值 500 支），568 測試通過 |
-| 16 | ✅ | **大戶持股分級（HoldingDistribution）** | 新增 `HoldingDistribution` ORM（schema.py）+ `fetch_holding_distribution()`（fetcher.py，FinMind TaiwanStockHoldingSharesPer）+ `sync_holding_distribution()`（pipeline.py）+ CLI `sync-holding`；`compute_whale_score()` 純函數計算大戶集中度（下限 ≥ 400,000 股）+ 週環比；整合至 MomentumScanner（5 因子 chip_score）+ SwingScanner（3 因子），588 測試通過 |
+| 16 | ✅ | **大戶持股分級（HoldingDistribution）** | 新增 `HoldingDistribution` ORM（schema.py）+ `fetch_tdcc_holding_all_market()`（twse_fetcher.py，**TDCC 集保戶股權分散表，免費**，替換原 FinMind TaiwanStockHoldingSharesPer 免費停供）+ `sync_holding_distribution()`（pipeline.py，一次全市場→篩 watchlist）+ CLI `sync-holding`；`compute_whale_score()` 純函數計算大戶集中度（下限 ≥ 400,000 股）+ 週環比；整合至 MomentumScanner（5 因子 chip_score）+ SwingScanner（3 因子），778 測試通過 |
 | 17 | ✅ | **MOPS 事件類型分類 + alert-check 命令（P2）** | `Announcement` ORM 新增 `event_type` 欄位（DB migration）；`mops_fetcher.py` 新增 `classify_event_type()` 純函數（earnings_call / investor_day / filing / revenue / general）+ 關鍵字群組；`_parse_announcement_html()` 自動分類；CLI `alert-check`（--days / --types / --stocks / --notify）；631 測試通過 |
 | 18 | ✅ | **revenue-scan 高成長掃描命令（P3）** | `_compute_revenue_scan()` 純函數：讀取 MonthlyRevenue（最新月 YoY）+ FinancialStatement（毛利率 QoQ），篩選 YoY ≥ min_yoy 且毛利率改善，revenue_rank = YoY 70% + 毛利率 30%；CLI `revenue-scan`（--stocks / --top / --min-yoy / --min-margin-improve / --notify）；631 測試通過 |
 | 19 | ✅ | **借券賣出整合（P4，TWSE TWT96U）** | 新增 `SecuritiesLending` ORM（schema.py，17 張表）；`fetch_twse_sbl()` 全市場日資料（twse_fetcher.py，免費）；`sync_sbl_all_market(days=3)`（pipeline.py）；`compute_sbl_score()` 純函數 + `_load_sbl_data()` + MomentumScanner 升級為最高 6-factor（外資22%+量比20%+法人20%+券資比13%+大戶15%+借券逆向10%）；CLI `sync-sbl`；649 測試通過 |

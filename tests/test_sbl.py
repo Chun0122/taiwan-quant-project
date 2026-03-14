@@ -1,7 +1,9 @@
 """借券賣出（Securities Borrowing and Lending）整合測試。
 
 測試項目：
-- fetch_twse_sbl: TWSE TWT96U 欄位映射 + sbl_change 計算（mock HTTP）
+- fetch_twse_sbl: TWSE TWT96U 新格式（2026）欄位映射（mock HTTP）
+  - 新格式：每列 4 欄，2 檔股票配對，股票代號包於 HTML <a> 標籤
+  - 僅 sbl_balance（可借券賣出股數），sbl_change 等欄位不再提供
 - SecuritiesLending ORM: 寫入 + 唯一鍵衝突（in-memory SQLite）
 - compute_sbl_score: 最新日篩選 + 欄位完整（純函數）
 - MomentumScanner 6-factor: 6-factor 啟用、降級、sbl_rank 逆向（_compute_chip_scores 單元）
@@ -37,36 +39,37 @@ class TestFetchTwseSbl:
         monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda x: None)
 
     def test_parses_valid_response(self, monkeypatch):
-        """正常回傳格式：欄位映射正確，sbl_change = sbl_balance - sbl_prev_balance。"""
+        """新版格式（2026）：每列 4 欄，2 檔股票配對，股票代號包於 HTML <a> 標籤。"""
         from src.data.twse_fetcher import fetch_twse_sbl
 
         self._mock_resp(
             monkeypatch,
             {
                 "stat": "OK",
-                "fields": ["證券代號", "證券名稱", "當日借券成交量", "次一交易日可回補", "借券餘額", "前日借券餘額"],
+                "fields": ["證券代號", "可借券賣出股數", "證券代號", "可借券賣出股數"],
                 "data": [
-                    ["2330", "台積電", "1,000", "500", "50,000", "48,000"],
-                    ["2317", "鴻海", "200", "100", "10,000", "9,500"],
+                    [
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=2330" target=_blank>2330</a>',
+                        "50,000",
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=2317" target=_blank>2317</a>',
+                        "10,000",
+                    ],
                 ],
             },
         )
         df = fetch_twse_sbl(date(2026, 3, 5))
         assert len(df) == 2
-        assert set(df.columns) >= {
-            "date",
-            "stock_id",
-            "sbl_sell_volume",
-            "sbl_balance",
-            "sbl_prev_balance",
-            "sbl_change",
-        }
+        assert set(df.columns) >= {"date", "stock_id", "sbl_balance"}
 
         row = df[df["stock_id"] == "2330"].iloc[0]
-        assert row["sbl_sell_volume"] == 1000
         assert row["sbl_balance"] == 50000
-        assert row["sbl_prev_balance"] == 48000
-        assert row["sbl_change"] == 2000  # 50000 - 48000
+        # 新版 API 不再提供這些欄位（填 None）
+        assert row["sbl_sell_volume"] is None
+        assert row["sbl_prev_balance"] is None
+        assert row["sbl_change"] is None
+
+        row_2317 = df[df["stock_id"] == "2317"].iloc[0]
+        assert row_2317["sbl_balance"] == 10000
 
     def test_stat_not_ok_returns_empty(self, monkeypatch):
         """stat != 'OK' 時（假日或無資料）回傳空 DataFrame。"""
@@ -76,35 +79,53 @@ class TestFetchTwseSbl:
         df = fetch_twse_sbl(date(2026, 3, 7))
         assert df.empty
 
-    def test_sbl_change_calculation(self, monkeypatch):
-        """sbl_change = sbl_balance - sbl_prev_balance 計算正確（含負值情況）。"""
+    def test_two_stocks_per_row_both_parsed(self, monkeypatch):
+        """每列含 2 檔股票配對，兩檔均應正確解析（含 HTML anchor 格式）。"""
         from src.data.twse_fetcher import fetch_twse_sbl
 
         self._mock_resp(
             monkeypatch,
             {
                 "stat": "OK",
+                "fields": ["證券代號", "可借券賣出股數", "證券代號", "可借券賣出股數"],
                 "data": [
-                    ["1234", "測試股", "0", "0", "3,000", "5,000"],  # 餘額下降 → change < 0
+                    [
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=1234" target=_blank>1234</a>',
+                        "3,000",
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=5678" target=_blank>5678</a>',
+                        "7,500",
+                    ],
                 ],
             },
         )
         df = fetch_twse_sbl(date(2026, 3, 5))
-        assert len(df) == 1
-        assert df.iloc[0]["sbl_change"] == -2000  # 3000 - 5000
+        assert len(df) == 2
+        assert set(df["stock_id"]) == {"1234", "5678"}
+        assert df[df["stock_id"] == "1234"].iloc[0]["sbl_balance"] == 3000
+        assert df[df["stock_id"] == "5678"].iloc[0]["sbl_balance"] == 7500
 
     def test_filters_non_4digit_stock_ids(self, monkeypatch):
-        """非 4 碼純數字代號（如指數）應被過濾。"""
+        """非 4 碼純數字代號（如指數、ETF）應被過濾。"""
         from src.data.twse_fetcher import fetch_twse_sbl
 
         self._mock_resp(
             monkeypatch,
             {
                 "stat": "OK",
+                "fields": ["證券代號", "可借券賣出股數", "證券代號", "可借券賣出股數"],
                 "data": [
-                    ["2330", "台積電", "1,000", "500", "50,000", "48,000"],
-                    ["IX0001", "指數", "0", "0", "0", "0"],
-                    ["00878", "ETF", "100", "50", "1,000", "900"],
+                    [
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=2330" target=_blank>2330</a>',
+                        "50,000",
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=006201" target=_blank>006201</a>',
+                        "1,000",
+                    ],
+                    [
+                        "IX0001",  # 非 HTML、非 4 碼
+                        "0",
+                        '<a href="https://mis.twse.com.tw/stock/fibest.jsp?stock=00878" target=_blank>00878</a>',
+                        "500",
+                    ],
                 ],
             },
         )
@@ -217,10 +238,10 @@ class TestComputeSblScore:
     """compute_sbl_score() 純函數測試。"""
 
     def test_empty_df_returns_empty_with_correct_columns(self):
-        """空 DF 回傳空 DataFrame，欄位 [stock_id, sbl_balance, sbl_change]。"""
+        """空 DF 回傳空 DataFrame，欄位 [stock_id, sbl_balance]。"""
         result = compute_sbl_score(pd.DataFrame())
         assert result.empty
-        assert list(result.columns) == ["stock_id", "sbl_balance", "sbl_change"]
+        assert list(result.columns) == ["stock_id", "sbl_balance"]
 
     def test_only_latest_date_returned(self):
         """有多日資料時，只取最新一日的資料。"""
@@ -228,8 +249,8 @@ class TestComputeSblScore:
         dt_new = date(2026, 3, 5)
         df = pd.DataFrame(
             [
-                {"date": dt_old, "stock_id": "2330", "sbl_balance": 10000, "sbl_change": 500},
-                {"date": dt_new, "stock_id": "2330", "sbl_balance": 12000, "sbl_change": 2000},
+                {"date": dt_old, "stock_id": "2330", "sbl_balance": 10000},
+                {"date": dt_new, "stock_id": "2330", "sbl_balance": 12000},
             ]
         )
         result = compute_sbl_score(df)
@@ -237,18 +258,17 @@ class TestComputeSblScore:
         assert result.iloc[0]["sbl_balance"] == 12000
 
     def test_correct_columns_returned(self):
-        """回傳欄位必須包含 [stock_id, sbl_balance, sbl_change]。"""
+        """回傳欄位必須包含 [stock_id, sbl_balance]。"""
         dt = date(2026, 3, 5)
         df = pd.DataFrame(
             [
-                {"date": dt, "stock_id": "2330", "sbl_balance": 50000, "sbl_change": 2000},
-                {"date": dt, "stock_id": "2317", "sbl_balance": 10000, "sbl_change": -500},
+                {"date": dt, "stock_id": "2330", "sbl_balance": 50000},
+                {"date": dt, "stock_id": "2317", "sbl_balance": 10000},
             ]
         )
         result = compute_sbl_score(df)
         assert "stock_id" in result.columns
         assert "sbl_balance" in result.columns
-        assert "sbl_change" in result.columns
 
     def test_multiple_stocks_latest_date(self):
         """多支股票，只取最新日，各股資料正確。"""
@@ -256,10 +276,10 @@ class TestComputeSblScore:
         dt_now = date(2026, 3, 5)
         df = pd.DataFrame(
             [
-                {"date": dt_prev, "stock_id": "2330", "sbl_balance": 40000, "sbl_change": 1000},
-                {"date": dt_now, "stock_id": "2330", "sbl_balance": 50000, "sbl_change": 10000},
-                {"date": dt_prev, "stock_id": "2317", "sbl_balance": 8000, "sbl_change": -200},
-                {"date": dt_now, "stock_id": "2317", "sbl_balance": 9000, "sbl_change": 1000},
+                {"date": dt_prev, "stock_id": "2330", "sbl_balance": 40000},
+                {"date": dt_now, "stock_id": "2330", "sbl_balance": 50000},
+                {"date": dt_prev, "stock_id": "2317", "sbl_balance": 8000},
+                {"date": dt_now, "stock_id": "2317", "sbl_balance": 9000},
             ]
         )
         result = compute_sbl_score(df)
@@ -292,10 +312,10 @@ def momentum_scanner():
 
 
 def _make_sbl_df(stock_ids: list[str], balances: list[int]) -> pd.DataFrame:
-    """建立測試用 SBL DataFrame（最新一日，各股不同借券餘額）。"""
+    """建立測試用 SBL DataFrame（最新一日，各股不同可借券賣出股數）。"""
     dt = date.today()
     rows = [
-        {"date": dt, "stock_id": sid, "sbl_balance": bal, "sbl_change": bal // 10}
+        {"date": dt, "stock_id": sid, "sbl_balance": bal}
         for sid, bal in zip(stock_ids, balances)
     ]
     return pd.DataFrame(rows)
@@ -400,8 +420,8 @@ class TestMomentumScannerSblFactor:
         dt_today = date.today()
         sbl_data = pd.DataFrame(
             [
-                {"date": dt_today, "stock_id": "low_sbl", "sbl_balance": 1000, "sbl_change": 100},
-                {"date": dt_today, "stock_id": "high_sbl", "sbl_balance": 100000, "sbl_change": 5000},
+                {"date": dt_today, "stock_id": "low_sbl", "sbl_balance": 1000},
+                {"date": dt_today, "stock_id": "high_sbl", "sbl_balance": 100000},
             ]
         )
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: sbl_data)
@@ -430,8 +450,8 @@ class TestMomentumScannerSblFactor:
         dt = date.today()
         sbl_data = pd.DataFrame(
             [
-                {"date": dt, "stock_id": "1000", "sbl_balance": 1000, "sbl_change": 100},
-                {"date": dt, "stock_id": "1001", "sbl_balance": 50000, "sbl_change": 2000},
+                {"date": dt, "stock_id": "1000", "sbl_balance": 1000},
+                {"date": dt, "stock_id": "1001", "sbl_balance": 50000},
             ]
         )
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: sbl_data)

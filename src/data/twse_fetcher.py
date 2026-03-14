@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import time
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 # TWSE/TPEX 建議的 User-Agent
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
+
+# TPEX 專用 Headers：關閉 keep-alive 與壓縮，避免 chunked 傳輸中斷（ConnectionResetError 10054）
+_TPEX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Connection": "close",
+    "Accept-Encoding": "identity",
 }
 
 # 請求間隔（秒），避免被封鎖
@@ -252,7 +260,7 @@ def fetch_tpex_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃日行情: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp = requests.get(url, params=params, headers=_TPEX_HEADERS, timeout=20, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -329,7 +337,7 @@ def fetch_tpex_institutional(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃三大法人: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp = requests.get(url, params=params, headers=_TPEX_HEADERS, timeout=20, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -443,11 +451,11 @@ def fetch_twse_margin(target_date: date | None = None) -> pd.DataFrame:
         logger.warning("TWSE 融資融券無資料: %s", data.get("stat", ""))
         return pd.DataFrame()
 
-    # 找到包含個股資料的 table（fields 包含「股票代號」）
+    # 找到包含個股資料的 table（fields[0] 含「代號」，相容 API 改版：舊版「股票代號」→新版「代號」）
     stock_table = None
     for table in data.get("tables", []):
         fields = table.get("fields", [])
-        if fields and "股票代號" in fields[0]:
+        if fields and "代號" in fields[0]:
             stock_table = table
             break
 
@@ -461,6 +469,9 @@ def fetch_twse_margin(target_date: date | None = None) -> pd.DataFrame:
             continue
 
         stock_id = item[0].strip()
+        # 跳過合計摘要列（stock_id 為空或非純數字）
+        if not stock_id or not stock_id.isdigit():
+            continue
         # 融資: 買進(1), 賣出(2), 現金償還(3), 前日餘額(4), 今日餘額(5)
         margin_buy = _parse_number(item[1]) or 0
         margin_sell = _parse_number(item[2]) or 0
@@ -505,7 +516,7 @@ def fetch_tpex_margin(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃融資融券: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp = requests.get(url, params=params, headers=_TPEX_HEADERS, timeout=20, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -579,25 +590,26 @@ def fetch_market_margin(target_date: date | None = None) -> pd.DataFrame:
 
 
 def fetch_twse_sbl(target_date: date | None = None) -> pd.DataFrame:
-    """抓取 TWSE 全市場借券賣出彙總（日資料，TWT96U）。
+    """抓取 TWSE 全市場可借券賣出股數（日資料，TWT96U）。
 
     每日一次更新，TWSE 免費開放資料，無需 Token。
-    借券餘額高 → 空頭壓力大，可用作 MomentumScanner 負向因子。
+    可借券賣出股數高 → 空頭壓力大，可用作 MomentumScanner 負向因子。
 
-    回傳欄位: date, stock_id, sbl_sell_volume, sbl_balance, sbl_prev_balance, sbl_change
-        - sbl_sell_volume:  當日借券賣出成交量（股）
-        - sbl_balance:      借券餘額（股，當日結算後）
-        - sbl_prev_balance: 前日借券餘額（股）
-        - sbl_change:       借券餘額日變化（sbl_balance - sbl_prev_balance）
+    2026 年 API 改版後格式：每列含 2 檔股票（4 欄），股票代號包於 HTML <a> 標籤：
+        [0] 證券代號(HTML)  [1] 可借券賣出股數  [2] 證券代號(HTML)  [3] 可借券賣出股數
+
+    回傳欄位: date, stock_id, sbl_balance
+        - sbl_balance:      當日可借券賣出股數（新版 API 唯一提供欄位）
+        - sbl_sell_volume, sbl_prev_balance, sbl_change: 新版 API 不再提供，填 None
     """
     if target_date is None:
         target_date = _find_last_trading_day(date.today())
 
     date_str = target_date.strftime("%Y%m%d")
-    url = "https://www.twse.com.tw/rwd/zh/sbl/TWT96U"
+    url = "https://www.twse.com.tw/zh/SBL/TWT96U"
     params = {"date": date_str, "response": "json"}
 
-    logger.info("抓取 TWSE 借券賣出彙總 (TWT96U): %s", target_date.isoformat())
+    logger.info("抓取 TWSE 可借券賣出股數 (TWT96U): %s", target_date.isoformat())
 
     try:
         resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
@@ -611,10 +623,6 @@ def fetch_twse_sbl(target_date: date | None = None) -> pd.DataFrame:
         logger.warning("TWSE 借券賣出無資料（可能為假日）: %s", data.get("stat", ""))
         return pd.DataFrame()
 
-    # TWT96U 回傳格式：資料在頂層 data 陣列（非 tables）
-    # 預期欄位順序（TWSE 可能調整，實作時加防護）：
-    # [0] 證券代號  [1] 證券名稱  [2] 當日借券成交量  [3] 次一交易日可回補
-    # [4] 借券餘額  [5] 前日借券餘額
     raw_data = data.get("data", [])
 
     # 若資料在 tables 結構中（API 版本差異）則嘗試取得
@@ -629,46 +637,40 @@ def fetch_twse_sbl(target_date: date | None = None) -> pd.DataFrame:
         logger.warning("TWSE 借券賣出: 無資料列")
         return pd.DataFrame()
 
-    # 欄位結構防護：記錄 fields 以便追蹤 API 改版
-    fields = data.get("fields", [])
-    if fields and len(fields) >= 4:
-        logger.debug("TWSE TWT96U fields: %s", fields[:6])
+    def _extract_stock_id(cell: str) -> str | None:
+        """從 HTML anchor 或純文字擷取 4 碼純數字股票代號。"""
+        cell = str(cell).strip()
+        m = re.search(r">(\w+)<", cell)
+        sid = m.group(1) if m else cell
+        return sid if (sid.isdigit() and len(sid) == 4) else None
 
     rows = []
     for item in raw_data:
-        if len(item) < 5:
-            continue
+        # 每列包含 2 組配對：(股票代號, 可借券賣出股數)
+        pairs: list[tuple[str, str]] = []
+        if len(item) >= 2:
+            pairs.append((item[0], item[1]))
+        if len(item) >= 4:
+            pairs.append((item[2], item[3]))
 
-        stock_id = item[0].strip()
-        # 只保留 4 碼純數字股票
-        if not (stock_id.isdigit() and len(stock_id) == 4):
-            continue
-
-        # 欄位對應（依 TWT96U 標準格式）
-        # item[1] = 證券名稱（跳過）
-        sbl_sell_volume = _parse_number(item[2]) if len(item) > 2 else None  # 當日借券成交量
-        sbl_balance = _parse_number(item[4]) if len(item) > 4 else None  # 借券餘額
-        sbl_prev_balance = _parse_number(item[5]) if len(item) > 5 else None  # 前日借券餘額
-
-        # 計算日變化
-        if sbl_balance is not None and sbl_prev_balance is not None:
-            sbl_change = int(sbl_balance) - int(sbl_prev_balance)
-        else:
-            sbl_change = None
-
-        rows.append(
-            {
-                "date": target_date,
-                "stock_id": stock_id,
-                "sbl_sell_volume": int(sbl_sell_volume) if sbl_sell_volume is not None else None,
-                "sbl_balance": int(sbl_balance) if sbl_balance is not None else None,
-                "sbl_prev_balance": int(sbl_prev_balance) if sbl_prev_balance is not None else None,
-                "sbl_change": sbl_change,
-            }
-        )
+        for sid_cell, vol_cell in pairs:
+            stock_id = _extract_stock_id(sid_cell)
+            if stock_id is None:
+                continue
+            sbl_balance = _parse_number(vol_cell)
+            rows.append(
+                {
+                    "date": target_date,
+                    "stock_id": stock_id,
+                    "sbl_sell_volume": None,
+                    "sbl_balance": int(sbl_balance) if sbl_balance is not None else None,
+                    "sbl_prev_balance": None,
+                    "sbl_change": None,
+                }
+            )
 
     df = pd.DataFrame(rows)
-    logger.info("TWSE 借券賣出: %d 支股票", len(df))
+    logger.info("TWSE 可借券賣出: %d 支股票", len(df))
     time.sleep(_REQUEST_DELAY)
     return df
 
@@ -825,7 +827,7 @@ def fetch_tpex_valuation_all(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TPEX 上櫃估值 (pera): %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        resp = requests.get(url, params=params, headers=_TPEX_HEADERS, timeout=20, verify=False)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -967,3 +969,101 @@ def fetch_dj_broker_trades(stock_id: str, start: date, end: date) -> pd.DataFram
     logger.info("[DJ分點] %s %s~%s 解析到 %d 個分點", stock_id, date_str_start, date_str_end, len(rows))
     time.sleep(_REQUEST_DELAY)
     return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------ #
+#  TDCC 集保戶股權分散表（大戶持股分級）
+# ------------------------------------------------------------------ #
+
+# TDCC 持股分級編號（1-15）→ 文字描述（與 _extract_level_lower_bound 相容）
+_TDCC_TIER_MAP: dict[int, str] = {
+    1: "1-999 Shares",
+    2: "1,000-5,000 Shares",
+    3: "5,001-10,000 Shares",
+    4: "10,001-15,000 Shares",
+    5: "15,001-20,000 Shares",
+    6: "20,001-30,000 Shares",
+    7: "30,001-40,000 Shares",
+    8: "40,001-50,000 Shares",
+    9: "50,001-100,000 Shares",
+    10: "100,001-200,000 Shares",
+    11: "200,001-400,000 Shares",
+    12: "400,001-600,000 Shares",  # 大戶起始：lower_bound = 400001 >= 400000
+    13: "600,001-800,000 Shares",
+    14: "800,001-1,000,000 Shares",
+    15: "over 1,000,000 Shares",
+    # 16: 25 大股東合計（特殊，跳過）
+    # 17: 合計（跳過）
+}
+
+
+def fetch_tdcc_holding_all_market() -> pd.DataFrame:
+    """從 TDCC 集保戶股權分散表抓取全市場持股分級（週資料，免費）。
+
+    資料來源：TDCC 臺灣集中保管結算所開放資料
+        https://smart.tdcc.com.tw/opendata/getOD.ashx?id=1-5
+    每週更新一次（週五公告上週最後交易日資料），一次呼叫取得全市場。
+
+    CSV 欄位：資料日期, 證券代號, 持股分級, 人數, 股數, 占集保庫存數比例%
+
+    回傳欄位：date, stock_id, level, count, percent
+        - level:   持股分級描述（如 "400,001-600,000 Shares"），與 compute_whale_score 相容
+        - count:   持有人數
+        - percent: 占集保庫存數比例（%）
+    """
+    url = "https://smart.tdcc.com.tw/opendata/getOD.ashx"
+    params = {"id": "1-5"}
+
+    logger.info("抓取 TDCC 集保戶股權分散表（全市場）")
+
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS, timeout=30, verify=False)
+        resp.raise_for_status()
+        df_raw = pd.read_csv(io.StringIO(resp.text))
+    except Exception as e:
+        logger.error("TDCC 持股分散表請求失敗: %s", e)
+        return pd.DataFrame()
+
+    if df_raw.empty:
+        logger.warning("TDCC 持股分散表: 無資料")
+        return pd.DataFrame()
+
+    # 欄位重命名
+    col_map = {
+        "資料日期": "date_str",
+        "證券代號": "stock_id",
+        "持股分級": "tier",
+        "人數": "count",
+        "股數": "shares",
+        "占集保庫存數比例%": "percent",
+    }
+    df_raw = df_raw.rename(columns={k: v for k, v in col_map.items() if k in df_raw.columns})
+
+    # 僅保留 4 碼純數字普通股（排除 ETF 代號 0050、債券等）
+    df_raw["stock_id"] = df_raw["stock_id"].astype(str).str.strip()
+    df_raw = df_raw[df_raw["stock_id"].str.fullmatch(r"\d{4}")].copy()
+
+    # 篩選有效分級（1-15），跳過 16（25大股東合計）和 17（合計）
+    df_raw["tier"] = pd.to_numeric(df_raw["tier"], errors="coerce")
+    df_raw = df_raw[df_raw["tier"].isin(_TDCC_TIER_MAP)].copy()
+
+    # 分級編號 → 文字描述
+    df_raw["level"] = df_raw["tier"].astype(int).map(_TDCC_TIER_MAP)
+
+    # 日期轉換：YYYYMMDD → date 物件
+    df_raw["date"] = pd.to_datetime(df_raw["date_str"].astype(str), format="%Y%m%d").dt.date
+
+    # 數值清理（TDCC CSV 可能含千分位逗號）
+    df_raw["count"] = (
+        pd.to_numeric(df_raw["count"].astype(str).str.replace(",", ""), errors="coerce").fillna(0).astype(int)
+    )
+    df_raw["percent"] = pd.to_numeric(df_raw["percent"].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+
+    result = df_raw[["date", "stock_id", "level", "count", "percent"]].copy()
+    logger.info(
+        "TDCC 集保戶股權分散表: %d 支股票, 資料日期 %s",
+        result["stock_id"].nunique(),
+        result["date"].max(),
+    )
+    time.sleep(_REQUEST_DELAY)
+    return result

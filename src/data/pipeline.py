@@ -277,47 +277,55 @@ def _upsert_holding(df: pd.DataFrame) -> int:
 
 def sync_holding_distribution(
     watchlist: list[str] | None = None,
-    weeks: int = 4,
+    weeks: int = 4,  # noqa: ARG001 — 保留參數相容性，TDCC 僅提供最新一週
 ) -> int:
-    """同步 watchlist 大戶持股分級資料（最近 N 週）。
+    """同步 watchlist 大戶持股分級資料（最新一週）。
 
-    資料來源：FinMind TaiwanStockHoldingSharesPer（每週更新一次）。
-    若 DB 已有 7 天內的資料，自動跳過，避免重複抓取。
+    資料來源：TDCC 集保戶股權分散表（免費開放，一次取全市場）。
+    每週更新一次，若 DB 已有 7 天內的資料，自動跳過。
 
     Args:
         watchlist: 股票代號清單（預設使用 settings.fetcher.watchlist）
-        weeks:     抓取最近幾週（預設 4 週）
+        weeks:     保留參數（TDCC 僅提供最新一週，歷史靠每週累積）
 
     Returns:
         新增的持股分級筆數
     """
+    from src.data.twse_fetcher import fetch_tdcc_holding_all_market
+
     if watchlist is None:
         watchlist = get_effective_watchlist()
 
     init_db()
-    fetcher = FinMindFetcher()
 
-    # 多抓兩週緩衝，確保資料完整
-    start = (date.today() - timedelta(days=weeks * 7 + 14)).isoformat()
-    end = date.today().isoformat()
-    total = 0
-    skipped = 0
+    # 快速跳過：若所有 watchlist 股票都已有 7 天內資料，整批略過
+    with get_session() as session:
+        recent_stock_count = session.execute(
+            select(func.count(HoldingDistribution.stock_id.distinct()))
+            .select_from(HoldingDistribution)
+            .where(
+                HoldingDistribution.stock_id.in_(watchlist),
+                HoldingDistribution.date >= (date.today() - timedelta(days=7)),
+            )
+        ).scalar_one()
+    if recent_stock_count >= len(watchlist):
+        logger.info("[持股分級] 所有 watchlist 股票已有 7 天內資料，跳過同步")
+        return 0
 
-    for sid in watchlist:
-        last = _get_last_date(HoldingDistribution, sid)
-        # 週資料：7 天內已有資料則跳過
-        if last and (date.today() - date.fromisoformat(last)).days < 7:
-            skipped += 1
-            continue
-        try:
-            df = fetcher.fetch_holding_distribution(sid, last or start, end)
-            total += _upsert_holding(df)
-        except Exception:
-            logger.warning("[%s] 持股分級資料補抓失敗，跳過", sid)
+    # 一次抓全市場最新一週
+    df_all = fetch_tdcc_holding_all_market()
+    if df_all.empty:
+        logger.warning("[持股分級] TDCC 回傳空資料")
+        return 0
 
-    if skipped:
-        logger.info("[持股分級] 跳過 %d 支（DB 已有近期資料）", skipped)
-    logger.info("[持股分級] 完成，共寫入 %d 筆", total)
+    # 篩選 watchlist 股票
+    df = df_all[df_all["stock_id"].isin(watchlist)].copy()
+    if df.empty:
+        logger.warning("[持股分級] watchlist 股票均無 TDCC 資料")
+        return 0
+
+    total = _upsert_holding(df)
+    logger.info("[持股分級] 完成，共寫入 %d 筆（%d 支股票）", total, df["stock_id"].nunique())
     return total
 
 
