@@ -1716,3 +1716,147 @@ class TestScannerStage05:
         )
         result = self._make_mocked_scanner(monkeypatch, ScannerCls, val_count=0).run()
         assert result is not None
+
+
+# ====================================================================== #
+#  消息面評分：時間衰減 + 事件類型加權（Task #38）
+# ====================================================================== #
+
+
+class TestComputeNewsDecayWeight:
+    """compute_news_decay_weight 純函數測試。"""
+
+    def test_day_zero_general_returns_one(self):
+        """當天 general 公告，衰減值應為 1.0。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w = compute_news_decay_weight(0, "general")
+        assert w == pytest.approx(1.0, abs=1e-9)
+
+    def test_day_zero_earnings_call_returns_three(self):
+        """當天 earnings_call 公告，衰減值應為 3.0。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w = compute_news_decay_weight(0, "earnings_call")
+        assert w == pytest.approx(3.0, abs=1e-9)
+
+    def test_decay_reduces_over_time(self):
+        """第 1 天的加權值應小於第 0 天（指數衰減）。"""
+        import math
+
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w0 = compute_news_decay_weight(0, "general")
+        w1 = compute_news_decay_weight(1, "general")
+        assert w1 == pytest.approx(math.exp(-0.3), abs=1e-9)
+        assert w1 < w0
+
+    def test_earnings_call_beats_general_same_age(self):
+        """相同天數下，earnings_call 加權值應大於 general。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        days = 3
+        assert compute_news_decay_weight(days, "earnings_call") > compute_news_decay_weight(days, "general")
+
+    def test_unknown_event_type_defaults_to_one(self):
+        """未知 event_type 應 fallback 為 type_weight=1.0。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(0, "unknown_xyz") == pytest.approx(1.0, abs=1e-9)
+
+    def test_negative_days_treated_as_zero(self):
+        """負數 days_ago（日期在未來）應 clamp 為 0，不應出現超過 type_weight 的值。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w = compute_news_decay_weight(-5, "general")
+        assert w == pytest.approx(1.0, abs=1e-9)
+
+
+class TestComputeNewsScores:
+    """_compute_news_scores 方法測試（直接傳入 df_ann，不觸及 DB）。"""
+
+    def _make_scanner(self):
+        return MarketScanner(min_price=10, max_price=2000, min_volume=100_000)
+
+    def _make_ann(self, rows: list[dict]) -> pd.DataFrame:
+        return pd.DataFrame(rows)
+
+    def test_empty_ann_returns_default(self):
+        """df_ann 為空時，所有 stock 應回傳 news_score=0.5。"""
+        scanner = self._make_scanner()
+        result = scanner._compute_news_scores(["1000", "2000"], pd.DataFrame())
+        assert (result["news_score"] == 0.5).all()
+
+    def test_no_matching_stocks_returns_default(self):
+        """df_ann 中無候選股的資料時，應回傳預設 0.5。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann([{"stock_id": "9999", "date": today, "sentiment": 1, "event_type": "general"}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann)
+        assert (result["news_score"] == 0.5).all()
+
+    def test_positive_ann_beats_no_ann(self):
+        """有正面公告的股票，排名應高於無公告的股票。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_earnings_call_beats_general_positive(self):
+        """同為正面公告、相同日期：earnings_call 股票排名應高於 general 股票。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "general"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_recent_beats_old_same_type(self):
+        """同類型正面公告，近期（今天）排名應高於舊公告（10 天前）。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        old_date = today - timedelta(days=10)
+        ann = self._make_ann(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"},
+                {"stock_id": "2000", "date": old_date, "sentiment": 1, "event_type": "general"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_negative_ann_lowers_score(self):
+        """負面公告股票，排名應低於無公告股票。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann([{"stock_id": "1000", "date": today, "sentiment": -1, "event_type": "general"}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] < result.loc["2000", "news_score"]
+
+    def test_missing_event_type_column_fallback(self):
+        """df_ann 無 event_type 欄位時，應降級為 general（不崩潰）。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann([{"stock_id": "1000", "date": today, "sentiment": 1}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann)
+        assert "news_score" in result.columns
+        assert len(result) == 2
+
+    def test_output_score_in_0_1_range(self):
+        """news_score 應在 [0, 1] 範圍內。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = self._make_ann(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+                {"stock_id": "2000", "date": today - timedelta(days=5), "sentiment": -1, "event_type": "general"},
+                {"stock_id": "3000", "date": today, "sentiment": 0, "event_type": "filing"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000", "3000"], ann)
+        assert result["news_score"].between(0.0, 1.0).all()

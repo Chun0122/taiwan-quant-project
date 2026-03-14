@@ -42,6 +42,31 @@ from src.data.schema import (
 
 logger = logging.getLogger(__name__)
 
+# 事件類型加權值（重要度由高到低）
+_EVENT_TYPE_WEIGHTS: dict[str, float] = {
+    "earnings_call": 3.0,
+    "investor_day": 2.0,
+    "filing": 1.5,
+    "revenue": 1.2,
+    "general": 1.0,
+}
+
+
+def compute_news_decay_weight(days_ago: int, event_type: str) -> float:
+    """計算單則公告的時間衰減加權值。
+
+    公式：exp(-0.3 × days_ago) × type_weight
+
+    Args:
+        days_ago: 公告距今天數（≥0）
+        event_type: 事件類型（earnings_call / investor_day / filing / revenue / general）
+
+    Returns:
+        加權值（≥0）
+    """
+    type_weight = _EVENT_TYPE_WEIGHTS.get(event_type, 1.0)
+    return float(np.exp(-0.3 * max(0, days_ago)) * type_weight)
+
 
 def _calc_atr14(stock_data: pd.DataFrame) -> float:
     """計算個股 ATR14。
@@ -781,6 +806,7 @@ class MarketScanner:
                 Announcement.seq,
                 Announcement.subject,
                 Announcement.sentiment,
+                Announcement.event_type,
             ).where(Announcement.date >= cutoff)
 
             if stock_ids:
@@ -790,15 +816,20 @@ class MarketScanner:
 
         return pd.DataFrame(
             rows,
-            columns=["stock_id", "date", "seq", "subject", "sentiment"],
+            columns=["stock_id", "date", "seq", "subject", "sentiment", "event_type"],
         )
 
     def _compute_news_scores(self, stock_ids: list[str], df_ann: pd.DataFrame) -> pd.DataFrame:
-        """計算消息面分數（3 因子：公告密度 + 正面訊號 + 負面懲罰）。
+        """計算消息面分數（時間衰減 × 事件類型加權，percentile 排名）。
+
+        公式：
+            各公告加權值 = exp(-0.3 × days_ago) × type_weight
+            net_score = Σ(加權值 for 正面公告) - Σ(加權值 for 負面公告)
+            news_score = percentile_rank(net_score)
 
         Args:
             stock_ids: 候選股代號清單
-            df_ann: 公告資料 DataFrame
+            df_ann: 公告資料 DataFrame（須含 sentiment, event_type, date 欄位）
 
         Returns:
             DataFrame(stock_id, news_score) — 分數 0~1，0.5 為中性預設
@@ -808,37 +839,39 @@ class MarketScanner:
         if df_ann.empty:
             return default
 
-        ann = df_ann[df_ann["stock_id"].isin(stock_ids)]
+        ann = df_ann[df_ann["stock_id"].isin(stock_ids)].copy()
         if ann.empty:
             return default
 
+        today = date.today()
+        ann["days_ago"] = ann["date"].apply(lambda d: max(0, (today - d).days))
+
+        # event_type 欄位相容（舊資料無此欄則預設 general）
+        if "event_type" not in ann.columns:
+            ann["event_type"] = "general"
+        else:
+            ann["event_type"] = ann["event_type"].fillna("general")
+
+        ann["decay_weight"] = ann.apply(
+            lambda row: compute_news_decay_weight(row["days_ago"], row["event_type"]),
+            axis=1,
+        )
+
+        pos_df = ann[ann["sentiment"] == 1].groupby("stock_id")["decay_weight"].sum().reset_index(name="pos_weighted")
+        neg_df = ann[ann["sentiment"] == -1].groupby("stock_id")["decay_weight"].sum().reset_index(name="neg_weighted")
+
         df = pd.DataFrame({"stock_id": stock_ids})
+        df = df.merge(pos_df, on="stock_id", how="left")
+        df = df.merge(neg_df, on="stock_id", how="left")
+        df["pos_weighted"] = df["pos_weighted"].fillna(0.0)
+        df["neg_weighted"] = df["neg_weighted"].fillna(0.0)
+        df["net_score"] = df["pos_weighted"] - df["neg_weighted"]
 
-        # 1) 公告密度：近期重訊數量排名（30%）
-        ann_count = ann.groupby("stock_id").size().reset_index(name="ann_count")
-        df = df.merge(ann_count, on="stock_id", how="left")
-        df["ann_count"] = df["ann_count"].fillna(0)
-
-        # 2) 正面訊號：sentiment=+1 的公告數量排名（40%）
-        positive = ann[ann["sentiment"] == 1].groupby("stock_id").size().reset_index(name="pos_count")
-        df = df.merge(positive, on="stock_id", how="left")
-        df["pos_count"] = df["pos_count"].fillna(0)
-
-        # 3) 負面懲罰：sentiment=-1 的公告數量（倒數排名，越多越低分）（30%）
-        negative = ann[ann["sentiment"] == -1].groupby("stock_id").size().reset_index(name="neg_count")
-        df = df.merge(negative, on="stock_id", how="left")
-        df["neg_count"] = df["neg_count"].fillna(0)
-
-        # 排名百分位（有公告的才有區分度，無公告者 = 0.5）
-        if df["ann_count"].sum() == 0:
+        # 無任何加權公告 → 回傳預設
+        if df["net_score"].abs().sum() == 0:
             return default
 
-        density_rank = df["ann_count"].rank(pct=True)
-        pos_rank = df["pos_count"].rank(pct=True)
-        # 負面用倒數排名：neg_count 越大 → 排名越低
-        neg_rank = (-df["neg_count"]).rank(pct=True)
-
-        df["news_score"] = density_rank * 0.30 + pos_rank * 0.40 + neg_rank * 0.30
+        df["news_score"] = df["net_score"].rank(pct=True)
 
         return df[["stock_id", "news_score"]]
 
