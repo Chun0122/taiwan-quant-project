@@ -1133,8 +1133,9 @@ class MarketScanner:
         # hook：子類可在加權後做額外處理
         candidates = self._post_score(candidates)
 
-        # 進出場建議欄位
-        entry_exit = self._compute_entry_exit_cols(stock_ids, df_price)
+        # 進出場建議欄位（依 regime 調整 ATR 倍數）
+        regime = getattr(self, "regime", "sideways")
+        entry_exit = self._compute_entry_exit_cols(stock_ids, df_price, regime=regime)
         candidates = candidates.merge(entry_exit, on="stock_id", how="left")
 
         return candidates
@@ -1147,19 +1148,38 @@ class MarketScanner:
         """hook：子類可在加權後做額外處理。"""
         return candidates
 
-    def _compute_entry_exit_cols(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+    # Regime 自適應 ATR 止損/目標倍數
+    _REGIME_ATR_PARAMS: dict[str, tuple[float, float]] = {
+        "bull": (1.5, 3.5),
+        "sideways": (1.5, 3.0),
+        "bear": (1.2, 2.5),
+    }
+
+    def _compute_entry_exit_cols(
+        self, stock_ids: list[str], df_price: pd.DataFrame, regime: str = "sideways"
+    ) -> pd.DataFrame:
         """計算每支股票的進出場建議欄位。
 
         欄位：
           entry_price  — 當日收盤價
-          stop_loss    — entry_price - 1.5 × ATR14
-          take_profit  — entry_price + 3.0 × ATR14（RR = 1:2）
+          stop_loss    — entry_price - stop_mult × ATR14（依 regime 調整）
+          take_profit  — entry_price + target_mult × ATR14（依 regime 調整）
           entry_trigger — 依均線位置與波動率產生中文說明
           valid_until  — scan_date + 5 工作日
+
+        Args:
+            stock_ids: 要計算的股票代號清單
+            df_price: 日K線 DataFrame
+            regime: 市場狀態（"bull"/"sideways"/"bear"），決定 ATR 倍數
+                    bull      → stop×1.5 / target×3.5
+                    sideways  → stop×1.5 / target×3.0（預設）
+                    bear      → stop×1.2 / target×2.5
 
         Returns:
             DataFrame，index reset，欄位含 stock_id 及上述五欄
         """
+        stop_mult, target_mult = self._REGIME_ATR_PARAMS.get(regime, (1.5, 3.0))
+
         scan_date = getattr(self, "scan_date", date.today())
         valid_until = (pd.Timestamp(scan_date) + pd.offsets.BDay(5)).date()
 
@@ -1199,8 +1219,8 @@ class MarketScanner:
                 continue
 
             atr14 = _calc_atr14(stock_data)
-            stop_loss = round(close - 1.5 * atr14, 2) if atr14 > 0 else None
-            take_profit = round(close + 3.0 * atr14, 2) if atr14 > 0 else None
+            stop_loss = round(close - stop_mult * atr14, 2) if atr14 > 0 else None
+            take_profit = round(close + target_mult * atr14, 2) if atr14 > 0 else None
 
             # SMA20 — 用 tail(20) 的平均收盤價
             sma20 = float(stock_data["close"].tail(20).mean())

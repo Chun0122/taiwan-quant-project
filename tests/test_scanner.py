@@ -1548,6 +1548,91 @@ class TestComputeEntryExitCols:
         assert "站上均線" in trigger
 
 
+class TestComputeEntryExitColsRegime:
+    """驗證 _compute_entry_exit_cols 的 Regime 自適應 ATR 倍數。"""
+
+    def _make_price_df(self, sid: str = "1000") -> pd.DataFrame:
+        """產生 20 天固定波動的日K，ATR14 = 4.0（high-low=4，無跳空）。"""
+        rows = []
+        for d in range(20):
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": 99.0,
+                    "high": 102.0,
+                    "low": 98.0,
+                    "close": 100.0,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_sideways_uses_default_multipliers(self, scanner):
+        """sideways → stop=entry-1.5×ATR，target=entry+3.0×ATR。"""
+        df = self._make_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df, regime="sideways")
+        row = result.iloc[0]
+        ep, sl, tp = row["entry_price"], row["stop_loss"], row["take_profit"]
+        atr = (ep - sl) / 1.5
+        assert tp == pytest.approx(ep + 3.0 * atr, abs=0.02)
+
+    def test_bull_wider_target(self, scanner):
+        """bull → target_mult=3.5，大於 sideways 的 3.0。"""
+        df = self._make_price_df()
+        res_bull = scanner._compute_entry_exit_cols(["1000"], df, regime="bull")
+        res_side = scanner._compute_entry_exit_cols(["1000"], df, regime="sideways")
+        # take_profit(bull) > take_profit(sideways)
+        assert res_bull.iloc[0]["take_profit"] > res_side.iloc[0]["take_profit"]
+        # stop_loss 相同（倍數相同）
+        assert res_bull.iloc[0]["stop_loss"] == pytest.approx(res_side.iloc[0]["stop_loss"], abs=0.02)
+
+    def test_bear_tighter_stop_and_target(self, scanner):
+        """bear → stop_mult=1.2、target_mult=2.5，止損更緊、目標更保守。"""
+        df = self._make_price_df()
+        res_bear = scanner._compute_entry_exit_cols(["1000"], df, regime="bear")
+        res_side = scanner._compute_entry_exit_cols(["1000"], df, regime="sideways")
+        ep_bear = res_bear.iloc[0]["entry_price"]
+        sl_bear = res_bear.iloc[0]["stop_loss"]
+        tp_bear = res_bear.iloc[0]["take_profit"]
+        ep_side = res_side.iloc[0]["entry_price"]
+        sl_side = res_side.iloc[0]["stop_loss"]
+        tp_side = res_side.iloc[0]["take_profit"]
+        # bear stop 更靠近 entry（止損距離更小）
+        assert (ep_bear - sl_bear) < (ep_side - sl_side)
+        # bear target 更保守（距離更小）
+        assert (tp_bear - ep_bear) < (tp_side - ep_side)
+
+    def test_unknown_regime_falls_back_to_sideways(self, scanner):
+        """未知 regime 字串 → fallback sideways（stop×1.5/target×3.0）。"""
+        df = self._make_price_df()
+        res_unknown = scanner._compute_entry_exit_cols(["1000"], df, regime="unknown_xyz")
+        res_side = scanner._compute_entry_exit_cols(["1000"], df, regime="sideways")
+        assert res_unknown.iloc[0]["stop_loss"] == pytest.approx(res_side.iloc[0]["stop_loss"], abs=0.02)
+        assert res_unknown.iloc[0]["take_profit"] == pytest.approx(res_side.iloc[0]["take_profit"], abs=0.02)
+
+    def test_regime_propagates_from_self(self, scanner):
+        """self.regime 設為 'bull' 後，_score_candidates 應採用 bull 倍數。"""
+        df_price = _make_entry_exit_price_df()
+        candidates = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "close": [df_price[df_price["stock_id"] == "1000"]["close"].iloc[-1]],
+                "volume": [500_000],
+            }
+        )
+        # 先以 sideways 取得基準
+        scanner.regime = "sideways"
+        res_side = scanner._score_candidates(candidates, df_price, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        # 再以 bull 取得結果
+        scanner.regime = "bull"
+        res_bull = scanner._score_candidates(candidates, df_price, pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        tp_side = res_side.iloc[0]["take_profit"]
+        tp_bull = res_bull.iloc[0]["take_profit"]
+        assert pd.notna(tp_bull) and pd.notna(tp_side)
+        assert tp_bull > tp_side
+
+
 class TestRankAndEnrichHasEntryExitCols:
     """驗證 _score_candidates 輸出含五個進出場欄位且值合理。"""
 
