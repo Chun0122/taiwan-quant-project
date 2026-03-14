@@ -31,6 +31,7 @@ from src.data.schema import (
     Announcement,
     BrokerTrade,
     DailyPrice,
+    FinancialStatement,
     HoldingDistribution,
     InstitutionalInvestor,
     MarginTrading,
@@ -786,6 +787,45 @@ class MarketScanner:
             result_rows.append(row)
 
         return pd.DataFrame(result_rows)
+
+    def _load_financial_data(self, stock_ids: list[str], quarters: int = 5) -> pd.DataFrame:
+        """從 DB 查詢最近 N 季財務資料（EPS / ROE / 毛利率 / 負債比）。
+
+        Args:
+            stock_ids: 限定查詢的股票清單
+            quarters: 每支股票取最近幾季（預設 5 季，足以計算 YoY + QoQ）
+
+        Returns:
+            DataFrame(stock_id, date, year, quarter, eps, roe, gross_margin, debt_ratio)
+            每支股票最多 quarters 筆，按 date desc 排列。無資料時回傳空 DataFrame。
+        """
+        _cols = ["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+        cutoff = date.today() - timedelta(days=quarters * 100)  # ~100 天/季，5 季 ≈ 500 天
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        FinancialStatement.stock_id,
+                        FinancialStatement.date,
+                        FinancialStatement.year,
+                        FinancialStatement.quarter,
+                        FinancialStatement.eps,
+                        FinancialStatement.roe,
+                        FinancialStatement.gross_margin,
+                        FinancialStatement.debt_ratio,
+                    )
+                    .where(
+                        FinancialStatement.stock_id.in_(stock_ids),
+                        FinancialStatement.date >= cutoff,
+                    )
+                    .order_by(FinancialStatement.stock_id, FinancialStatement.date.desc())
+                ).all()
+        except Exception:
+            return pd.DataFrame(columns=_cols)
+
+        if not rows:
+            return pd.DataFrame(columns=_cols)
+        return pd.DataFrame(rows, columns=_cols)
 
     def _load_announcement_data(self, stock_ids: list[str] | None = None, days: int = 10) -> pd.DataFrame:
         """從 DB 查詢近 N 日的 MOPS 重大訊息公告。
@@ -2835,27 +2875,81 @@ class ValueScanner(MarketScanner):
         return candidates
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """價值模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%。"""
-        if df_revenue.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+        """價值模式基本面：營收 40% + ROE 25% + 毛利率 QoQ 20% + EPS YoY 15%。
 
-        rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
-        if rev.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
-
-        yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
-        mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
-
-        if "prev_yoy_growth" in rev.columns:
-            rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["prev_yoy_growth"].fillna(0)
-            accel_rank = rev["acceleration"].rank(pct=True)
+        財報資料不足時自動降回營收單因子（YoY 70% + MoM 30%）。
+        """
+        # --- 營收基礎分（與 base class 相同）---
+        if not df_revenue.empty:
+            rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
         else:
-            accel_rank = pd.Series(0.5, index=rev.index)
+            rev = pd.DataFrame()
 
-        rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+        if not rev.empty:
+            yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
+            mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
+            rev["rev_base"] = yoy_rank * 0.70 + mom_rank * 0.30
+        else:
+            rev = pd.DataFrame({"stock_id": stock_ids, "rev_base": [0.5] * len(stock_ids)})
+
+        # --- 財報因子 ---
+        df_fin = self._load_financial_data(stock_ids, quarters=5)
+        if df_fin.empty:
+            # 降回純營收分
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+            result["fundamental_score"] = result["rev_base"].fillna(0.5)
+            return result[["stock_id", "fundamental_score"]]
+
+        # 計算每支股票財報指標
+        grouped = df_fin.groupby("stock_id", sort=False)
+        fin_rows = []
+        for sid in stock_ids:
+            row: dict = {"stock_id": sid, "roe_val": None, "gm_qoq": None, "eps_yoy": None}
+            if sid in grouped.groups:
+                grp = grouped.get_group(sid).sort_values("date", ascending=False)
+                # ROE：最新一季
+                if len(grp) >= 1 and pd.notna(grp.iloc[0]["roe"]):
+                    row["roe_val"] = float(grp.iloc[0]["roe"])
+                # 毛利率 QoQ：最新季 - 上一季
+                if len(grp) >= 2 and pd.notna(grp.iloc[0]["gross_margin"]) and pd.notna(grp.iloc[1]["gross_margin"]):
+                    row["gm_qoq"] = float(grp.iloc[0]["gross_margin"]) - float(grp.iloc[1]["gross_margin"])
+                # EPS YoY：最新季 vs 去年同季
+                if len(grp) >= 1 and pd.notna(grp.iloc[0]["eps"]):
+                    cur_q = int(grp.iloc[0]["quarter"])
+                    cur_y = int(grp.iloc[0]["year"])
+                    same_q = grp[(grp["quarter"] == cur_q) & (grp["year"] == cur_y - 1)]
+                    if not same_q.empty and pd.notna(same_q.iloc[0]["eps"]):
+                        prev_eps = float(same_q.iloc[0]["eps"])
+                        if abs(prev_eps) > 0.01:
+                            row["eps_yoy"] = (float(grp.iloc[0]["eps"]) - prev_eps) / abs(prev_eps)
+            fin_rows.append(row)
+
+        df_metrics = pd.DataFrame(fin_rows)
+        has_any = df_metrics[["roe_val", "gm_qoq", "eps_yoy"]].notna().any(axis=1).any()
+        if not has_any:
+            # 財報欄位全 NULL → 降回純營收分
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+            result["fundamental_score"] = result["rev_base"].fillna(0.5)
+            return result[["stock_id", "fundamental_score"]]
+
+        # 排名百分位（用 min_count=1 避免全 NaN 時 rank 失敗）
+        roe_rank = df_metrics["roe_val"].rank(pct=True).fillna(0.5)
+        gm_qoq_rank = df_metrics["gm_qoq"].rank(pct=True).fillna(0.5)
+        eps_yoy_rank = df_metrics["eps_yoy"].rank(pct=True).fillna(0.5)
+
+        # 合併營收基礎分
+        df_metrics = df_metrics.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+        df_metrics["rev_base"] = df_metrics["rev_base"].fillna(0.5)
+
+        # 加權：營收 40% + ROE 25% + 毛利率 QoQ 20% + EPS YoY 15%
+        df_metrics["fundamental_score"] = (
+            df_metrics["rev_base"] * 0.40 + roe_rank * 0.25 + gm_qoq_rank * 0.20 + eps_yoy_rank * 0.15
+        )
 
         result = pd.DataFrame({"stock_id": stock_ids})
-        result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+        result = result.merge(df_metrics[["stock_id", "fundamental_score"]], on="stock_id", how="left")
         return result
 
     def _compute_valuation_scores(self, stock_ids: list[str]) -> pd.DataFrame:
@@ -3195,27 +3289,71 @@ class DividendScanner(MarketScanner):
         return result
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """高息模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%。"""
-        if df_revenue.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+        """高息模式基本面：營收 40% + EPS 穩定性 35% + 配息率代理 25%。
 
-        rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
-        if rev.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
-
-        yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
-        mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
-
-        if "prev_yoy_growth" in rev.columns:
-            rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["prev_yoy_growth"].fillna(0)
-            accel_rank = rev["acceleration"].rank(pct=True)
+        EPS 穩定性 = 最近 4 季 EPS 標準差（越低越穩定，倒排）。
+        配息率代理 = 4 季中 EPS > 0 的比例（能穩定獲利才能持續配息）。
+        財報資料不足時自動降回營收單因子（YoY 70% + MoM 30%）。
+        """
+        # --- 營收基礎分 ---
+        if not df_revenue.empty:
+            rev = df_revenue[df_revenue["stock_id"].isin(stock_ids)].copy()
         else:
-            accel_rank = pd.Series(0.5, index=rev.index)
+            rev = pd.DataFrame()
 
-        rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+        if not rev.empty:
+            yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
+            mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
+            rev["rev_base"] = yoy_rank * 0.70 + mom_rank * 0.30
+        else:
+            rev = pd.DataFrame({"stock_id": stock_ids, "rev_base": [0.5] * len(stock_ids)})
+
+        # --- 財報因子（需要最近 4 季 EPS）---
+        df_fin = self._load_financial_data(stock_ids, quarters=5)
+        if df_fin.empty:
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+            result["fundamental_score"] = result["rev_base"].fillna(0.5)
+            return result[["stock_id", "fundamental_score"]]
+
+        grouped = df_fin.groupby("stock_id", sort=False)
+        fin_rows = []
+        for sid in stock_ids:
+            row: dict = {"stock_id": sid, "eps_std": None, "positive_eps_ratio": None}
+            if sid in grouped.groups:
+                grp = grouped.get_group(sid).sort_values("date", ascending=False).head(4)
+                eps_vals = grp["eps"].dropna().tolist()
+                if len(eps_vals) >= 2:
+                    row["eps_std"] = float(pd.Series(eps_vals).std())
+                    row["positive_eps_ratio"] = sum(1 for e in eps_vals if e > 0) / len(eps_vals)
+                elif len(eps_vals) == 1:
+                    row["eps_std"] = 0.0  # 只有 1 季，視為完全穩定
+                    row["positive_eps_ratio"] = 1.0 if eps_vals[0] > 0 else 0.0
+            fin_rows.append(row)
+
+        df_metrics = pd.DataFrame(fin_rows)
+        has_any = df_metrics[["eps_std", "positive_eps_ratio"]].notna().any(axis=1).any()
+        if not has_any:
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+            result["fundamental_score"] = result["rev_base"].fillna(0.5)
+            return result[["stock_id", "fundamental_score"]]
+
+        # EPS 穩定性：std 越低越好 → ascending=False（反向排名）
+        eps_stability_rank = df_metrics["eps_std"].rank(pct=True, ascending=False).fillna(0.5)
+        # 配息率代理：正 EPS 比例越高越好
+        payout_proxy_rank = df_metrics["positive_eps_ratio"].rank(pct=True).fillna(0.5)
+
+        df_metrics = df_metrics.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
+        df_metrics["rev_base"] = df_metrics["rev_base"].fillna(0.5)
+
+        # 加權：營收 40% + EPS 穩定性 35% + 配息率代理 25%
+        df_metrics["fundamental_score"] = (
+            df_metrics["rev_base"] * 0.40 + eps_stability_rank * 0.35 + payout_proxy_rank * 0.25
+        )
 
         result = pd.DataFrame({"stock_id": stock_ids})
-        result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+        result = result.merge(df_metrics[["stock_id", "fundamental_score"]], on="stock_id", how="left")
         return result
 
     def _compute_chip_scores(
@@ -3588,7 +3726,12 @@ class GrowthScanner(MarketScanner):
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """高成長模式基本面 2 因子：YoY 60% + 營收加速度 40%（本月 YoY - 3 個月前 YoY）。"""
+        """高成長模式基本面：YoY 40% + 營收加速度 25% + 毛利率加速 20% + EPS 季增率 15%。
+
+        毛利率加速 = 最新季毛利率 - 去年同季毛利率（年對年改善）。
+        EPS 季增率 = (EPS 最新季 - EPS 上季) / abs(EPS 上季)。
+        財報資料不足時自動降回營收雙因子（YoY 60% + 加速度 40%）。
+        """
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
@@ -3597,17 +3740,79 @@ class GrowthScanner(MarketScanner):
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
         yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
-
         if "yoy_3m_ago" in rev.columns:
             rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["yoy_3m_ago"].fillna(0)
             accel_rank = rev["acceleration"].rank(pct=True)
         else:
             accel_rank = pd.Series(0.5, index=rev.index)
 
-        rev["fundamental_score"] = yoy_rank * 0.60 + accel_rank * 0.40
+        # --- 財報因子 ---
+        df_fin = self._load_financial_data(stock_ids, quarters=5)
+        if df_fin.empty:
+            # 降回純營收雙因子
+            rev["fundamental_score"] = yoy_rank * 0.60 + accel_rank * 0.40
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+            return result
+
+        grouped = df_fin.groupby("stock_id", sort=False)
+        fin_rows = []
+        for sid in stock_ids:
+            row: dict = {"stock_id": sid, "gm_accel": None, "eps_qoq": None}
+            if sid in grouped.groups:
+                grp = grouped.get_group(sid).sort_values("date", ascending=False)
+                # 毛利率加速 = 最新季 - 去年同季
+                if len(grp) >= 1 and pd.notna(grp.iloc[0]["gross_margin"]):
+                    cur_q = int(grp.iloc[0]["quarter"])
+                    cur_y = int(grp.iloc[0]["year"])
+                    same_q = grp[(grp["quarter"] == cur_q) & (grp["year"] == cur_y - 1)]
+                    if not same_q.empty and pd.notna(same_q.iloc[0]["gross_margin"]):
+                        row["gm_accel"] = float(grp.iloc[0]["gross_margin"]) - float(same_q.iloc[0]["gross_margin"])
+                # EPS 季增率 = (最新 - 上季) / abs(上季)
+                if (
+                    len(grp) >= 2
+                    and pd.notna(grp.iloc[0]["eps"])
+                    and pd.notna(grp.iloc[1]["eps"])
+                    and abs(float(grp.iloc[1]["eps"])) > 0.01
+                ):
+                    row["eps_qoq"] = (float(grp.iloc[0]["eps"]) - float(grp.iloc[1]["eps"])) / abs(
+                        float(grp.iloc[1]["eps"])
+                    )
+            fin_rows.append(row)
+
+        df_metrics = pd.DataFrame(fin_rows)
+        has_any = df_metrics[["gm_accel", "eps_qoq"]].notna().any(axis=1).any()
+        if not has_any:
+            rev["fundamental_score"] = yoy_rank * 0.60 + accel_rank * 0.40
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+            return result
+
+        gm_accel_rank = df_metrics["gm_accel"].rank(pct=True).fillna(0.5)
+        eps_qoq_rank = df_metrics["eps_qoq"].rank(pct=True).fillna(0.5)
+
+        # 將財報指標合進 rev（以 stock_id 對齊）
+        df_metrics = df_metrics.merge(
+            rev[["stock_id", "yoy_growth"] + (["acceleration"] if "acceleration" in rev.columns else [])],
+            on="stock_id",
+            how="left",
+        )
+        df_metrics["yoy_growth"] = df_metrics["yoy_growth"].fillna(0)
+        df_metrics["yoy_rank_val"] = df_metrics["yoy_growth"].rank(pct=True)
+        if "acceleration" in df_metrics.columns:
+            df_metrics["accel_rank_val"] = df_metrics["acceleration"].rank(pct=True).fillna(0.5)
+        else:
+            df_metrics["accel_rank_val"] = 0.5
+
+        df_metrics["fundamental_score"] = (
+            df_metrics["yoy_rank_val"] * 0.40
+            + df_metrics["accel_rank_val"] * 0.25
+            + gm_accel_rank * 0.20
+            + eps_qoq_rank * 0.15
+        )
 
         result = pd.DataFrame({"stock_id": stock_ids})
-        result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+        result = result.merge(df_metrics[["stock_id", "fundamental_score"]], on="stock_id", how="left")
         return result
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:

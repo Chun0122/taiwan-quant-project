@@ -1860,3 +1860,378 @@ class TestComputeNewsScores:
         )
         result = scanner._compute_news_scores(["1000", "2000", "3000"], ann)
         assert result["news_score"].between(0.0, 1.0).all()
+
+
+# ====================================================================== #
+#  財報因子整合測試（Task 39）
+# ====================================================================== #
+
+
+def _make_fin_df(rows: list[dict]) -> pd.DataFrame:
+    """建立 _load_financial_data() 回傳格式的財報 DataFrame。"""
+    defaults = {
+        "stock_id": "1000",
+        "date": date(2024, 12, 31),
+        "year": 2024,
+        "quarter": 4,
+        "eps": None,
+        "roe": None,
+        "gross_margin": None,
+        "debt_ratio": None,
+    }
+    result = []
+    for r in rows:
+        row = dict(defaults)
+        row.update(r)
+        result.append(row)
+    return pd.DataFrame(result)
+
+
+class TestValueFinancialFundamentalScores:
+    """ValueScanner 財報因子整合測試。"""
+
+    def _make_revenue(self):
+        return pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [15.0, 10.0],
+                "mom_growth": [5.0, 5.0],
+            }
+        )
+
+    def test_high_roe_improves_score(self, value_scanner):
+        """高 ROE 股票在財報整合後應得到更高基本面分數。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                {
+                    "stock_id": "1000",
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 5.0,
+                    "roe": 25.0,
+                    "gross_margin": 40.0,
+                    "debt_ratio": 30.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 4.5,
+                    "roe": 22.0,
+                    "gross_margin": 38.0,
+                    "debt_ratio": 30.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2023, 12, 31),
+                    "year": 2023,
+                    "quarter": 4,
+                    "eps": 3.0,
+                    "roe": 18.0,
+                    "gross_margin": 35.0,
+                    "debt_ratio": 35.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 1.0,
+                    "roe": 5.0,
+                    "gross_margin": 20.0,
+                    "debt_ratio": 60.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 1.2,
+                    "roe": 6.0,
+                    "gross_margin": 21.0,
+                    "debt_ratio": 60.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2023, 12, 31),
+                    "year": 2023,
+                    "quarter": 4,
+                    "eps": 0.8,
+                    "roe": 4.0,
+                    "gross_margin": 19.0,
+                    "debt_ratio": 62.0,
+                },
+            ]
+        )
+        value_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = value_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_fallback_no_financial_data(self, value_scanner):
+        """無財報資料時應降回純營收分（不崩潰，分數在 0~1）。"""
+        df_revenue = self._make_revenue()
+        value_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
+            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+        )
+        result = value_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert "fundamental_score" in result.columns
+        assert result["fundamental_score"].between(0.0, 1.0).all()
+        scores = result.set_index("stock_id")["fundamental_score"]
+        # 高 YoY(1000) 應仍優於低 YoY(1001)
+        assert scores["1000"] > scores["1001"]
+
+    def test_gm_qoq_improvement_rewarded(self, value_scanner):
+        """毛利率 QoQ 改善（本季 > 上季）應在同等條件下得到更高分數。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [10.0, 10.0],
+                "mom_growth": [5.0, 5.0],
+            }
+        )
+        fin_df = _make_fin_df(
+            [
+                # 1000: 毛利率改善 (35 → 40)
+                {"stock_id": "1000", "year": 2024, "quarter": 4, "eps": 3.0, "roe": 15.0, "gross_margin": 40.0},
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 3.0,
+                    "roe": 15.0,
+                    "gross_margin": 35.0,
+                },
+                # 1001: 毛利率下滑 (40 → 35)
+                {"stock_id": "1001", "year": 2024, "quarter": 4, "eps": 3.0, "roe": 15.0, "gross_margin": 35.0},
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 3.0,
+                    "roe": 15.0,
+                    "gross_margin": 40.0,
+                },
+            ]
+        )
+        value_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = value_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_output_schema(self, value_scanner):
+        """回傳應有 stock_id + fundamental_score 兩欄。"""
+        value_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
+            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+        )
+        result = value_scanner._compute_fundamental_scores(
+            ["1000", "1001"],
+            pd.DataFrame({"stock_id": ["1000", "1001"], "yoy_growth": [5.0, 3.0], "mom_growth": [1.0, 1.0]}),
+        )
+        assert set(result.columns) >= {"stock_id", "fundamental_score"}
+        assert len(result) == 2
+
+
+class TestDividendFinancialFundamentalScores:
+    """DividendScanner 財報因子整合測試（EPS 穩定性 + 配息率代理）。"""
+
+    def _make_revenue(self):
+        return pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [10.0, 10.0],
+                "mom_growth": [5.0, 5.0],
+            }
+        )
+
+    def test_stable_eps_rewarded(self, dividend_scanner):
+        """EPS 穩定（低標準差）的股票基本面分數應優於波動大的股票。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: EPS 穩定 (2.0, 2.1, 2.0, 1.9)
+                {"stock_id": "1000", "date": date(2024, 12, 31), "year": 2024, "quarter": 4, "eps": 2.0},
+                {"stock_id": "1000", "date": date(2024, 9, 30), "year": 2024, "quarter": 3, "eps": 2.1},
+                {"stock_id": "1000", "date": date(2024, 6, 30), "year": 2024, "quarter": 2, "eps": 2.0},
+                {"stock_id": "1000", "date": date(2024, 3, 31), "year": 2024, "quarter": 1, "eps": 1.9},
+                # 1001: EPS 波動大 (5.0, -1.0, 3.0, -2.0)
+                {"stock_id": "1001", "date": date(2024, 12, 31), "year": 2024, "quarter": 4, "eps": 5.0},
+                {"stock_id": "1001", "date": date(2024, 9, 30), "year": 2024, "quarter": 3, "eps": -1.0},
+                {"stock_id": "1001", "date": date(2024, 6, 30), "year": 2024, "quarter": 2, "eps": 3.0},
+                {"stock_id": "1001", "date": date(2024, 3, 31), "year": 2024, "quarter": 1, "eps": -2.0},
+            ]
+        )
+        dividend_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = dividend_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_positive_eps_payout_proxy(self, dividend_scanner):
+        """全正 EPS 的股票配息代理分數應優於含負 EPS 的股票。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: 4 季全正 EPS
+                {"stock_id": "1000", "date": date(2024, 12, 31), "year": 2024, "quarter": 4, "eps": 2.0},
+                {"stock_id": "1000", "date": date(2024, 9, 30), "year": 2024, "quarter": 3, "eps": 2.0},
+                {"stock_id": "1000", "date": date(2024, 6, 30), "year": 2024, "quarter": 2, "eps": 2.0},
+                {"stock_id": "1000", "date": date(2024, 3, 31), "year": 2024, "quarter": 1, "eps": 2.0},
+                # 1001: 含 2 季負 EPS
+                {"stock_id": "1001", "date": date(2024, 12, 31), "year": 2024, "quarter": 4, "eps": 3.0},
+                {"stock_id": "1001", "date": date(2024, 9, 30), "year": 2024, "quarter": 3, "eps": -1.0},
+                {"stock_id": "1001", "date": date(2024, 6, 30), "year": 2024, "quarter": 2, "eps": 2.0},
+                {"stock_id": "1001", "date": date(2024, 3, 31), "year": 2024, "quarter": 1, "eps": -0.5},
+            ]
+        )
+        dividend_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = dividend_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_fallback_no_financial_data(self, dividend_scanner):
+        """無財報資料時降回純營收分，不崩潰。"""
+        df_revenue = self._make_revenue()
+        dividend_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
+            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+        )
+        result = dividend_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert "fundamental_score" in result.columns
+        assert result["fundamental_score"].between(0.0, 1.0).all()
+
+
+class TestGrowthFinancialFundamentalScores:
+    """GrowthScanner 財報因子整合測試（毛利率加速 + EPS 季增率）。"""
+
+    def _make_revenue(self):
+        return pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [25.0, 25.0],
+                "mom_growth": [5.0, 5.0],
+                "yoy_3m_ago": [15.0, 15.0],  # 兩者加速度相同
+            }
+        )
+
+    def test_gm_acceleration_rewarded(self, growth_scanner):
+        """毛利率 YoY 加速（改善）的股票基本面分數應優於惡化的股票。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: 毛利率 YoY 改善 (Q4 2024 vs Q4 2023: 40 vs 30 → +10)
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 5.0,
+                    "gross_margin": 40.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 4.5,
+                    "gross_margin": 38.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2023, 12, 31),
+                    "year": 2023,
+                    "quarter": 4,
+                    "eps": 3.0,
+                    "gross_margin": 30.0,
+                },
+                # 1001: 毛利率 YoY 惡化 (Q4 2024 vs Q4 2023: 25 vs 35 → -10)
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 5.0,
+                    "gross_margin": 25.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 4.5,
+                    "gross_margin": 28.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2023, 12, 31),
+                    "year": 2023,
+                    "quarter": 4,
+                    "eps": 3.0,
+                    "gross_margin": 35.0,
+                },
+            ]
+        )
+        growth_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_eps_qoq_growth_rewarded(self, growth_scanner):
+        """EPS 季增率正成長應優於季衰退。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: EPS QoQ 成長 (3.0 → 5.0)
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 5.0,
+                    "gross_margin": 35.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 3.0,
+                    "gross_margin": 34.0,
+                },
+                # 1001: EPS QoQ 衰退 (5.0 → 3.0)
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "eps": 3.0,
+                    "gross_margin": 35.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "eps": 5.0,
+                    "gross_margin": 34.0,
+                },
+            ]
+        )
+        growth_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_fallback_no_financial_data(self, growth_scanner):
+        """無財報資料時降回 YoY+加速度（原邏輯），不崩潰。"""
+        df_revenue = self._make_revenue()
+        growth_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
+            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+        )
+        result = growth_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert "fundamental_score" in result.columns
+        assert result["fundamental_score"].between(0.0, 1.0).all()
+        # 原邏輯：相同 YoY + 相同加速度 → 分數應相近
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert abs(scores["1000"] - scores["1001"]) < 0.01
