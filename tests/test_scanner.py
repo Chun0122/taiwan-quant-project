@@ -512,8 +512,8 @@ class TestChipTier:
         result = scanner._compute_chip_scores(sids, df_inst, None, None)
         assert all(result["chip_tier"] == "2F")
 
-    def test_chip_tier_in_rankings_columns(self, momentum_scanner):
-        """chip_tier 欄位應出現在 _rank_and_enrich 輸出中。"""
+    def test_chip_tier_in_rankings_columns(self, momentum_scanner, db_session):
+        """chip_tier 欄位應出現在 _rank_and_enrich 輸出中（需 db_session 建立 stock_info 表）。"""
         scored = pd.DataFrame(
             {
                 "rank": [1, 2],
