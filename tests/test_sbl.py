@@ -314,10 +314,7 @@ def momentum_scanner():
 def _make_sbl_df(stock_ids: list[str], balances: list[int]) -> pd.DataFrame:
     """建立測試用 SBL DataFrame（最新一日，各股不同可借券賣出股數）。"""
     dt = date.today()
-    rows = [
-        {"date": dt, "stock_id": sid, "sbl_balance": bal}
-        for sid, bal in zip(stock_ids, balances)
-    ]
+    rows = [{"date": dt, "stock_id": sid, "sbl_balance": bal} for sid, bal in zip(stock_ids, balances)]
     return pd.DataFrame(rows)
 
 
