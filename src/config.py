@@ -33,12 +33,18 @@ class DiscordWebhookConfig(BaseModel):
     enabled: bool = True
 
 
+class AnthropicConfig(BaseModel):
+    api_key: str = ""
+    model: str = "claude-sonnet-4-6"
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
     fetcher: FetcherConfig = FetcherConfig()
     logging: LoggingConfig = LoggingConfig()
     discord: DiscordWebhookConfig = DiscordWebhookConfig()
+    anthropic: AnthropicConfig = AnthropicConfig()
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:

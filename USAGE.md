@@ -730,6 +730,10 @@ python main.py discover all --skip-sync --export compare.csv
 # 啟用週線多時框確認（週線多頭 +5%，週線空頭 -5%）
 python main.py discover momentum --weekly-confirm
 python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
+
+# 啟用 AI 選股摘要（需設定 anthropic.api_key）
+python main.py discover momentum --skip-sync --ai-summary
+python main.py discover swing --top 20 --ai-summary --notify
 ```
 
 每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。`all` 模式會將五個模式分別存入 DB。
@@ -748,6 +752,7 @@ python main.py discover all --skip-sync --weekly-confirm --min-appearances 2
 | `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名，單模式有效） |
 | `--min-appearances N` | [all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示） |
 | `--weekly-confirm` | 啟用週線多時框確認：從 DB 讀取近 90 天日K 聚合週K，SMA13 + RSI14 週線信號同為多頭 → composite_score ×1.05（+5%），同為空頭 → ×0.95（-5%），預設關閉 |
+| `--ai-summary` | 掃描完成後呼叫 Claude API（`claude-sonnet-4-6`）生成約 300 字繁體中文摘要（市場狀態分析 + 前三名亮點 + 風險提示），需在 `config/settings.yaml` 設定 `anthropic.api_key` |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 

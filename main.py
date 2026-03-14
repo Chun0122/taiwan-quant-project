@@ -925,6 +925,17 @@ def cmd_discover(args: argparse.Namespace) -> None:
         result.rankings.to_csv(args.export, index=False)
         print(f"\n結果已匯出至: {args.export}")
 
+    # AI 選股摘要
+    if getattr(args, "ai_summary", False):
+        from src.report.ai_report import generate_ai_summary
+
+        regime = getattr(scanner, "regime", "sideways")
+        print(f"\n{'─' * 80}")
+        print("[ AI 選股摘要 ]")
+        summary = generate_ai_summary(result, regime=regime, top_stocks=result.rankings.head(args.top))
+        print(summary)
+        print(f"{'─' * 80}")
+
     # Discord 通知
     if args.notify:
         from src.notification.line_notify import send_message
@@ -3370,6 +3381,12 @@ def main() -> None:
         action="store_true",
         default=False,
         help="啟用週線多時框確認（週線多頭 +5%%，週線空頭 -5%%，預設關閉）",
+    )
+    sp_disc.add_argument(
+        "--ai-summary",
+        action="store_true",
+        default=False,
+        help="呼叫 Claude API 生成 AI 選股摘要（需在 settings.yaml 設定 anthropic.api_key）",
     )
 
     # discover-backtest 子命令

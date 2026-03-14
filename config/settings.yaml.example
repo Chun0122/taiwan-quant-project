@@ -22,6 +22,12 @@ fetcher:
 logging:
   level: "INFO"
 
+# Anthropic Claude API 設定（AI 選股摘要功能，--ai-summary 旗標需要）
+# 在 https://console.anthropic.com 取得 API Key
+anthropic:
+  api_key: ""                      # 請填入你的 Anthropic API Key
+  model: "claude-sonnet-4-6"       # 可選：claude-opus-4-6（最強）/ claude-sonnet-4-6（預設）/ claude-haiku-4-5-20251001（最快）
+
 # Discord Webhook 通知設定
 # 在 Discord 頻道設定 → 整合 → Webhook → 建立 Webhook，複製 URL
 discord:

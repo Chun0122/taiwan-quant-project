@@ -33,6 +33,9 @@ schedule>=1.2.0
 scikit-learn>=1.3.0
 xgboost>=2.0.0  # 可選，未安裝時 fallback 到 Random Forest
 
+# Claude AI (P30)
+anthropic>=0.40.0
+
 # Testing & Linting
 pytest>=7.4.0
 pytest-mock>=3.12.0
