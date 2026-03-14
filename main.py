@@ -1517,26 +1517,31 @@ def cmd_sync_sbl(args: argparse.Namespace) -> None:
 def cmd_sync_broker(args: argparse.Namespace) -> None:
     """同步分點交易資料（FinMind TaiwanStockTradingDailyReport）。
 
-    --watchlist-bootstrap：一次性對所有 watchlist 股票補齊最大可用歷史資料。
-      FinMind 免費帳號約可取得近 30~60 天；付費帳號可取更長歷史。
-      建議在首次部署或新增股票到 watchlist 後執行一次。
+    --watchlist-bootstrap：一次性對所有 watchlist 股票逐日補齊歷史分點資料。
+      DJ 端點每次呼叫僅回傳期間彙整（date=end），因此改為逐日查詢（start=d, end=d），
+      使每個交易日產生獨立記錄，達到 Smart Broker 8F 所需的 min_trading_days=20。
+      預設補齊最近 30 個交易日（約 45 分鐘），建議首次部署或新增 watchlist 股票後執行。
     """
-    from src.data.pipeline import sync_broker_trades
+    from src.data.pipeline import sync_broker_bootstrap, sync_broker_trades
 
     stock_ids = args.stocks if args.stocks else None
     days = getattr(args, "days", 5)
 
-    # --watchlist-bootstrap：以最大天數（120天）補齊 watchlist 全部股票
+    # --watchlist-bootstrap：逐日補齊 watchlist 股票的分點歷史（啟用 8F）
     if getattr(args, "watchlist_bootstrap", False):
         from src.data.database import get_effective_watchlist
 
-        bootstrap_days = getattr(args, "days", 120)
+        bootstrap_days = getattr(args, "days", 30)
         watchlist = get_effective_watchlist()
         target_ids = stock_ids if stock_ids else watchlist
-        print(f"[Bootstrap] 對 {len(target_ids)} 支 watchlist 股票補齊最近 {bootstrap_days} 天分點歷史...")
-        print("  （FinMind 免費帳號約可取得 30~60 天，付費帳號可取更長歷史）")
-        count = sync_broker_trades(stock_ids=target_ids, days=bootstrap_days)
-        print(f"\n分點 Bootstrap 完成: {count:,} 筆")
+        print(f"[Bootstrap] 對 {len(target_ids)} 支股票逐日補齊最近 {bootstrap_days} 個交易日分點歷史...")
+        print(
+            f"  預估時間：{len(target_ids)} 支 × {bootstrap_days} 天 × 3s ≈ {len(target_ids) * bootstrap_days * 3 // 60} 分鐘"
+        )
+        print("  （已存在的日期自動跳過，可中斷後重跑）")
+        count = sync_broker_bootstrap(stock_ids=target_ids, days=bootstrap_days)
+        print(f"\n分點 Bootstrap 完成: {count:,} 筆（{bootstrap_days} 個交易日）")
+        print("  若筆數 > 0，watchlist 股票已可使用 Smart Broker 8F 評分")
         return
 
     if getattr(args, "from_discover", False):
@@ -3414,7 +3419,7 @@ def main() -> None:
     sp_broker.add_argument(
         "--watchlist-bootstrap",
         action="store_true",
-        help="一次性補齊 watchlist 所有股票最大可用歷史分點資料（預設 120 日，受 FinMind 帳號限制）",
+        help="一次性逐日補齊 watchlist 所有股票分點歷史（預設 30 個交易日），啟用 Smart Broker 8F",
     )
 
     # alert-check 子命令

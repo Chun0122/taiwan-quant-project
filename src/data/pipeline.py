@@ -576,6 +576,96 @@ def sync_broker_for_stocks(stock_ids: list[str]) -> int:
     return sync_broker_trades(stock_ids=stock_ids, days=7)
 
 
+def sync_broker_bootstrap(
+    stock_ids: list[str] | None = None,
+    days: int = 30,
+) -> int:
+    """逐日補齊分點交易歷史（Bootstrap 模式，用於啟用 Smart Broker 8F）。
+
+    DJ 端點每次呼叫只回傳期間彙整（date = end），因此普通的 sync_broker_trades()
+    無論 days 多大，每次都只增加 1 個 date 記錄。本函數改為對每個交易日分別呼叫
+    DJ 端點（start=d, end=d），使每日產生獨立的 date 記錄，累積後達到
+    _load_broker_data_extended() 的 min_trading_days=20 門檻，啟用 8F。
+
+    交易日來源：從 DailyPrice 查詢過去 days 天內的實際有成交日期（自動排除假日）。
+    若 DailyPrice 無資料，退回使用平日曆法（跳過週末）。
+
+    Args:
+        stock_ids: 指定股票清單，預設使用 watchlist
+        days:      補齊最近幾個交易日（預設 30，建議 ≥ 20 以啟用 8F）
+
+    Returns:
+        新增的分點交易總筆數
+
+    時間估算（30 支 × 30 天 × 3s = 45 分鐘）：僅適合一次性部署使用。
+    """
+    from src.data.twse_fetcher import fetch_dj_broker_trades
+
+    if stock_ids is None:
+        stock_ids = get_effective_watchlist()
+
+    init_db()
+    cutoff = date.today() - timedelta(days=days + 5)
+
+    # 取得過去 days 天的實際交易日（從 DailyPrice 查任意有資料的股票）
+    trading_dates: list[date] = []
+    try:
+        with get_session() as session:
+            rows = (
+                session.execute(
+                    select(DailyPrice.date)
+                    .where(DailyPrice.date >= cutoff)
+                    .group_by(DailyPrice.date)
+                    .order_by(DailyPrice.date.desc())
+                    .limit(days)
+                )
+                .scalars()
+                .all()
+            )
+        trading_dates = list(rows)
+    except Exception:
+        pass
+
+    # Fallback：若 DailyPrice 無資料，用平日曆法（跳過週末）
+    if not trading_dates:
+        d = date.today()
+        while len(trading_dates) < days:
+            if d.weekday() < 5:  # 週一至週五
+                trading_dates.append(d)
+            d -= timedelta(days=1)
+
+    if not trading_dates:
+        logger.warning("[Bootstrap] 無法確定交易日，放棄")
+        return 0
+
+    logger.info("[Bootstrap] 對 %d 支股票逐日補齊最近 %d 個交易日...", len(stock_ids), len(trading_dates))
+    total = 0
+    for sid in stock_ids:
+        sid_total = 0
+        for trading_day in trading_dates:  # 從新到舊
+            # 已存在此日資料則跳過（UniqueConstraint 天然去重，此處加速判斷）
+            with get_session() as session:
+                existing = session.execute(
+                    select(func.count())
+                    .select_from(BrokerTrade)
+                    .where(BrokerTrade.stock_id == sid, BrokerTrade.date == trading_day)
+                ).scalar()
+            if existing and existing > 0:
+                continue
+
+            df = fetch_dj_broker_trades(sid, trading_day, trading_day)
+            if not df.empty:
+                n = _upsert_broker_trade(df)
+                sid_total += n
+
+        if sid_total > 0:
+            logger.info("[Bootstrap] %s 補齊 %d 筆", sid, sid_total)
+        total += sid_total
+
+    logger.info("[Bootstrap] 完成，總計新增 %d 筆", total)
+    return total
+
+
 def sync_stock(
     stock_id: str,
     start_date: str | None = None,

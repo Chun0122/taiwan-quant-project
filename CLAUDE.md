@@ -145,7 +145,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_holding.py`        | `_extract_level_lower_bound` + `compute_whale_score` + `HoldingDistribution` ORM + `fetch_holding_distribution` | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
-| `tests/test_broker.py`         | `fetch_dj_broker_trades` HTML 解析（Big5/BHID/多分點彙整/單位換算）+ `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 + `TestLoadBrokerDataExtendedCloseProxy` 收盤價代理均價（NULL 填補/不覆蓋/無資料降回 7F） | 純函數 + in-memory SQLite + mock HTTP |
+| `tests/test_broker.py`         | `fetch_dj_broker_trades` HTML 解析（Big5/BHID/多分點彙整/單位換算）+ `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 + `TestLoadBrokerDataExtendedCloseProxy` 收盤價代理均價（NULL 填補/不覆蓋/無資料降回 7F）+ `TestSyncBrokerBootstrap` 逐日查詢簽名/獨立性/預設值/單日 vs 期間 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_anomaly.py`        | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數（量能暴增/外資大買超/借券激增/主力集中）| 純函數 |
 | `tests/test_attribution.py`    | `FactorAttribution.compute()` / `compute_from_df()` 五因子歸因（momentum/reversal/quality/size/liquidity）純函數測試 | 純函數 |
 
@@ -289,6 +289,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 32 | ✅ | **Smart Broker 自適應歷史累積** | `_load_broker_data_extended()` 查詢窗口改 365 天（充分利用 daily sync 累積），新增 `min_trading_days=20` 過濾（≥20 交易日才啟用 8F）；morning-routine Step 2 拆為兩次：2a `sync-broker`（watchlist 全部，確保每日累積）+ 2b `sync-broker --from-discover`（僅非 watchlist 新發現股）；`sync-broker --watchlist-bootstrap` 新旗標供首次部署時一次性補齊最大歷史；更新 `--from-discover` 排除已在 watchlist 的股票避免重複呼叫；`TestLoadBrokerDataExtendedAdaptive` 5 個新測試；756 測試通過 |
 | 33 | ✅ | **分點資料來源切換：FinMind → DJ 端點** | FinMind 免費帳號已不提供 `TaiwanStockTradingDailyReport`，`sync-broker` 回傳 0 筆。改用 DJ 分點端點（fubon-ebrokerdj.fbs.com.tw，免費，Big5 HTML）；`fetch_dj_broker_trades(stock_id, start, end)` 新增至 `twse_fetcher.py`（Big5 解碼 + regex 解析 BHID + 多分點彙整 + 張→股 ×1000）；`sync_broker_trades()` 改呼叫新函數（移除 FinMind fetcher 依賴）；Smart Broker（8F）因無均價資料自動降至 7F；`TestFetchDJBrokerTrades` 8 個新測試；764 測試通過 |
 | 34 | ✅ | **Smart Broker 均價代理（方案 B）：以 DailyPrice 收盤價啟用 8F** | `_load_broker_data_extended()`（scanner.py）新增均價代理策略：當 BrokerTrade.buy_price / sell_price 為 NULL 時，JOIN DailyPrice 以同日收盤價填補，使 Smart Broker 8F 計算得以啟用；已有真實均價時不覆蓋；DailyPrice 無資料時保持 NULL（系統降回 7F）；修正 FutureWarning（`.astype("float64").fillna()`）；新增 `TestLoadBrokerDataExtendedCloseProxy` 4 個測試；768 測試通過 |
+| 35 | ✅ | **Bootstrap 逐日補齊（啟用 8F 歷史）** | `sync_broker_bootstrap(stock_ids, days=30)`（pipeline.py）逐日查詢 DJ 端點（start=d, end=d），每次呼叫產生獨立 date 記錄，累積 ≥20 交易日後啟用 8F；從 DailyPrice 取交易日清單（fallback 工作日曆）；跳過 DB 已有資料的日期；`--watchlist-bootstrap` 改用逐日查詢（預設 30 天，可 `--days` 指定）；`main.py` 顯示預估時間；`TestSyncBrokerBootstrap` 4 個新測試；772 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

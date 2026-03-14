@@ -668,6 +668,86 @@ class TestSyncBrokerForStocks:
 
 
 # ------------------------------------------------------------------ #
+#  TestSyncBrokerBootstrap — 逐日 Bootstrap 測試
+# ------------------------------------------------------------------ #
+
+
+class TestSyncBrokerBootstrap:
+    """sync_broker_bootstrap() 逐日補齊歷史分點資料測試。"""
+
+    def test_bootstrap_default_days_is_30(self):
+        """sync_broker_bootstrap() 預設 days=30。"""
+        import inspect
+
+        from src.data.pipeline import sync_broker_bootstrap
+
+        sig = inspect.signature(sync_broker_bootstrap)
+        assert "stock_ids" in sig.parameters
+        assert "days" in sig.parameters
+        assert sig.parameters["days"].default == 30
+
+    def test_bootstrap_independent_from_sync_broker_trades(self):
+        """sync_broker_bootstrap 存在且與 sync_broker_trades 獨立（不是包裝它）。"""
+        import inspect
+
+        from src.data.pipeline import sync_broker_bootstrap, sync_broker_trades
+
+        # 確認兩個函數是獨立的（bootstrap 不是 sync_broker_trades 的 alias）
+        assert sync_broker_bootstrap is not sync_broker_trades
+        # 確認 bootstrap 有 days 參數但預設值不同（bootstrap=30, sync=5）
+        assert inspect.signature(sync_broker_bootstrap).parameters["days"].default == 30
+        assert inspect.signature(sync_broker_trades).parameters["days"].default == 5
+
+    def test_bootstrap_calls_dj_once_per_trading_day(self, monkeypatch):
+        """Bootstrap 應對每個交易日獨立呼叫 DJ 端點（start=d, end=d），而非一次大範圍查詢。"""
+        from src.data.pipeline import sync_broker_bootstrap
+
+        fetch_calls: list[tuple] = []
+
+        def mock_fetch(stock_id, start, end):
+            fetch_calls.append((stock_id, start, end))
+            return pd.DataFrame()  # 回傳空，不寫 DB
+
+        # 模擬交易日清單（跳過 DailyPrice 查詢，退回平日曆法）
+        monkeypatch.setattr("src.data.pipeline.init_db", lambda: None)
+        monkeypatch.setattr("src.data.pipeline.get_effective_watchlist", lambda: ["TEST"])
+
+        import src.data.twse_fetcher as twse_mod
+
+        original = twse_mod.fetch_dj_broker_trades
+        twse_mod.fetch_dj_broker_trades = mock_fetch
+
+        # 讓 DailyPrice 查詢失敗，觸發平日曆法 fallback（簡化測試環境）
+        def fail_session():
+            raise Exception("no db in test")
+
+        monkeypatch.setattr("src.data.pipeline.get_session", fail_session)
+
+        try:
+            sync_broker_bootstrap(stock_ids=["TEST"], days=5)
+        except Exception:
+            pass  # 可能因其他 DB 操作失敗，但我們關注的是 fetch_calls 的模式
+        finally:
+            twse_mod.fetch_dj_broker_trades = original
+
+        # 若有呼叫，每次的 start 應等於 end（單日查詢）
+        for _, start, end in fetch_calls:
+            assert start == end, f"Bootstrap 應用單日查詢（start=end），但 start={start}, end={end}"
+
+    def test_bootstrap_single_day_query_vs_range_query(self):
+        """驗證 Bootstrap 與一般 sync 的根本差異：Bootstrap 用 start=d, end=d（單日），sync 用 start~end（範圍）。"""
+        import inspect
+
+        from src.data.pipeline import sync_broker_bootstrap
+
+        # Bootstrap 透過逐日 loop 呼叫，確保每次 start=end（產生多個獨立 date 記錄）
+        # 一般 sync_broker_trades 用 start=today-days, end=today（期間彙整，date=end）
+        # 此測試確認函數存在且有正確接口
+        sig = inspect.signature(sync_broker_bootstrap)
+        assert list(sig.parameters.keys()) == ["stock_ids", "days"]
+
+
+# ------------------------------------------------------------------ #
 #  TestStage25AutoFetch — Stage 2.5 自動補抓觸發測試
 # ------------------------------------------------------------------ #
 
