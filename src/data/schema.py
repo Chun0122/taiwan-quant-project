@@ -455,6 +455,7 @@ class DiscoveryRecord(Base):
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)  # 止利價（entry + 3×ATR14）
     entry_trigger: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 進場觸發條件說明
     valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)  # 建議有效日（+5 工作日）
+    chip_tier: Mapped[str | None] = mapped_column(String(5), nullable=True)  # 籌碼因子層級（3F~8F 或 N/A）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

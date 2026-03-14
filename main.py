@@ -867,9 +867,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
     print(f"{'=' * 80}")
     print(
         f"{'#':>3}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  {'綜合':>6}  "
-        f"{'技術':>6}  {'籌碼':>6}  {'基本':>6}  {'產業加成':>6}  {'產業':<10}"
+        f"{'技術':>6}  {'籌碼':>6} {'層':>3}  {'基本':>6}  {'產業加成':>6}  {'產業':<10}"
     )
-    print(f"{'─' * 86}")
+    print(f"{'─' * 90}")
 
     for _, row in display.iterrows():
         name = str(row.get("stock_name", ""))[:8]
@@ -877,10 +877,11 @@ def cmd_discover(args: argparse.Namespace) -> None:
         sector_bonus = row.get("sector_bonus", 0.0)
         if pd.isna(sector_bonus):
             sector_bonus = 0.0
+        chip_tier = str(row.get("chip_tier", "")) or "N/A"
         print(
             f"{int(row['rank']):>3}  {row['stock_id']:>6} {name:<8}  "
             f"{row['close']:>8.1f}  {row['composite_score']:>6.3f}  "
-            f"{row['technical_score']:>6.3f}  {row['chip_score']:>6.3f}  "
+            f"{row['technical_score']:>6.3f}  {row['chip_score']:>6.3f} {chip_tier:>3}  "
             f"{row['fundamental_score']:>6.3f}  {sector_bonus:>+6.1%}  {industry:<10}"
         )
 
@@ -1260,6 +1261,7 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 take_profit=float(row.get("take_profit")) if pd.notna(row.get("take_profit")) else None,
                 entry_trigger=str(row.get("entry_trigger", "")) or None,
                 valid_until=row.get("valid_until") if pd.notna(row.get("valid_until")) else None,
+                chip_tier=str(row.get("chip_tier", "")) or None,
             )
         )
 

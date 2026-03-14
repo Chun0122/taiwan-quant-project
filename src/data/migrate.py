@@ -34,6 +34,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("watch_entry", "trailing_stop_enabled", "INTEGER DEFAULT 0"),  # SQLite 用 INTEGER 表示 bool
     ("watch_entry", "trailing_atr_multiplier", "REAL"),
     ("watch_entry", "highest_price_since_entry", "REAL"),
+    # P1: Discover 籌碼因子層級透明度
+    ("discovery_record", "chip_tier", "VARCHAR(5)"),
 ]
 
 

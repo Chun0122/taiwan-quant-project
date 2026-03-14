@@ -442,6 +442,105 @@ class TestMomentumChipWithMargin:
         assert result_no_margin.iloc[0]["chip_score"] == result_empty.iloc[0]["chip_score"]
 
 
+class TestChipTier:
+    """籌碼因子層級（chip_tier）透明度測試。"""
+
+    def test_empty_inst_returns_na_tier(self, momentum_scanner):
+        """法人資料空時，chip_tier 應為 N/A。"""
+        result = momentum_scanner._compute_chip_scores(["1000"], pd.DataFrame())
+        assert "chip_tier" in result.columns
+        assert result.iloc[0]["chip_tier"] == "N/A"
+
+    def test_three_factor_tier(self, momentum_scanner):
+        """無任何附加資料時，MomentumScanner 應回傳 3F。"""
+        sids = ["1000", "1001"]
+        df_inst = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 200},
+            ]
+        )
+        result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
+        assert result.iloc[0]["chip_tier"] == "3F"
+        assert result.iloc[1]["chip_tier"] == "3F"
+
+    def test_four_factor_tier_with_margin(self, momentum_scanner):
+        """有融資融券資料時（無大戶/借券），MomentumScanner 應回傳 4F。"""
+        sids = ["1000", "1001"]
+        df_inst = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 100},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "name": "外資買賣超", "net": 200},
+            ]
+        )
+        df_margin = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "margin_balance": 1000, "short_balance": 200},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "margin_balance": 1000, "short_balance": 100},
+            ]
+        )
+        result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
+        assert result.iloc[0]["chip_tier"] == "4F"
+
+    def test_swing_scanner_tier_without_whale(self):
+        """SwingScanner 無大戶資料時回傳 2F。"""
+        from src.discovery.scanner import SwingScanner
+
+        scanner = SwingScanner()
+        sids = ["1000", "1001"]
+        df_inst = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "name": "投信買賣超", "net": 100},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "name": "投信買賣超", "net": 200},
+            ]
+        )
+        result = scanner._compute_chip_scores(sids, df_inst, None, None)
+        assert result.iloc[0]["chip_tier"] == "2F"
+
+    def test_value_scanner_tier_always_2f(self):
+        """ValueScanner 籌碼面固定 2F。"""
+        from src.discovery.scanner import ValueScanner
+
+        scanner = ValueScanner()
+        sids = ["1000", "1001"]
+        df_inst = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": date(2025, 1, 25), "name": "投信買賣超", "net": 100},
+                {"stock_id": "1001", "date": date(2025, 1, 25), "name": "投信買賣超", "net": 200},
+            ]
+        )
+        result = scanner._compute_chip_scores(sids, df_inst, None, None)
+        assert all(result["chip_tier"] == "2F")
+
+    def test_chip_tier_in_rankings_columns(self, momentum_scanner):
+        """chip_tier 欄位應出現在 _rank_and_enrich 輸出中。"""
+        scored = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "stock_id": ["1000", "1001"],
+                "close": [100.0, 200.0],
+                "volume": [1000, 2000],
+                "composite_score": [0.8, 0.6],
+                "technical_score": [0.7, 0.6],
+                "chip_score": [0.9, 0.5],
+                "chip_tier": ["4F", "3F"],
+                "fundamental_score": [0.6, 0.7],
+                "news_score": [0.5, 0.5],
+                "sector_bonus": [0.0, 0.0],
+                "momentum": [0.1, 0.05],
+                "inst_net": [1000, 500],
+                "entry_price": [100.0, 200.0],
+                "stop_loss": [95.0, 190.0],
+                "take_profit": [115.0, 230.0],
+                "entry_trigger": ["突破均線", "動能確認"],
+                "valid_until": [date(2025, 2, 1), date(2025, 2, 1)],
+            }
+        )
+        result = momentum_scanner._rank_and_enrich(scored)
+        assert "chip_tier" in result.columns
+        assert list(result["chip_tier"]) == ["4F", "3F"]
+
+
 class TestMomentumFundamentalScores:
     def test_yoy_positive_gets_higher(self, momentum_scanner):
         """YoY > 0 得 0.7，YoY <= 0 得 0.3。"""

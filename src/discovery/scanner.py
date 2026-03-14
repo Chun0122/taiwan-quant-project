@@ -1121,6 +1121,10 @@ class MarketScanner:
         for col in score_cols:
             candidates[col] = candidates[col].fillna(0.5)
 
+        # chip_tier 字串欄位 fillna
+        if "chip_tier" in candidates.columns:
+            candidates["chip_tier"] = candidates["chip_tier"].fillna("N/A")
+
         # 根據 regime 動態加權（weight key 直接映射 {key}_score 欄位）
         from src.regime.detector import MarketRegimeDetector
 
@@ -1677,6 +1681,7 @@ class MarketScanner:
             "composite_score",
             "technical_score",
             "chip_score",
+            "chip_tier",
             "fundamental_score",
             "news_score",
             "sector_bonus",
@@ -1804,9 +1809,11 @@ class MomentumScanner(MarketScanner):
         - 5 因子（含大戶持股，無借券）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
         - 4 因子（含券資比，無大戶/借券）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
         - 3 因子（基本）: 外資 40% + 量比 30% + 法人 30%
+
+        回傳欄位：stock_id, chip_score, chip_tier（因子層級字串，如 "8F"/"3F"/"N/A"）
         """
         if df_inst.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
+            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         inst_grouped = inst_filtered.groupby("stock_id", sort=False)
@@ -1941,6 +1948,7 @@ class MomentumScanner(MarketScanner):
                 + broker_rank * 0.11
                 + smart_broker_rank * 0.10
             )
+            chip_tier = "8F"
         elif has_broker and has_sbl and has_margin and has_whale:
             # 7 因子：外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
             df["chip_score"] = (
@@ -1952,6 +1960,7 @@ class MomentumScanner(MarketScanner):
                 + sbl_rank * 0.08
                 + broker_rank * 0.12
             )
+            chip_tier = "7F"
         elif has_broker and has_sbl and has_margin:
             # 6 因子（有分點、無大戶）：外資22%+量比20%+法人20%+券資比14%+借券12%+分點12%
             df["chip_score"] = (
@@ -1962,14 +1971,17 @@ class MomentumScanner(MarketScanner):
                 + sbl_rank * 0.12
                 + broker_rank * 0.12
             )
+            chip_tier = "6F"
         elif has_broker and has_sbl:
             # 5 因子（有分點+借券、無大戶/融資券）：外資28%+量比22%+法人22%+借券14%+分點14%
             df["chip_score"] = (
                 consec_rank * 0.28 + bvr_rank * 0.22 + total_rank * 0.22 + sbl_rank * 0.14 + broker_rank * 0.14
             )
+            chip_tier = "5F"
         elif has_broker:
             # 4 因子（僅分點）：外資32%+量比24%+法人24%+分點20%
             df["chip_score"] = consec_rank * 0.32 + bvr_rank * 0.24 + total_rank * 0.24 + broker_rank * 0.20
+            chip_tier = "4F"
         elif has_sbl and has_margin and has_whale:
             # 6 因子：外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
             df["chip_score"] = (
@@ -1980,35 +1992,44 @@ class MomentumScanner(MarketScanner):
                 + whale_rank * 0.15
                 + sbl_rank * 0.10
             )
+            chip_tier = "6F"
         elif has_sbl and has_margin:
             # 5 因子（有借券、無大戶）：外資 25% + 量比 22% + 法人 22% + 券資比 16% + 借券(逆) 15%
             df["chip_score"] = (
                 consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.16 + sbl_rank * 0.15
             )
+            chip_tier = "5F"
         elif has_sbl and has_whale:
             # 5 因子（有借券、無券資比）：外資 28% + 量比 20% + 法人 20% + 大戶 22% + 借券(逆) 10%
             df["chip_score"] = (
                 consec_rank * 0.28 + bvr_rank * 0.20 + total_rank * 0.20 + whale_rank * 0.22 + sbl_rank * 0.10
             )
+            chip_tier = "5F"
         elif has_sbl:
             # 4 因子（僅借券）：外資 35% + 量比 25% + 法人 25% + 借券(逆) 15%
             df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + sbl_rank * 0.15
+            chip_tier = "4F"
         elif has_margin and has_whale:
             # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
             df["chip_score"] = (
                 consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.15 + whale_rank * 0.16
             )
+            chip_tier = "5F"
         elif has_margin:
             # 4 因子：外資 30% + 量比 25% + 法人 25% + 券資比 20%
             df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
+            chip_tier = "4F"
         elif has_whale:
             # 4 因子：外資 35% + 量比 25% + 法人 25% + 大戶 15%
             df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + whale_rank * 0.15
+            chip_tier = "4F"
         else:
             # 3 因子：外資 40% + 量比 30% + 法人 30%
             df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
+            chip_tier = "3F"
 
-        return df[["stock_id", "chip_score"]]
+        df["chip_tier"] = chip_tier
+        return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _load_sbl_data(self, stock_ids: list[str]) -> pd.DataFrame:
         """從 DB 載入最近 5 天的借券賣出彙總資料。
@@ -2398,9 +2419,11 @@ class SwingScanner(MarketScanner):
         權重組合：
         - 3 因子（含大戶）: 投信 40% + 累積 40% + 大戶 20%
         - 2 因子（基本）:   投信 50% + 累積 50%
+
+        回傳欄位：stock_id, chip_score, chip_tier
         """
         if df_inst.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
+            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
 
@@ -2448,11 +2471,14 @@ class SwingScanner(MarketScanner):
         if has_whale:
             # 3 因子：投信 40% + 累積 40% + 大戶 20%
             df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + whale_rank * 0.20
+            chip_tier = "3F"
         else:
             # 2 因子：投信 50% + 累積 50%
             df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
+            chip_tier = "2F"
 
-        return df[["stock_id", "chip_score"]]
+        df["chip_tier"] = chip_tier
+        return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
         """從 DB 載入最近 2 週的大戶持股分級資料（波段模式）。"""
@@ -2809,9 +2835,12 @@ class ValueScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """價值模式籌碼面 2 因子：投信近期買超 50% + 三大法人累積 50%。"""
+        """價值模式籌碼面 2 因子：投信近期買超 50% + 三大法人累積 50%。
+
+        回傳欄位：stock_id, chip_score, chip_tier（固定 "2F"）
+        """
         if df_inst.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
+            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         dates = sorted(df_inst["date"].unique())
@@ -2837,8 +2866,9 @@ class ValueScanner(MarketScanner):
         trust_rank = df["trust_net"].rank(pct=True)
         cum_rank = df["cum_net"].rank(pct=True)
         df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
+        df["chip_tier"] = "2F"
 
-        return df[["stock_id", "chip_score"]]
+        return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """價值模式風險過濾：近 20 日波動率 > 90th percentile 剔除。"""
@@ -3139,9 +3169,12 @@ class DividendScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """高息模式籌碼面 2 因子：投信淨買超 50% + 三大法人累積買超 50%。"""
+        """高息模式籌碼面 2 因子：投信淨買超 50% + 三大法人累積買超 50%。
+
+        回傳欄位：stock_id, chip_score, chip_tier（固定 "2F"）
+        """
         if df_inst.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
+            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         dates = sorted(df_inst["date"].unique())
@@ -3167,8 +3200,9 @@ class DividendScanner(MarketScanner):
         trust_rank = df["trust_net"].rank(pct=True)
         cum_rank = df["cum_net"].rank(pct=True)
         df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
+        df["chip_tier"] = "2F"
 
-        return df[["stock_id", "chip_score"]]
+        return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """高息模式風險過濾：近 20 日波動率 > 90th percentile 剔除。"""
@@ -3417,9 +3451,12 @@ class GrowthScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """高成長模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比（有資料時）。"""
+        """高成長模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比（有資料時）。
+
+        回傳欄位：stock_id, chip_score, chip_tier（"4F" 或 "3F"）
+        """
         if df_inst.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids)})
+            return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         inst_grouped = inst_filtered.groupby("stock_id", sort=False)
@@ -3483,13 +3520,16 @@ class GrowthScanner(MarketScanner):
                 df["short_margin_ratio"] = df["short_margin_ratio"].fillna(0.0)
                 smr_rank = df["short_margin_ratio"].rank(pct=True)
                 df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
+                chip_tier = "4F"
             else:
                 has_margin = False
 
         if not has_margin:
             df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
+            chip_tier = "3F"
 
-        return df[["stock_id", "chip_score"]]
+        df["chip_tier"] = chip_tier
+        return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
         """高成長模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%。"""
