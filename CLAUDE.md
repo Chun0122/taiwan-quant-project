@@ -46,8 +46,7 @@ python main.py validate --export issues.csv  # 匯出問題清單
 python main.py sync-financial                # 同步 watchlist 財報（預設最近 4 季）
 python main.py sync-financial --stocks 2330  # 指定股票
 python main.py sync-financial --quarters 8   # 最近 8 季
-python main.py sync-holding                  # 同步大戶持股分級（週資料，TDCC 全市場一次取）
-python main.py sync-holding --stocks 2330 2317  # 指定股票（仍從全市場篩選）
+python main.py sync-holding                  # 同步大戶持股分級（週資料，TDCC 全市場 ~2928 支，存全市場讓 discover 7F 可用）
 python main.py sync-holding --weeks 8        # 保留參數（TDCC 僅提供最新一週，歷史靠每週累積）
 python main.py sync-broker                   # 同步 watchlist 分點交易資料（最近 5 日）
 python main.py sync-broker --stocks 2330 2317  # 指定股票
