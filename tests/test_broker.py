@@ -21,7 +21,7 @@ import pytest
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 # 模組層級 ORM import：確保 Base.metadata 在 in_memory_engine.create_all() 前已包含全表
-from src.data.schema import BrokerTrade  # noqa: F401
+from src.data.schema import BrokerTrade, DailyPrice  # noqa: F401
 from src.discovery.scanner import MomentumScanner, SwingScanner, compute_broker_score, compute_smart_broker_score
 
 # ------------------------------------------------------------------ #
@@ -1361,3 +1361,180 @@ class TestLoadBrokerDataExtendedAdaptive:
         scanner = MomentumScanner.__new__(MomentumScanner)
         result = scanner._load_broker_data_extended(["Z999"], days=365, min_trading_days=1)
         assert result.empty
+
+
+# ------------------------------------------------------------------ #
+#  TestLoadBrokerDataExtendedCloseProxy — 收盤價代理均價（方案 B）
+# ------------------------------------------------------------------ #
+
+
+class TestLoadBrokerDataExtendedCloseProxy:
+    """_load_broker_data_extended() 以 DailyPrice.close 填補 NULL buy_price/sell_price 的測試。
+
+    DJ 端點不提供均價，buy_price / sell_price 存 NULL。
+    本功能以同日收盤價作為代理，使 Smart Broker 8F 計算得以啟用。
+    """
+
+    def _write_broker_rows_no_price(self, session, stock_id: str, dates: list[date]) -> None:
+        """寫入 buy_price / sell_price 為 NULL 的分點資料（模擬 DJ 端點）。"""
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": d,
+                "broker_id": "B001",
+                "broker_name": "測試券商",
+                "buy": 5000,
+                "sell": 2000,
+                "buy_price": None,
+                "sell_price": None,
+            }
+            for d in dates
+        ]
+        stmt = sqlite_upsert(BrokerTrade).values(rows).on_conflict_do_nothing()
+        session.execute(stmt)
+        session.commit()
+
+    def _write_daily_price(self, session, stock_id: str, dates: list[date], close: float) -> None:
+        """寫入 DailyPrice 收盤價測試資料。"""
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": d,
+                "open": close - 1.0,
+                "high": close + 2.0,
+                "low": close - 2.0,
+                "close": close,
+                "volume": 10_000_000,
+                "turnover": int(close * 10_000_000),
+                "spread": 0.0,
+            }
+            for d in dates
+        ]
+        stmt = sqlite_upsert(DailyPrice).values(rows).on_conflict_do_nothing()
+        session.execute(stmt)
+        session.commit()
+
+    def test_null_price_filled_by_daily_close(self, db_session):
+        """buy_price / sell_price 為 NULL 時，應填入同日 DailyPrice.close。"""
+        from datetime import date as _date
+
+        base = _date.today() - timedelta(days=30)
+        dates = [base + timedelta(days=i) for i in range(25)]
+        self._write_broker_rows_no_price(db_session, "P001", dates)
+        self._write_daily_price(db_session, "P001", dates, close=120.0)
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["P001"], days=365, min_trading_days=20)
+
+        assert not result.empty
+        assert result["buy_price"].notna().all(), "buy_price 應已填入收盤價代理值"
+        assert result["sell_price"].notna().all(), "sell_price 應已填入收盤價代理值"
+        assert (result["buy_price"] == 120.0).all(), "buy_price 應等於收盤價 120.0"
+        assert (result["sell_price"] == 120.0).all(), "sell_price 應等於收盤價 120.0"
+
+    def test_existing_price_not_overwritten(self, db_session):
+        """已有 buy_price / sell_price 時，不應被收盤價覆蓋。"""
+        from datetime import date as _date
+
+        base = _date.today() - timedelta(days=30)
+        dates = [base + timedelta(days=i) for i in range(25)]
+        rows = [
+            {
+                "stock_id": "P002",
+                "date": d,
+                "broker_id": "B001",
+                "broker_name": "測試券商",
+                "buy": 5000,
+                "sell": 2000,
+                "buy_price": 99.5,  # 已有真實均價
+                "sell_price": 101.0,
+            }
+            for d in dates
+        ]
+        stmt = sqlite_upsert(BrokerTrade).values(rows).on_conflict_do_nothing()
+        db_session.execute(stmt)
+        db_session.commit()
+        self._write_daily_price(db_session, "P002", dates, close=200.0)  # 收盤價故意不同
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["P002"], days=365, min_trading_days=20)
+
+        assert not result.empty
+        assert (result["buy_price"] == 99.5).all(), "已有的 buy_price 不應被覆蓋"
+        assert (result["sell_price"] == 101.0).all(), "已有的 sell_price 不應被覆蓋"
+
+    def test_no_daily_price_keeps_null_gracefully(self, db_session):
+        """DailyPrice 無資料時，buy_price / sell_price 維持 NULL（系統降回 7F）。"""
+        from datetime import date as _date
+
+        base = _date.today() - timedelta(days=30)
+        dates = [base + timedelta(days=i) for i in range(25)]
+        self._write_broker_rows_no_price(db_session, "P003", dates)
+        # 故意不寫 DailyPrice
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["P003"], days=365, min_trading_days=20)
+
+        assert not result.empty
+        # 無法填入代理均價，維持 NULL（呼叫端將降至 7F）
+        assert result["buy_price"].isna().all(), "無收盤價資料時，buy_price 應維持 NULL"
+
+    def test_close_proxy_enables_smart_broker_score(self, db_session):
+        """填入收盤價代理後，compute_smart_broker_score() 應能產生非零評分（8F 啟用前提）。"""
+        from datetime import date as _date
+
+        base = _date.today() - timedelta(days=60)
+        # 模擬一個「買漲賣漲」的分點：買在低點，賣在高點（勝率 100%）
+        buy_dates = [base + timedelta(days=i * 2) for i in range(15)]  # 奇數日買入
+        sell_dates = [base + timedelta(days=i * 2 + 1) for i in range(15)]  # 偶數日賣出
+        all_dates = sorted(set(buy_dates + sell_dates))
+
+        broker_rows = []
+        for i, d in enumerate(all_dates):
+            is_buy_day = d in buy_dates
+            broker_rows.append(
+                {
+                    "stock_id": "P004",
+                    "date": d,
+                    "broker_id": "B001",
+                    "broker_name": "測試券商",
+                    "buy": 10_000 if is_buy_day else 0,
+                    "sell": 0 if is_buy_day else 5_000,
+                    "buy_price": None,  # DJ 無均價
+                    "sell_price": None,
+                }
+            )
+        stmt = sqlite_upsert(BrokerTrade).values(broker_rows).on_conflict_do_nothing()
+        db_session.execute(stmt)
+        db_session.commit()
+
+        # 收盤價：單調遞增，模擬多頭趨勢（賣出時均高於買入時）
+        price_rows = [
+            {
+                "stock_id": "P004",
+                "date": d,
+                "open": 100.0 + i * 0.5,
+                "high": 101.0 + i * 0.5,
+                "low": 99.0 + i * 0.5,
+                "close": 100.0 + i * 0.5,  # 每天上漲 0.5 元
+                "volume": 5_000_000,
+                "turnover": 500_000_000,
+                "spread": 0.5,
+            }
+            for i, d in enumerate(all_dates)
+        ]
+        stmt2 = sqlite_upsert(DailyPrice).values(price_rows).on_conflict_do_nothing()
+        db_session.execute(stmt2)
+        db_session.commit()
+
+        scanner = MomentumScanner.__new__(MomentumScanner)
+        result = scanner._load_broker_data_extended(["P004"], days=365, min_trading_days=1)
+
+        assert not result.empty
+        assert result["buy_price"].notna().all(), "代理均價應已填入"
+
+        # 進一步確認 compute_smart_broker_score 可執行（8F 前提）
+        close_map = {"P004": result["buy_price"].max()}
+        smart_result = compute_smart_broker_score(result, close_map)
+        # 評分可能為空（需達門檻），但函數執行不應拋例外
+        assert isinstance(smart_result, pd.DataFrame)

@@ -2104,6 +2104,12 @@ class MomentumScanner(MarketScanner):
           - morning-routine Step 2 每日同步 watchlist 分點資料（5日）
           - 連續執行 20 天後即可觸發 Smart Broker 8F 計算
           - 資料越豐富（60~120 天），勝率/PF 估算越準確
+
+        均價代理策略（方案 B）：
+          - DJ 端點不提供 buy_price / sell_price，欄位存 NULL
+          - 本函數自動以 DailyPrice.close 填補 NULL 均價（同日收盤價）
+          - win_rate / PF 的意義：衡量分點「是否在漲前買、跌前賣」的擇時能力
+          - 所有分點使用相同日收盤價，失去「執行品質」訊號，但「擇時」信號仍有效
         """
         cutoff = date.today() - timedelta(days=days)
         try:
@@ -2128,6 +2134,25 @@ class MomentumScanner(MarketScanner):
                 rows,
                 columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
             )
+            # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
+            # DJ 端點無均價欄位，改用收盤價作為代理，使 Smart Broker 8F 得以啟用。
+            if df["buy_price"].isna().any() or df["sell_price"].isna().any():
+                try:
+                    with get_session() as session:
+                        price_rows = session.execute(
+                            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                                DailyPrice.stock_id.in_(stock_ids),
+                                DailyPrice.date >= cutoff,
+                            )
+                        ).all()
+                    if price_rows:
+                        price_df = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+                        df = df.merge(price_df, on=["stock_id", "date"], how="left")
+                        df["buy_price"] = df["buy_price"].astype("float64").fillna(df["close"])
+                        df["sell_price"] = df["sell_price"].astype("float64").fillna(df["close"])
+                        df = df.drop(columns=["close"])
+                except Exception:
+                    pass  # 無法載入收盤價時保持原始 NULL，系統降回 7F
             # 過濾掉歷史資料不足的股票，避免以少量資料誤判分點行為
             if min_trading_days > 0 and not df.empty:
                 day_counts = df.groupby("stock_id")["date"].nunique()
