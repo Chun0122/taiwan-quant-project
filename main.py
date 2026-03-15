@@ -956,12 +956,23 @@ def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
 
     Returns:
         DataFrame，欄位：stock_id, stock_name, close, appearances, best_rank,
+        avg_score, best_mode, chip_tier,
         momentum_rank, swing_rank, value_rank, dividend_rank, growth_rank,
         industry_category
     """
     mode_cols = ["momentum", "swing", "value", "dividend", "growth"]
+    mode_labels = {"momentum": "動能", "swing": "波段", "value": "價值", "dividend": "高息", "growth": "成長"}
 
-    # 收集各模式的 stock → rank 映射
+    # chip_tier 排序權重（數字越大越高）
+    def _tier_weight(tier: str) -> int:
+        if not tier or tier == "N/A":
+            return 0
+        try:
+            return int(tier.replace("F", ""))
+        except ValueError:
+            return 0
+
+    # 收集各模式的 stock → {rank, composite_score, chip_tier} 映射
     mode_data: dict[str, dict] = {}
     stock_meta: dict[str, dict] = {}  # stock_id → {name, close, industry}
 
@@ -970,17 +981,21 @@ def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
             mode_data[mode_key] = {}
             continue
         subset = result.rankings.head(top_n)
-        ranks = {}
+        per_mode: dict[str, dict] = {}
         for _, row in subset.iterrows():
             sid = row["stock_id"]
-            ranks[sid] = int(row["rank"])
+            per_mode[sid] = {
+                "rank": int(row["rank"]),
+                "composite_score": float(row.get("composite_score", 0.0)),
+                "chip_tier": str(row.get("chip_tier", "N/A") or "N/A"),
+            }
             if sid not in stock_meta:
                 stock_meta[sid] = {
                     "stock_name": str(row.get("stock_name", "")),
                     "close": float(row.get("close", 0.0)),
                     "industry_category": str(row.get("industry_category", "")),
                 }
-        mode_data[mode_key] = ranks
+        mode_data[mode_key] = per_mode
 
     if not stock_meta:
         return pd.DataFrame()
@@ -990,19 +1005,44 @@ def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
         row = {"stock_id": sid, **meta}
         appearances = 0
         best_rank = 9999
+        scores: list[float] = []
+        best_mode_key = None
+        best_score = -1.0
+        best_chip_tier = "N/A"
+
         for col in mode_cols:
-            rank_val = mode_data.get(col, {}).get(sid)
-            row[f"{col}_rank"] = rank_val
-            if rank_val is not None:
+            entry = mode_data.get(col, {}).get(sid)
+            if entry is not None:
+                rank_val = entry["rank"]
+                score_val = entry["composite_score"]
+                tier_val = entry["chip_tier"]
+                row[f"{col}_rank"] = rank_val
                 appearances += 1
                 if rank_val < best_rank:
                     best_rank = rank_val
+                scores.append(score_val)
+                if score_val > best_score:
+                    best_score = score_val
+                    best_mode_key = col
+                if _tier_weight(tier_val) > _tier_weight(best_chip_tier):
+                    best_chip_tier = tier_val
+            else:
+                row[f"{col}_rank"] = None
+
         row["appearances"] = appearances
         row["best_rank"] = best_rank if best_rank < 9999 else None
+        row["avg_score"] = round(sum(scores) / len(scores), 4) if scores else None
+        row["best_mode"] = mode_labels.get(best_mode_key, best_mode_key) if best_mode_key else None
+        row["chip_tier"] = best_chip_tier
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(["appearances", "best_rank"], ascending=[False, True]).reset_index(drop=True)
+    # 主要排序：avg_score 降序；次要：appearances 降序；再次：best_rank 升序
+    df = df.sort_values(
+        ["avg_score", "appearances", "best_rank"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
     return df
 
 
@@ -1178,18 +1218,18 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     today = datetime.date.today().strftime("%Y-%m-%d")
     n_modes = sum(1 for r in results.values() if r is not None and not r.rankings.empty)
 
-    print(f"\n{'═' * 82}")
-    print(f"多模式綜合比較 — {today}  ｜  掃描 {n_modes} 個模式  ×  Top {args.top}")
-    print(f"{'═' * 82}")
+    print(f"\n{'═' * 100}")
+    print(f"多模式綜合比較 — {today}  ｜  掃描 {n_modes} 個模式  ×  Top {args.top}  ｜  排序：avg_score ↓")
+    print(f"{'═' * 100}")
 
     if df.empty:
         print(f"  （無出現在 {min_app}+ 個模式的股票）")
     else:
         print(
-            f"{'出現':>5}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  "
+            f"{'出現':>5}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  {'均分':>6}  {'最佳模式':<6} {'層':>3}  "
             f"{'動能':>5} {'波段':>5} {'價值':>5} {'高息':>5} {'成長':>5}  {'產業':<12}"
         )
-        print(f"{'─' * 82}")
+        print(f"{'─' * 100}")
 
         def _fmt_rank(val) -> str:
             if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -1203,8 +1243,12 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
             industry = str(row.get("industry_category", ""))[:12]
             close_val = row.get("close", 0.0)
             close_str = f"{close_val:>8.1f}" if pd.notna(close_val) else "       —"
+            avg_score = row.get("avg_score")
+            avg_str = f"{avg_score:>6.3f}" if pd.notna(avg_score) else "     —"
+            best_mode = str(row.get("best_mode") or "—")[:6]
+            chip_tier = str(row.get("chip_tier") or "N/A")
             print(
-                f"{star:>5}  {row['stock_id']:>6} {name:<8}  {close_str}  "
+                f"{star:>5}  {row['stock_id']:>6} {name:<8}  {close_str}  {avg_str}  {best_mode:<6} {chip_tier:>3}  "
                 f"{_fmt_rank(row.get('momentum_rank')):>5} "
                 f"{_fmt_rank(row.get('swing_rank')):>5} "
                 f"{_fmt_rank(row.get('value_rank')):>5} "
@@ -1212,7 +1256,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
                 f"{_fmt_rank(row.get('growth_rank')):>5}  {industry:<12}"
             )
 
-    print(f"{'─' * 82}")
+    print(f"{'─' * 100}")
     print("\n各模式掃描摘要：")
     for s in scan_summaries:
         print(s)
@@ -1222,7 +1266,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
         df.to_csv(args.export, index=False)
         print(f"\n結果已匯出至: {args.export}")
 
-    # Discord 通知
+    # Discord 通知（以 avg_score 排序）
     if args.notify and not df.empty:
         from src.notification.line_notify import send_message
 
@@ -1231,7 +1275,11 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
         for _, row in top10.iterrows():
             name = str(row.get("stock_name", ""))[:8]
             app = int(row["appearances"])
-            lines.append(f"{'★' * app} {row['stock_id']} {name} (出現{app}模式)")
+            avg_score = row.get("avg_score")
+            avg_str = f"{avg_score:.3f}" if pd.notna(avg_score) else "—"
+            best_mode = str(row.get("best_mode") or "—")
+            chip_tier = str(row.get("chip_tier") or "N/A")
+            lines.append(f"{'★' * app} {row['stock_id']} {name}  均分{avg_str} [{best_mode}] {chip_tier}")
         send_message("\n".join(lines))
         print("Discord 通知已發送")
 
