@@ -5,14 +5,13 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pandas as pd
-import pytest
 
 from src.industry.analyzer import compute_flow_acceleration_from_df
-
 
 # ---------------------------------------------------------------------------
 # 輔助函數
 # ---------------------------------------------------------------------------
+
 
 def _make_inst_df(rows: list[dict]) -> pd.DataFrame:
     """建立測試用法人資料 DataFrame（stock_id, date, net, industry）。"""
@@ -26,6 +25,7 @@ def _days_ago(n: int) -> date:
 # ---------------------------------------------------------------------------
 # TestComputeFlowAccelerationFromDf
 # ---------------------------------------------------------------------------
+
 
 class TestComputeFlowAccelerationFromDf:
     """compute_flow_acceleration_from_df() 純函數測試。"""
