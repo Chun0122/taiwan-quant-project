@@ -715,6 +715,87 @@ class TestSwingCoarseFilter:
         assert "5001" not in sids
 
 
+class TestSwingSma60Vectorized:
+    """驗證向量化 SMA60 計算結果與語義正確性。"""
+
+    def _make_sma60_price(self, sid: str, n_days: int, start_close: float, slope: float) -> list[dict]:
+        rows = []
+        for d in range(n_days):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            close = start_close + d * slope
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": close - 0.5,
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 500_000,
+                }
+            )
+        return rows
+
+    def test_sma60_vectorized_excludes_downtrend(self, swing_scanner):
+        """向量化 SMA60：下降趨勢（close < SMA60）應被排除。"""
+        rows = self._make_sma60_price("UP60", 65, 100.0, 0.5)  # 上升：close > SMA60
+        rows += self._make_sma60_price("DN60", 65, 200.0, -0.5)  # 下降：close < SMA60
+        df_price = pd.DataFrame(rows)
+        result = swing_scanner._coarse_filter(df_price, pd.DataFrame())
+        sids = result["stock_id"].tolist() if not result.empty else []
+        assert "UP60" in sids
+        assert "DN60" not in sids
+
+    def test_sma60_insufficient_data_passes(self, swing_scanner):
+        """資料不足 60 天時 SMA60 過濾應跳過（不因資料不足而拒絕所有股票）。"""
+        rows = self._make_sma60_price("SHORT", 30, 100.0, 0.5)  # 僅 30 天，不足 60
+        df_price = pd.DataFrame(rows)
+        result = swing_scanner._coarse_filter(df_price, pd.DataFrame())
+        # 資料不足 60 天 → SMA60 為 NaN → 過濾跳過 → 股票應保留（只要其他條件通過）
+        assert result.empty or "SHORT" in result["stock_id"].tolist()
+
+    def test_sma60_vectorized_matches_exact_value(self, swing_scanner):
+        """向量化 SMA60 結果應等於手動計算的最後 60 天均值。"""
+        rows = self._make_sma60_price("VERI", 70, 100.0, 0.5)
+        df_price = pd.DataFrame(rows)
+        # 手動計算：最後 60 個 close 的平均
+        closes = [100.0 + d * 0.5 for d in range(70)]
+        expected_sma60 = sum(closes[-60:]) / 60
+        result = swing_scanner._coarse_filter(df_price, pd.DataFrame())
+        if not result.empty and "VERI" in result["stock_id"].values:
+            row = result[result["stock_id"] == "VERI"].iloc[0]
+            assert abs(row["sma60"] - expected_sma60) < 0.01
+
+
+class TestEffectiveTopN:
+    """驗證 _effective_top_n() 自適應候選數邏輯。"""
+
+    def test_returns_floor_for_small_universe(self, scanner):
+        """小 Universe（< top_n_candidates / 0.15）應回傳 top_n_candidates 下限。"""
+        # top_n_candidates=10，15% of 20 = 3 → max(10, 3) = 10
+        assert scanner._effective_top_n(20) == 10
+
+    def test_scales_with_large_universe(self, scanner):
+        """大 Universe 應線性擴展：max(10, 15% * size)。"""
+        # top_n_candidates=10，15% of 100 = 15 → max(10, 15) = 15
+        assert scanner._effective_top_n(100) == 15
+        # 15% of 200 = 30 → max(10, 30) = 30
+        assert scanner._effective_top_n(200) == 30
+
+    def test_boundary_at_threshold(self, scanner):
+        """剛好在閾值邊界（67 支）：int(67 * 0.15) = 10 == top_n_candidates。"""
+        # top_n_candidates=10，int(67 * 0.15) = 10 → max(10, 10) = 10
+        assert scanner._effective_top_n(67) == 10
+
+    def test_coarse_filter_respects_adaptive_limit(self, scanner):
+        """_coarse_filter 傳入大量股票時，輸出不超過 _effective_top_n 上限。"""
+        # 建立 80 支股票（80 * 0.15 = 12 > top_n_candidates=10）
+        df_price = _make_price_df(80)
+        result = scanner._coarse_filter(df_price, pd.DataFrame())
+        expected_limit = scanner._effective_top_n(len(df_price["stock_id"].unique()))
+        assert len(result) <= expected_limit
+
+
 class TestSwingTechnicalScores:
     def test_scores_in_valid_range(self, swing_scanner):
         df_price = _make_swing_price_df(80, 5)

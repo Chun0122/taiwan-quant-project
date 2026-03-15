@@ -1186,6 +1186,19 @@ class MarketScanner:
             mask = mask & (latest["close"] <= self.max_price)
         return latest[mask].copy()
 
+    def _effective_top_n(self, universe_size: int) -> int:
+        """依 Universe 大小自適應粗篩候選數。
+
+        Universe 超過閾值時以 15% 比例線性擴展，防止從大量候選直接壓縮至固定 N 個；
+        Universe 較小時以 top_n_candidates 為下限保護，確保候選池不過少。
+
+        例：top_n_candidates=150 時：
+            universe=1000 → max(150, 150) = 150
+            universe=1500 → max(150, 225) = 225
+            universe=200  → max(150,  30) = 150（下限保護）
+        """
+        return max(self.top_n_candidates, int(universe_size * 0.15))
+
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """粗篩：股價/量/法人/動能加權 → 取 top N candidates。"""
         filtered = self._base_filter(df_price)
@@ -1230,7 +1243,7 @@ class MarketScanner:
         )
 
         # 取 top N
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     # ------------------------------------------------------------------ #
@@ -1963,7 +1976,7 @@ class MomentumScanner(MarketScanner):
             filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
 
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
@@ -2474,21 +2487,19 @@ class SwingScanner(MarketScanner):
         if filtered.empty:
             return pd.DataFrame()
 
-        # 額外條件：close > SMA60
-        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
-        swing_price_grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
-        sma60_data = {}
-        for sid in filtered["stock_id"].unique():
-            stock_data = swing_price_grouped.get_group(sid) if sid in swing_price_grouped.groups else pd.DataFrame()
-            if len(stock_data) >= 60:
-                sma60_data[sid] = stock_data["close"].values[-60:].mean()
+        # 額外條件：close > SMA60（全量向量化，取代逐股 for 迴圈）
+        # 對 df_price 全量做 rolling(60)，一次計算所有股票，再取各股最新值
+        price_sorted = df_price[["stock_id", "date", "close"]].sort_values(["stock_id", "date"])
+        sma60_rolling = price_sorted.groupby("stock_id")["close"].transform(
+            lambda s: s.rolling(60, min_periods=60).mean()
+        )
+        # last() 取每支股票最後一列的 SMA60；NaN = 資料不足 60 天 → dropna 排除
+        sma60_latest = price_sorted.assign(_sma60=sma60_rolling).groupby("stock_id")["_sma60"].last().dropna()
 
-        if sma60_data:
-            filtered["sma60"] = filtered["stock_id"].map(sma60_data)
+        if not sma60_latest.empty:
+            filtered["sma60"] = filtered["stock_id"].map(sma60_latest)
             filtered = filtered[filtered["sma60"].notna() & (filtered["close"] > filtered["sma60"])].copy()
-        else:
-            # 資料不足 60 天時跳過 SMA60 過濾
-            pass
+        # else: 全市場資料不足 60 天時跳過 SMA60 過濾（通常不會發生）
 
         if filtered.empty:
             return pd.DataFrame()
@@ -2536,7 +2547,7 @@ class SwingScanner(MarketScanner):
             filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
 
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
@@ -2961,7 +2972,7 @@ class ValueScanner(MarketScanner):
         filtered["coarse_score"] = sum(
             filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
@@ -3358,7 +3369,7 @@ class DividendScanner(MarketScanner):
         filtered["coarse_score"] = sum(
             filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
@@ -3751,7 +3762,7 @@ class GrowthScanner(MarketScanner):
         filtered["coarse_score"] = sum(
             filtered[k] * v for k, v in self._COARSE_WEIGHTS.items() if k in filtered.columns
         )
-        filtered = filtered.nlargest(self.top_n_candidates, "coarse_score")
+        filtered = filtered.nlargest(self._effective_top_n(len(filtered)), "coarse_score")
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
