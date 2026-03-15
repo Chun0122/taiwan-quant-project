@@ -98,6 +98,63 @@ def compute_sector_relative_strength(
     return pd.DataFrame(records)
 
 
+def compute_flow_acceleration_from_df(
+    df: pd.DataFrame,
+    recent_days: int = 5,
+    base_days: int = 15,
+) -> pd.Series:
+    """計算各產業法人資金流加速度（純函數，不依賴 DB）。
+
+    acceleration = (近 recent_days 日平均淨買超) - (前 base_days 日平均淨買超)
+
+    當加速度轉正代表資金「剛轉入」該產業，具前瞻性；
+    當加速度轉負代表資金「剛流出」該產業。
+    使用混合法人分數時（30% level + 70% acceleration），可降低追高風險。
+
+    Args:
+        df: DataFrame，需含欄位 stock_id、date、net、industry。
+            date 可為 datetime.date 或 pd.Timestamp。
+        recent_days: 近期窗口交易日數（預設 5）
+        base_days: 前期窗口交易日數（預設 15）
+
+    Returns:
+        Series: index=industry, value=acceleration（浮點數）。
+        若資料不足 (recent_days + base_days) 個交易日，回傳全零 Series。
+    """
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    all_industries = df["industry"].unique()
+
+    # 取得全部交易日（降序）
+    unique_dates = sorted(df["date"].unique(), reverse=True)
+    total_needed = recent_days + base_days
+
+    if len(unique_dates) < total_needed:
+        # 資料不足 → 回傳全零，避免 NaN 污染下游
+        return pd.Series(0.0, index=all_industries)
+
+    # 近期窗口：最近 recent_days 個交易日
+    recent_cutoff = unique_dates[recent_days - 1]
+    df_recent = df[df["date"] >= recent_cutoff]
+
+    # 前期窗口：倒數第 (recent_days+1) 到 (recent_days+base_days) 個交易日
+    base_newest = unique_dates[recent_days]
+    base_oldest = unique_dates[total_needed - 1]
+    df_base = df[(df["date"] >= base_oldest) & (df["date"] <= base_newest)]
+
+    def _sector_avg(sub_df: pd.DataFrame, n_days: int) -> pd.Series:
+        return sub_df.groupby("industry")["net"].sum() / n_days
+
+    recent_avg = _sector_avg(df_recent, recent_days)
+    base_avg = _sector_avg(df_base, base_days)
+
+    # 對齊產業索引後相減
+    recent_filled = recent_avg.reindex(all_industries, fill_value=0.0)
+    base_filled = base_avg.reindex(all_industries, fill_value=0.0)
+    return recent_filled - base_filled
+
+
 class IndustryRotationAnalyzer:
     """產業輪動分析器。"""
 
@@ -128,6 +185,48 @@ class IndustryRotationAnalyzer:
             result[sid] = db_map.get(sid, "未分類")
 
         return result
+
+    def compute_sector_flow_acceleration(
+        self,
+        recent_days: int = 5,
+        base_days: int = 15,
+    ) -> pd.Series:
+        """計算各產業法人資金流加速度（二階導數）。
+
+        查詢 DB 並呼叫模組層級純函數 `compute_flow_acceleration_from_df()`。
+
+        Args:
+            recent_days: 近期窗口交易日數（預設 5）
+            base_days: 前期窗口交易日數（預設 15）
+
+        Returns:
+            Series: index=industry_category, value=acceleration
+            若資料不足回傳全零 Series。
+        """
+        industry_map = self.get_industry_map()
+        end_date = date.today()
+        # 查詢足夠的歷史：(recent + base) × 2 個日曆天 + 10 天 buffer
+        start_date = end_date - timedelta(days=(recent_days + base_days) * 2 + 10)
+
+        with get_session() as session:
+            rows = (
+                session.execute(
+                    select(InstitutionalInvestor)
+                    .where(InstitutionalInvestor.stock_id.in_(self.watchlist))
+                    .where(InstitutionalInvestor.date >= start_date)
+                    .order_by(InstitutionalInvestor.date.desc())
+                )
+                .scalars()
+                .all()
+            )
+
+        if not rows:
+            return pd.Series(dtype=float)
+
+        df = pd.DataFrame([{"stock_id": r.stock_id, "date": r.date, "net": r.net} for r in rows])
+        df["industry"] = df["stock_id"].map(industry_map).fillna("未分類")
+
+        return compute_flow_acceleration_from_df(df, recent_days=recent_days, base_days=base_days)
 
     def compute_sector_institutional_flow(self) -> pd.DataFrame:
         """計算各產業法人資金流向。
@@ -243,12 +342,19 @@ class IndustryRotationAnalyzer:
         self,
         inst_weight: float = 0.5,
         momentum_weight: float = 0.5,
+        use_flow_acceleration: bool = True,
+        accel_weight: float = 0.7,
     ) -> pd.DataFrame:
         """綜合排名各產業（法人動能 + 價格動能）。
 
         Args:
-            inst_weight: 法人分數權重
-            momentum_weight: 價格動能權重
+            inst_weight: 法人分數權重（相對於動能分數）
+            momentum_weight: 價格動能權重（相對於法人分數）
+            use_flow_acceleration: 是否啟用「資金流加速度」訊號（預設 True）。
+                啟用時法人分數 = (1 - accel_weight) × level + accel_weight × acceleration，
+                可捕捉資金「剛轉入」初升段，降低追高風險。
+            accel_weight: 加速度信號在法人子分數中的權重（預設 0.7）；
+                level 信號權重 = 1 - accel_weight。
 
         Returns:
             DataFrame: [rank, industry, sector_score, institutional_score,
@@ -287,7 +393,22 @@ class IndustryRotationAnalyzer:
                 return pd.Series(0.5, index=series.index)
             return (series - mn) / (mx - mn)
 
-        merged["institutional_score"] = _minmax(merged["total_net"])
+        # 法人子分數：level 或 level + acceleration 混合
+        level_score = _minmax(merged["total_net"])
+        if use_flow_acceleration:
+            accel_series = self.compute_sector_flow_acceleration()
+            if not accel_series.empty:
+                # 對齊 merged 的 industry 索引
+                accel_aligned = accel_series.reindex(merged["industry"].values, fill_value=0.0)
+                accel_aligned.index = merged.index
+                accel_score = _minmax(accel_aligned)
+                inst_sub_score = (1.0 - accel_weight) * level_score + accel_weight * accel_score
+            else:
+                inst_sub_score = level_score
+        else:
+            inst_sub_score = level_score
+
+        merged["institutional_score"] = inst_sub_score
         merged["momentum_score"] = _minmax(merged["avg_return_pct"])
         merged["sector_score"] = (
             inst_weight * merged["institutional_score"] + momentum_weight * merged["momentum_score"]
