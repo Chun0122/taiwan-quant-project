@@ -32,6 +32,20 @@ _HEADERS = {
 # 請求間隔（秒），避免被封鎖
 _REQUEST_DELAY = 3
 
+# --- 上下文情緒 Regex Patterns（優先於單詞比對，捕捉特定上下文誤判）--- #
+
+_NEGATIVE_CONTEXT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"處分.{0,10}(股權|持股|投資)"),
+    re.compile(r"澄清.{0,10}(下修|衰退|虧損)"),
+    re.compile(r"(大股東|董事).{0,10}處分.{0,10}持股"),
+]
+
+_POSITIVE_CONTEXT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"處分.{0,10}(利益|盈餘|獲利)"),
+    re.compile(r"取得.{0,10}(專利|合約|標案|訂單)"),
+    re.compile(r"(合約|框架協議).{0,10}(簽訂|簽署)"),
+]
+
 # --- 情緒分類關鍵字 --- #
 
 _POSITIVE_KEYWORDS = [
@@ -85,7 +99,26 @@ _NEGATIVE_KEYWORDS = [
 ]
 
 # --- 事件類型分類關鍵字 --- #
-# 優先序：earnings_call → investor_day → filing → revenue → general
+# 優先序：governance_change → buyback → earnings_call → investor_day → filing → revenue → general
+
+_EVENT_GOVERNANCE = [
+    "董監改選",
+    "董事改選",
+    "監察人改選",
+    "股東臨時會",
+    "市場派",
+    "大股東持股申報",
+    "持股申報轉讓",
+    "董事會改選",
+    "獨立董事選任",
+]
+
+_EVENT_BUYBACK = [
+    "決議買回庫藏股",
+    "買回庫藏股",
+    "庫藏股買回",
+    "庫藏股執行",
+]
 
 _EVENT_EARNINGS_CALL = [
     "法說會",
@@ -127,6 +160,11 @@ _EVENT_REVENUE = [
 def classify_sentiment(subject: str) -> int:
     """依公告主旨關鍵字分類情緒。
 
+    優先序：
+        1. Regex 上下文比對（負面 → 正面）— 捕捉如「處分持股」vs「處分利益」等上下文差異
+        2. 「澄清/說明媒體」中性規則（已通過 regex 過濾後才套用）
+        3. 單詞關鍵字比對（負面優先）
+
     Args:
         subject: 公告主旨文字
 
@@ -136,11 +174,20 @@ def classify_sentiment(subject: str) -> int:
     if not subject:
         return 0
 
-    # 「澄清媒體報導」通常為中性（依法回應媒體傳言），不應被內文關鍵字誤判
+    # 1. Regex 上下文比對（最高優先，可覆寫澄清規則）
+    for pat in _NEGATIVE_CONTEXT_PATTERNS:
+        if pat.search(subject):
+            return -1
+
+    for pat in _POSITIVE_CONTEXT_PATTERNS:
+        if pat.search(subject):
+            return 1
+
+    # 2. 「澄清媒體報導」通常為中性（依法回應媒體傳言），不應被內文關鍵字誤判
     if "澄清" in subject or "說明媒體" in subject:
         return 0
 
-    # 負面優先比對（負面關鍵字多為具體搭配如「終止上市」「現金增資」）
+    # 3. 負面優先比對（負面關鍵字多為具體搭配如「終止上市」「現金增資」）
     for kw in _NEGATIVE_KEYWORDS:
         if kw in subject:
             return -1
@@ -155,21 +202,31 @@ def classify_sentiment(subject: str) -> int:
 def classify_event_type(subject: str) -> str:
     """依公告主旨關鍵字分類事件類型。
 
-    優先序：earnings_call → investor_day → filing → revenue → general
+    優先序：governance_change → buyback → earnings_call → investor_day → filing → revenue → general
 
     Args:
         subject: 公告主旨文字
 
     Returns:
         事件類型字串：
-        - "earnings_call"  法說會 / 法人說明會
-        - "investor_day"   投資人日 / 股東說明會
-        - "filing"         年報 / 季報 / 財務報告 / EPS
-        - "revenue"        月營收
-        - "general"        一般公告
+        - "governance_change" 董監改選 / 股東臨時會 / 市場派
+        - "buyback"           決議買回庫藏股（護盤行動）
+        - "earnings_call"     法說會 / 法人說明會
+        - "investor_day"      投資人日 / 股東說明會
+        - "filing"            年報 / 季報 / 財務報告 / EPS
+        - "revenue"           月營收
+        - "general"           一般公告
     """
     if not subject:
         return "general"
+
+    for kw in _EVENT_GOVERNANCE:
+        if kw in subject:
+            return "governance_change"
+
+    for kw in _EVENT_BUYBACK:
+        if kw in subject:
+            return "buyback"
 
     for kw in _EVENT_EARNINGS_CALL:
         if kw in subject:

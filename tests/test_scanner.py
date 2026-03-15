@@ -1874,14 +1874,14 @@ class TestComputeNewsDecayWeight:
         assert w == pytest.approx(3.0, abs=1e-9)
 
     def test_decay_reduces_over_time(self):
-        """第 1 天的加權值應小於第 0 天（指數衰減）。"""
+        """第 1 天的加權值應小於第 0 天（指數衰減，常數 0.2）。"""
         import math
 
         from src.discovery.scanner import compute_news_decay_weight
 
         w0 = compute_news_decay_weight(0, "general")
         w1 = compute_news_decay_weight(1, "general")
-        assert w1 == pytest.approx(math.exp(-0.3), abs=1e-9)
+        assert w1 == pytest.approx(math.exp(-0.2), abs=1e-9)
         assert w1 < w0
 
     def test_earnings_call_beats_general_same_age(self):
@@ -1992,6 +1992,189 @@ class TestComputeNewsScores:
             ]
         )
         result = scanner._compute_news_scores(["1000", "2000", "3000"], ann)
+        assert result["news_score"].between(0.0, 1.0).all()
+
+
+# ====================================================================== #
+#  消息面評分升級測試（Task 48）
+# ====================================================================== #
+
+
+class TestComputeNewsDecayWeightV2:
+    """新 decay 常數（0.2）與新事件類型（governance_change/buyback）測試。"""
+
+    def test_decay_constant_is_0_2(self):
+        """1 天後 general 公告的衰減值應為 exp(-0.2)。"""
+        import math
+
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(1, "general") == pytest.approx(math.exp(-0.2), abs=1e-9)
+
+    def test_seven_days_retention_above_20pct(self):
+        """7 天後仍保留 >20%（exp(-1.4) ≈ 0.247）。"""
+        import math
+
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w = compute_news_decay_weight(7, "general")
+        assert w == pytest.approx(math.exp(-1.4), abs=1e-9)
+        assert w > 0.20
+
+    def test_governance_change_weight_5(self):
+        """governance_change 事件類型加權值應為 5.0。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(0, "governance_change") == pytest.approx(5.0, abs=1e-9)
+
+    def test_buyback_weight_4(self):
+        """buyback 事件類型加權值應為 4.0。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(0, "buyback") == pytest.approx(4.0, abs=1e-9)
+
+    def test_governance_beats_earnings_call_same_age(self):
+        """相同天數下，governance_change 加權值應大於 earnings_call。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(3, "governance_change") > compute_news_decay_weight(3, "earnings_call")
+
+    def test_buyback_beats_investor_day_same_age(self):
+        """相同天數下，buyback 加權值應大於 investor_day。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        assert compute_news_decay_weight(3, "buyback") > compute_news_decay_weight(3, "investor_day")
+
+
+class TestComputeAbnormalAnnouncementRate:
+    """compute_abnormal_announcement_rate 純函數測試。"""
+
+    def _make_history(self, stock_id: str, dates: list) -> pd.DataFrame:
+        return pd.DataFrame({"stock_id": [stock_id] * len(dates), "date": dates})
+
+    def test_empty_history_returns_zero(self):
+        """無歷史資料 → Z=0.0。"""
+        from src.discovery.scanner import compute_abnormal_announcement_rate
+
+        result = compute_abnormal_announcement_rate(pd.DataFrame(), ["1000", "2000"])
+        assert (result == 0.0).all()
+
+    def test_no_recent_activity_returns_negative(self):
+        """基準期有公告但近期無 → Z < 0（安靜期）。"""
+        from src.discovery.scanner import compute_abnormal_announcement_rate
+
+        today = date.today()
+        # 基準期早期有密集公告，近 10 天沒有
+        dates = [today - timedelta(days=d) for d in range(20, 150, 10)]
+        df_hist = self._make_history("1000", dates)
+        result = compute_abnormal_announcement_rate(df_hist, ["1000"])
+        assert result["1000"] < 0.0
+
+    def test_abnormal_spike_returns_high_z(self):
+        """近期公告突增（vs 基準期低頻）→ Z > 2（異常活躍）。"""
+        from src.discovery.scanner import compute_abnormal_announcement_rate
+
+        today = date.today()
+        # 基準期：每窗口僅 1 篇（低頻）
+        baseline_dates = [today - timedelta(days=d) for d in range(15, 170, 10)]
+        # 近期 10 天：10 篇（高頻爆量）
+        recent_dates = [today - timedelta(days=d) for d in range(0, 10)]
+        all_dates = baseline_dates + recent_dates
+        df_hist = self._make_history("1000", all_dates)
+        result = compute_abnormal_announcement_rate(df_hist, ["1000"])
+        assert result["1000"] > 2.0
+
+    def test_stock_not_in_history_returns_zero(self):
+        """候選股不在歷史中 → Z=0.0。"""
+        from src.discovery.scanner import compute_abnormal_announcement_rate
+
+        today = date.today()
+        df_hist = self._make_history("9999", [today - timedelta(days=5)])
+        result = compute_abnormal_announcement_rate(df_hist, ["1000"])
+        assert result["1000"] == 0.0
+
+    def test_result_is_series_indexed_by_stock_id(self):
+        """回傳 Series，包含所有傳入的 stock_id。"""
+        from src.discovery.scanner import compute_abnormal_announcement_rate
+
+        result = compute_abnormal_announcement_rate(pd.DataFrame(), ["1000", "2000"])
+        assert isinstance(result, pd.Series)
+        assert set(result.index) == {"1000", "2000"}
+
+
+class TestComputeNewsScoresV2:
+    """_compute_news_scores 整合新事件類型與異常率乘數測試。"""
+
+    def _make_scanner(self):
+        return MarketScanner(min_price=10, max_price=2000, min_volume=100_000)
+
+    def test_governance_change_beats_earnings_call(self):
+        """governance_change 正面公告排名應高於 earnings_call 正面公告。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "governance_change"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_buyback_beats_general(self):
+        """buyback 正面公告排名應高於 general 正面公告。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "buyback"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "general"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_abnormal_rate_boosts_score(self):
+        """有異常公告爆量（Z>2）的股票相較普通公告的股票得分更高。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        # 兩股都有相同類型正面公告
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "general"},
+            ]
+        )
+        # 1000 近期爆量（基準期低頻），2000 無歷史
+        baseline = [today - timedelta(days=d) for d in range(15, 170, 15)]
+        recent = [today - timedelta(days=d) for d in range(0, 10)]
+        df_hist = pd.DataFrame({"stock_id": ["1000"] * len(baseline + recent), "date": baseline + recent})
+        result = scanner._compute_news_scores(["1000", "2000"], ann, df_ann_history=df_hist).set_index("stock_id")
+        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+
+    def test_no_history_behaves_same_as_before(self):
+        """未傳入 df_ann_history（None）時，正常計算不崩潰。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann, df_ann_history=None)
+        assert len(result) == 2
+        assert "news_score" in result.columns
+
+    def test_output_still_0_1_range_with_history(self):
+        """加入歷史後 news_score 仍應在 [0, 1] 範圍內。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "governance_change"},
+                {"stock_id": "2000", "date": today, "sentiment": -1, "event_type": "general"},
+                {"stock_id": "3000", "date": today - timedelta(days=5), "sentiment": 1, "event_type": "buyback"},
+            ]
+        )
+        history_dates = [today - timedelta(days=d) for d in range(5, 50, 5)]
+        df_hist = pd.DataFrame({"stock_id": ["1000"] * len(history_dates), "date": history_dates})
+        result = scanner._compute_news_scores(["1000", "2000", "3000"], ann, df_ann_history=df_hist)
         assert result["news_score"].between(0.0, 1.0).all()
 
 

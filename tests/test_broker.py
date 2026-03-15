@@ -815,7 +815,7 @@ class TestStage25AutoFetch:
         # patch sync_revenue_for_stocks 和其他 Stage 方法，避免 DB 依賴
         monkeypatch.setattr("src.data.pipeline.sync_revenue_for_stocks", lambda ids: 0, raising=False)
         monkeypatch.setattr(scanner, "_load_revenue_data", lambda ids, months=2: pd.DataFrame())
-        monkeypatch.setattr(scanner, "_load_announcement_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_announcement_data", lambda ids: (pd.DataFrame(), pd.DataFrame()))
         monkeypatch.setattr(
             scanner,
             "_score_candidates",

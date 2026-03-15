@@ -12,7 +12,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from src.data.mops_fetcher import classify_sentiment
+from src.data.mops_fetcher import classify_event_type, classify_sentiment
 from src.regime.detector import REGIME_WEIGHTS, MarketRegimeDetector
 
 # ------------------------------------------------------------------ #
@@ -90,6 +90,89 @@ class TestClassifySentiment:
         """澄清媒體報導 → 0（不受內文關鍵字影響）。"""
         assert classify_sentiment("澄清媒體報導本公司營收創歷史新高") == 0
         assert classify_sentiment("說明媒體報導本公司合併案") == 0
+
+
+# ------------------------------------------------------------------ #
+#  Regex 上下文情緒分類（Task 48）
+# ------------------------------------------------------------------ #
+
+
+class TestClassifySentimentContextPairs:
+    """Regex 上下文情緒分類測試（取代單詞誤判）。"""
+
+    def test_disposal_profit_is_positive(self):
+        """處分+利益/盈餘/獲利 → 正面（非「處分持股」）。"""
+        assert classify_sentiment("本公司處分土地取得利益") == 1
+        assert classify_sentiment("本公司處分設備獲利公告") == 1
+        assert classify_sentiment("本公司不動產處分盈餘入帳") == 1
+
+    def test_disposal_stock_is_negative(self):
+        """處分+股權/持股/投資 → 負面。"""
+        assert classify_sentiment("大股東申報處分持股") == -1
+        assert classify_sentiment("本公司處分子公司股權") == -1
+        assert classify_sentiment("主要股東處分投資公告") == -1
+
+    def test_obtain_contract_is_positive(self):
+        """取得+合約/標案/訂單 → 正面。"""
+        assert classify_sentiment("本公司取得合約公告") == 1
+        assert classify_sentiment("本公司取得標案") == 1
+        assert classify_sentiment("本公司取得訂單") == 1
+
+    def test_clarification_decline_is_negative(self):
+        """澄清+下修/衰退/虧損 → 負面（regex 優先於澄清中性規則）。"""
+        assert classify_sentiment("澄清媒體報導本公司營收衰退") == -1
+        assert classify_sentiment("澄清本公司EPS下修") == -1
+
+    def test_neutral_clarification_preserved(self):
+        """澄清媒體報導（無具體負面上下文）→ 仍為中性。"""
+        assert classify_sentiment("澄清媒體報導本公司訂單情況") == 0
+        assert classify_sentiment("說明媒體報導本公司合作案") == 0
+
+    def test_contract_signing_is_positive(self):
+        """框架協議+簽訂/簽署 → 正面。"""
+        assert classify_sentiment("本公司與XX公司框架協議簽訂公告") == 1
+        assert classify_sentiment("合約簽署完成公告") == 1
+
+
+# ------------------------------------------------------------------ #
+#  新增事件類型分類（Task 48）
+# ------------------------------------------------------------------ #
+
+
+class TestClassifyEventTypeV2:
+    """governance_change / buyback 新事件類型測試。"""
+
+    def test_governance_change_board_election(self):
+        """董監改選 → governance_change。"""
+        assert classify_event_type("本公司召開股東會討論董監改選事宜") == "governance_change"
+
+    def test_governance_change_extraordinary_meeting(self):
+        """股東臨時會 → governance_change。"""
+        assert classify_event_type("本公司召開股東臨時會（市場派提案）") == "governance_change"
+
+    def test_governance_change_market_activist(self):
+        """市場派 → governance_change。"""
+        assert classify_event_type("市場派股東提案公告") == "governance_change"
+
+    def test_buyback_resolution(self):
+        """決議買回庫藏股 → buyback。"""
+        assert classify_event_type("本公司董事會決議買回庫藏股") == "buyback"
+
+    def test_buyback_execution(self):
+        """庫藏股執行 → buyback。"""
+        assert classify_event_type("庫藏股執行進度說明") == "buyback"
+
+    def test_governance_beats_earnings_call(self):
+        """governance_change 優先序高於 earnings_call。"""
+        assert classify_event_type("董監改選說明會暨法說會") == "governance_change"
+
+    def test_buyback_beats_revenue(self):
+        """buyback 優先序高於 revenue（如「庫藏股執行後合併營收」）。"""
+        assert classify_event_type("庫藏股買回完成合併營收公告") == "buyback"
+
+    def test_independent_director_election(self):
+        """獨立董事選任 → governance_change。"""
+        assert classify_event_type("本公司獨立董事選任公告") == "governance_change"
 
 
 # ------------------------------------------------------------------ #

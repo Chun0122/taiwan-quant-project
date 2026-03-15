@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 
 # 事件類型加權值（重要度由高到低）
 _EVENT_TYPE_WEIGHTS: dict[str, float] = {
+    "governance_change": 5.0,  # 董監改選 / 市場派（最強結構性事件）
+    "buyback": 4.0,  # 庫藏股決議（真金白銀護盤）
     "earnings_call": 3.0,
     "investor_day": 2.0,
     "filing": 1.5,
@@ -57,17 +59,91 @@ _EVENT_TYPE_WEIGHTS: dict[str, float] = {
 def compute_news_decay_weight(days_ago: int, event_type: str) -> float:
     """計算單則公告的時間衰減加權值。
 
-    公式：exp(-0.3 × days_ago) × type_weight
+    公式：exp(-0.2 × days_ago) × type_weight
+
+    衰減常數 0.2：7 天後仍保留 ~25% 權重（exp(-1.4) ≈ 0.247），
+    適合「董監改選」等後續發酵型事件。
 
     Args:
         days_ago: 公告距今天數（≥0）
-        event_type: 事件類型（earnings_call / investor_day / filing / revenue / general）
+        event_type: 事件類型（governance_change / buyback / earnings_call /
+                    investor_day / filing / revenue / general）
 
     Returns:
         加權值（≥0）
     """
     type_weight = _EVENT_TYPE_WEIGHTS.get(event_type, 1.0)
-    return float(np.exp(-0.3 * max(0, days_ago)) * type_weight)
+    return float(np.exp(-0.2 * max(0, days_ago)) * type_weight)
+
+
+def compute_abnormal_announcement_rate(
+    df_ann_history: pd.DataFrame,
+    stock_ids: list[str],
+    recent_days: int = 10,
+    baseline_days: int = 180,
+) -> pd.Series:
+    """計算各股公告頻率異常 Z-Score（近 recent_days 與過去 baseline_days 基準比較）。
+
+    算法：
+        1. 將 baseline_days 拆為 (baseline_days // recent_days - 1) 個非重疊基準窗口
+        2. 計算各基準窗口的公告數 → 估算 μ, σ
+        3. Z-Score = (最近 recent_days 公告數 - μ) / max(σ, 1)
+
+    Z-Score > 2  → 異常活躍（外部乘數加成，最高 +50%）
+    Z-Score < -1 → 異常沉寂（外部乘數降權，最低至 70%）
+    -1 ≤ Z ≤ 2  → 正常範圍（乘數 = 1.0）
+
+    Args:
+        df_ann_history: 公告歷史 DataFrame，須含 stock_id, date 欄位
+        stock_ids: 候選股代號清單
+        recent_days: 近期窗口天數（預設 10）
+        baseline_days: 基準期天數（預設 180，約 6 個月）
+
+    Returns:
+        Series(index=stock_id, dtype=float)；無歷史資料的股票 Z=0.0
+    """
+    if df_ann_history.empty or "stock_id" not in df_ann_history.columns:
+        return pd.Series(0.0, index=pd.Index(stock_ids))
+
+    today = date.today()
+    recent_cutoff = today - timedelta(days=recent_days)
+    baseline_start = today - timedelta(days=baseline_days)
+
+    df_hist = df_ann_history[["stock_id", "date"]].copy()
+    df_hist = df_hist[df_hist["date"] >= baseline_start]
+
+    # 基準窗口數（排除最近窗口本身）
+    n_baseline_windows = baseline_days // recent_days - 1
+    if n_baseline_windows < 1:
+        return pd.Series(0.0, index=pd.Index(stock_ids))
+
+    z_scores: dict[str, float] = {}
+    for sid in stock_ids:
+        stock_df = df_hist[df_hist["stock_id"] == sid]
+        if stock_df.empty:
+            z_scores[sid] = 0.0
+            continue
+
+        # 最近 recent_days 的公告數
+        recent_count = int((stock_df["date"] >= recent_cutoff).sum())
+
+        # 基準期各窗口的公告數
+        window_counts: list[int] = []
+        for i in range(1, n_baseline_windows + 1):
+            wend = today - timedelta(days=recent_days * i)
+            wstart = today - timedelta(days=recent_days * (i + 1))
+            cnt = int(((stock_df["date"] >= wstart) & (stock_df["date"] < wend)).sum())
+            window_counts.append(cnt)
+
+        if not window_counts:
+            z_scores[sid] = 0.0
+            continue
+
+        mu = float(np.mean(window_counts))
+        sigma = float(np.std(window_counts))
+        z_scores[sid] = (recent_count - mu) / max(sigma, 1.0)
+
+    return pd.Series(z_scores).reindex(stock_ids).fillna(0.0)
 
 
 def compute_relative_pe_thresholds(
@@ -726,15 +802,15 @@ class MarketScanner:
             except Exception:
                 logger.warning("Stage 2.5: 分點資料補抓失敗（可能無 FinMind token），使用既有資料")
 
-        # Stage 2.7: 載入候選股近期 MOPS 公告
-        df_ann = self._load_announcement_data(candidate_ids)
+        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
+        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
         if not df_ann.empty:
             logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
         else:
             logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
 
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.3: 產業加成
@@ -974,19 +1050,32 @@ class MarketScanner:
             return pd.DataFrame(columns=_cols)
         return pd.DataFrame(rows, columns=_cols)
 
-    def _load_announcement_data(self, stock_ids: list[str] | None = None, days: int = 10) -> pd.DataFrame:
-        """從 DB 查詢近 N 日的 MOPS 重大訊息公告。
+    def _load_announcement_data(
+        self,
+        stock_ids: list[str] | None = None,
+        days: int = 10,
+        baseline_days: int = 180,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """從 DB 查詢 MOPS 重大訊息公告（近期 + 基準期歷史）。
 
         Args:
             stock_ids: 限定查詢的股票清單，None 表示查全部
-            days: 回溯天數
+            days: 近期回溯天數（供評分用）
+            baseline_days: 基準期天數（供異常公告率計算用，預設 180）
 
         Returns:
-            DataFrame(stock_id, date, seq, subject, sentiment)
+            (recent_df, history_df)
+            - recent_df: 最近 days 天，含 stock_id/date/seq/subject/sentiment/event_type
+            - history_df: 最近 baseline_days 天，含 stock_id/date（供異常率計算）
         """
-        cutoff = date.today() - timedelta(days=days)
+        today = date.today()
+        recent_cutoff = today - timedelta(days=days)
+        baseline_cutoff = today - timedelta(days=baseline_days)
+
+        col_names = ["stock_id", "date", "seq", "subject", "sentiment", "event_type"]
 
         with get_session() as session:
+            # 近期完整資料
             query = select(
                 Announcement.stock_id,
                 Announcement.date,
@@ -994,29 +1083,43 @@ class MarketScanner:
                 Announcement.subject,
                 Announcement.sentiment,
                 Announcement.event_type,
-            ).where(Announcement.date >= cutoff)
+            ).where(Announcement.date >= recent_cutoff)
 
             if stock_ids:
                 query = query.where(Announcement.stock_id.in_(stock_ids))
 
-            rows = session.execute(query).all()
+            recent_rows = session.execute(query).all()
 
-        return pd.DataFrame(
-            rows,
-            columns=["stock_id", "date", "seq", "subject", "sentiment", "event_type"],
-        )
+            # 基準期（僅需 stock_id + date）
+            hist_query = select(Announcement.stock_id, Announcement.date).where(Announcement.date >= baseline_cutoff)
+            if stock_ids:
+                hist_query = hist_query.where(Announcement.stock_id.in_(stock_ids))
 
-    def _compute_news_scores(self, stock_ids: list[str], df_ann: pd.DataFrame) -> pd.DataFrame:
-        """計算消息面分數（時間衰減 × 事件類型加權，percentile 排名）。
+            history_rows = session.execute(hist_query).all()
+
+        recent_df = pd.DataFrame(recent_rows, columns=col_names)
+        history_df = pd.DataFrame(history_rows, columns=["stock_id", "date"])
+        return recent_df, history_df
+
+    def _compute_news_scores(
+        self,
+        stock_ids: list[str],
+        df_ann: pd.DataFrame,
+        df_ann_history: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """計算消息面分數（時間衰減 × 事件類型加權 × 異常公告率，percentile 排名）。
 
         公式：
-            各公告加權值 = exp(-0.3 × days_ago) × type_weight
-            net_score = Σ(加權值 for 正面公告) - Σ(加權值 for 負面公告)
-            news_score = percentile_rank(net_score)
+            各公告加權值 = exp(-0.2 × days_ago) × type_weight
+            net_score = Σ(加權值 for 正面) - Σ(加權值 for 負面)
+            abnormal_multiplier：z>2 最高 +50%，z<-1 最低降至 70%，平常 1.0
+            net_score_adj = net_score × abnormal_multiplier
+            news_score = percentile_rank(net_score_adj)
 
         Args:
             stock_ids: 候選股代號清單
-            df_ann: 公告資料 DataFrame（須含 sentiment, event_type, date 欄位）
+            df_ann: 近期公告 DataFrame（須含 sentiment, event_type, date 欄位）
+            df_ann_history: 基準期公告歷史（stock_id, date），供異常率計算，None 則略過
 
         Returns:
             DataFrame(stock_id, news_score) — 分數 0~1，0.5 為中性預設
@@ -1054,11 +1157,28 @@ class MarketScanner:
         df["neg_weighted"] = df["neg_weighted"].fillna(0.0)
         df["net_score"] = df["pos_weighted"] - df["neg_weighted"]
 
+        # 異常公告率乘數（僅在 history 有效時套用）
+        if df_ann_history is not None and not df_ann_history.empty:
+            z_series = compute_abnormal_announcement_rate(df_ann_history, stock_ids)
+
+            def _to_multiplier(z: float) -> float:
+                if z > 2.0:
+                    return min(1.0 + (z - 2.0) * 0.15, 1.5)
+                elif z < -1.0:
+                    return max(1.0 + z * 0.10, 0.7)
+                return 1.0
+
+            mult_map = {sid: _to_multiplier(float(z)) for sid, z in z_series.items()}
+            df["mult"] = df["stock_id"].map(mult_map).fillna(1.0)
+            df["net_score_adj"] = df["net_score"] * df["mult"]
+        else:
+            df["net_score_adj"] = df["net_score"]
+
         # 無任何加權公告 → 回傳預設
-        if df["net_score"].abs().sum() == 0:
+        if df["net_score_adj"].abs().sum() == 0:
             return default
 
-        df["news_score"] = df["net_score"].rank(pct=True)
+        df["news_score"] = df["net_score_adj"].rank(pct=True)
 
         return df[["stock_id", "news_score"]]
 
@@ -1385,6 +1505,7 @@ class MarketScanner:
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
         df_ann: pd.DataFrame | None = None,
+        df_ann_history: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """對候選股進行多維度評分（通用流程）。
 
@@ -1400,7 +1521,7 @@ class MarketScanner:
             self._compute_technical_scores(stock_ids, df_price),
             self._compute_chip_scores(stock_ids, df_inst, df_price, df_margin),
             self._compute_fundamental_scores(stock_ids, df_revenue),
-            self._compute_news_scores(stock_ids, ann),
+            self._compute_news_scores(stock_ids, ann, df_ann_history=df_ann_history),
         ]
         # hook：子類可加額外維度（如 ValueScanner 的 valuation_score）
         score_dfs.extend(self._compute_extra_scores(stock_ids))
@@ -2906,11 +3027,12 @@ class SwingScanner(MarketScanner):
         df_margin: pd.DataFrame,
         df_revenue: pd.DataFrame,
         df_ann: pd.DataFrame | None = None,
+        df_ann_history: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """覆寫：執行通用評分後套用 VCP 波動收斂加成。"""
         # 儲存 df_price 供 _post_score() 的 VCP 計算使用
         self._df_price_for_vcp = df_price
-        return super()._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        return super()._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
 
     def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
         """波段模式加成：VCP 波動收斂形態符合者 composite_score +3%。"""
@@ -3073,15 +3195,15 @@ class ValueScanner(MarketScanner):
         except Exception:
             logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
 
-        # Stage 2.7: 載入候選股近期 MOPS 公告
-        df_ann = self._load_announcement_data(candidate_ids)
+        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
+        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
         if not df_ann.empty:
             logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
         else:
             logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
 
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.3: 產業加成
@@ -3515,15 +3637,15 @@ class DividendScanner(MarketScanner):
         except Exception:
             logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
 
-        # Stage 2.7: 載入候選股近期 MOPS 公告
-        df_ann = self._load_announcement_data(candidate_ids)
+        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
+        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
         if not df_ann.empty:
             logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
         else:
             logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
 
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.3: 產業加成
@@ -3866,15 +3988,15 @@ class GrowthScanner(MarketScanner):
         except Exception:
             logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
 
-        # Stage 2.7: 載入候選股近期 MOPS 公告
-        df_ann = self._load_announcement_data(candidate_ids)
+        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
+        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
         if not df_ann.empty:
             logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
         else:
             logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
 
         # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
         # Stage 3.3: 產業加成
