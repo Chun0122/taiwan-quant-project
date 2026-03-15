@@ -2703,3 +2703,196 @@ class TestComputeSectorRelativeStrength:
         rs = result.set_index("stock_id")["relative_strength_bonus"]
         # 9999 無資料 → 0.0
         assert rs["9999"] == pytest.approx(0.0)
+
+
+# ─── 分點資料接入非 Momentum 模式 chip_tier 測試 ───────────────────────
+
+
+def _make_broker_df(stock_ids: list[str]) -> pd.DataFrame:
+    """建立簡單的分點交易 DataFrame（單日單分點淨買超）。"""
+    rows = []
+    for sid in stock_ids:
+        rows.append(
+            {
+                "stock_id": sid,
+                "date": date(2025, 1, 25),
+                "broker_id": "9A00",
+                "buy": 5000,
+                "sell": 1000,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _make_basic_inst_df(stock_ids: list[str]) -> pd.DataFrame:
+    """建立最小法人 DataFrame（所有股票單日投信買超）。"""
+    return pd.DataFrame(
+        [{"stock_id": sid, "date": date(2025, 1, 25), "name": "投信買賣超", "net": 100} for sid in stock_ids]
+    )
+
+
+class TestSwingChipBrokerTier:
+    """SwingScanner 接入分點資料後的 chip_tier 升級測試。"""
+
+    def _make_scanner(self):
+        from src.discovery.scanner import SwingScanner
+
+        return SwingScanner()
+
+    def _make_holding_df(self, stock_ids: list[str]) -> pd.DataFrame:
+        """建立符合 compute_whale_score 格式的大戶持股資料（下限 >= 400,000 股）。"""
+        rows = []
+        for sid in stock_ids:
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, 25),
+                    "level": "400001600000",  # _extract_level_lower_bound → 400001 >= 400000
+                    "percent": 30.0,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_whale_and_broker_gives_4f(self, monkeypatch):
+        """有大戶 + 有分點時，chip_tier 應升至 4F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "4F"
+
+    def test_broker_only_gives_3f(self, monkeypatch):
+        """無大戶 + 有分點時，chip_tier 應為 3F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "3F"
+
+    def test_no_broker_no_whale_gives_2f(self, monkeypatch):
+        """無大戶 + 無分點時，chip_tier 維持 2F（現狀不退化）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "2F"
+
+    def test_chip_score_in_range(self, monkeypatch):
+        """有分點資料時 chip_score 應在 [0, 1] 範圍內。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert (result["chip_score"] >= 0).all()
+        assert (result["chip_score"] <= 1.0).all()
+
+
+class TestGrowthChipBrokerTier:
+    """GrowthScanner 接入分點資料後的 chip_tier 升級測試。"""
+
+    def _make_scanner(self):
+        from src.discovery.scanner import GrowthScanner
+
+        return GrowthScanner()
+
+    def _make_margin_df(self, stock_ids: list[str]) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date(2025, 1, 25), "margin_balance": 1000, "short_balance": 100}
+                for sid in stock_ids
+            ]
+        )
+
+    def test_margin_and_broker_gives_5f(self, monkeypatch):
+        """有券資比 + 有分點時，chip_tier 應升至 5F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        df_margin = self._make_margin_df(sids)
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids), None, df_margin)
+        assert result.iloc[0]["chip_tier"] == "5F"
+
+    def test_margin_no_broker_gives_4f(self, monkeypatch):
+        """有券資比 + 無分點時，chip_tier 維持 4F（現狀不退化）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+        df_margin = self._make_margin_df(sids)
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids), None, df_margin)
+        assert result.iloc[0]["chip_tier"] == "4F"
+
+    def test_broker_no_margin_gives_4f(self, monkeypatch):
+        """有分點 + 無券資比時，chip_tier 應為 4F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids), None, None)
+        assert result.iloc[0]["chip_tier"] == "4F"
+
+    def test_no_margin_no_broker_gives_3f(self, monkeypatch):
+        """無券資比 + 無分點時，chip_tier 維持 3F（現狀不退化）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids), None, None)
+        assert result.iloc[0]["chip_tier"] == "3F"
+
+
+class TestValueChipBrokerTier:
+    """ValueScanner 接入分點資料後的 chip_tier 升級測試。"""
+
+    def _make_scanner(self):
+        from src.discovery.scanner import ValueScanner
+
+        return ValueScanner()
+
+    def test_broker_gives_3f(self, monkeypatch):
+        """有分點資料時，chip_tier 應升至 3F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "3F"
+
+    def test_no_broker_gives_2f(self, monkeypatch):
+        """無分點資料時，chip_tier 維持 2F（現狀不退化）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "2F"
+
+    def test_chip_score_in_range_with_broker(self, monkeypatch):
+        """有分點資料時 chip_score 應在 [0, 1] 範圍內。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert (result["chip_score"] >= 0).all()
+        assert (result["chip_score"] <= 1.0).all()

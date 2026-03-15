@@ -1976,6 +1976,34 @@ class MarketScanner:
         summary.columns = ["industry", "count", "avg_score"]
         return summary
 
+    def _load_broker_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 7 天的分點交易資料。
+
+        共用方法（MarketScanner 基底），供 MomentumScanner / SwingScanner /
+        ValueScanner / GrowthScanner 的 _compute_chip_scores() 呼叫。
+        若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
+        """
+        cutoff = date.today() - timedelta(days=7)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        BrokerTrade.stock_id,
+                        BrokerTrade.date,
+                        BrokerTrade.broker_id,
+                        BrokerTrade.buy,
+                        BrokerTrade.sell,
+                    ).where(
+                        BrokerTrade.stock_id.in_(stock_ids),
+                        BrokerTrade.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
+        except Exception:
+            return pd.DataFrame()
+
 
 # ====================================================================== #
 #  MomentumScanner — 短線動能模式
@@ -2346,32 +2374,6 @@ class MomentumScanner(MarketScanner):
         except Exception:
             return pd.DataFrame()
 
-    def _load_broker_data(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DB 載入最近 7 天的分點交易資料。
-
-        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
-        """
-        cutoff = date.today() - timedelta(days=7)
-        try:
-            with get_session() as session:
-                rows = session.execute(
-                    select(
-                        BrokerTrade.stock_id,
-                        BrokerTrade.date,
-                        BrokerTrade.broker_id,
-                        BrokerTrade.buy,
-                        BrokerTrade.sell,
-                    ).where(
-                        BrokerTrade.stock_id.in_(stock_ids),
-                        BrokerTrade.date >= cutoff,
-                    )
-                ).all()
-            if not rows:
-                return pd.DataFrame()
-            return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
-        except Exception:
-            return pd.DataFrame()
-
     def _load_broker_data_extended(
         self,
         stock_ids: list[str],
@@ -2690,11 +2692,13 @@ class SwingScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """波段模式籌碼面：投信淨買超 + 三大法人 20 日累積買超 + 大戶持股（有資料時）。
+        """波段模式籌碼面：投信淨買超 + 三大法人 20 日累積買超 + 大戶持股 + 分點集中度（有資料時）。
 
         權重組合：
-        - 3 因子（含大戶）: 投信 40% + 累積 40% + 大戶 20%
-        - 2 因子（基本）:   投信 50% + 累積 50%
+        - 4 因子（大戶 + 分點）: 投信 35% + 累積 35% + 大戶 15% + 分點 15%
+        - 3 因子（含大戶）:      投信 40% + 累積 40% + 大戶 20%
+        - 3 因子（含分點）:      投信 40% + 累積 40% + 分點 20%
+        - 2 因子（基本）:        投信 50% + 累積 50%
 
         回傳欄位：stock_id, chip_score, chip_tier
         """
@@ -2744,9 +2748,29 @@ class SwingScanner(MarketScanner):
             whale_chg_rank = df["whale_change"].rank(pct=True)
             whale_rank = whale_pct_rank * 0.60 + whale_chg_rank * 0.40
 
-        if has_whale:
+        # ── 分點集中度因子 ────────────────────────────────────────────
+        df_broker_raw = self._load_broker_data(stock_ids)
+        broker_df = compute_broker_score(df_broker_raw)
+        has_broker = not broker_df.empty
+        if has_broker:
+            df = df.merge(broker_df, on="stock_id", how="left")
+            df["broker_concentration"] = df["broker_concentration"].fillna(0.0)
+            df["broker_consecutive_days"] = df["broker_consecutive_days"].fillna(0)
+            broker_conc_rank = df["broker_concentration"].rank(pct=True)
+            broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
+            broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+
+        if has_whale and has_broker:
+            # 4 因子：投信 35% + 累積 35% + 大戶 15% + 分點 15%
+            df["chip_score"] = trust_rank * 0.35 + cum_rank * 0.35 + whale_rank * 0.15 + broker_rank * 0.15
+            chip_tier = "4F"
+        elif has_whale:
             # 3 因子：投信 40% + 累積 40% + 大戶 20%
             df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + whale_rank * 0.20
+            chip_tier = "3F"
+        elif has_broker:
+            # 3 因子：投信 40% + 累積 40% + 分點 20%
+            df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + broker_rank * 0.20
             chip_tier = "3F"
         else:
             # 2 因子：投信 50% + 累積 50%
@@ -3189,9 +3213,13 @@ class ValueScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """價值模式籌碼面 2 因子：投信近期買超 50% + 三大法人累積 50%。
+        """價值模式籌碼面：投信近期買超 + 三大法人累積 + 分點集中度（有資料時）。
 
-        回傳欄位：stock_id, chip_score, chip_tier（固定 "2F"）
+        權重組合：
+        - 3 因子（含分點）: 投信 40% + 累積 40% + 分點 20%
+        - 2 因子（基本）:   投信 50% + 累積 50%
+
+        回傳欄位：stock_id, chip_score, chip_tier（"3F" 或 "2F"）
         """
         if df_inst.empty:
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
@@ -3219,9 +3247,27 @@ class ValueScanner(MarketScanner):
         df = pd.DataFrame(rows)
         trust_rank = df["trust_net"].rank(pct=True)
         cum_rank = df["cum_net"].rank(pct=True)
-        df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
-        df["chip_tier"] = "2F"
 
+        # ── 分點集中度因子 ────────────────────────────────────────────
+        df_broker_raw = self._load_broker_data(stock_ids)
+        broker_df = compute_broker_score(df_broker_raw)
+        has_broker = not broker_df.empty
+        if has_broker:
+            df = df.merge(broker_df, on="stock_id", how="left")
+            df["broker_concentration"] = df["broker_concentration"].fillna(0.0)
+            df["broker_consecutive_days"] = df["broker_consecutive_days"].fillna(0)
+            broker_conc_rank = df["broker_concentration"].rank(pct=True)
+            broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
+            broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+            # 3 因子：投信 40% + 累積 40% + 分點 20%
+            df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + broker_rank * 0.20
+            chip_tier = "3F"
+        else:
+            # 2 因子：投信 50% + 累積 50%
+            df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
+            chip_tier = "2F"
+
+        df["chip_tier"] = chip_tier
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
@@ -3894,9 +3940,15 @@ class GrowthScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """高成長模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比（有資料時）。
+        """高成長模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 分點集中度（有資料時）。
 
-        回傳欄位：stock_id, chip_score, chip_tier（"4F" 或 "3F"）
+        權重組合：
+        - 5 因子（券資比 + 分點）: 外資 25% + 量比 22% + 法人 22% + 券資比 16% + 分點 15%
+        - 4 因子（含券資比）:      外資 30% + 量比 25% + 法人 25% + 券資比 20%
+        - 4 因子（含分點）:        外資 32% + 量比 24% + 法人 24% + 分點 20%
+        - 3 因子（基本）:          外資 40% + 量比 30% + 法人 30%
+
+        回傳欄位：stock_id, chip_score, chip_tier（"5F"、"4F" 或 "3F"）
         """
         if df_inst.empty:
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
@@ -3948,6 +4000,7 @@ class GrowthScanner(MarketScanner):
         bvr_rank = df["buy_vol_ratio"].rank(pct=True)
         total_rank = df["total_net"].rank(pct=True)
 
+        # ── 券資比因子 ────────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
             margin_latest = df_margin[df_margin["date"] == df_margin["date"].max()]
@@ -3962,12 +4015,37 @@ class GrowthScanner(MarketScanner):
                 df = df.merge(margin_data[["stock_id", "short_margin_ratio"]], on="stock_id", how="left")
                 df["short_margin_ratio"] = df["short_margin_ratio"].fillna(0.0)
                 smr_rank = df["short_margin_ratio"].rank(pct=True)
-                df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
-                chip_tier = "4F"
             else:
                 has_margin = False
 
-        if not has_margin:
+        # ── 分點集中度因子 ────────────────────────────────────────────
+        df_broker_raw = self._load_broker_data(stock_ids)
+        broker_df = compute_broker_score(df_broker_raw)
+        has_broker = not broker_df.empty
+        if has_broker:
+            df = df.merge(broker_df, on="stock_id", how="left")
+            df["broker_concentration"] = df["broker_concentration"].fillna(0.0)
+            df["broker_consecutive_days"] = df["broker_consecutive_days"].fillna(0)
+            broker_conc_rank = df["broker_concentration"].rank(pct=True)
+            broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
+            broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+
+        if has_margin and has_broker:
+            # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 16% + 分點 15%
+            df["chip_score"] = (
+                consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.16 + broker_rank * 0.15
+            )
+            chip_tier = "5F"
+        elif has_margin:
+            # 4 因子：外資 30% + 量比 25% + 法人 25% + 券資比 20%
+            df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
+            chip_tier = "4F"
+        elif has_broker:
+            # 4 因子：外資 32% + 量比 24% + 法人 24% + 分點 20%
+            df["chip_score"] = consec_rank * 0.32 + bvr_rank * 0.24 + total_rank * 0.24 + broker_rank * 0.20
+            chip_tier = "4F"
+        else:
+            # 3 因子：外資 40% + 量比 30% + 法人 30%
             df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
             chip_tier = "3F"
 
