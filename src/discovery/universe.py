@@ -41,6 +41,7 @@ class UniverseConfig:
         security_type:        Stage 1 允許的有價證券類型（None = 不過濾）
         avg_turnover_5d_min:  Stage 2 5 日均成交金額下限（元）
         min_turnover_5d_min:  Stage 2 5 日最低成交金額下限（元，防假流動性）
+        turnover_ma20_min:    Stage 2 20 日均成交金額下限（元，雙窗口確認，防短暫放量誘多）
         trend_ma:             Stage 3 趨勢過濾均線週期（None = 跳過趨勢過濾）
         volume_ratio_min:     Stage 3 量比門檻（volume / volume_ma20，None = 跳過）
         candidate_memory_days: Candidate Memory 回溯天數（0 = 停用）
@@ -52,6 +53,7 @@ class UniverseConfig:
     security_type: str | None = "stock"
     avg_turnover_5d_min: float = 30_000_000.0
     min_turnover_5d_min: float = 10_000_000.0
+    turnover_ma20_min: float = 20_000_000.0  # Stage 2 20 日均成交金額下限（防短暫放量誘多）
     trend_ma: int | None = 60
     volume_ratio_min: float | None = 1.5
     candidate_memory_days: int = 1
@@ -71,10 +73,17 @@ class UniverseConfig:
 
 
 def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig) -> list[str]:
-    """Stage 2 純函數：依 5 日成交金額過濾，回傳通過的 stock_id 清單。
+    """Stage 2 純函數：依成交金額過濾，回傳通過的 stock_id 清單。
+
+    雙窗口確認邏輯：
+    - 基本條件：5 日均成交金額 >= avg_turnover_5d_min，且 5 日最低 >= min_turnover_5d_min
+    - 若 df_5d 含 turnover_ma20 欄位（DailyFeature 或 fallback 計算），額外要求
+      20 日均成交金額 >= turnover_ma20_min，防止「近 5 日突然爆量、中期流動性不足」
+      的誘多陷阱股通過過濾
 
     Args:
-        df_5d: 含 [stock_id, turnover] 欄位的 DataFrame（最近 5 日資料）
+        df_5d: 含 [stock_id, turnover] 欄位的 DataFrame；
+               可選含 turnover_ma20（每股最新一日的 20 日均成交金額）
         config: UniverseConfig
 
     Returns:
@@ -87,6 +96,15 @@ def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig) -> list[str]:
     avg5 = grp.mean()
     min5 = grp.min()
     mask = (avg5 >= config.avg_turnover_5d_min) & (min5 >= config.min_turnover_5d_min)
+
+    # 雙窗口確認：若提供 20 日均成交金額，額外驗證中期流動性穩定
+    # NaN = 資料不足（新股或 DailyFeature 尚未重算），跳過該股的 ma20 門檻
+    if "turnover_ma20" in df_5d.columns:
+        ma20 = df_5d.groupby("stock_id")["turnover_ma20"].last()
+        ma20 = ma20.reindex(avg5.index)
+        ma20_ok = ma20.isna() | (ma20 >= config.turnover_ma20_min)
+        mask = mask & ma20_ok
+
     return list(avg5[mask].index)
 
 
@@ -324,14 +342,22 @@ class UniverseFilter:
             # DailyFeature 中無 min_turnover_5d，使用 0.33×avg5 作為保守估計
             conservative_min = avg5_map * 0.33
             mask = (avg5_map >= self.config.avg_turnover_5d_min) & (conservative_min >= self.config.min_turnover_5d_min)
+            # 雙窗口確認：若有 turnover_ma20，額外驗證中期流動性穩定（防短暫放量誘多）
+            # NaN = DailyFeature 欄位剛新增尚未重算 → 跳過該股的 ma20 門檻
+            if "turnover_ma20" in df_feature.columns:
+                ma20_map = latest.set_index("stock_id")["turnover_ma20"]
+                ma20_map = ma20_map.reindex(avg5_map.index)
+                ma20_ok = ma20_map.isna() | (ma20_map >= self.config.turnover_ma20_min)
+                mask = mask & ma20_ok
             return list(avg5_map[mask].index)
 
-        # Fallback: 從 DailyPrice 計算
+        # Fallback: 從 DailyPrice 計算（多抓 30 天以計算 turnover_ma20）
+        cutoff_30d = date.today() - timedelta(days=30)
         try:
             with get_session() as session:
                 rows = session.execute(
                     select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.turnover)
-                    .where(DailyPrice.date >= cutoff_5d)
+                    .where(DailyPrice.date >= cutoff_30d)
                     .where(DailyPrice.stock_id.in_(stage1_ids))
                 ).all()
         except Exception:
@@ -342,22 +368,36 @@ class UniverseFilter:
             logger.warning("UniverseFilter Stage 2: 無 turnover 資料，跳過流動性過濾")
             return stage1_ids
 
-        df_5d = pd.DataFrame(rows, columns=["stock_id", "date", "turnover"])
+        df_full = pd.DataFrame(rows, columns=["stock_id", "date", "turnover"])
+        df_full = df_full.sort_values(["stock_id", "date"])
+
+        # 計算每股 turnover_ma20（20 日滾動均值）
+        df_full["turnover_ma20"] = df_full.groupby("stock_id")["turnover"].transform(
+            lambda s: s.rolling(20, min_periods=10).mean()
+        )
+        # 取最新一日的 turnover_ma20 值（每股一筆）
+        latest_ma20 = df_full.groupby("stock_id")["turnover_ma20"].last().reset_index()
+
+        # 只取最近 5 日做 avg5/min5 計算，並附帶 ma20 欄位
+        df_5d = df_full.groupby("stock_id").tail(5).copy()
+        df_5d = df_5d.drop(columns=["turnover_ma20"], errors="ignore")
+        df_5d = df_5d.merge(latest_ma20, on="stock_id", how="left")
+
         return filter_liquidity(df_5d, self.config)
 
     def _load_feature_turnover(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DailyFeature 讀取最新一日的 turnover_ma5。"""
+        """從 DailyFeature 讀取最新一日的 turnover_ma5 與 turnover_ma20。"""
         try:
             with get_session() as session:
                 latest_date_subq = (
                     select(func.max(DailyFeature.date)).where(DailyFeature.stock_id.in_(stock_ids)).scalar_subquery()
                 )
                 rows = session.execute(
-                    select(DailyFeature.stock_id, DailyFeature.turnover_ma5)
+                    select(DailyFeature.stock_id, DailyFeature.turnover_ma5, DailyFeature.turnover_ma20)
                     .where(DailyFeature.stock_id.in_(stock_ids))
                     .where(DailyFeature.date == latest_date_subq)
                 ).all()
-                return pd.DataFrame(rows, columns=["stock_id", "turnover_ma5"])
+                return pd.DataFrame(rows, columns=["stock_id", "turnover_ma5", "turnover_ma20"])
         except Exception:
             return pd.DataFrame()
 

@@ -537,7 +537,8 @@ class DailyFeature(Base):
     欄位說明：
     - ma20 / ma60:      20/60 日收盤均線（趨勢判斷）
     - volume_ma20:      20 日均量（成交量動能比較基準）
-    - turnover_ma5:     5 日均成交金額（流動性過濾基準）
+    - turnover_ma5:     5 日均成交金額（短期流動性過濾基準）
+    - turnover_ma20:    20 日均成交金額（中期流動性確認，防短暫放量誘多）
     - momentum_20d:     20 日報酬率（%）
     - volatility_20d:   20 日年化波動率（%）
     """
@@ -555,6 +556,7 @@ class DailyFeature(Base):
     ma60: Mapped[float | None] = mapped_column(Float, nullable=True)  # 60 日均線（季線）
     volume_ma20: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日均量
     turnover_ma5: Mapped[float | None] = mapped_column(Float, nullable=True)  # 5 日均成交金額
+    turnover_ma20: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日均成交金額（雙窗口流動性確認用）
     momentum_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日報酬率 (%)
     volatility_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日年化波動率 (%)
     computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

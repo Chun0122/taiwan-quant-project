@@ -1,13 +1,14 @@
 """Universe Filtering Module 測試。
 
 涵蓋：
-- TestFilterLiquidity (4):  filter_liquidity() 純函數
-- TestFilterTrend (5):      filter_trend() 純函數
-- TestStage1SqlFilter (6):  UniverseFilter._stage1_sql_filter() DB 整合
-- TestStage2LiquidityFilter (4): Stage 2 DB fallback
-- TestCandidateMemory (3):  _load_candidate_memory() DB 整合
+- TestFilterLiquidity (4):           filter_liquidity() 純函數
+- TestFilterTrend (5):               filter_trend() 純函數
+- TestStage1SqlFilter (6):           UniverseFilter._stage1_sql_filter() DB 整合
+- TestStage2LiquidityFilter (4):     Stage 2 DB fallback
+- TestCandidateMemory (3):           _load_candidate_memory() DB 整合
 - TestComputeAndStoreDailyFeatures (4): pipeline ETL 整合
-- TestClassifySecurityType (8): _classify_security_type() 純函數
+- TestClassifySecurityType (8):      _classify_security_type() 純函數
+- TestFilterLiquidityDualWindow (5): 雙窗口流動性確認（turnover_ma20 欄位）
 """
 
 from __future__ import annotations
@@ -460,3 +461,79 @@ class TestClassifySecurityType:
     # --- 權證 ---
     def test_warrant_6digit(self):
         assert self._classify("123456") == "warrant"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestFilterLiquidityDualWindow — 純函數（雙窗口流動性確認）
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestFilterLiquidityDualWindow:
+    """filter_liquidity() 雙窗口流動性確認測試（無 DB）。
+
+    驗證當 df_5d 含 turnover_ma20 欄位時，額外的 20 日均量門檻正確生效。
+    """
+
+    def _cfg(
+        self,
+        avg=30_000_000.0,
+        min_=10_000_000.0,
+        ma20_min=20_000_000.0,
+    ) -> UniverseConfig:
+        return UniverseConfig(avg_turnover_5d_min=avg, min_turnover_5d_min=min_, turnover_ma20_min=ma20_min)
+
+    def _make_df(self, turnover_5d: list[int], turnover_ma20: float | None) -> pd.DataFrame:
+        """建立 5 日 turnover 資料，附帶可選的 turnover_ma20 欄位。"""
+        rows = [{"stock_id": "2330", "turnover": t} for t in turnover_5d]
+        df = pd.DataFrame(rows)
+        if turnover_ma20 is not None:
+            df["turnover_ma20"] = turnover_ma20
+        return df
+
+    def test_passes_when_ma5_and_ma20_both_meet_threshold(self):
+        """5 日均量 + 20 日均量皆達標 → 通過。"""
+        df = self._make_df([40_000_000] * 5, turnover_ma20=25_000_000.0)
+        result = filter_liquidity(df, self._cfg())
+        assert "2330" in result
+
+    def test_excludes_when_ma20_below_threshold(self):
+        """5 日均量達標但 20 日均量不足 → 誘多陷阱，應排除。"""
+        # 近 5 日突然爆量（平均 40M），但 20 日均量只有 15M（中期流動性不足）
+        df = self._make_df([40_000_000] * 5, turnover_ma20=15_000_000.0)
+        result = filter_liquidity(df, self._cfg())
+        assert "2330" not in result
+
+    def test_no_ma20_column_falls_back_to_old_logic(self):
+        """未提供 turnover_ma20 欄位時，降回舊有 avg5/min5 邏輯（向後相容）。"""
+        # 不帶 turnover_ma20 → 舊邏輯只看 avg5 + min5
+        df = self._make_df([40_000_000] * 5, turnover_ma20=None)
+        result = filter_liquidity(df, self._cfg())
+        # 舊邏輯通過（avg5=40M > 30M，min5=40M > 10M）
+        assert "2330" in result
+
+    def test_multiple_stocks_independent_ma20_check(self):
+        """多股混合情況：各股獨立判斷 20 日均量。"""
+        rows = [
+            # 2330: 5 日均量達標，20 日均量也達標 → 通過
+            {"stock_id": "2330", "turnover": 40_000_000, "turnover_ma20": 25_000_000.0},
+            {"stock_id": "2330", "turnover": 40_000_000, "turnover_ma20": 25_000_000.0},
+            {"stock_id": "2330", "turnover": 40_000_000, "turnover_ma20": 25_000_000.0},
+            {"stock_id": "2330", "turnover": 40_000_000, "turnover_ma20": 25_000_000.0},
+            {"stock_id": "2330", "turnover": 40_000_000, "turnover_ma20": 25_000_000.0},
+            # 9999: 5 日均量達標，但 20 日均量不足 → 排除
+            {"stock_id": "9999", "turnover": 50_000_000, "turnover_ma20": 10_000_000.0},
+            {"stock_id": "9999", "turnover": 50_000_000, "turnover_ma20": 10_000_000.0},
+            {"stock_id": "9999", "turnover": 50_000_000, "turnover_ma20": 10_000_000.0},
+            {"stock_id": "9999", "turnover": 50_000_000, "turnover_ma20": 10_000_000.0},
+            {"stock_id": "9999", "turnover": 50_000_000, "turnover_ma20": 10_000_000.0},
+        ]
+        df = pd.DataFrame(rows)
+        result = filter_liquidity(df, self._cfg())
+        assert "2330" in result
+        assert "9999" not in result
+
+    def test_ma20_zero_excluded(self):
+        """turnover_ma20 為 0（新股或無資料）→ 應排除（0 < 20M）。"""
+        df = self._make_df([40_000_000] * 5, turnover_ma20=0.0)
+        result = filter_liquidity(df, self._cfg())
+        assert "2330" not in result

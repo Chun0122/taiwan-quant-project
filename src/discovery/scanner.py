@@ -146,6 +146,57 @@ def compute_eps_sustainability(
     return frozenset(recent.loc[recent["eps"] <= 0, "stock_id"].unique())
 
 
+def compute_vcp_score(stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+    """VCP（波動收斂形態）評分純函數（SwingScanner Stage 3 加成用）。
+
+    以 close-based 代替 high/low，計算近期波動收斂與量縮狀態：
+    - 條件一：近 10 日 close 波動幅度 = (max - min) / mean < 8%（價格整理中）
+    - 條件二：近 3 日均量 / 近 20 日均量 < 0.8（量縮，主動賣壓減少）
+
+    兩個條件同時滿足 → +3% composite_score 加成（作為加分而非硬門，不影響其他 Scanner）。
+    資料不足時回傳 0.0 加成（安全 fallback）。
+
+    Args:
+        stock_ids: 候選股代號清單
+        df_price: 日K線 DataFrame，需含 stock_id/date/close/volume 欄位
+
+    Returns:
+        DataFrame，欄位：[stock_id, vcp_bonus]
+    """
+    if df_price.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "vcp_bonus": 0.0})
+
+    sorted_dates = sorted(df_price["date"].unique())
+    if len(sorted_dates) < 3:
+        return pd.DataFrame({"stock_id": stock_ids, "vcp_bonus": 0.0})
+
+    dates_10d = sorted_dates[-10:] if len(sorted_dates) >= 10 else sorted_dates
+    dates_3d = sorted_dates[-3:]
+
+    df_10d = df_price[df_price["date"].isin(dates_10d)]
+    df_3d = df_price[df_price["date"].isin(dates_3d)]
+
+    # 條件一：10 日 close 波動幅度（max - min）/ mean
+    price_stats = df_10d.groupby("stock_id")["close"].agg(["max", "min", "mean"])
+    price_range = (price_stats["max"] - price_stats["min"]) / price_stats["mean"].replace(0, float("nan"))
+    price_ok = price_range < 0.08
+
+    # 條件二：3 日均量 / 20 日均量
+    vol_3d = df_3d.groupby("stock_id")["volume"].mean()
+    vol_20d = df_price.groupby("stock_id")["volume"].apply(lambda s: s.tail(20).mean())
+    vol_ratio = (vol_3d / vol_20d.replace(0, float("nan"))).fillna(1.0)
+    vol_ok = vol_ratio < 0.8
+
+    vcp_ok = price_ok & vol_ok
+
+    results = []
+    for sid in stock_ids:
+        bonus = 0.03 if (sid in vcp_ok.index and bool(vcp_ok.get(sid, False))) else 0.0
+        results.append({"stock_id": sid, "vcp_bonus": bonus})
+
+    return pd.DataFrame(results)
+
+
 def _calc_atr14(stock_data: pd.DataFrame) -> float:
     """計算個股 ATR14。
 
@@ -2833,6 +2884,32 @@ class SwingScanner(MarketScanner):
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """波段模式風險過濾：近 60 日年化波動率 > 85th percentile 剔除。"""
         return self._apply_vol_risk_filter(scored, df_price, percentile=85, window=60, annualize=True)
+
+    def _score_candidates(
+        self,
+        candidates: pd.DataFrame,
+        df_price: pd.DataFrame,
+        df_inst: pd.DataFrame,
+        df_margin: pd.DataFrame,
+        df_revenue: pd.DataFrame,
+        df_ann: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """覆寫：執行通用評分後套用 VCP 波動收斂加成。"""
+        # 儲存 df_price 供 _post_score() 的 VCP 計算使用
+        self._df_price_for_vcp = df_price
+        return super()._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann)
+
+    def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """波段模式加成：VCP 波動收斂形態符合者 composite_score +3%。"""
+        df_price = getattr(self, "_df_price_for_vcp", pd.DataFrame())
+        if df_price.empty or candidates.empty:
+            return candidates
+        candidates = candidates.copy()
+        vcp_df = compute_vcp_score(candidates["stock_id"].tolist(), df_price)
+        candidates = candidates.merge(vcp_df, on="stock_id", how="left")
+        candidates["vcp_bonus"] = candidates["vcp_bonus"].fillna(0.0)
+        candidates["composite_score"] = candidates["composite_score"] + candidates["vcp_bonus"]
+        return candidates
 
 
 # ====================================================================== #

@@ -1276,6 +1276,7 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
     df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
     df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
     df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
+    df["turnover_ma20"] = g_turnover.transform(lambda s: s.rolling(20, min_periods=10).mean())
 
     # 20 日報酬率 (%)
     df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
@@ -1300,6 +1301,7 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
         "ma60",
         "volume_ma20",
         "turnover_ma5",
+        "turnover_ma20",
         "momentum_20d",
         "volatility_20d",
         "computed_at",

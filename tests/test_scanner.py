@@ -2896,3 +2896,76 @@ class TestValueChipBrokerTier:
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert (result["chip_score"] >= 0).all()
         assert (result["chip_score"] <= 1.0).all()
+
+
+# ─── compute_vcp_score ────────────────────────────────────────────────────
+
+
+class TestVcpBonus:
+    """compute_vcp_score() 純函數測試（無 DB）。
+
+    VCP 條件：
+    - 近 10 日 close 波動幅度 < 8%（價格整理）
+    - 近 3 日均量 / 近 20 日均量 < 0.8（量縮）
+    兩個條件同時滿足 → vcp_bonus = 0.03
+    """
+
+    def _make_price_df(self, stock_id: str, closes: list[float], volumes: list[int]) -> pd.DataFrame:
+        """建立日K線 DataFrame，日期從今天往前推。"""
+        today = date.today()
+        n = len(closes)
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": today - timedelta(days=n - 1 - i),
+                "close": closes[i],
+                "volume": volumes[i],
+            }
+            for i in range(n)
+        ]
+        return pd.DataFrame(rows)
+
+    def test_vcp_conditions_met_gives_bonus(self):
+        """近 10 日低波動 + 量縮 → vcp_bonus = 0.03。"""
+        from src.discovery.scanner import compute_vcp_score
+
+        # 近 20 日均量 = 1,000,000；近 3 日量縮到 700,000（ratio=0.7 < 0.8）
+        # 近 10 日 close 在 100~102（波動幅度 = 2/101 ≈ 1.98% < 8%）
+        closes = [100.0] * 10 + [100.0, 101.0, 102.0, 101.5, 100.5, 101.0, 100.0, 100.5, 101.0, 101.5]
+        volumes = [1_000_000] * 17 + [700_000, 700_000, 700_000]
+        df = self._make_price_df("2330", closes, volumes)
+
+        result = compute_vcp_score(["2330"], df)
+        assert result.iloc[0]["vcp_bonus"] == pytest.approx(0.03)
+
+    def test_high_volatility_no_bonus(self):
+        """近 10 日高波動（>8%）→ vcp_bonus = 0。"""
+        from src.discovery.scanner import compute_vcp_score
+
+        # 近 10 日 close 從 100 到 115（波動幅度 > 8%）
+        closes = [100.0] * 10 + [100.0, 105.0, 110.0, 108.0, 106.0, 104.0, 102.0, 100.0, 115.0, 112.0]
+        volumes = [1_000_000] * 17 + [700_000, 700_000, 700_000]
+        df = self._make_price_df("2330", closes, volumes)
+
+        result = compute_vcp_score(["2330"], df)
+        assert result.iloc[0]["vcp_bonus"] == pytest.approx(0.0)
+
+    def test_volume_not_contracting_no_bonus(self):
+        """量能未收縮（ratio >= 0.8）→ vcp_bonus = 0，即使價格低波動。"""
+        from src.discovery.scanner import compute_vcp_score
+
+        # 近 10 日低波動，但近 3 日量 = 均量（ratio = 1.0 >= 0.8）
+        closes = [100.0] * 20
+        volumes = [1_000_000] * 20  # 近 3 日量 = 均量（ratio = 1.0）
+        df = self._make_price_df("2330", closes, volumes)
+
+        result = compute_vcp_score(["2330"], df)
+        assert result.iloc[0]["vcp_bonus"] == pytest.approx(0.0)
+
+    def test_empty_df_returns_zero_bonus(self):
+        """空 DataFrame → 所有股票 vcp_bonus = 0。"""
+        from src.discovery.scanner import compute_vcp_score
+
+        result = compute_vcp_score(["2330", "2317"], pd.DataFrame())
+        assert (result["vcp_bonus"] == 0.0).all()
+        assert set(result["stock_id"].tolist()) == {"2330", "2317"}

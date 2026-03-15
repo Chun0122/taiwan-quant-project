@@ -38,6 +38,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("discovery_record", "chip_tier", "VARCHAR(5)"),
     # Universe Filter: StockInfo 新增有價證券類型欄位（stock/etf/warrant/preferred/None）
     ("stock_info", "security_type", "VARCHAR(20)"),
+    # 雙窗口流動性確認：DailyFeature 新增 20 日均成交金額（防短暫放量誘多）
+    ("daily_feature", "turnover_ma20", "REAL"),
 ]
 
 
