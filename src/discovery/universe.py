@@ -48,7 +48,7 @@ class UniverseConfig:
 
     min_close: float = 10.0
     min_available_days: int = 120
-    listing_types: tuple[str, ...] = ("上市", "上櫃")
+    listing_types: tuple[str, ...] = ("twse", "tpex")
     security_type: str | None = "stock"
     avg_turnover_5d_min: float = 30_000_000.0
     min_turnover_5d_min: float = 10_000_000.0

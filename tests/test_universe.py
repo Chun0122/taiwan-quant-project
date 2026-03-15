@@ -44,7 +44,7 @@ def _make_dp(
     )
 
 
-def _make_si(stock_id: str, listing_type: str = "上市", security_type: str | None = "stock") -> StockInfo:
+def _make_si(stock_id: str, listing_type: str = "twse", security_type: str | None = "stock") -> StockInfo:
     return StockInfo(
         stock_id=stock_id,
         stock_name=f"Test {stock_id}",
@@ -189,7 +189,7 @@ class TestStage1SqlFilter:
         self,
         db_session,
         stock_id: str,
-        listing_type: str = "上市",
+        listing_type: str = "twse",
         security_type: str | None = "stock",
         days: int = 130,
         close: float = 50.0,
@@ -235,7 +235,7 @@ class TestStage1SqlFilter:
 
     def test_excludes_wrong_listing_type(self, db_session):
         self._add_stock_with_history(db_session, "8888", listing_type="興櫃")
-        uf = UniverseFilter(UniverseConfig(listing_types=("上市", "上櫃")))
+        uf = UniverseFilter(UniverseConfig(listing_types=("twse", "tpex")))
         result = uf._stage1_sql_filter()
         assert "8888" not in result
 
