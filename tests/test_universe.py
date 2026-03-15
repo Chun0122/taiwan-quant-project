@@ -7,6 +7,7 @@
 - TestStage2LiquidityFilter (4): Stage 2 DB fallback
 - TestCandidateMemory (3):  _load_candidate_memory() DB 整合
 - TestComputeAndStoreDailyFeatures (4): pipeline ETL 整合
+- TestClassifySecurityType (8): _classify_security_type() 純函數
 """
 
 from __future__ import annotations
@@ -402,3 +403,60 @@ class TestComputeAndStoreDailyFeatures:
         count = db_session.execute(select(func.count()).where(DailyFeature.stock_id == "3008")).scalar()
         # 每支股票在最新一日只應有 1 筆記錄
         assert count == 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestClassifySecurityType — 純函數
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestClassifySecurityType:
+    """_classify_security_type() 純函數測試。
+
+    驗證各類台股代號的分類正確性，重點涵蓋 ETF 的多種代號格式。
+    """
+
+    def _classify(self, stock_id: str, stock_name: str = "") -> str:
+        from src.data.pipeline import _classify_security_type
+
+        return _classify_security_type(stock_id, stock_name)
+
+    # --- 普通股 ---
+    def test_regular_4digit_stock(self):
+        assert self._classify("2330") == "stock"
+
+    def test_regular_4digit_stock_1xxx(self):
+        assert self._classify("1301") == "stock"
+
+    # --- ETF（各種代號格式）---
+    def test_etf_4digit_0050(self):
+        r"""0050 — 最早 ETF，4 位代號（舊 regex ^00\d{4}$ 誤判為 stock）"""
+        assert self._classify("0050") == "etf"
+
+    def test_etf_5digit_00878(self):
+        """00878 — 5 位代號（舊 regex 誤判為 stock）"""
+        assert self._classify("00878") == "etf"
+
+    def test_etf_5digit_00882(self):
+        """00882 — 5 位代號（債券型 ETF，舊 regex 誤判為 stock）"""
+        assert self._classify("00882") == "etf"
+
+    def test_etf_with_letter_suffix_00991A(self):
+        """00991A — 含字母後綴的期貨 ETF（舊 regex 誤判為 stock）"""
+        assert self._classify("00991A") == "etf"
+
+    def test_etf_with_L_suffix_00715L(self):
+        """00715L — 槓桿 ETF（舊 regex 誤判為 stock）"""
+        assert self._classify("00715L") == "etf"
+
+    def test_etf_with_B_suffix_00679B(self):
+        """00679B — 債券 ETF（舊 regex 誤判為 stock）"""
+        assert self._classify("00679B") == "etf"
+
+    # --- 名稱含 ETF 字樣 ---
+    def test_etf_by_name(self):
+        assert self._classify("9999", "富邦ETF") == "etf"
+
+    # --- 權證 ---
+    def test_warrant_6digit(self):
+        assert self._classify("123456") == "warrant"

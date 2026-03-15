@@ -811,7 +811,8 @@ def _classify_security_type(stock_id: str, stock_name: str = "") -> str:
     sid = str(stock_id).strip()
     name = str(stock_name or "").upper()
 
-    if re.match(r"^00\d{4}$", sid) or "ETF" in name:
+    # 台股 ETF 代號皆以 "00" 開頭：0050、00878、00882、00991A、00715L 等
+    if re.match(r"^00", sid) or "ETF" in name:
         return "etf"
     if len(sid) == 6 and sid.isdigit():
         return "warrant"
