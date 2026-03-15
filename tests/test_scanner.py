@@ -2301,6 +2301,168 @@ class TestDividendFinancialFundamentalScores:
         assert result["fundamental_score"].between(0.0, 1.0).all()
 
 
+class TestComputeEpsSustainability:
+    """compute_eps_sustainability() 模組級純函數測試。"""
+
+    def _make_fin(self, rows: list[dict]) -> pd.DataFrame:
+        return pd.DataFrame(rows)
+
+    def test_returns_empty_when_no_data(self):
+        """財報 DataFrame 為空時，應回傳空集合（不排除任何股票）。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        result = compute_eps_sustainability(pd.DataFrame())
+        assert result == frozenset()
+
+    def test_all_positive_returns_empty(self):
+        """全部季度 EPS > 0 時，回傳空集合（無排除）。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        df = self._make_fin(
+            [
+                {"stock_id": "A", "date": date(2024, 12, 31), "eps": 2.0},
+                {"stock_id": "A", "date": date(2024, 9, 30), "eps": 1.5},
+                {"stock_id": "A", "date": date(2024, 6, 30), "eps": 1.8},
+                {"stock_id": "A", "date": date(2024, 3, 31), "eps": 2.1},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=4)
+        assert result == frozenset()
+
+    def test_any_nonpositive_eps_excluded(self):
+        """任一季 EPS ≤ 0 的股票應出現在回傳集合中（被排除）。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        df = self._make_fin(
+            [
+                {"stock_id": "B", "date": date(2024, 12, 31), "eps": 3.0},
+                {"stock_id": "B", "date": date(2024, 9, 30), "eps": -0.5},  # 負值
+                {"stock_id": "B", "date": date(2024, 6, 30), "eps": 1.0},
+                {"stock_id": "B", "date": date(2024, 3, 31), "eps": 2.0},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=4)
+        assert "B" in result
+
+    def test_zero_eps_also_excluded(self):
+        """EPS = 0 也應視為不可持續而排除。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        df = self._make_fin(
+            [
+                {"stock_id": "C", "date": date(2024, 12, 31), "eps": 0.0},
+                {"stock_id": "C", "date": date(2024, 9, 30), "eps": 1.0},
+                {"stock_id": "C", "date": date(2024, 6, 30), "eps": 1.5},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=4)
+        assert "C" in result
+
+    def test_mixed_stocks(self):
+        """混合場景：部分股票有負 EPS，部分全正。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        df = self._make_fin(
+            [
+                # GOOD: 全正
+                {"stock_id": "GOOD", "date": date(2024, 12, 31), "eps": 2.0},
+                {"stock_id": "GOOD", "date": date(2024, 9, 30), "eps": 1.5},
+                {"stock_id": "GOOD", "date": date(2024, 6, 30), "eps": 1.8},
+                {"stock_id": "GOOD", "date": date(2024, 3, 31), "eps": 2.2},
+                # BAD: 含負值
+                {"stock_id": "BAD", "date": date(2024, 12, 31), "eps": 2.0},
+                {"stock_id": "BAD", "date": date(2024, 9, 30), "eps": -1.0},
+                {"stock_id": "BAD", "date": date(2024, 6, 30), "eps": 1.0},
+                {"stock_id": "BAD", "date": date(2024, 3, 31), "eps": 0.5},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=4)
+        assert "GOOD" not in result
+        assert "BAD" in result
+
+    def test_no_data_stock_passes(self):
+        """某股在財報 DataFrame 中完全無紀錄，不應出現在排除集合中（pass through）。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        # 只有 A 的財報，B 沒有任何紀錄
+        df = self._make_fin(
+            [
+                {"stock_id": "A", "date": date(2024, 12, 31), "eps": 2.0},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=4)
+        assert "B" not in result  # B 無資料 → pass through
+
+    def test_only_recent_quarters_evaluated(self):
+        """只評估最近 min_quarters 季，較舊的負 EPS 不影響結果。"""
+        from src.discovery.scanner import compute_eps_sustainability
+
+        df = self._make_fin(
+            [
+                # 最近 2 季正值
+                {"stock_id": "D", "date": date(2024, 12, 31), "eps": 2.0},
+                {"stock_id": "D", "date": date(2024, 9, 30), "eps": 1.5},
+                # 較舊的 2 季有負值（超出 min_quarters=2 的窗口）
+                {"stock_id": "D", "date": date(2024, 6, 30), "eps": -1.0},
+                {"stock_id": "D", "date": date(2024, 3, 31), "eps": -2.0},
+            ]
+        )
+        result = compute_eps_sustainability(df, min_quarters=2)
+        # 只看最近 2 季（12月、9月），皆正 → 不排除
+        assert "D" not in result
+
+    def test_dividend_coarse_filter_excludes_negative_eps(self):
+        """DividendScanner._coarse_filter() 應排除有負 EPS 的股票。"""
+        scanner = DividendScanner(
+            min_price=10, max_price=2000, min_volume=100_000, top_n_candidates=10, top_n_results=5
+        )
+        # 設定估值資料：兩股都通過殖利率 > 3% + PE > 0
+        scanner._df_valuation = pd.DataFrame(
+            [
+                {
+                    "stock_id": "GOOD",
+                    "date": date(2025, 3, 1),
+                    "pe_ratio": 12.0,
+                    "pb_ratio": 1.5,
+                    "dividend_yield": 4.5,
+                },
+                {"stock_id": "BAD", "date": date(2025, 3, 1), "pe_ratio": 10.0, "pb_ratio": 1.2, "dividend_yield": 5.0},
+            ]
+        )
+        # GOOD: 近 4 季 EPS 全正 / BAD: 有一季負 EPS
+        scanner._df_eps_quarterly = pd.DataFrame(
+            [
+                {"stock_id": "GOOD", "date": date(2024, 12, 31), "eps": 2.0},
+                {"stock_id": "GOOD", "date": date(2024, 9, 30), "eps": 1.8},
+                {"stock_id": "GOOD", "date": date(2024, 6, 30), "eps": 1.5},
+                {"stock_id": "GOOD", "date": date(2024, 3, 31), "eps": 1.6},
+                {"stock_id": "BAD", "date": date(2024, 12, 31), "eps": 3.0},
+                {"stock_id": "BAD", "date": date(2024, 9, 30), "eps": -0.5},
+                {"stock_id": "BAD", "date": date(2024, 6, 30), "eps": 1.0},
+                {"stock_id": "BAD", "date": date(2024, 3, 31), "eps": 0.8},
+            ]
+        )
+        rows = []
+        for sid in ["GOOD", "BAD"]:
+            for d in range(20):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": 99,
+                        "high": 102,
+                        "low": 98,
+                        "close": 100,
+                        "volume": 500_000,
+                    }
+                )
+        result = scanner._coarse_filter(pd.DataFrame(rows), pd.DataFrame())
+        sids = result["stock_id"].tolist() if not result.empty else []
+        assert "GOOD" in sids
+        assert "BAD" not in sids
+
+
 class TestGrowthFinancialFundamentalScores:
     """GrowthScanner 財報因子整合測試（毛利率加速 + EPS 季增率）。"""
 

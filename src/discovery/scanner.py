@@ -114,6 +114,38 @@ def compute_relative_pe_thresholds(
     return thresholds
 
 
+def compute_eps_sustainability(
+    df_financial: pd.DataFrame,
+    min_quarters: int = 4,
+) -> frozenset[str]:
+    """近 min_quarters 季 EPS 配息可持續性評估（模組級純函數）。
+
+    掃描每支股票最近 min_quarters 季的 EPS 記錄，找出任一季 EPS ≤ 0 的股票。
+
+    Args:
+        df_financial: 財務資料（需含 stock_id, date, eps 欄位）
+        min_quarters: 評估最近幾季，預設 4
+
+    Returns:
+        frozenset[str]，代表「EPS 不可持續」的 stock_id（應被排除）。
+        - df_financial 為空 → 回傳空集合（呼叫方不做任何排除）
+        - 某股無 EPS 記錄 → 不加入集合（pass through，避免冷啟動誤殺）
+        - 某股近期有任一季 EPS ≤ 0 → 加入集合（排除）
+    """
+    if df_financial.empty or "eps" not in df_financial.columns:
+        return frozenset()
+
+    df = df_financial[df_financial["eps"].notna()][["stock_id", "date", "eps"]].copy()
+    if df.empty:
+        return frozenset()
+
+    # 每股取最近 min_quarters 季（date 降序，各股取前 min_quarters 筆）
+    recent = df.sort_values(["stock_id", "date"], ascending=[True, False]).groupby("stock_id").head(min_quarters)
+
+    # 任一季 EPS ≤ 0 → 不可持續（一次性高配息 / 業外收益等風險）
+    return frozenset(recent.loc[recent["eps"] <= 0, "stock_id"].unique())
+
+
 def _calc_atr14(stock_data: pd.DataFrame) -> float:
     """計算個股 ATR14。
 
@@ -3281,6 +3313,18 @@ class DividendScanner(MarketScanner):
                 columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
             )
 
+            # 載入近 4 季 EPS（供 _coarse_filter 配息連續性篩選）
+            eps_cutoff = date.today() - timedelta(days=400)  # 4 季 ≈ 400 天
+            eps_query = select(
+                FinancialStatement.stock_id,
+                FinancialStatement.date,
+                FinancialStatement.eps,
+            ).where(FinancialStatement.date >= eps_cutoff)
+            if universe_ids:
+                eps_query = eps_query.where(FinancialStatement.stock_id.in_(universe_ids))
+            eps_rows = session.execute(eps_query).all()
+            self._df_eps_quarterly = pd.DataFrame(eps_rows, columns=["stock_id", "date", "eps"])
+
         # 載入 2 個月營收（含上月，算加速度）
         df_revenue = self._load_revenue_data(stock_ids=universe_ids if universe_ids else None, months=2)
 
@@ -3393,6 +3437,19 @@ class DividendScanner(MarketScanner):
             filtered = filtered[has_val & dy_ok & pe_ok].copy()
         else:
             return pd.DataFrame()
+
+        if filtered.empty:
+            return pd.DataFrame()
+
+        # 配息連續性篩選：近 4 季 EPS 皆 > 0（無財報資料者 pass through）
+        df_eps = getattr(self, "_df_eps_quarterly", pd.DataFrame())
+        eps_fail_ids = compute_eps_sustainability(df_eps, min_quarters=4)
+        if eps_fail_ids:
+            before_count = len(filtered)
+            filtered = filtered[~filtered["stock_id"].isin(eps_fail_ids)].copy()
+            removed = before_count - len(filtered)
+            if removed > 0:
+                logger.info("Stage 2 EPS 連續性: 排除 %d 支近 4 季有負 EPS 股票", removed)
 
         if filtered.empty:
             return pd.DataFrame()
