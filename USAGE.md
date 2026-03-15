@@ -900,7 +900,10 @@ python main.py discover swing --top 20 --ai-summary --notify
 # 評估 momentum 推薦績效（預設持有 5,10,20 天）
 python main.py discover-backtest --mode momentum
 
-# 自訂持有天數
+# swing 模式預設持有 20,40,60 天（波段持有期）
+python main.py discover-backtest --mode swing
+
+# 自訂持有天數（覆蓋模式預設值）
 python main.py discover-backtest --mode swing --days 5,10,20,60
 
 # 只看每次掃描前 10 名的績效
@@ -918,7 +921,7 @@ python main.py discover-backtest --mode momentum --export result.csv
 | 參數 | 說明 |
 |------|------|
 | `--mode` | 必填，掃描模式：`momentum` / `swing` / `value` / `dividend` / `growth` |
-| `--days` | 持有天數，逗號分隔（預設 `5,10,20`） |
+| `--days` | 持有天數，逗號分隔（swing 預設 `20,40,60`，其他模式預設 `5,10,20`） |
 | `--top` | 只計算每次掃描前 N 名的績效（預設全部） |
 | `--start` | 掃描日期範圍起始（YYYY-MM-DD） |
 | `--end` | 掃描日期範圍結束（YYYY-MM-DD） |

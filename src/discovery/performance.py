@@ -37,6 +37,13 @@ class DiscoveryPerformance:
         "momentum": "Momentum 短線動能",
         "swing": "Swing 中期波段",
         "value": "Value 價值修復",
+        "dividend": "Dividend 高息存股",
+        "growth": "Growth 高成長",
+    }
+
+    # 各模式預設持有天數（未明確指定時使用）
+    MODE_HORIZONS: dict[str, list[int]] = {
+        "swing": [20, 40, 60],
     }
 
     def __init__(
@@ -48,7 +55,7 @@ class DiscoveryPerformance:
         end_date: Optional[str] = None,
     ):
         self.mode = mode
-        self.holding_days = holding_days or [5, 10, 20]
+        self.holding_days = holding_days or self.MODE_HORIZONS.get(mode, [5, 10, 20])
         self.top_n = top_n
         self.start_date = date.fromisoformat(start_date) if start_date else None
         self.end_date = date.fromisoformat(end_date) if end_date else None

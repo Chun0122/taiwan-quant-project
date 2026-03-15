@@ -5,6 +5,7 @@
 - RSI(14)
 - MACD(12, 26, 9) → macd, macd_signal, macd_hist
 - Bollinger Bands(20, 2) → bb_upper, bb_middle, bb_lower
+- ADX(14) → adx_14（趨勢強度，0~100）
 
 週線聚合：
 - aggregate_to_weekly() → 日K聚合為週K + 週線 SMA13 / RSI14 / MACD
@@ -17,7 +18,7 @@ import logging
 import pandas as pd
 from sqlalchemy import select
 from ta.momentum import RSIIndicator
-from ta.trend import MACD, SMAIndicator
+from ta.trend import MACD, ADXIndicator, SMAIndicator
 from ta.volatility import BollingerBands
 
 from src.data.database import get_session
@@ -100,6 +101,12 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
             if pd.notna(val):
                 records.append({"stock_id": stock_id, "date": dates[i], "name": name, "value": round(val, 4)})
 
+    # --- ADX(14) ---
+    adx = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+    for i, val in enumerate(adx):
+        if pd.notna(val):
+            records.append({"stock_id": stock_id, "date": dates[i], "name": "adx_14", "value": round(val, 4)})
+
     result = pd.DataFrame(records)
     logger.info("[%s] 計算完成: %d 筆指標", stock_id, len(result))
     return result
@@ -115,9 +122,12 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
 
     Returns:
         DataFrame with indicator columns (sma_5, sma_10, sma_20, sma_60,
-        rsi_14, macd, macd_signal, macd_hist, bb_upper, bb_middle, bb_lower)
+        rsi_14, macd, macd_signal, macd_hist, bb_upper, bb_middle, bb_lower,
+        adx_14)
     """
     close = df["close"]
+    high = df["high"]
+    low = df["low"]
     result = pd.DataFrame(index=df.index)
 
     # SMA
@@ -138,6 +148,12 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
     result["bb_upper"] = bb.bollinger_hband()
     result["bb_middle"] = bb.bollinger_mavg()
     result["bb_lower"] = bb.bollinger_lband()
+
+    # ADX(14)：資料不足 14 根時跳過（避免 ValueError）
+    if len(close) >= 14:
+        result["adx_14"] = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+    else:
+        result["adx_14"] = float("nan")
 
     return result
 

@@ -2176,6 +2176,101 @@ class MarketScanner:
         except Exception:
             return pd.DataFrame()
 
+    def _load_sbl_data(self, stock_ids: list[str]) -> pd.DataFrame:
+        """從 DB 載入最近 5 天的借券賣出彙總資料。
+
+        共用方法（MarketScanner 基底），供 MomentumScanner / SwingScanner 的
+        _compute_chip_scores() 呼叫。
+        若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
+        """
+        cutoff = date.today() - timedelta(days=5)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        SecuritiesLending.stock_id,
+                        SecuritiesLending.date,
+                        SecuritiesLending.sbl_balance,
+                    ).where(
+                        SecuritiesLending.stock_id.in_(stock_ids),
+                        SecuritiesLending.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows, columns=["stock_id", "date", "sbl_balance"])
+        except Exception:
+            return pd.DataFrame()
+
+    def _load_broker_data_extended(
+        self,
+        stock_ids: list[str],
+        days: int = 365,
+        min_trading_days: int = 20,
+    ) -> pd.DataFrame:
+        """從 DB 載入所有可用的分點交易資料（含 buy_price / sell_price）。
+
+        共用方法（MarketScanner 基底），供 MomentumScanner / SwingScanner 的
+        _compute_chip_scores() 呼叫（Smart Broker 因子）。
+
+        查詢窗口改為 days=365，充分利用 daily sync 累積的歷史資料。
+        min_trading_days：每支股票至少需有 N 個交易日資料，否則排除（避免假信號）。
+
+        均價代理策略（方案 B）：
+          - DJ 端點不提供 buy_price / sell_price，欄位存 NULL
+          - 本函數自動以 DailyPrice.close 填補 NULL 均價（同日收盤價）
+          - win_rate / PF 的意義：衡量分點「是否在漲前買、跌前賣」的擇時能力
+        """
+        cutoff = date.today() - timedelta(days=days)
+        try:
+            with get_session() as session:
+                rows = session.execute(
+                    select(
+                        BrokerTrade.stock_id,
+                        BrokerTrade.date,
+                        BrokerTrade.broker_id,
+                        BrokerTrade.buy,
+                        BrokerTrade.sell,
+                        BrokerTrade.buy_price,
+                        BrokerTrade.sell_price,
+                    ).where(
+                        BrokerTrade.stock_id.in_(stock_ids),
+                        BrokerTrade.date >= cutoff,
+                    )
+                ).all()
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                rows,
+                columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
+            )
+            # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
+            if df["buy_price"].isna().any() or df["sell_price"].isna().any():
+                try:
+                    with get_session() as session:
+                        price_rows = session.execute(
+                            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                                DailyPrice.stock_id.in_(stock_ids),
+                                DailyPrice.date >= cutoff,
+                            )
+                        ).all()
+                    if price_rows:
+                        price_df = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+                        df = df.merge(price_df, on=["stock_id", "date"], how="left")
+                        df["buy_price"] = df["buy_price"].astype("float64").fillna(df["close"])
+                        df["sell_price"] = df["sell_price"].astype("float64").fillna(df["close"])
+                        df = df.drop(columns=["close"])
+                except Exception:
+                    pass  # 無法載入收盤價時保持原始 NULL，系統降回 7F
+            # 過濾掉歷史資料不足的股票，避免以少量資料誤判分點行為
+            if min_trading_days > 0 and not df.empty:
+                day_counts = df.groupby("stock_id")["date"].nunique()
+                valid_stocks = day_counts[day_counts >= min_trading_days].index
+                df = df[df["stock_id"].isin(valid_stocks)]
+            return df
+        except Exception:
+            return pd.DataFrame()
+
 
 # ====================================================================== #
 #  MomentumScanner — 短線動能模式
@@ -2497,30 +2592,6 @@ class MomentumScanner(MarketScanner):
         df["chip_tier"] = chip_tier
         return df[["stock_id", "chip_score", "chip_tier"]]
 
-    def _load_sbl_data(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DB 載入最近 5 天的借券賣出彙總資料。
-
-        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
-        """
-        cutoff = date.today() - timedelta(days=5)
-        try:
-            with get_session() as session:
-                rows = session.execute(
-                    select(
-                        SecuritiesLending.stock_id,
-                        SecuritiesLending.date,
-                        SecuritiesLending.sbl_balance,
-                    ).where(
-                        SecuritiesLending.stock_id.in_(stock_ids),
-                        SecuritiesLending.date >= cutoff,
-                    )
-                ).all()
-            if not rows:
-                return pd.DataFrame()
-            return pd.DataFrame(rows, columns=["stock_id", "date", "sbl_balance"])
-        except Exception:
-            return pd.DataFrame()
-
     def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
         """從 DB 載入最近 2 週的大戶持股分級資料。
 
@@ -2543,82 +2614,6 @@ class MomentumScanner(MarketScanner):
             if not rows:
                 return pd.DataFrame()
             return pd.DataFrame(rows, columns=["stock_id", "date", "level", "percent"])
-        except Exception:
-            return pd.DataFrame()
-
-    def _load_broker_data_extended(
-        self,
-        stock_ids: list[str],
-        days: int = 365,
-        min_trading_days: int = 20,
-    ) -> pd.DataFrame:
-        """從 DB 載入所有可用的分點交易資料（含 buy_price / sell_price）。
-
-        查詢窗口改為 days=365，充分利用 daily sync 累積的歷史資料。
-        min_trading_days：每支股票至少需有 N 個交易日資料，否則排除（避免假信號）。
-
-        計算僅針對 Stage 2 粗篩後的候選股（~150 支），不涉及全市場。
-        若表不存在或無資料則回傳空 DataFrame（呼叫端自動降級）。
-
-        資料累積說明：
-          - morning-routine Step 2 每日同步 watchlist 分點資料（5日）
-          - 連續執行 20 天後即可觸發 Smart Broker 8F 計算
-          - 資料越豐富（60~120 天），勝率/PF 估算越準確
-
-        均價代理策略（方案 B）：
-          - DJ 端點不提供 buy_price / sell_price，欄位存 NULL
-          - 本函數自動以 DailyPrice.close 填補 NULL 均價（同日收盤價）
-          - win_rate / PF 的意義：衡量分點「是否在漲前買、跌前賣」的擇時能力
-          - 所有分點使用相同日收盤價，失去「執行品質」訊號，但「擇時」信號仍有效
-        """
-        cutoff = date.today() - timedelta(days=days)
-        try:
-            with get_session() as session:
-                rows = session.execute(
-                    select(
-                        BrokerTrade.stock_id,
-                        BrokerTrade.date,
-                        BrokerTrade.broker_id,
-                        BrokerTrade.buy,
-                        BrokerTrade.sell,
-                        BrokerTrade.buy_price,
-                        BrokerTrade.sell_price,
-                    ).where(
-                        BrokerTrade.stock_id.in_(stock_ids),
-                        BrokerTrade.date >= cutoff,
-                    )
-                ).all()
-            if not rows:
-                return pd.DataFrame()
-            df = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
-            )
-            # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
-            # DJ 端點無均價欄位，改用收盤價作為代理，使 Smart Broker 8F 得以啟用。
-            if df["buy_price"].isna().any() or df["sell_price"].isna().any():
-                try:
-                    with get_session() as session:
-                        price_rows = session.execute(
-                            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
-                                DailyPrice.stock_id.in_(stock_ids),
-                                DailyPrice.date >= cutoff,
-                            )
-                        ).all()
-                    if price_rows:
-                        price_df = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
-                        df = df.merge(price_df, on=["stock_id", "date"], how="left")
-                        df["buy_price"] = df["buy_price"].astype("float64").fillna(df["close"])
-                        df["sell_price"] = df["sell_price"].astype("float64").fillna(df["close"])
-                        df = df.drop(columns=["close"])
-                except Exception:
-                    pass  # 無法載入收盤價時保持原始 NULL，系統降回 7F
-            # 過濾掉歷史資料不足的股票，避免以少量資料誤判分點行為
-            if min_trading_days > 0 and not df.empty:
-                day_counts = df.groupby("stock_id")["date"].nunique()
-                valid_stocks = day_counts[day_counts >= min_trading_days].index
-                df = df[df["stock_id"].isin(valid_stocks)]
-            return df
         except Exception:
             return pd.DataFrame()
 
@@ -2680,8 +2675,10 @@ class MomentumScanner(MarketScanner):
 class SwingScanner(MarketScanner):
     """中期波段掃描器（1~3 個月）。
 
-    粗篩：趨勢（close > SMA60）+ 基本面
-    細評：技術面 30% + 籌碼面 30% + 基本面 40%
+    粗篩：趨勢（close > SMA60）+ 法人 20 日累積 + 量能
+    細評：技術面 30% + 籌碼面 30% + 基本面 40%（依 Regime 動態調整）
+    基本面：YoY 30% + MoM 20% + 加速度 20% + ROE QoQ 15% + 毛利率趨勢 15%；財報不足時降回純營收三因子
+    籌碼面：最高 6F（投信 + 累積 + 大戶 + 分點 + 借券逆向 + 智慧分點），依資料可用性自適應降級
     風險過濾：年化波動率 > 85th percentile 剔除
     """
 
@@ -2814,7 +2811,9 @@ class SwingScanner(MarketScanner):
         return filtered
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """波段模式技術面 4 因子：趨勢確認 + 均線排列 + 60日動能 + 量價齊揚。"""
+        """波段模式技術面 5 因子：趨勢確認 + 均線排列 + 60日動能 + 量價齊揚 + ADX趨勢強度。"""
+        from ta.trend import ADXIndicator as _ADXIndicator
+
         results = []
         grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
 
@@ -2829,6 +2828,8 @@ class SwingScanner(MarketScanner):
 
             closes = stock_data["close"].values
             volumes = stock_data["volume"].values.astype(float)
+            highs = stock_data["high"].values
+            lows = stock_data["low"].values
 
             score = 0.0
             n_factors = 0
@@ -2865,6 +2866,22 @@ class SwingScanner(MarketScanner):
                 score += count / 20.0
                 n_factors += 1
 
+            # 5) ADX(14) 趨勢強度：adx_score = min(1.0, max(0.0, (adx - 15) / 30))
+            #    ADX=15 → 0，ADX=45 → 1；需至少 28 根（2×14）才能取到有效值
+            if len(closes) >= 28:
+                window = min(len(closes), 60)
+                adx_series = _ADXIndicator(
+                    high=pd.Series(highs[-window:]),
+                    low=pd.Series(lows[-window:]),
+                    close=pd.Series(closes[-window:]),
+                    n=14,
+                ).adx()
+                valid = adx_series.dropna()
+                if not valid.empty:
+                    adx_val = float(valid.iloc[-1])
+                    score += min(1.0, max(0.0, (adx_val - 15) / 30))
+                    n_factors += 1
+
             tech_score = score / max(n_factors, 1)
             results.append({"stock_id": sid, "technical_score": tech_score})
 
@@ -2877,13 +2894,18 @@ class SwingScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """波段模式籌碼面：投信淨買超 + 三大法人 20 日累積買超 + 大戶持股 + 分點集中度（有資料時）。
+        """波段模式籌碼面：投信 + 累積 + 大戶 + 分點 + 借券（逆向）+ Smart Broker（有資料時）。
 
-        權重組合：
-        - 4 因子（大戶 + 分點）: 投信 35% + 累積 35% + 大戶 15% + 分點 15%
-        - 3 因子（含大戶）:      投信 40% + 累積 40% + 大戶 20%
-        - 3 因子（含分點）:      投信 40% + 累積 40% + 分點 20%
-        - 2 因子（基本）:        投信 50% + 累積 50%
+        權重組合（由資料可用性決定）：
+        - 6F（含 Smart Broker）: 投信 22% + 累積 22% + 大戶 12% + 分點 12% + 借券逆向 10% + 智慧分點 22%
+        - 5F（大戶 + 分點 + 借券）: 投信 28% + 累積 28% + 大戶 16% + 分點 16% + 借券逆向 12%
+        - 4F（大戶 + 借券，無分點）: 投信 33% + 累積 33% + 大戶 19% + 借券逆向 15%
+        - 4F（分點 + 借券，無大戶）: 投信 33% + 累積 33% + 分點 19% + 借券逆向 15%
+        - 3F（僅借券）:             投信 40% + 累積 40% + 借券逆向 20%
+        - 4F（大戶 + 分點，無借券）: 投信 35% + 累積 35% + 大戶 15% + 分點 15%
+        - 3F（含大戶，無借券）:      投信 40% + 累積 40% + 大戶 20%
+        - 3F（含分點，無借券）:      投信 40% + 累積 40% + 分點 20%
+        - 2F（基本）:               投信 50% + 累積 50%
 
         回傳欄位：stock_id, chip_score, chip_tier
         """
@@ -2945,20 +2967,76 @@ class SwingScanner(MarketScanner):
             broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
             broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
 
-        if has_whale and has_broker:
-            # 4 因子：投信 35% + 累積 35% + 大戶 15% + 分點 15%
+        # ── 借券賣出因子（空頭壓力逆向評分）────────────────────────
+        df_sbl_raw = self._load_sbl_data(stock_ids)
+        sbl_df = compute_sbl_score(df_sbl_raw)
+        has_sbl = not sbl_df.empty
+        if has_sbl:
+            df = df.merge(sbl_df[["stock_id", "sbl_balance"]], on="stock_id", how="left")
+            df["sbl_balance"] = df["sbl_balance"].fillna(
+                df["sbl_balance"].median() if not df["sbl_balance"].isna().all() else 0.0
+            )
+            # 逆向評分：借券餘額低 → 空頭壓力小 → 評分高
+            sbl_rank = 1.0 - df["sbl_balance"].rank(pct=True)
+
+        # ── 智慧分點因子（365 天歷史勝率 + 蓄積型分點）────────────────
+        _close_map: dict[str, float] = {}
+        if df_price is not None and not df_price.empty:
+            _close_map = df_price.sort_values("date").groupby("stock_id")["close"].last().to_dict()
+        df_broker_ext = self._load_broker_data_extended(stock_ids)
+        has_smart_broker = False
+        if not df_broker_ext.empty:
+            smart_df = compute_smart_broker_score(df_broker_ext, _close_map)
+            has_smart_broker = not smart_df.empty and float(smart_df["smart_broker_factor"].sum()) > 0
+            if has_smart_broker:
+                df = df.merge(smart_df[["stock_id", "smart_broker_factor"]], on="stock_id", how="left")
+                df["smart_broker_factor"] = df["smart_broker_factor"].fillna(0.0)
+                smart_broker_rank = df["smart_broker_factor"].rank(pct=True)
+
+        # ── 加權組合 ─────────────────────────────────────────────────
+        if has_smart_broker and has_broker and has_sbl and has_whale:
+            # 6F：投信 22% + 累積 22% + 大戶 12% + 分點 12% + 借券逆向 10% + 智慧分點 22%
+            df["chip_score"] = (
+                trust_rank * 0.22
+                + cum_rank * 0.22
+                + whale_rank * 0.12
+                + broker_rank * 0.12
+                + sbl_rank * 0.10
+                + smart_broker_rank * 0.22
+            )
+            chip_tier = "6F"
+        elif has_whale and has_broker and has_sbl:
+            # 5F：投信 28% + 累積 28% + 大戶 16% + 分點 16% + 借券逆向 12%
+            df["chip_score"] = (
+                trust_rank * 0.28 + cum_rank * 0.28 + whale_rank * 0.16 + broker_rank * 0.16 + sbl_rank * 0.12
+            )
+            chip_tier = "5F"
+        elif has_whale and has_sbl:
+            # 4F：投信 33% + 累積 33% + 大戶 19% + 借券逆向 15%
+            df["chip_score"] = trust_rank * 0.33 + cum_rank * 0.33 + whale_rank * 0.19 + sbl_rank * 0.15
+            chip_tier = "4F"
+        elif has_broker and has_sbl:
+            # 4F：投信 33% + 累積 33% + 分點 19% + 借券逆向 15%
+            df["chip_score"] = trust_rank * 0.33 + cum_rank * 0.33 + broker_rank * 0.19 + sbl_rank * 0.15
+            chip_tier = "4F"
+        elif has_sbl:
+            # 3F：投信 40% + 累積 40% + 借券逆向 20%
+            df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + sbl_rank * 0.20
+            chip_tier = "3F"
+        elif has_whale and has_broker:
+            # 4F：投信 35% + 累積 35% + 大戶 15% + 分點 15%
             df["chip_score"] = trust_rank * 0.35 + cum_rank * 0.35 + whale_rank * 0.15 + broker_rank * 0.15
             chip_tier = "4F"
         elif has_whale:
-            # 3 因子：投信 40% + 累積 40% + 大戶 20%
+            # 3F：投信 40% + 累積 40% + 大戶 20%
             df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + whale_rank * 0.20
             chip_tier = "3F"
         elif has_broker:
-            # 3 因子：投信 40% + 累積 40% + 分點 20%
+            # 3F：投信 40% + 累積 40% + 分點 20%
             df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + broker_rank * 0.20
             chip_tier = "3F"
         else:
-            # 2 因子：投信 50% + 累積 50%
+            # 2F：投信 50% + 累積 50%
             df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
             chip_tier = "2F"
 
@@ -2988,7 +3066,12 @@ class SwingScanner(MarketScanner):
             return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """波段模式基本面 3 因子：YoY 40% + MoM 30% + 營收加速度 30%（排名百分位）。"""
+        """波段模式基本面：YoY 30% + MoM 20% + 加速度 20% + ROE QoQ 15% + 毛利率趨勢 15%。
+
+        ROE QoQ = roe[t] - roe[t-1]（季度環比，資本使用效率是否提升）。
+        毛利率趨勢 = gross_margin[t] - gross_margin[t-2]（兩季對比，判斷是否正在轉好）。
+        財報資料不足時自動降回純營收三因子（YoY 40% + MoM 30% + 加速度 30%）。
+        """
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
@@ -2996,23 +3079,79 @@ class SwingScanner(MarketScanner):
         if rev.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
-        # YoY 排名
-        yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
-        # MoM 排名
-        mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
-
         # 營收加速度 = current_yoy - prev_yoy
         if "prev_yoy_growth" in rev.columns:
             rev["acceleration"] = rev["yoy_growth"].fillna(0) - rev["prev_yoy_growth"].fillna(0)
-            accel_rank = rev["acceleration"].rank(pct=True)
-        else:
-            accel_rank = pd.Series(0.5, index=rev.index)
 
-        # YoY 40% + MoM 30% + 加速度 30%
-        rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+        # --- 財報因子 ---
+        df_fin = self._load_financial_data(stock_ids, quarters=5)
+        if df_fin.empty:
+            # 降回純營收三因子
+            yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
+            mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
+            accel_rank = (
+                rev["acceleration"].rank(pct=True) if "acceleration" in rev.columns else pd.Series(0.5, index=rev.index)
+            )
+            rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+            return result
+
+        grouped = df_fin.groupby("stock_id", sort=False)
+        fin_rows = []
+        for sid in stock_ids:
+            row: dict = {"stock_id": sid, "roe_qoq": None, "gm_trend": None}
+            if sid in grouped.groups:
+                grp = grouped.get_group(sid).sort_values("date", ascending=False)
+                # ROE QoQ = roe[t] - roe[t-1]（最新季 - 上季）
+                if len(grp) >= 2 and pd.notna(grp.iloc[0]["roe"]) and pd.notna(grp.iloc[1]["roe"]):
+                    row["roe_qoq"] = float(grp.iloc[0]["roe"]) - float(grp.iloc[1]["roe"])
+                # 毛利率趨勢 = gross_margin[t] - gross_margin[t-2]（兩季對比）
+                if len(grp) >= 3 and pd.notna(grp.iloc[0]["gross_margin"]) and pd.notna(grp.iloc[2]["gross_margin"]):
+                    row["gm_trend"] = float(grp.iloc[0]["gross_margin"]) - float(grp.iloc[2]["gross_margin"])
+            fin_rows.append(row)
+
+        df_metrics = pd.DataFrame(fin_rows)
+        has_any = df_metrics[["roe_qoq", "gm_trend"]].notna().any(axis=1).any()
+        if not has_any:
+            yoy_rank = rev["yoy_growth"].fillna(0).rank(pct=True)
+            mom_rank = rev["mom_growth"].fillna(0).rank(pct=True)
+            accel_rank = (
+                rev["acceleration"].rank(pct=True) if "acceleration" in rev.columns else pd.Series(0.5, index=rev.index)
+            )
+            rev["fundamental_score"] = yoy_rank * 0.40 + mom_rank * 0.30 + accel_rank * 0.30
+            result = pd.DataFrame({"stock_id": stock_ids})
+            result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+            return result
+
+        roe_qoq_rank = df_metrics["roe_qoq"].rank(pct=True).fillna(0.5)
+        gm_trend_rank = df_metrics["gm_trend"].rank(pct=True).fillna(0.5)
+
+        # 合入營收指標（以 stock_id 對齊）
+        merge_cols = ["stock_id", "yoy_growth", "mom_growth"]
+        if "acceleration" in rev.columns:
+            merge_cols.append("acceleration")
+        df_metrics = df_metrics.merge(rev[merge_cols], on="stock_id", how="left")
+        df_metrics["yoy_growth"] = df_metrics["yoy_growth"].fillna(0)
+        df_metrics["mom_growth"] = df_metrics["mom_growth"].fillna(0)
+        df_metrics["yoy_rank_val"] = df_metrics["yoy_growth"].rank(pct=True)
+        df_metrics["mom_rank_val"] = df_metrics["mom_growth"].rank(pct=True)
+        if "acceleration" in df_metrics.columns:
+            df_metrics["accel_rank_val"] = df_metrics["acceleration"].rank(pct=True).fillna(0.5)
+        else:
+            df_metrics["accel_rank_val"] = 0.5
+
+        # YoY 30% + MoM 20% + 加速度 20% + ROE QoQ 15% + 毛利率趨勢 15%
+        df_metrics["fundamental_score"] = (
+            df_metrics["yoy_rank_val"] * 0.30
+            + df_metrics["mom_rank_val"] * 0.20
+            + df_metrics["accel_rank_val"] * 0.20
+            + roe_qoq_rank * 0.15
+            + gm_trend_rank * 0.15
+        )
 
         result = pd.DataFrame({"stock_id": stock_ids})
-        result = result.merge(rev[["stock_id", "fundamental_score"]], on="stock_id", how="left")
+        result = result.merge(df_metrics[["stock_id", "fundamental_score"]], on="stock_id", how="left")
         return result
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
@@ -3034,16 +3173,80 @@ class SwingScanner(MarketScanner):
         self._df_price_for_vcp = df_price
         return super()._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
 
+    def _compute_breakout_bonus(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """技術形態突破加成（互斥取最高）：
+
+        1. 季線突破（+4%）：前 5 日收盤 < SMA60，今日 close > SMA60，且成交量 > MA20量 × 1.5
+        2. 箱型突破（+3%）：近 20 日高低差 < ATR20 × 3（窄幅整理），今日突破 20 日最高點
+        """
+        rows = []
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
+        for sid in stock_ids:
+            bonus = 0.0
+            if sid not in grouped.groups:
+                rows.append({"stock_id": sid, "breakout_bonus": bonus})
+                continue
+
+            stock_data = grouped.get_group(sid)
+            if len(stock_data) < 21:
+                rows.append({"stock_id": sid, "breakout_bonus": bonus})
+                continue
+
+            closes = stock_data["close"].values
+            highs = stock_data["high"].values
+            lows = stock_data["low"].values
+            volumes = stock_data["volume"].values.astype(float)
+
+            # ── 季線突破 +4% ──────────────────────────────────────────
+            if len(closes) >= 66:
+                sma60 = closes[-60:].mean()
+                prev5_below = all(closes[-(i + 2)] < sma60 for i in range(1, 6))
+                vol_ma20 = volumes[-21:-1].mean()
+                if prev5_below and closes[-1] > sma60 and volumes[-1] > vol_ma20 * 1.5:
+                    bonus = max(bonus, 0.04)
+
+            # ── 箱型突破 +3% ──────────────────────────────────────────
+            if len(closes) >= 20:
+                recent_high = highs[-21:-1].max()
+                recent_low = lows[-21:-1].min()
+                # ATR20（TR = max(H-L, |H-prevC|, |L-prevC|)）
+                tr_list = []
+                for i in range(-20, 0):
+                    h = highs[i]
+                    lo = lows[i]
+                    pc = closes[i - 1]
+                    tr_list.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+                atr20 = sum(tr_list) / len(tr_list)
+                # 窄幅整理（range < ATR20×3）且今日突破前 20 日最高點
+                if (recent_high - recent_low) < atr20 * 3 and closes[-1] > recent_high:
+                    bonus = max(bonus, 0.03)
+
+            rows.append({"stock_id": sid, "breakout_bonus": bonus})
+
+        return pd.DataFrame(rows)
+
     def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """波段模式加成：VCP 波動收斂形態符合者 composite_score +3%。"""
+        """波段模式加成：VCP / 季線突破 / 箱型突破三種形態，互斥取最高加成。"""
         df_price = getattr(self, "_df_price_for_vcp", pd.DataFrame())
         if df_price.empty or candidates.empty:
             return candidates
         candidates = candidates.copy()
+
+        # VCP 加成（+3%）
         vcp_df = compute_vcp_score(candidates["stock_id"].tolist(), df_price)
         candidates = candidates.merge(vcp_df, on="stock_id", how="left")
         candidates["vcp_bonus"] = candidates["vcp_bonus"].fillna(0.0)
-        candidates["composite_score"] = candidates["composite_score"] + candidates["vcp_bonus"]
+
+        # 技術突破加成（+3% or +4%）
+        breakout_df = self._compute_breakout_bonus(candidates["stock_id"].tolist(), df_price)
+        candidates = candidates.merge(breakout_df, on="stock_id", how="left")
+        candidates["breakout_bonus"] = candidates["breakout_bonus"].fillna(0.0)
+
+        # 互斥取最高
+        candidates["composite_score"] = candidates["composite_score"] + candidates[["vcp_bonus", "breakout_bonus"]].max(
+            axis=1
+        )
         return candidates
 
 

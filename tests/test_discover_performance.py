@@ -231,3 +231,63 @@ class TestDateRangeFilter:
         assert date(2025, 6, 1) in scan_dates
         assert date(2025, 7, 1) in scan_dates
         assert date(2025, 8, 1) not in scan_dates
+
+
+class TestSwingModeHorizons:
+    """swing 模式預設持有期 [20, 40, 60] 測試。"""
+
+    def test_swing_default_holding_days(self):
+        """swing 模式未指定 holding_days 時，應使用 [20, 40, 60]。"""
+        perf = DiscoveryPerformance(mode="swing")
+        assert perf.holding_days == [20, 40, 60]
+
+    def test_momentum_default_holding_days(self):
+        """momentum 模式未指定 holding_days 時，應使用預設 [5, 10, 20]。"""
+        perf = DiscoveryPerformance(mode="momentum")
+        assert perf.holding_days == [5, 10, 20]
+
+    def test_explicit_holding_days_override(self):
+        """明確傳入 holding_days 時，應覆蓋模式預設值。"""
+        perf = DiscoveryPerformance(mode="swing", holding_days=[5, 10])
+        assert perf.holding_days == [5, 10]
+
+    def test_swing_summary_columns_20_40_60(self, db_session):
+        """swing 模式績效回測摘要的 holding_days 欄位應包含 20, 40, 60。"""
+        # 插入 1 筆推薦
+        db_session.add(
+            DiscoveryRecord(
+                scan_date=date(2025, 1, 2),
+                mode="swing",
+                rank=1,
+                stock_id="D001",
+                stock_name="D001",
+                close=100.0,
+                composite_score=0.8,
+            )
+        )
+        db_session.flush()
+        # 插入 60 天後的價格
+        dates = pd.bdate_range("2025-01-03", periods=65)
+        for i, dt in enumerate(dates):
+            db_session.add(
+                DailyPrice(
+                    stock_id="D001",
+                    date=dt.date(),
+                    open=100.0 + i,
+                    high=101.0 + i,
+                    low=99.0 + i,
+                    close=100.0 + i,
+                    volume=500_000,
+                    turnover=50_000_000,
+                    spread=0.5,
+                )
+            )
+        db_session.flush()
+
+        perf = DiscoveryPerformance(mode="swing")
+        result = perf.evaluate()
+        if not result["summary"].empty:
+            holding_days_in_summary = set(result["summary"]["holding_days"].tolist())
+            assert 20 in holding_days_in_summary
+            assert 40 in holding_days_in_summary
+            assert 60 in holding_days_in_summary

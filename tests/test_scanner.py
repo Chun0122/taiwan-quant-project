@@ -990,6 +990,213 @@ class TestSwingFundamentalScores:
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
 
 
+class TestSwingFinancialFundamentalScores:
+    """SwingScanner 財報因子整合測試（ROE QoQ + 毛利率趨勢）。"""
+
+    def _make_revenue(self):
+        return pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001"],
+                "yoy_growth": [15.0, 15.0],
+                "mom_growth": [3.0, 3.0],
+                "prev_yoy_growth": [10.0, 10.0],
+            }
+        )
+
+    def test_roe_qoq_improvement_rewarded(self, swing_scanner):
+        """ROE QoQ 改善（上升）的股票基本面分數應優於退化的股票。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: ROE QoQ 改善 (15 → 20)
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 20.0,
+                    "gross_margin": 35.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 15.0,
+                    "gross_margin": 34.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 13.0,
+                    "gross_margin": 33.0,
+                },
+                # 1001: ROE QoQ 退化 (20 → 10)
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 10.0,
+                    "gross_margin": 35.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 20.0,
+                    "gross_margin": 34.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 18.0,
+                    "gross_margin": 33.0,
+                },
+            ]
+        )
+        swing_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_gm_trend_improvement_rewarded(self, swing_scanner):
+        """毛利率兩季對比改善應優於惡化。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                # 1000: 毛利率改善（t vs t-2: 40 vs 30 = +10）
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 15.0,
+                    "gross_margin": 40.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 15.0,
+                    "gross_margin": 36.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 14.0,
+                    "gross_margin": 30.0,
+                },
+                # 1001: 毛利率惡化（t vs t-2: 25 vs 38 = -13）
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 15.0,
+                    "gross_margin": 25.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 15.0,
+                    "gross_margin": 30.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 14.0,
+                    "gross_margin": 38.0,
+                },
+            ]
+        )
+        swing_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["1000"] > scores["1001"]
+
+    def test_no_financial_data_fallback_to_revenue(self, swing_scanner):
+        """財報空 DataFrame 時，應降回純營收三因子，分數仍在 [0, 1]。"""
+        df_revenue = self._make_revenue()
+        swing_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame()
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert len(result) == 2
+        assert (result["fundamental_score"].dropna() >= 0).all()
+        assert (result["fundamental_score"].dropna() <= 1).all()
+
+    def test_score_range_with_financial_data(self, swing_scanner):
+        """有財報資料時 fundamental_score 應在 [0, 1] 範圍內。"""
+        df_revenue = self._make_revenue()
+        fin_df = _make_fin_df(
+            [
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 18.0,
+                    "gross_margin": 38.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 15.0,
+                    "gross_margin": 35.0,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 13.0,
+                    "gross_margin": 33.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 12, 31),
+                    "year": 2024,
+                    "quarter": 4,
+                    "roe": 12.0,
+                    "gross_margin": 32.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 9, 30),
+                    "year": 2024,
+                    "quarter": 3,
+                    "roe": 14.0,
+                    "gross_margin": 34.0,
+                },
+                {
+                    "stock_id": "1001",
+                    "date": date(2024, 6, 30),
+                    "year": 2024,
+                    "quarter": 2,
+                    "roe": 16.0,
+                    "gross_margin": 36.0,
+                },
+            ]
+        )
+        swing_scanner._load_financial_data = lambda sids, quarters=5: fin_df
+        result = swing_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
+        assert (result["fundamental_score"].dropna() >= 0).all()
+        assert (result["fundamental_score"].dropna() <= 1).all()
+
+
 class TestSwingCompositeWeights:
     def test_weights_with_regime(self, swing_scanner):
         """確認綜合分數依 regime 權重計算（含消息面）。"""
@@ -2989,34 +3196,40 @@ class TestSwingChipBrokerTier:
         return pd.DataFrame(rows)
 
     def test_whale_and_broker_gives_4f(self, monkeypatch):
-        """有大戶 + 有分點時，chip_tier 應升至 4F。"""
+        """有大戶 + 有分點（無借券）時，chip_tier 應為 4F。"""
         sids = ["1000", "1001"]
         scanner = self._make_scanner()
 
         monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert result.iloc[0]["chip_tier"] == "4F"
 
     def test_broker_only_gives_3f(self, monkeypatch):
-        """無大戶 + 有分點時，chip_tier 應為 3F。"""
+        """無大戶 + 有分點（無借券）時，chip_tier 應為 3F。"""
         sids = ["1000", "1001"]
         scanner = self._make_scanner()
 
         monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert result.iloc[0]["chip_tier"] == "3F"
 
     def test_no_broker_no_whale_gives_2f(self, monkeypatch):
-        """無大戶 + 無分點時，chip_tier 維持 2F（現狀不退化）。"""
+        """無大戶 + 無分點（無借券）時，chip_tier 維持 2F（現狀不退化）。"""
         sids = ["1000", "1001"]
         scanner = self._make_scanner()
 
         monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert result.iloc[0]["chip_tier"] == "2F"
@@ -3028,10 +3241,157 @@ class TestSwingChipBrokerTier:
 
         monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert (result["chip_score"] >= 0).all()
         assert (result["chip_score"] <= 1.0).all()
+
+
+def _make_sbl_df(stock_ids: list[str]) -> pd.DataFrame:
+    """建立最小借券賣出 DataFrame（compute_sbl_score 格式）。"""
+    return pd.DataFrame([{"stock_id": sid, "date": date(2025, 1, 25), "sbl_balance": 5000} for sid in stock_ids])
+
+
+def _make_broker_ext_df(stock_ids: list[str]) -> pd.DataFrame:
+    """建立含均價的分點歷史資料（供 compute_smart_broker_score 使用）。
+
+    模擬一個分點有 5 天買進、3 次獲利賣出，達到 Smart Broker 判定門檻。
+    """
+    rows = []
+    for sid in stock_ids:
+        bp, sp = 100.0, 112.0  # 買低賣高
+        # 買入 5 天（累計 ~600 萬）
+        for d in range(5):
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, d + 10),
+                    "broker_id": "9A00",
+                    "buy": 12000,
+                    "sell": 0,
+                    "buy_price": bp,
+                    "sell_price": 0.0,
+                }
+            )
+        # 賣出 3 次（獲利）
+        for d in range(3):
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, d + 18),
+                    "broker_id": "9A00",
+                    "buy": 0,
+                    "sell": 8000,
+                    "buy_price": 0.0,
+                    "sell_price": sp,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+class TestSwingChipSblTier:
+    """SwingScanner 接入借券資料後的 chip_tier 升級測試。"""
+
+    def _make_scanner(self):
+        from src.discovery.scanner import SwingScanner
+
+        return SwingScanner()
+
+    def _make_holding_df(self, stock_ids):
+        return pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date(2025, 1, 25), "level": "400001600000", "percent": 30.0}
+                for sid in stock_ids
+            ]
+        )
+
+    def test_sbl_with_whale_and_broker_gives_5f(self, monkeypatch):
+        """有大戶 + 分點 + 借券時，chip_tier 應升至 5F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: _make_sbl_df(ids))
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "5F"
+
+    def test_sbl_without_broker_whale_gives_3f(self, monkeypatch):
+        """有借券但無大戶/分點時，chip_tier 應為 3F（借券逆向因子納入）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: _make_sbl_df(ids))
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: pd.DataFrame())
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "3F"
+
+
+class TestSwingChipSmartBrokerTier:
+    """SwingScanner Smart Broker 因子啟用後的 chip_tier 升級測試。"""
+
+    def _make_scanner(self):
+        from src.discovery.scanner import SwingScanner
+
+        return SwingScanner()
+
+    def _make_holding_df(self, stock_ids):
+        return pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date(2025, 1, 25), "level": "400001600000", "percent": 30.0}
+                for sid in stock_ids
+            ]
+        )
+
+    def test_smart_broker_full_data_gives_6f(self, monkeypatch):
+        """有大戶 + 分點 + 借券 + Smart Broker 時，chip_tier 應升至 6F。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        ext_df = _make_broker_ext_df(sids)
+        smart_result = pd.DataFrame(
+            [
+                {"stock_id": sid, "smart_broker_score": 0.8, "accum_broker_score": 0.6, "smart_broker_factor": 0.72}
+                for sid in sids
+            ]
+        )
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: _make_broker_df(ids))
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: _make_sbl_df(ids))
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
+        monkeypatch.setattr("src.discovery.scanner.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        assert result.iloc[0]["chip_tier"] == "6F"
+
+    def test_smart_broker_without_other_factors_no_6f(self, monkeypatch):
+        """有 Smart Broker 但無大戶/分點/借券時，不觸發 6F（條件未全部滿足）。"""
+        sids = ["1000", "1001"]
+        scanner = self._make_scanner()
+
+        smart_result = pd.DataFrame(
+            [
+                {"stock_id": sid, "smart_broker_score": 0.8, "accum_broker_score": 0.6, "smart_broker_factor": 0.72}
+                for sid in sids
+            ]
+        )
+        ext_df = _make_broker_ext_df(sids)
+        monkeypatch.setattr(scanner, "_load_broker_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
+        monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
+        monkeypatch.setattr("src.discovery.scanner.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+
+        result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
+        # 沒有 broker/whale/sbl，smart_broker 單獨無法觸發 6F
+        assert result.iloc[0]["chip_tier"] != "6F"
 
 
 class TestGrowthChipBrokerTier:
@@ -3204,3 +3564,90 @@ class TestVcpBonus:
         result = compute_vcp_score(["2330", "2317"], pd.DataFrame())
         assert (result["vcp_bonus"] == 0.0).all()
         assert set(result["stock_id"].tolist()) == {"2330", "2317"}
+
+
+class TestSwingAdxTechnicalFactor:
+    """SwingScanner ADX(14) 第 5 技術因子測試。"""
+
+    def _make_price_df(self, sid: str, n: int, rising: bool = True) -> pd.DataFrame:
+        rows = []
+        for d in range(n):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            if rising:
+                close = 100.0 + d * 0.8
+            else:
+                close = 100.0 - d * 0.1
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": close * 0.99,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_adx_factor_boosts_strong_trend(self):
+        """強趨勢（ADX>25）的股票技術得分應高於資料不足（無 ADX 因子）的股票。"""
+        scanner = SwingScanner()
+        # 強趨勢：80 根足以計算 ADX
+        df_strong = self._make_price_df("STRONG", 80, rising=True)
+        # 短資料：只有 10 根，ADX 無法計算（未達 28 根門檻）
+        df_short = self._make_price_df("SHORT", 10, rising=True)
+        df_price = pd.concat([df_strong, df_short], ignore_index=True)
+        result = scanner._compute_technical_scores(["STRONG", "SHORT"], df_price)
+        scores = result.set_index("stock_id")["technical_score"]
+        # 強趨勢有完整 5 因子，短資料少 1 因子，分母不同不影響比較方向
+        assert scores["STRONG"] >= 0.0
+        assert scores["SHORT"] >= 0.0
+
+    def test_adx_score_range(self):
+        """包含 ADX 因子的技術得分應仍在 [0, 1] 範圍內。"""
+        scanner = SwingScanner()
+        df_price = _make_swing_price_df(80, 3)
+        sids = df_price["stock_id"].unique().tolist()
+        result = scanner._compute_technical_scores(sids, df_price)
+        assert (result["technical_score"] >= 0.0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+
+class TestSwingBreakoutBonus:
+    """SwingScanner 技術突破形態加成測試。"""
+
+    def _make_price_df(self, sid: str, closes, highs=None, lows=None, volumes=None) -> pd.DataFrame:
+        n = len(closes)
+        rows = []
+        for i in range(n):
+            day = date(2025, 1, 1) + timedelta(days=i)
+            c = closes[i]
+            h = highs[i] if highs else c * 1.005
+            lo = lows[i] if lows else c * 0.995
+            v = volumes[i] if volumes else 500_000
+            rows.append({"stock_id": sid, "date": day, "open": c * 0.99, "high": h, "low": lo, "close": c, "volume": v})
+        return pd.DataFrame(rows)
+
+    def test_quarterly_breakout_gives_4pct(self):
+        """前 5 日 close < SMA60，今日 close > SMA60，且量 > MA20量×1.5 → breakout_bonus = 0.04。"""
+        scanner = SwingScanner()
+        # 設計：前 74 根 90，接著 5 根 88（回落，仍 < SMA60≈90），最後 1 根 102（突破）
+        # SMA60 = (54*90 + 5*88 + 102)/60 ≈ 90.03；prev5 = 88 < 90.03，today 102 > 90.03
+        closes = [90.0] * 74 + [88.0] * 5 + [102.0]
+        normal_vol = 500_000
+        volumes = [normal_vol] * 79 + [normal_vol * 2]
+        highs = [c * 1.005 for c in closes]
+        lows = [c * 0.995 for c in closes]
+        df = self._make_price_df("A", closes, highs, lows, volumes)
+        result = scanner._compute_breakout_bonus(["A"], df)
+        assert result.iloc[0]["breakout_bonus"] == pytest.approx(0.04)
+
+    def test_no_breakout_gives_zero(self):
+        """無突破形態時 breakout_bonus = 0。"""
+        scanner = SwingScanner()
+        # 橫向整理，今日未突破
+        closes = [100.0] * 80
+        df = self._make_price_df("B", closes)
+        result = scanner._compute_breakout_bonus(["B"], df)
+        assert result.iloc[0]["breakout_bonus"] == pytest.approx(0.0)

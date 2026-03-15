@@ -57,6 +57,7 @@ class TestComputeIndicatorsFromDf:
             "bb_upper",
             "bb_middle",
             "bb_lower",
+            "adx_14",
         }
         assert expected_cols == set(result.columns)
 
@@ -163,6 +164,29 @@ class TestComputeIndicatorsFromDf:
         df = _make_ohlcv(1)
         result = compute_indicators_from_df(df)
         assert len(result) == 1
+
+    def test_adx14_range(self, df_100):
+        """ADX(14) 值應在 0~100 之間。"""
+        from src.features.indicators import compute_indicators_from_df
+
+        result = compute_indicators_from_df(df_100)
+        adx = result["adx_14"].dropna()
+        assert len(adx) > 0
+        assert adx.min() >= 0
+        assert adx.max() <= 100
+
+    def test_adx14_strong_trend_high(self):
+        """持續劇烈上漲的序列，ADX 應偏高（>20）。"""
+        from src.features.indicators import compute_indicators_from_df
+
+        df = _make_ohlcv(80, base=100.0)
+        # 讓每天漲幅擴大，形成強趨勢
+        df["close"] = [100.0 + i * 2.0 for i in range(80)]
+        df["high"] = df["close"] + 2.0
+        df["low"] = df["close"] - 0.5
+        result = compute_indicators_from_df(df)
+        adx_last = result["adx_14"].dropna().iloc[-1]
+        assert adx_last > 20
 
 
 class TestAggregateToWeekly:

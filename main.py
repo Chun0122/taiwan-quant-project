@@ -2341,7 +2341,7 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
 
     _init_db()
 
-    holding_days = [int(d) for d in args.days.split(",")]
+    holding_days = [int(d) for d in args.days.split(",")] if args.days else None
 
     perf = DiscoveryPerformance(
         mode=args.mode,
@@ -3515,7 +3515,11 @@ def main() -> None:
     sp_db.add_argument(
         "--mode", required=True, choices=["momentum", "swing", "value", "dividend", "growth"], help="掃描模式"
     )
-    sp_db.add_argument("--days", default="5,10,20", help="持有天數（逗號分隔，預設 5,10,20）")
+    sp_db.add_argument(
+        "--days",
+        default=None,
+        help="持有天數（逗號分隔；swing 預設 20,40,60，其他模式預設 5,10,20）",
+    )
     sp_db.add_argument("--top", type=int, default=None, help="只計算每次掃描前 N 名的績效")
     sp_db.add_argument("--start", default=None, help="掃描日期範圍起始 (YYYY-MM-DD)")
     sp_db.add_argument("--end", default=None, help="掃描日期範圍結束 (YYYY-MM-DD)")
