@@ -2235,3 +2235,110 @@ class TestGrowthFinancialFundamentalScores:
         # 原邏輯：相同 YoY + 相同加速度 → 分數應相近
         scores = result.set_index("stock_id")["fundamental_score"]
         assert abs(scores["1000"] - scores["1001"]) < 0.01
+
+
+# ─── compute_sector_relative_strength ────────────────────────────────
+
+
+class TestComputeSectorRelativeStrength:
+    """測試 compute_sector_relative_strength() 純函數。"""
+
+    def _make_price_df(self, sid: str, start_close: float, end_close: float, n: int = 20) -> pd.DataFrame:
+        """產生 n 天從 start_close 線性變化到 end_close 的日K（只需 close）。"""
+        rows = []
+        for i in range(n):
+            close = start_close + (end_close - start_close) * i / max(n - 1, 1)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, 1) + timedelta(days=i),
+                    "close": round(close, 2),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_outperformer_gets_positive_bonus(self):
+        """個股報酬率顯著超越產業中位數時應得 +0.03。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        # 同產業兩支股票：1000 漲 50%，1001 漲 5%，中位數 ≈ 27.5%；差 = 22.5% > 20% → +0.03
+        df1 = self._make_price_df("1000", 100.0, 150.0)
+        df2 = self._make_price_df("1001", 100.0, 105.0)
+        df_price = pd.concat([df1, df2], ignore_index=True)
+        industry_map = {"1000": "半導體", "1001": "半導體"}
+
+        result = compute_sector_relative_strength(["1000", "1001"], df_price, industry_map)
+        rs = result.set_index("stock_id")["relative_strength_bonus"]
+        assert rs["1000"] == pytest.approx(0.03)
+
+    def test_underperformer_gets_negative_bonus(self):
+        """個股報酬率顯著落後產業中位數時應得 -0.03。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        # 1000 漲 5%，1001 漲 50%；1000 落後 22.5% < -20% → -0.03
+        df1 = self._make_price_df("1000", 100.0, 105.0)
+        df2 = self._make_price_df("1001", 100.0, 150.0)
+        df_price = pd.concat([df1, df2], ignore_index=True)
+        industry_map = {"1000": "半導體", "1001": "半導體"}
+
+        result = compute_sector_relative_strength(["1000", "1001"], df_price, industry_map)
+        rs = result.set_index("stock_id")["relative_strength_bonus"]
+        assert rs["1000"] == pytest.approx(-0.03)
+
+    def test_within_threshold_gets_zero(self):
+        """差距未超過門檻時 bonus 應為 0.0。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        # 1000 漲 10%，1001 漲 15%；差 = 2.5% < 20% → 皆為 0.0
+        df1 = self._make_price_df("1000", 100.0, 110.0)
+        df2 = self._make_price_df("1001", 100.0, 115.0)
+        df_price = pd.concat([df1, df2], ignore_index=True)
+        industry_map = {"1000": "金融", "1001": "金融"}
+
+        result = compute_sector_relative_strength(["1000", "1001"], df_price, industry_map)
+        for _, row in result.iterrows():
+            assert row["relative_strength_bonus"] == pytest.approx(0.0)
+
+    def test_empty_price_df_returns_all_zeros(self):
+        """空 df_price 應回傳全 0.0。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        df_price = pd.DataFrame(columns=["stock_id", "date", "close"])
+        industry_map = {"1000": "半導體"}
+        result = compute_sector_relative_strength(["1000"], df_price, industry_map)
+        assert result.iloc[0]["relative_strength_bonus"] == pytest.approx(0.0)
+
+    def test_single_stock_per_sector_gets_zero(self):
+        """產業內只有一支股票時，中位數 = 自身，差距 = 0 → bonus = 0.0。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        df_price = self._make_price_df("1000", 100.0, 200.0)  # 漲 100%
+        industry_map = {"1000": "化工"}
+        result = compute_sector_relative_strength(["1000"], df_price, industry_map)
+        assert result.iloc[0]["relative_strength_bonus"] == pytest.approx(0.0)
+
+    def test_different_industries_independent(self):
+        """不同產業的個股相互獨立計算，不互相影響。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        # 1000 在半導體，1001 在金融；各自產業只有一支 → 皆為 0.0
+        df1 = self._make_price_df("1000", 100.0, 200.0)
+        df2 = self._make_price_df("1001", 100.0, 50.0)  # 跌 50%
+        df_price = pd.concat([df1, df2], ignore_index=True)
+        industry_map = {"1000": "半導體", "1001": "金融"}
+
+        result = compute_sector_relative_strength(["1000", "1001"], df_price, industry_map)
+        for _, row in result.iterrows():
+            assert row["relative_strength_bonus"] == pytest.approx(0.0)
+
+    def test_missing_stock_id_defaults_zero(self):
+        """stock_ids 中有股票無對應 price 資料時，應回傳 0.0（不崩潰）。"""
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        df_price = self._make_price_df("1000", 100.0, 130.0)
+        industry_map = {"1000": "電子", "9999": "電子"}
+
+        result = compute_sector_relative_strength(["1000", "9999"], df_price, industry_map)
+        rs = result.set_index("stock_id")["relative_strength_bonus"]
+        # 9999 無資料 → 0.0
+        assert rs["9999"] == pytest.approx(0.0)

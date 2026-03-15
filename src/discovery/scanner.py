@@ -608,6 +608,9 @@ class MarketScanner:
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
 
+        # Stage 3.3a: 產業同儕相對強度加成
+        scored = self._apply_sector_relative_strength(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -1077,6 +1080,71 @@ class MarketScanner:
             "Stage 3.4: 週線趨勢加成已套用（範圍 %.3f ~ %.3f）",
             scored["weekly_bonus"].min(),
             scored["weekly_bonus"].max(),
+        )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  產業同儕相對強度加成
+    # ------------------------------------------------------------------ #
+
+    def _compute_sector_relative_strength(self, stock_ids: list[str]) -> pd.DataFrame:
+        """計算個股相對同產業中位數的相對強度加成（±3%）。
+
+        從 DB 讀取近 30 天日K（確保包含 20 個交易日），
+        取得 StockInfo 產業對照，呼叫純函數計算。失敗時回傳全 0。
+
+        Returns:
+            DataFrame(stock_id, relative_strength_bonus)  值域 {-0.03, 0.0, +0.03}
+        """
+        from src.industry.analyzer import compute_sector_relative_strength
+
+        default = pd.DataFrame({"stock_id": stock_ids, "relative_strength_bonus": [0.0] * len(stock_ids)})
+
+        try:
+            cutoff = date.today() - timedelta(days=30)
+
+            with get_session() as session:
+                price_rows = session.execute(
+                    select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+                    .where(DailyPrice.stock_id.in_(stock_ids))
+                    .where(DailyPrice.date >= cutoff)
+                    .order_by(DailyPrice.stock_id, DailyPrice.date)
+                ).all()
+
+            if not price_rows:
+                return default
+
+            df_price = pd.DataFrame([{"stock_id": r[0], "date": r[1], "close": r[2]} for r in price_rows])
+
+            with get_session() as session:
+                info_rows = session.execute(
+                    select(StockInfo.stock_id, StockInfo.industry_category).where(StockInfo.stock_id.in_(stock_ids))
+                ).all()
+            industry_map = {r[0]: (r[1] or "未分類") for r in info_rows}
+
+            return compute_sector_relative_strength(stock_ids, df_price, industry_map)
+
+        except Exception:
+            logger.warning("產業相對強度計算失敗，跳過")
+            return default
+
+    def _apply_sector_relative_strength(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """將產業同儕相對強度加成套用到 composite_score。
+
+        final_score = composite_score × (1 + relative_strength_bonus)
+        """
+        if scored.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        rs_df = self._compute_sector_relative_strength(stock_ids)
+        scored = scored.merge(rs_df, on="stock_id", how="left")
+        scored["relative_strength_bonus"] = scored["relative_strength_bonus"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["relative_strength_bonus"])
+        logger.info(
+            "Stage 3.3a: 產業相對強度加成已套用（範圍 %.3f ~ %.3f）",
+            scored["relative_strength_bonus"].min(),
+            scored["relative_strength_bonus"].max(),
         )
         return scored
 
@@ -2784,6 +2852,9 @@ class ValueScanner(MarketScanner):
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
 
+        # Stage 3.3a: 產業同儕相對強度加成
+        scored = self._apply_sector_relative_strength(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -3176,6 +3247,9 @@ class DividendScanner(MarketScanner):
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
 
+        # Stage 3.3a: 產業同儕相對強度加成
+        scored = self._apply_sector_relative_strength(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -3501,6 +3575,9 @@ class GrowthScanner(MarketScanner):
 
         # Stage 3.3: 產業加成
         scored = self._apply_sector_bonus(scored)
+
+        # Stage 3.3a: 產業同儕相對強度加成
+        scored = self._apply_sector_relative_strength(scored)
 
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:

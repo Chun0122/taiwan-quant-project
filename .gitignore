@@ -38,3 +38,6 @@ logs/
 
 # Claude Code
 .claude/
+
+# 分點匯入清單
+stocks.txt

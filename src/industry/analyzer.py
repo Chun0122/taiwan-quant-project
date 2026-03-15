@@ -20,6 +20,84 @@ from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
 logger = logging.getLogger(__name__)
 
 
+def compute_sector_relative_strength(
+    stock_ids: list[str],
+    df_price: pd.DataFrame,
+    industry_map: dict[str, str],
+    lookback_days: int = 20,
+    threshold: float = 0.20,
+    bonus: float = 0.03,
+) -> pd.DataFrame:
+    """計算個股相對同產業中位數的相對強度加成（±3%）。
+
+    計算邏輯：
+      1. 計算每支股票近 lookback_days 個交易日的報酬率
+      2. 計算每個產業的中位數報酬率
+      3. 若個股報酬率高於中位數超過 threshold → +bonus
+         若個股報酬率低於中位數超過 threshold → -bonus
+
+    Args:
+        stock_ids: 候選股代號清單
+        df_price: DataFrame（需含 stock_id, date, close 欄位）
+        industry_map: {stock_id: industry_category} 對照表
+        lookback_days: 計算報酬率的回看天數（預設 20 日）
+        threshold: 超越/落後中位數的門檻（預設 0.20 = ±20 個百分點）
+        bonus: 加成幅度（預設 0.03 = ±3%）
+
+    Returns:
+        DataFrame(stock_id, relative_strength_bonus)  值域 {-bonus, 0.0, +bonus}
+    """
+    default = pd.DataFrame({"stock_id": stock_ids, "relative_strength_bonus": [0.0] * len(stock_ids)})
+
+    if df_price.empty or not stock_ids:
+        return default
+
+    # 計算每支股票的近期報酬率
+    returns: dict[str, float] = {}
+    for sid in stock_ids:
+        grp = df_price[df_price["stock_id"] == sid].sort_values("date")
+        grp = grp.tail(lookback_days)
+        if len(grp) < 2:
+            continue
+        first_close = float(grp.iloc[0]["close"])
+        last_close = float(grp.iloc[-1]["close"])
+        if first_close > 0:
+            returns[sid] = (last_close - first_close) / first_close
+
+    if not returns:
+        return default
+
+    # 計算每個產業的中位數報酬率
+    sector_rets: dict[str, list[float]] = {}
+    for sid, ret in returns.items():
+        industry = industry_map.get(sid, "未分類")
+        sector_rets.setdefault(industry, []).append(ret)
+
+    sector_median: dict[str, float] = {ind: float(pd.Series(rets).median()) for ind, rets in sector_rets.items()}
+
+    # 映射每支股票的加成
+    records = []
+    for sid in stock_ids:
+        industry = industry_map.get(sid, "未分類")
+        median = sector_median.get(industry)
+        ret = returns.get(sid)
+
+        if ret is None or median is None:
+            bonus_val = 0.0
+        else:
+            diff = ret - median
+            if diff > threshold:
+                bonus_val = bonus
+            elif diff < -threshold:
+                bonus_val = -bonus
+            else:
+                bonus_val = 0.0
+
+        records.append({"stock_id": sid, "relative_strength_bonus": bonus_val})
+
+    return pd.DataFrame(records)
+
+
 class IndustryRotationAnalyzer:
     """產業輪動分析器。"""
 
