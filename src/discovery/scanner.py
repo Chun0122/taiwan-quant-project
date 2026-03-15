@@ -2502,8 +2502,13 @@ class MomentumScanner(MarketScanner):
             return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：YoY > 0 加分(0.7)，≤ 0 中性(0.3)，無資料 fallback 0.5。
-        有 yoy_3m_ago 資料時，加速度正 +0.05、減速 -0.05（輕微調整，上限 0.8 / 下限 0.2）。
+        """動能模式基本面：四階梯短線爆發濾網（此 10% 權重不評長線品質，只捕捉短線催化劑）。
+
+        Tier 1 (0.85)：MoM > 0 且 YoY > 0 且 YoY > yoy_3m_ago（月營收雙增 + YoY 近期創高）
+        Tier 2 (0.72)：YoY > 0 且 YoY > yoy_3m_ago（YoY 正且加速）
+        Tier 3 (0.55)：YoY > 0（YoY 正但未加速，或無加速度資料）
+        Tier 4 (0.30)：YoY <= 0（YoY 衰退）
+        無資料 fallback：0.50（中性）
         """
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
@@ -2514,22 +2519,30 @@ class MomentumScanner(MarketScanner):
         for sid in stock_ids:
             if sid not in rev_grouped.groups:
                 result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                continue
+
+            rev = rev_grouped.get_group(sid)
+            yoy = rev.iloc[0].get("yoy_growth", None)
+            if yoy is None or pd.isna(yoy):
+                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                continue
+
+            mom = rev.iloc[0].get("mom_growth", None)
+            yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
+
+            has_mom_pos = mom is not None and not pd.isna(mom) and float(mom) > 0
+            has_accel = yoy_3m is not None and not pd.isna(yoy_3m) and float(yoy) > float(yoy_3m)
+
+            if float(yoy) > 0 and has_mom_pos and has_accel:
+                score = 0.85  # Tier 1: 月營收雙增 + YoY 近期創高
+            elif float(yoy) > 0 and has_accel:
+                score = 0.72  # Tier 2: YoY 正且加速（MoM 未必正）
+            elif float(yoy) > 0:
+                score = 0.55  # Tier 3: YoY 正但未加速
             else:
-                rev = rev_grouped.get_group(sid)
-                yoy = rev.iloc[0].get("yoy_growth", None)
-                if yoy is not None and not pd.isna(yoy):
-                    base = 0.7 if yoy > 0 else 0.3
-                    # 輕微加速度加成：本月 YoY - 3 個月前 YoY > 0 加分，< 0 減分
-                    yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
-                    if yoy_3m is not None and not pd.isna(yoy_3m):
-                        accel = float(yoy) - float(yoy_3m)
-                        if accel > 0:
-                            base = min(0.8, base + 0.05)
-                        elif accel < 0:
-                            base = max(0.2, base - 0.05)
-                    result_rows.append({"stock_id": sid, "fundamental_score": base})
-                else:
-                    result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                score = 0.30  # Tier 4: YoY 衰退
+
+            result_rows.append({"stock_id": sid, "fundamental_score": score})
 
         return pd.DataFrame(result_rows)
 

@@ -543,7 +543,7 @@ class TestChipTier:
 
 class TestMomentumFundamentalScores:
     def test_yoy_positive_gets_higher(self, momentum_scanner):
-        """YoY > 0 得 0.7，YoY <= 0 得 0.3（無加速度資料時）。"""
+        """YoY > 0 且無加速度資料 → Tier 3 (0.55)；YoY <= 0 → Tier 4 (0.30)。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000", "1001"],
@@ -553,8 +553,8 @@ class TestMomentumFundamentalScores:
         )
         result = momentum_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
         scores = result.set_index("stock_id")["fundamental_score"]
-        assert scores["1000"] == pytest.approx(0.7)
-        assert scores["1001"] == pytest.approx(0.3)
+        assert scores["1000"] == pytest.approx(0.55)
+        assert scores["1001"] == pytest.approx(0.30)
 
     def test_no_data_fallback(self, momentum_scanner):
         result = momentum_scanner._compute_fundamental_scores(
@@ -563,30 +563,82 @@ class TestMomentumFundamentalScores:
         assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
 
     def test_acceleration_bonus_positive(self, momentum_scanner):
-        """YoY > 0 且加速（yoy_3m_ago 較小），基分 0.7 加 0.05 = 0.75。"""
+        """YoY > 0、MoM > 0、加速（yoy < yoy_3m_ago 的逆）→ Tier 1: 0.85。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000"],
                 "yoy_growth": [20.0],
                 "mom_growth": [5.0],
-                "yoy_3m_ago": [10.0],  # 加速：20 - 10 = +10
+                "yoy_3m_ago": [10.0],  # 加速：20 > 10
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.75)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.85)
 
     def test_acceleration_bonus_negative(self, momentum_scanner):
-        """YoY > 0 但減速（yoy_3m_ago 較大），基分 0.7 減 0.05 = 0.65。"""
+        """YoY > 0、MoM > 0 但減速（yoy < yoy_3m_ago）→ Tier 3: 0.55。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000"],
                 "yoy_growth": [10.0],
                 "mom_growth": [5.0],
-                "yoy_3m_ago": [30.0],  # 減速：10 - 30 = -20
+                "yoy_3m_ago": [30.0],  # 減速：10 < 30
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.65)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.55)
+
+    def test_tier2_yoy_accelerating_mom_negative(self, momentum_scanner):
+        """YoY > 0 且加速，但 MoM <= 0 → Tier 2: 0.72（非雙增故不升 Tier 1）。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [20.0],
+                "mom_growth": [-3.0],
+                "yoy_3m_ago": [10.0],
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.72)
+
+    def test_tier3_yoy_positive_no_yoy3m(self, momentum_scanner):
+        """YoY > 0 但無 yoy_3m_ago → 無法判斷加速 → Tier 3: 0.55。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [15.0],
+                "mom_growth": [5.0],
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.55)
+
+    def test_tier4_yoy_negative_regardless_mom(self, momentum_scanner):
+        """YoY <= 0 → Tier 4: 0.30（MoM 正也無法拉升）。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "yoy_growth": [-5.0],
+                "mom_growth": [10.0],
+                "yoy_3m_ago": [-8.0],
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.30)
+
+    def test_tier1_highest_tier2_second(self, momentum_scanner):
+        """四階梯排序：Tier 1 > Tier 2 > Tier 3 > Tier 4。"""
+        df_revenue = pd.DataFrame(
+            {
+                "stock_id": ["t1", "t2", "t3", "t4"],
+                "yoy_growth": [20.0, 20.0, 15.0, -5.0],
+                "mom_growth": [5.0, -3.0, 5.0, 5.0],
+                "yoy_3m_ago": [10.0, 10.0, 30.0, -8.0],
+            }
+        )
+        result = momentum_scanner._compute_fundamental_scores(["t1", "t2", "t3", "t4"], df_revenue)
+        scores = result.set_index("stock_id")["fundamental_score"]
+        assert scores["t1"] > scores["t2"] > scores["t3"] > scores["t4"]
 
 
 @pytest.mark.parametrize(

@@ -29,9 +29,12 @@ RegimeType = Literal["bull", "bear", "sideways"]
 # Regime 對 Discover 各模式的權重調整矩陣
 REGIME_WEIGHTS: dict[str, dict[RegimeType, dict[str, float]]] = {
     "momentum": {
-        "bull": {"technical": 0.45, "chip": 0.35, "fundamental": 0.10, "news": 0.10},
-        "sideways": {"technical": 0.40, "chip": 0.40, "fundamental": 0.10, "news": 0.10},
-        "bear": {"technical": 0.30, "chip": 0.40, "fundamental": 0.15, "news": 0.15},
+        # Bull：技術/籌碼等重 40/40，降低「技術突破 + 外資買超同步」的共線性偏誤
+        "bull": {"technical": 0.40, "chip": 0.40, "fundamental": 0.10, "news": 0.10},
+        # Sideways：籌碼面拉至 50%，盤整期 Smart Broker 蓄積訊號最有效；壓縮技術面避免追假突破
+        "sideways": {"technical": 0.30, "chip": 0.50, "fundamental": 0.10, "news": 0.10},
+        # Bear：技術面降至 25%，消息面提升至 20%，確保選出有事件催化劑的錯殺股
+        "bear": {"technical": 0.25, "chip": 0.40, "fundamental": 0.15, "news": 0.20},
     },
     "swing": {
         "bull": {"technical": 0.30, "chip": 0.20, "fundamental": 0.40, "news": 0.10},

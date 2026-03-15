@@ -86,10 +86,22 @@ class TestRegimeWeights:
     def test_get_weights_known_mode(self):
         """get_weights 回傳正確的權重。"""
         w = MarketRegimeDetector.get_weights("momentum", "bull")
-        assert w["technical"] == 0.45
-        assert w["chip"] == 0.35
+        assert w["technical"] == 0.40
+        assert w["chip"] == 0.40
         assert w["fundamental"] == 0.10
         assert w["news"] == 0.10
+
+    def test_momentum_sideways_chip_dominant(self):
+        """盤整時 momentum 籌碼面 50% > 技術面 30%，Smart Broker 蓄積效益最大。"""
+        w = REGIME_WEIGHTS["momentum"]["sideways"]
+        assert w["chip"] == 0.50
+        assert w["technical"] == 0.30
+
+    def test_momentum_bear_news_elevated(self):
+        """空頭時 momentum 消息面提升至 20%，確保選出有事件催化劑的錯殺股。"""
+        w = REGIME_WEIGHTS["momentum"]["bear"]
+        assert w["news"] == 0.20
+        assert w["technical"] == 0.25
 
     def test_get_weights_unknown_mode_returns_default(self):
         """未知模式回傳預設權重。"""
