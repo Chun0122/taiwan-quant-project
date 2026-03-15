@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-十九張核心表：
+二十一張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -15,11 +15,12 @@
 - BrokerTrade:             分點交易資料（日資料，FinMind TaiwanStockTradingDailyReport）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
-- StockInfo:               股票基本資料（產業分類）
+- StockInfo:               股票基本資料（產業分類 + security_type）
 - PortfolioBacktestResult: 投資組合回測結果
 - DiscoveryRecord:         Discover 推薦記錄（歷史追蹤）
 - WatchEntry:              持倉監控表（進出場追蹤 + 止損止利狀態）
 - Watchlist:               使用者自訂觀察清單（DB 驅動，取代 settings.yaml watchlist）
+- DailyFeature:            每日特徵快取（Feature Store，供 UniverseFilter 使用）
 """
 
 from datetime import date, datetime
@@ -385,7 +386,7 @@ class PortfolioBacktestResult(Base):
 
 
 class StockInfo(Base):
-    """股票基本資料（產業分類）。"""
+    """股票基本資料（產業分類 + 有價證券類型）。"""
 
     __tablename__ = "stock_info"
     __table_args__ = (UniqueConstraint("stock_id", name="uq_stock_info"),)
@@ -395,6 +396,9 @@ class StockInfo(Base):
     stock_name: Mapped[str] = mapped_column(String(50), nullable=True)
     industry_category: Mapped[str] = mapped_column(String(50), nullable=True, index=True)
     listing_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    security_type: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True
+    )  # stock / etf / etn / warrant / preferred / None（未填入時不過濾）
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
@@ -521,3 +525,39 @@ class Watchlist(Base):
 
     def __repr__(self) -> str:
         return f"<Watchlist {self.stock_id} added={self.added_date}>"
+
+
+class DailyFeature(Base):
+    """每日特徵快取（Feature Store）。
+
+    由 `compute_and_store_daily_features()`（pipeline.py）每日計算並存入。
+    供 UniverseFilter Stage 2/3 使用，加速全市場流動性與趨勢過濾。
+    DailyPrice 載入後向量化滾動計算，無須重複從原始資料計算指標。
+
+    欄位說明：
+    - ma20 / ma60:      20/60 日收盤均線（趨勢判斷）
+    - volume_ma20:      20 日均量（成交量動能比較基準）
+    - turnover_ma5:     5 日均成交金額（流動性過濾基準）
+    - momentum_20d:     20 日報酬率（%）
+    - volatility_20d:   20 日年化波動率（%）
+    """
+
+    __tablename__ = "daily_feature"
+    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_daily_feature"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    turnover: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ma20: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日均線
+    ma60: Mapped[float | None] = mapped_column(Float, nullable=True)  # 60 日均線（季線）
+    volume_ma20: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日均量
+    turnover_ma5: Mapped[float | None] = mapped_column(Float, nullable=True)  # 5 日均成交金額
+    momentum_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日報酬率 (%)
+    volatility_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日年化波動率 (%)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<DailyFeature {self.stock_id} {self.date} ma60={self.ma60}>"

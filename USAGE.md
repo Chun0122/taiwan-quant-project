@@ -1389,6 +1389,37 @@ python main.py sync-info --force
 
 ---
 
+### 4.28 計算 Feature Store（`sync-features`）
+
+計算全市場每日特徵（`DailyFeature` 表），供 `UniverseFilter` 三層漏斗的 Stage 2（流動性）與 Stage 3（趨勢動能）快取使用，避免每次 `discover` 時重複計算滾動均值。
+
+```bash
+# 計算全市場 DailyFeature（預設回溯 90 天）
+python main.py sync-features
+
+# 自訂回溯天數
+python main.py sync-features --days 60
+```
+
+**計算欄位：**
+
+| 欄位 | 說明 |
+|------|------|
+| `ma20` / `ma60` | 20 / 60 日收盤均線（趨勢判斷） |
+| `volume_ma20` | 20 日均量（量比計算基準） |
+| `turnover_ma5` | 5 日均成交金額（流動性過濾基準） |
+| `momentum_20d` | 20 日報酬率（%） |
+| `volatility_20d` | 20 日年化波動率（%） |
+
+**使用時機：**
+- 初次部署後，執行 `sync-info --force && sync-features` 建立完整基礎資料
+- 可加入 `morning-routine` 前執行（或獨立夜間排程），確保當日 `discover` 使用最新特徵
+- DailyFeature 表為空時，`UniverseFilter` 會自動從 `DailyPrice` fallback 計算（冷啟動相容）
+
+> **冷啟動順序**：`sync-info --force` → `sync-features` → `discover`
+
+---
+
 ## 5. 資料庫 Schema
 
 資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表（另含 `stock_valuation` 估值表）：

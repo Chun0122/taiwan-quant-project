@@ -40,6 +40,7 @@ from src.data.schema import (
     StockInfo,
     StockValuation,
 )
+from src.discovery.universe import UniverseConfig, UniverseFilter
 
 logger = logging.getLogger(__name__)
 
@@ -518,6 +519,7 @@ class MarketScanner:
         top_n_results: int = 30,
         lookback_days: int = 5,
         weekly_confirm: bool = False,
+        universe_config: UniverseConfig | None = None,
     ) -> None:
         self.min_price = min_price
         self.max_price = max_price
@@ -526,6 +528,9 @@ class MarketScanner:
         self.top_n_results = top_n_results
         self.lookback_days = lookback_days
         self.weekly_confirm = weekly_confirm
+        # Universe Filter：各子類可在 __init__ 中傳入模式專屬 config
+        self._universe_config = universe_config or UniverseConfig()
+        self._universe_filter = UniverseFilter(self._universe_config)
 
     def run(self) -> DiscoveryResult:
         """執行四階段漏斗掃描。"""
@@ -635,76 +640,88 @@ class MarketScanner:
     #  Stage 1: 載入資料
     # ------------------------------------------------------------------ #
 
+    def _get_universe_ids(self) -> list[str]:
+        """執行 UniverseFilter 三層過濾，回傳候選 stock_id 清單。
+
+        供 _load_market_data() 及子類覆寫版本呼叫，以 IN 子句限定 SQL 查詢範圍。
+        若 UniverseFilter 失敗（DB 空等原因）回傳空清單，呼叫端的 SQL 不加 IN 子句。
+        """
+        universe_ids, universe_stats = self._universe_filter.run(mode=self.mode_name)
+        logger.info(
+            "Stage 0.5 UniverseFilter: SQL=%d → 流動性=%d → 趨勢=%d → 最終候選=%d",
+            universe_stats.get("total_after_sql", 0),
+            universe_stats.get("total_after_liquidity", 0),
+            universe_stats.get("total_after_trend", 0),
+            universe_stats.get("final_candidates", 0),
+        )
+        return universe_ids
+
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """從 DB 查詢最近的 daily_price + institutional + margin + monthly_revenue 資料。"""
+        """從 DB 查詢最近的 daily_price + institutional + margin + monthly_revenue 資料。
+
+        Stage 0.5（Universe Filter）：先執行三層 SQL/Pandas 過濾，取得 ~150-1500 支候選 stock_id，
+        再以 IN 子句限定 DailyPrice/InstitutionalInvestor/MarginTrading 查詢範圍，
+        避免全量載入 ~6000 支股票，節省約 75% I/O。
+        """
+        # Stage 0.5: Universe Filter — SQL 硬過濾 + 流動性 + 趨勢
+        universe_ids = self._get_universe_ids()
+
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
 
         with get_session() as session:
-            # 日K線
-            rows = session.execute(
-                select(
-                    DailyPrice.stock_id,
-                    DailyPrice.date,
-                    DailyPrice.open,
-                    DailyPrice.high,
-                    DailyPrice.low,
-                    DailyPrice.close,
-                    DailyPrice.volume,
-                ).where(DailyPrice.date >= cutoff)
-            ).all()
+            # 日K線（含 turnover，供流動性評分使用）
+            price_query = select(
+                DailyPrice.stock_id,
+                DailyPrice.date,
+                DailyPrice.open,
+                DailyPrice.high,
+                DailyPrice.low,
+                DailyPrice.close,
+                DailyPrice.volume,
+                DailyPrice.turnover,
+            ).where(DailyPrice.date >= cutoff)
+
+            if universe_ids:
+                price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
+
+            rows = session.execute(price_query).all()
             df_price = pd.DataFrame(
                 rows,
-                columns=[
-                    "stock_id",
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ],
+                columns=["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"],
             )
 
             # 三大法人
-            rows = session.execute(
-                select(
-                    InstitutionalInvestor.stock_id,
-                    InstitutionalInvestor.date,
-                    InstitutionalInvestor.name,
-                    InstitutionalInvestor.net,
-                ).where(InstitutionalInvestor.date >= cutoff)
-            ).all()
-            df_inst = pd.DataFrame(
-                rows,
-                columns=[
-                    "stock_id",
-                    "date",
-                    "name",
-                    "net",
-                ],
-            )
+            inst_query = select(
+                InstitutionalInvestor.stock_id,
+                InstitutionalInvestor.date,
+                InstitutionalInvestor.name,
+                InstitutionalInvestor.net,
+            ).where(InstitutionalInvestor.date >= cutoff)
+
+            if universe_ids:
+                inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
+
+            rows = session.execute(inst_query).all()
+            df_inst = pd.DataFrame(rows, columns=["stock_id", "date", "name", "net"])
 
             # 融資融券
-            rows = session.execute(
-                select(
-                    MarginTrading.stock_id,
-                    MarginTrading.date,
-                    MarginTrading.margin_balance,
-                    MarginTrading.short_balance,
-                ).where(MarginTrading.date >= cutoff)
-            ).all()
-            df_margin = pd.DataFrame(
-                rows,
-                columns=[
-                    "stock_id",
-                    "date",
-                    "margin_balance",
-                    "short_balance",
-                ],
-            )
+            margin_query = select(
+                MarginTrading.stock_id,
+                MarginTrading.date,
+                MarginTrading.margin_balance,
+                MarginTrading.short_balance,
+            ).where(MarginTrading.date >= cutoff)
 
-        # 月營收（全部股票）
-        df_revenue = self._load_revenue_data(months=self._revenue_months)
+            if universe_ids:
+                margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
+
+            rows = session.execute(margin_query).all()
+            df_margin = pd.DataFrame(rows, columns=["stock_id", "date", "margin_balance", "short_balance"])
+
+        # 月營收（限候選股）
+        df_revenue = self._load_revenue_data(
+            stock_ids=universe_ids if universe_ids else None, months=self._revenue_months
+        )
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -1153,7 +1170,11 @@ class MarketScanner:
     # ------------------------------------------------------------------ #
 
     def _base_filter(self, df_price: pd.DataFrame) -> pd.DataFrame:
-        """基礎過濾：股價範圍 + 成交量 + 排除指數/ETF。供子類 _coarse_filter 呼叫。"""
+        """基礎過濾：股價範圍 + 成交量。供子類 _coarse_filter 呼叫。
+
+        ETF/指數/權證排除已由 UniverseFilter Stage 1（SQL 硬過濾）負責，
+        此處僅保留模式專屬的股價區間與成交量門檻。
+        """
         latest_date = df_price["date"].max()
         latest = df_price[df_price["date"] == latest_date].copy()
 
@@ -1163,10 +1184,6 @@ class MarketScanner:
         mask = (latest["close"] >= self.min_price) & (latest["volume"] >= self.min_volume)
         if self.max_price is not None:
             mask = mask & (latest["close"] <= self.max_price)
-        # 排除指數類（如 TAIEX）
-        mask = mask & (~latest["stock_id"].str.contains(r"[A-Za-z]", na=False))
-        # 排除 ETF（代號 00 開頭，如 0050、00878、009xx）
-        mask = mask & (~latest["stock_id"].str.startswith("00"))
         return latest[mask].copy()
 
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
@@ -2391,58 +2408,57 @@ class SwingScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)
+        kwargs.setdefault("universe_config", UniverseConfig(volume_ratio_min=1.2))
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：swing 模式載入 2 個月營收資料（算加速度）。"""
+        """覆寫：swing 模式載入 2 個月營收資料（算加速度）。含 UniverseFilter Stage 0.5。"""
+        universe_ids = self._get_universe_ids()
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
 
         with get_session() as session:
-            rows = session.execute(
-                select(
-                    DailyPrice.stock_id,
-                    DailyPrice.date,
-                    DailyPrice.open,
-                    DailyPrice.high,
-                    DailyPrice.low,
-                    DailyPrice.close,
-                    DailyPrice.volume,
-                ).where(DailyPrice.date >= cutoff)
-            ).all()
+            price_query = select(
+                DailyPrice.stock_id,
+                DailyPrice.date,
+                DailyPrice.open,
+                DailyPrice.high,
+                DailyPrice.low,
+                DailyPrice.close,
+                DailyPrice.volume,
+                DailyPrice.turnover,
+            ).where(DailyPrice.date >= cutoff)
+            if universe_ids:
+                price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
+            rows = session.execute(price_query).all()
             df_price = pd.DataFrame(
                 rows,
-                columns=["stock_id", "date", "open", "high", "low", "close", "volume"],
+                columns=["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"],
             )
 
-            rows = session.execute(
-                select(
-                    InstitutionalInvestor.stock_id,
-                    InstitutionalInvestor.date,
-                    InstitutionalInvestor.name,
-                    InstitutionalInvestor.net,
-                ).where(InstitutionalInvestor.date >= cutoff)
-            ).all()
-            df_inst = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "name", "net"],
-            )
+            inst_query = select(
+                InstitutionalInvestor.stock_id,
+                InstitutionalInvestor.date,
+                InstitutionalInvestor.name,
+                InstitutionalInvestor.net,
+            ).where(InstitutionalInvestor.date >= cutoff)
+            if universe_ids:
+                inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
+            rows = session.execute(inst_query).all()
+            df_inst = pd.DataFrame(rows, columns=["stock_id", "date", "name", "net"])
 
-            # 融資融券
-            rows = session.execute(
-                select(
-                    MarginTrading.stock_id,
-                    MarginTrading.date,
-                    MarginTrading.margin_balance,
-                    MarginTrading.short_balance,
-                ).where(MarginTrading.date >= cutoff)
-            ).all()
-            df_margin = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "margin_balance", "short_balance"],
-            )
+            margin_query = select(
+                MarginTrading.stock_id,
+                MarginTrading.date,
+                MarginTrading.margin_balance,
+                MarginTrading.short_balance,
+            ).where(MarginTrading.date >= cutoff)
+            if universe_ids:
+                margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
+            rows = session.execute(margin_query).all()
+            df_margin = pd.DataFrame(rows, columns=["stock_id", "date", "margin_balance", "short_balance"])
 
         # 載入 2 個月營收（含上月，用於計算加速度）
-        df_revenue = self._load_revenue_data(months=2)
+        df_revenue = self._load_revenue_data(stock_ids=universe_ids if universe_ids else None, months=2)
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -2718,73 +2734,73 @@ class ValueScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：value 模式額外載入估值資料 + 2 個月營收。"""
+        """覆寫：value 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。"""
+        universe_ids = self._get_universe_ids()
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
 
         with get_session() as session:
-            rows = session.execute(
-                select(
-                    DailyPrice.stock_id,
-                    DailyPrice.date,
-                    DailyPrice.open,
-                    DailyPrice.high,
-                    DailyPrice.low,
-                    DailyPrice.close,
-                    DailyPrice.volume,
-                ).where(DailyPrice.date >= cutoff)
-            ).all()
+            price_query = select(
+                DailyPrice.stock_id,
+                DailyPrice.date,
+                DailyPrice.open,
+                DailyPrice.high,
+                DailyPrice.low,
+                DailyPrice.close,
+                DailyPrice.volume,
+                DailyPrice.turnover,
+            ).where(DailyPrice.date >= cutoff)
+            if universe_ids:
+                price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
+            rows = session.execute(price_query).all()
             df_price = pd.DataFrame(
                 rows,
-                columns=["stock_id", "date", "open", "high", "low", "close", "volume"],
+                columns=["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"],
             )
 
-            rows = session.execute(
-                select(
-                    InstitutionalInvestor.stock_id,
-                    InstitutionalInvestor.date,
-                    InstitutionalInvestor.name,
-                    InstitutionalInvestor.net,
-                ).where(InstitutionalInvestor.date >= cutoff)
-            ).all()
-            df_inst = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "name", "net"],
-            )
+            inst_query = select(
+                InstitutionalInvestor.stock_id,
+                InstitutionalInvestor.date,
+                InstitutionalInvestor.name,
+                InstitutionalInvestor.net,
+            ).where(InstitutionalInvestor.date >= cutoff)
+            if universe_ids:
+                inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
+            rows = session.execute(inst_query).all()
+            df_inst = pd.DataFrame(rows, columns=["stock_id", "date", "name", "net"])
 
-            # 融資融券
-            rows = session.execute(
-                select(
-                    MarginTrading.stock_id,
-                    MarginTrading.date,
-                    MarginTrading.margin_balance,
-                    MarginTrading.short_balance,
-                ).where(MarginTrading.date >= cutoff)
-            ).all()
-            df_margin = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "margin_balance", "short_balance"],
-            )
+            margin_query = select(
+                MarginTrading.stock_id,
+                MarginTrading.date,
+                MarginTrading.margin_balance,
+                MarginTrading.short_balance,
+            ).where(MarginTrading.date >= cutoff)
+            if universe_ids:
+                margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
+            rows = session.execute(margin_query).all()
+            df_margin = pd.DataFrame(rows, columns=["stock_id", "date", "margin_balance", "short_balance"])
 
             # 估值資料
-            rows = session.execute(
-                select(
-                    StockValuation.stock_id,
-                    StockValuation.date,
-                    StockValuation.pe_ratio,
-                    StockValuation.pb_ratio,
-                    StockValuation.dividend_yield,
-                ).where(StockValuation.date >= cutoff)
-            ).all()
+            val_query = select(
+                StockValuation.stock_id,
+                StockValuation.date,
+                StockValuation.pe_ratio,
+                StockValuation.pb_ratio,
+                StockValuation.dividend_yield,
+            ).where(StockValuation.date >= cutoff)
+            if universe_ids:
+                val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
+            rows = session.execute(val_query).all()
             self._df_valuation = pd.DataFrame(
                 rows,
                 columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
             )
 
         # 載入 2 個月營收（含上月，算加速度）
-        df_revenue = self._load_revenue_data(months=2)
+        df_revenue = self._load_revenue_data(stock_ids=universe_ids if universe_ids else None, months=2)
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -3115,72 +3131,73 @@ class DividendScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：dividend 模式額外載入估值資料 + 2 個月營收。"""
+        """覆寫：dividend 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。"""
+        universe_ids = self._get_universe_ids()
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
 
         with get_session() as session:
-            rows = session.execute(
-                select(
-                    DailyPrice.stock_id,
-                    DailyPrice.date,
-                    DailyPrice.open,
-                    DailyPrice.high,
-                    DailyPrice.low,
-                    DailyPrice.close,
-                    DailyPrice.volume,
-                ).where(DailyPrice.date >= cutoff)
-            ).all()
+            price_query = select(
+                DailyPrice.stock_id,
+                DailyPrice.date,
+                DailyPrice.open,
+                DailyPrice.high,
+                DailyPrice.low,
+                DailyPrice.close,
+                DailyPrice.volume,
+                DailyPrice.turnover,
+            ).where(DailyPrice.date >= cutoff)
+            if universe_ids:
+                price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
+            rows = session.execute(price_query).all()
             df_price = pd.DataFrame(
                 rows,
-                columns=["stock_id", "date", "open", "high", "low", "close", "volume"],
+                columns=["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"],
             )
 
-            rows = session.execute(
-                select(
-                    InstitutionalInvestor.stock_id,
-                    InstitutionalInvestor.date,
-                    InstitutionalInvestor.name,
-                    InstitutionalInvestor.net,
-                ).where(InstitutionalInvestor.date >= cutoff)
-            ).all()
-            df_inst = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "name", "net"],
-            )
+            inst_query = select(
+                InstitutionalInvestor.stock_id,
+                InstitutionalInvestor.date,
+                InstitutionalInvestor.name,
+                InstitutionalInvestor.net,
+            ).where(InstitutionalInvestor.date >= cutoff)
+            if universe_ids:
+                inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
+            rows = session.execute(inst_query).all()
+            df_inst = pd.DataFrame(rows, columns=["stock_id", "date", "name", "net"])
 
-            rows = session.execute(
-                select(
-                    MarginTrading.stock_id,
-                    MarginTrading.date,
-                    MarginTrading.margin_balance,
-                    MarginTrading.short_balance,
-                ).where(MarginTrading.date >= cutoff)
-            ).all()
-            df_margin = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "margin_balance", "short_balance"],
-            )
+            margin_query = select(
+                MarginTrading.stock_id,
+                MarginTrading.date,
+                MarginTrading.margin_balance,
+                MarginTrading.short_balance,
+            ).where(MarginTrading.date >= cutoff)
+            if universe_ids:
+                margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
+            rows = session.execute(margin_query).all()
+            df_margin = pd.DataFrame(rows, columns=["stock_id", "date", "margin_balance", "short_balance"])
 
             # 估值資料
-            rows = session.execute(
-                select(
-                    StockValuation.stock_id,
-                    StockValuation.date,
-                    StockValuation.pe_ratio,
-                    StockValuation.pb_ratio,
-                    StockValuation.dividend_yield,
-                ).where(StockValuation.date >= cutoff)
-            ).all()
+            val_query = select(
+                StockValuation.stock_id,
+                StockValuation.date,
+                StockValuation.pe_ratio,
+                StockValuation.pb_ratio,
+                StockValuation.dividend_yield,
+            ).where(StockValuation.date >= cutoff)
+            if universe_ids:
+                val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
+            rows = session.execute(val_query).all()
             self._df_valuation = pd.DataFrame(
                 rows,
                 columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
             )
 
         # 載入 2 個月營收（含上月，算加速度）
-        df_revenue = self._load_revenue_data(months=2)
+        df_revenue = self._load_revenue_data(stock_ids=universe_ids if universe_ids else None, months=2)
 
         return df_price, df_inst, df_margin, df_revenue
 
@@ -3496,6 +3513,7 @@ class GrowthScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=20, volume_ratio_min=2.0))
         super().__init__(**kwargs)
 
     def run(self) -> DiscoveryResult:

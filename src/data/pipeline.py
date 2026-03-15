@@ -16,6 +16,7 @@ from src.data.schema import (
     Announcement,
     BacktestResult,
     BrokerTrade,
+    DailyFeature,
     DailyPrice,
     Dividend,
     FinancialStatement,
@@ -766,8 +767,39 @@ def sync_watchlist(
     return all_results
 
 
+def _classify_security_type(stock_id: str, stock_name: str = "") -> str:
+    """從股票代號與名稱推斷有價證券類型（純函數）。
+
+    分類規則（優先順序）：
+    1. 6 位數字開頭 00：ETF（如 0050、00878）
+    2. 名稱含 ETF 字樣：ETF
+    3. 6 位數字：權證（warrant）
+    4. 名稱含「特」：特別股（preferred）
+    5. 其餘（4 位數字等）：普通股（stock）
+
+    Args:
+        stock_id: 股票代號
+        stock_name: 股票名稱（可選）
+
+    Returns:
+        "stock" / "etf" / "warrant" / "preferred"
+    """
+    import re
+
+    sid = str(stock_id).strip()
+    name = str(stock_name or "").upper()
+
+    if re.match(r"^00\d{4}$", sid) or "ETF" in name:
+        return "etf"
+    if len(sid) == 6 and sid.isdigit():
+        return "warrant"
+    if "特" in (stock_name or ""):
+        return "preferred"
+    return "stock"
+
+
 def sync_stock_info(force_refresh: bool = False) -> int:
-    """同步全市場股票基本資料（產業分類）到 stock_info 表。
+    """同步全市場股票基本資料（產業分類 + security_type）到 stock_info 表。
 
     Args:
         force_refresh: True 時強制重新抓取，否則 DB 已有資料就跳過
@@ -790,6 +822,15 @@ def sync_stock_info(force_refresh: bool = False) -> int:
         logger.warning("[StockInfo] 未取得任何資料")
         return 0
 
+    # 自動填入 security_type
+    df["security_type"] = df.apply(
+        lambda row: _classify_security_type(
+            row.get("stock_id", ""),
+            row.get("stock_name", ""),
+        ),
+        axis=1,
+    )
+
     records = df.to_dict("records")
     with get_session() as session:
         for i in range(0, len(records), 80):
@@ -801,12 +842,13 @@ def sync_stock_info(force_refresh: bool = False) -> int:
                     "stock_name": stmt.excluded.stock_name,
                     "industry_category": stmt.excluded.industry_category,
                     "listing_type": stmt.excluded.listing_type,
+                    "security_type": stmt.excluded.security_type,
                 },
             )
             session.execute(stmt)
         session.commit()
 
-    logger.info("[StockInfo] 已同步 %d 筆股票基本資料", len(records))
+    logger.info("[StockInfo] 已同步 %d 筆股票基本資料（含 security_type）", len(records))
     return len(records)
 
 
@@ -1152,3 +1194,95 @@ def save_portfolio_result(result_data) -> int:
         logger.info("投資組合回測結果已儲存 (id=%d, %d 筆交易)", pbt_id, len(result_data.trades))
 
     return pbt_id
+
+
+# ────────────────────────────────────────────────────────────────
+#  Feature Store ETL
+# ────────────────────────────────────────────────────────────────
+
+
+def compute_and_store_daily_features(lookback_days: int = 90) -> int:
+    """計算並儲存全市場每日特徵到 DailyFeature 表（Feature Store）。
+
+    從 DailyPrice 讀取最近 lookback_days 天資料，以 Pandas 向量化 rolling
+    計算：MA20/MA60、均量、均成交金額、動能、波動率。
+    只將「最新一日」的特徵寫入 DB（增量更新），避免全量重寫。
+
+    供 UniverseFilter Stage 2/3 使用，加速全市場過濾流程。
+    建議每日收盤後由 sync-features 命令呼叫，或整合進 morning-routine。
+
+    Args:
+        lookback_days: 讀取多少天的 DailyPrice（至少需 MA60+緩衝 = 80 天）
+
+    Returns:
+        寫入 DailyFeature 的筆數
+    """
+    init_db()
+
+    # 確保至少有足夠歷史計算 MA60
+    lookback_days = max(lookback_days, 80)
+    cutoff = date.today() - timedelta(days=lookback_days)
+
+    logger.info("[DailyFeature] 讀取近 %d 天 DailyPrice...", lookback_days)
+    with get_session() as session:
+        rows = session.execute(
+            select(
+                DailyPrice.stock_id,
+                DailyPrice.date,
+                DailyPrice.close,
+                DailyPrice.volume,
+                DailyPrice.turnover,
+            ).where(DailyPrice.date >= cutoff)
+        ).all()
+
+    if not rows:
+        logger.warning("[DailyFeature] 無 DailyPrice 資料可計算")
+        return 0
+
+    df = pd.DataFrame(rows, columns=["stock_id", "date", "close", "volume", "turnover"])
+    df = df.sort_values(["stock_id", "date"])
+
+    logger.info("[DailyFeature] 共 %d 筆原始資料，開始向量化計算...", len(df))
+
+    # 向量化 rolling 計算（groupby + transform，無 Python for-loop）
+    g_close = df.groupby("stock_id")["close"]
+    g_vol = df.groupby("stock_id")["volume"]
+    g_turnover = df.groupby("stock_id")["turnover"]
+
+    df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
+    df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
+
+    # 20 日報酬率 (%)
+    df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
+
+    # 20 日年化波動率 (%)
+    df["volatility_20d"] = g_close.transform(
+        lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
+    )
+
+    # 只取最新一日（增量更新策略）
+    latest_date = df["date"].max()
+    df_latest = df[df["date"] == latest_date].copy()
+    df_latest["computed_at"] = pd.Timestamp.utcnow()
+
+    keep_cols = [
+        "stock_id",
+        "date",
+        "close",
+        "volume",
+        "turnover",
+        "ma20",
+        "ma60",
+        "volume_ma20",
+        "turnover_ma5",
+        "momentum_20d",
+        "volatility_20d",
+        "computed_at",
+    ]
+    df_out = df_latest[keep_cols].reset_index(drop=True)
+
+    written = _upsert_batch(DailyFeature, df_out, ["stock_id", "date"])
+    logger.info("[DailyFeature] 已寫入 %d 筆（日期 %s）", written, latest_date)
+    return written

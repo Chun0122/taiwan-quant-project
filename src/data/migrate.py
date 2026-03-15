@@ -36,6 +36,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("watch_entry", "highest_price_since_entry", "REAL"),
     # P1: Discover 籌碼因子層級透明度
     ("discovery_record", "chip_tier", "VARCHAR(5)"),
+    # Universe Filter: StockInfo 新增有價證券類型欄位（stock/etf/warrant/preferred/None）
+    ("stock_info", "security_type", "VARCHAR(20)"),
 ]
 
 

@@ -1528,6 +1528,17 @@ def cmd_sync_info(args: argparse.Namespace) -> None:
         print("\nStockInfo 無需更新（DB 已有資料，使用 --force 強制重新同步）")
 
 
+def cmd_sync_features(args: argparse.Namespace) -> None:
+    """計算並寫入全市場 DailyFeature（Feature Store），供 UniverseFilter Stage 2/3 使用。"""
+    from src.data.pipeline import compute_and_store_daily_features
+
+    _init_db()
+    days = getattr(args, "days", 90)
+    print(f"正在計算全市場 DailyFeature（回溯 {days} 天）...")
+    count = compute_and_store_daily_features(lookback_days=days)
+    print(f"DailyFeature 寫入完成: {count:,} 筆")
+
+
 def cmd_sync_holding(args: argparse.Namespace) -> None:
     """同步 watchlist 大戶持股分級資料（週資料，FinMind TaiwanStockHoldingSharesPer）。"""
     from src.data.pipeline import sync_holding_distribution
@@ -3530,6 +3541,12 @@ def main() -> None:
         help="強制重新同步（即使 DB 已有資料，預設跳過）",
     )
 
+    # sync-features 子命令
+    sp_feat = subparsers.add_parser(
+        "sync-features", help="計算全市場 DailyFeature（Feature Store，供 UniverseFilter 使用）"
+    )
+    sp_feat.add_argument("--days", type=int, default=90, help="回溯計算天數（預設 90）")
+
     # sync-holding 子命令
     sp_hold = subparsers.add_parser("sync-holding", help="同步大戶持股分級資料（週資料）")
     sp_hold.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
@@ -3767,6 +3784,8 @@ def main() -> None:
         cmd_sync_financial(args)
     elif args.command == "sync-info":
         cmd_sync_info(args)
+    elif args.command == "sync-features":
+        cmd_sync_features(args)
     elif args.command == "sync-holding":
         cmd_sync_holding(args)
     elif args.command == "sync-sbl":
