@@ -70,6 +70,50 @@ def compute_news_decay_weight(days_ago: int, event_type: str) -> float:
     return float(np.exp(-0.3 * max(0, days_ago)) * type_weight)
 
 
+def compute_relative_pe_thresholds(
+    industry_series: pd.Series,
+    pe_series: pd.Series,
+    multiplier: float = 1.5,
+    fallback_pe: float = 50.0,
+    min_industry_count: int = 3,
+) -> pd.Series:
+    """計算各股票相對估值 PE 門檻（模組級純函數，方便測試）。
+
+    依同產業有效 PE（> 0）中位數 × multiplier 計算個股門檻；
+    同業樣本不足 min_industry_count 支時，fallback 至絕對門檻 fallback_pe。
+
+    Args:
+        industry_series: 產業分類 Series（與 pe_series 同 index）
+        pe_series: PE 比率 Series（> 0 才納入產業中位數計算）
+        multiplier: 相對中位數倍數，預設 1.5
+        fallback_pe: 樣本不足時的絕對 PE 上限，預設 50.0（取代舊有絕對值 30）
+        min_industry_count: 最小產業樣本數，預設 3
+
+    Returns:
+        pd.Series（同 index），每股的 PE 門檻值
+    """
+    if industry_series.empty:
+        return pd.Series(dtype=float)
+
+    df_tmp = pd.DataFrame(
+        {"industry": industry_series.values, "pe": pe_series.values},
+        index=industry_series.index,
+    )
+
+    # 有效 PE > 0 的樣本用於計算產業中位數
+    valid = df_tmp[df_tmp["pe"] > 0]
+    if not valid.empty:
+        industry_stats = valid.groupby("industry")["pe"].agg(["median", "count"])
+        sufficient = industry_stats[industry_stats["count"] >= min_industry_count]
+        threshold_map = (sufficient["median"] * multiplier).to_dict()
+    else:
+        threshold_map = {}
+
+    # 對每股映射門檻（查不到充足同業資料時用 fallback_pe）
+    thresholds = df_tmp["industry"].map(threshold_map).fillna(fallback_pe)
+    return thresholds
+
+
 def _calc_atr14(stock_data: pd.DataFrame) -> float:
     """計算個股 ATR14。
 
@@ -2819,6 +2863,15 @@ class ValueScanner(MarketScanner):
                 columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
             )
 
+            # 載入產業分類（供 _coarse_filter 相對 PE 計算）
+            info_query = select(StockInfo.stock_id, StockInfo.industry_category)
+            if universe_ids:
+                info_query = info_query.where(StockInfo.stock_id.in_(universe_ids))
+            info_rows = session.execute(info_query).all()
+            df_info = pd.DataFrame(info_rows, columns=["stock_id", "industry_category"])
+            df_info["industry_category"] = df_info["industry_category"].fillna("未分類")
+            self._df_stock_info = df_info
+
         # 載入 2 個月營收（含上月，算加速度）
         df_revenue = self._load_revenue_data(stock_ids=universe_ids if universe_ids else None, months=2)
 
@@ -2929,7 +2982,15 @@ class ValueScanner(MarketScanner):
             )
             # 嚴格模式：必須有估值資料，且 PE 或殖利率至少一項合格
             has_val = filtered["pe_ratio"].notna()
-            pe_ok = (filtered["pe_ratio"] > 0) & (filtered["pe_ratio"] < 30)
+            # 相對估值 PE：同產業中位數 × 1.5（樣本不足 3 支時 fallback PE < 50）
+            df_info = getattr(self, "_df_stock_info", pd.DataFrame())
+            if not df_info.empty:
+                info_map = df_info.set_index("stock_id")["industry_category"]
+                industry_cat = filtered["stock_id"].map(info_map).fillna("未分類")
+            else:
+                industry_cat = pd.Series("未分類", index=filtered.index)
+            pe_thresholds = compute_relative_pe_thresholds(industry_cat, filtered["pe_ratio"])
+            pe_ok = (filtered["pe_ratio"] > 0) & (filtered["pe_ratio"] < pe_thresholds.values)
             dy_ok = filtered["dividend_yield"] > 2.0
             filtered = filtered[has_val & (pe_ok | dy_ok)].copy()
         else:

@@ -2116,6 +2116,124 @@ class TestValueFinancialFundamentalScores:
         assert len(result) == 2
 
 
+class TestComputeRelativePEThresholds:
+    """compute_relative_pe_thresholds() 模組級純函數測試。"""
+
+    from src.discovery.scanner import compute_relative_pe_thresholds as _fn  # noqa: E402
+
+    def test_relative_threshold_with_sufficient_industry(self):
+        """同產業樣本充足（≥3）時，門檻 = 產業 PE 中位數 × 1.5。"""
+        from src.discovery.scanner import compute_relative_pe_thresholds
+
+        industry = pd.Series(["科技", "科技", "科技", "科技", "科技"])
+        pe = pd.Series([20.0, 22.0, 24.0, 26.0, 28.0])
+        thresholds = compute_relative_pe_thresholds(industry, pe, multiplier=1.5, fallback_pe=50.0)
+        expected_median = 24.0
+        expected_threshold = expected_median * 1.5  # = 36.0
+        assert abs(thresholds.iloc[0] - expected_threshold) < 0.01
+        assert abs(thresholds.iloc[-1] - expected_threshold) < 0.01
+
+    def test_fallback_when_industry_count_below_min(self):
+        """同產業樣本不足（< min_industry_count=3）時，使用 fallback_pe。"""
+        from src.discovery.scanner import compute_relative_pe_thresholds
+
+        industry = pd.Series(["生技", "生技"])
+        pe = pd.Series([15.0, 20.0])
+        thresholds = compute_relative_pe_thresholds(
+            industry, pe, multiplier=1.5, fallback_pe=50.0, min_industry_count=3
+        )
+        assert (thresholds == 50.0).all()
+
+    def test_mixed_industries(self):
+        """部分產業充足、部分不足，分別使用相對/絕對門檻。"""
+        from src.discovery.scanner import compute_relative_pe_thresholds
+
+        industry = pd.Series(["科技", "科技", "科技", "生技"])  # 科技3支, 生技1支
+        pe = pd.Series([20.0, 24.0, 28.0, 15.0])
+        thresholds = compute_relative_pe_thresholds(
+            industry, pe, multiplier=1.5, fallback_pe=50.0, min_industry_count=3
+        )
+        # 科技：中位數 24 × 1.5 = 36
+        assert abs(thresholds.iloc[0] - 36.0) < 0.01
+        # 生技：樣本不足 → fallback 50
+        assert thresholds.iloc[3] == 50.0
+
+    def test_negative_pe_excluded_from_median(self):
+        """PE ≤ 0 的股票不應影響產業中位數計算。"""
+        from src.discovery.scanner import compute_relative_pe_thresholds
+
+        industry = pd.Series(["金融", "金融", "金融", "金融"])
+        pe = pd.Series([-5.0, 10.0, 12.0, 14.0])  # 第一支 PE < 0
+        thresholds = compute_relative_pe_thresholds(industry, pe, multiplier=1.5, fallback_pe=50.0)
+        # 只有 10, 12, 14 有效，中位數 12 × 1.5 = 18
+        assert abs(thresholds.iloc[1] - 18.0) < 0.01
+        assert abs(thresholds.iloc[-1] - 18.0) < 0.01
+
+    def test_empty_input_returns_empty(self):
+        """空 Series 應回傳空 Series。"""
+        from src.discovery.scanner import compute_relative_pe_thresholds
+
+        thresholds = compute_relative_pe_thresholds(pd.Series(dtype=str), pd.Series(dtype=float))
+        assert thresholds.empty
+
+    def test_value_coarse_filter_uses_relative_pe(self):
+        """ValueScanner._coarse_filter() 應接受同產業高 PE 股票（相對估值合格）。"""
+        scanner = ValueScanner(min_price=10, max_price=2000, min_volume=100_000, top_n_candidates=10, top_n_results=5)
+        # 設定 _df_valuation（all PE=35，絕對 PE<30 會濾掉，但相對 PE<中位數×1.5=52.5 應通過）
+        scanner._df_valuation = pd.DataFrame(
+            [
+                {
+                    "stock_id": "A001",
+                    "date": date(2025, 3, 1),
+                    "pe_ratio": 35.0,
+                    "pb_ratio": 2.0,
+                    "dividend_yield": 1.0,
+                },
+                {
+                    "stock_id": "A002",
+                    "date": date(2025, 3, 1),
+                    "pe_ratio": 35.0,
+                    "pb_ratio": 2.0,
+                    "dividend_yield": 1.0,
+                },
+                {
+                    "stock_id": "A003",
+                    "date": date(2025, 3, 1),
+                    "pe_ratio": 35.0,
+                    "pb_ratio": 2.0,
+                    "dividend_yield": 1.0,
+                },
+            ]
+        )
+        # 三支股票同屬「科技」產業，中位數 PE=35，閾值=35×1.5=52.5 → PE=35 通過
+        scanner._df_stock_info = pd.DataFrame(
+            [
+                {"stock_id": "A001", "industry_category": "科技"},
+                {"stock_id": "A002", "industry_category": "科技"},
+                {"stock_id": "A003", "industry_category": "科技"},
+            ]
+        )
+        rows = []
+        for sid in ["A001", "A002", "A003"]:
+            for d in range(20):
+                day = date(2025, 1, 1) + timedelta(days=d)
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": 99,
+                        "high": 102,
+                        "low": 98,
+                        "close": 100,
+                        "volume": 500_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        result = scanner._coarse_filter(df_price, pd.DataFrame())
+        # 三支股票 PE=35 < 52.5（相對閾值）→ 全部應保留
+        assert len(result) == 3
+
+
 class TestDividendFinancialFundamentalScores:
     """DividendScanner 財報因子整合測試（EPS 穩定性 + 配息率代理）。"""
 
