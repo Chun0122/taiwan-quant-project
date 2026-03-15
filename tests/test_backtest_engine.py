@@ -449,3 +449,86 @@ class TestAtrBasedStop:
         trade = result.trades[0]
         assert trade.stop_price is None
         assert trade.target_price is None
+
+
+# ─── ATR 尺度一致性（除權息模式）───────────────────────────────────────────────
+
+
+class TestAtrScaleAdjustedDividend:
+    """驗證除權息模式（adjust_dividend）下，ATR 使用原始價格欄位計算，確保與 entry_price 同尺度。"""
+
+    def _make_adjusted_data(
+        self,
+        n: int,
+        adj_factor: float = 0.9,
+    ) -> pd.DataFrame:
+        """建立含 raw_* 欄位的除權息資料。
+
+        raw 價格：high=12, low=10, close=11（ATR ≈ 2.0）
+        調整後價格：乘以 adj_factor（ATR ≈ 2.0 × adj_factor）
+        """
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        raw_high = 12.0
+        raw_low = 10.0
+        raw_close = 11.0
+        return pd.DataFrame(
+            {
+                "open": [raw_close * adj_factor] * n,
+                "high": [raw_high * adj_factor] * n,
+                "low": [raw_low * adj_factor] * n,
+                "close": [raw_close * adj_factor] * n,
+                "volume": [10_000] * n,
+                "raw_high": [raw_high] * n,
+                "raw_low": [raw_low] * n,
+                "raw_close": [raw_close] * n,
+            },
+            index=[d.date() for d in dates],
+        )
+
+    def test_use_raw_true_returns_raw_scale_atr(self):
+        """use_raw=True 時，ATR 以原始價格尺度計算（≈ raw TR，非調整後）。
+
+        raw 價格 TR ≈ 2.0，調整後 TR ≈ 2.0 × 0.9 = 1.8。
+        use_raw=True 應回傳 ≈2.0，use_raw=False 應回傳 ≈1.8。
+        """
+        n = 20
+        data = self._make_adjusted_data(n, adj_factor=0.9)
+        engine = _make_engine(data, pd.Series([0] * n, index=data.index))
+
+        dt = data.index[15]  # idx=15 > atr_period=14，資料足夠
+        atr_raw = engine._compute_atr(data, dt, use_raw=True)
+        atr_adj = engine._compute_atr(data, dt, use_raw=False)
+
+        assert atr_raw is not None
+        assert atr_adj is not None
+        # raw ATR ≈ 2.0（原始尺度）
+        assert atr_raw == pytest.approx(2.0, abs=0.05)
+        # 調整後 ATR ≈ 1.8（縮小 10%）
+        assert atr_adj == pytest.approx(1.8, abs=0.05)
+        # 兩者必須不同（用以確認尺度確實不一樣）
+        assert atr_raw != pytest.approx(atr_adj, abs=0.05)
+
+    def test_use_raw_false_without_raw_cols_unchanged(self):
+        """無 raw_* 欄位時，use_raw=True 應自動 fallback 至調整後欄位，不報錯。"""
+        n = 20
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        data = pd.DataFrame(
+            {
+                "open": [11.0] * n,
+                "high": [12.0] * n,
+                "low": [10.0] * n,
+                "close": [11.0] * n,
+                "volume": [10_000] * n,
+                # 無 raw_* 欄位
+            },
+            index=[d.date() for d in dates],
+        )
+        engine = _make_engine(data, pd.Series([0] * n, index=data.index))
+
+        dt = data.index[15]
+        atr_with_flag = engine._compute_atr(data, dt, use_raw=True)
+        atr_without_flag = engine._compute_atr(data, dt, use_raw=False)
+
+        # 兩者應相等（皆 fallback 至 high/low/close）
+        assert atr_with_flag is not None
+        assert atr_with_flag == pytest.approx(atr_without_flag, abs=1e-9)

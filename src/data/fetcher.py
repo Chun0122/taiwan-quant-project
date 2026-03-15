@@ -310,11 +310,9 @@ class FinMindFetcher(DataFetcher):
                 df.loc[pd.isna(df[col]), col] = None
         df["cash_dividend"] = df.get("cash_dividend", pd.Series(dtype=float)).fillna(0.0)
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
-        # 確保 year 欄位為字符串，並移除 NaN/None 值
+        # 確保 year 欄位為整數，非數值轉為 NaN（由 _upsert_dividend 的 dropna 過濾）
         if "year" in df.columns:
-            df["year"] = df["year"].astype(str)
-            # 將 'nan' 字符串或空字符串替換為 None（保持 nullable=False 的資料品質）
-            df.loc[df["year"].isin(["nan", ""]), "year"] = None
+            df["year"] = pd.to_numeric(df["year"], errors="coerce")
         return df
 
     def fetch_holding_distribution(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:

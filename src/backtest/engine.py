@@ -223,7 +223,8 @@ class BacktestEngine:
                         peak_since_entry = raw_high
 
                         # 計算並固定止損價（ATR-based 優先，否則百分比，否則 None）
-                        atr_val = self._compute_atr(data, dt)
+                        # use_raw=has_raw：除權息模式下以原始價格計算 ATR，確保與 entry_price 同尺度
+                        atr_val = self._compute_atr(data, dt, use_raw=has_raw)
                         if self.risk_config.atr_multiplier_stop is not None and atr_val is not None:
                             current_stop_price = entry_price - self.risk_config.atr_multiplier_stop * atr_val
                         elif self.risk_config.stop_loss_pct is not None:
@@ -407,18 +408,28 @@ class BacktestEngine:
         kelly = max(0.01, min(kelly, 1.0))  # 限制在 1%~100%
         return kelly * self.risk_config.kelly_fraction
 
-    def _compute_atr(self, data: pd.DataFrame, dt) -> float | None:
-        """計算 ATR(N)，資料不足時回傳 None。"""
+    def _compute_atr(self, data: pd.DataFrame, dt, use_raw: bool = False) -> float | None:
+        """計算 ATR(N)，資料不足時回傳 None。
+
+        Args:
+            use_raw: True 時優先使用 raw_high/raw_low/raw_close（除權息還原模式下
+                     確保 ATR 與 entry_price 在相同的原始價格尺度計算）。
+        """
         idx = data.index.get_loc(dt)
         period = self.risk_config.atr_period
 
         if idx < period:
             return None
 
+        # 依 use_raw 決定使用哪組價格欄位，fallback 至調整後欄位
+        high_col = "raw_high" if use_raw and "raw_high" in data.columns else "high"
+        low_col = "raw_low" if use_raw and "raw_low" in data.columns else "low"
+        close_col = "raw_close" if use_raw and "raw_close" in data.columns else "close"
+
         window = data.iloc[idx - period : idx]
-        high = window["high"].values
-        low = window["low"].values
-        prev_close = data.iloc[idx - period - 1 : idx - 1]["close"].values
+        high = window[high_col].values
+        low = window[low_col].values
+        prev_close = data.iloc[idx - period - 1 : idx - 1][close_col].values
 
         if len(prev_close) < period:
             return None

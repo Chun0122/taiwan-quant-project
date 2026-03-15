@@ -45,6 +45,18 @@ def _get_last_date(model, stock_id: str) -> str | None:
     return None
 
 
+def _batch_get_last_dates(model, stock_ids: list[str]) -> dict[str, str | None]:
+    """一次查詢多支股票在指定表中的最後日期。回傳 {stock_id: 'YYYY-MM-DD' | None}。"""
+    if not stock_ids:
+        return {}
+    with get_session() as session:
+        rows = session.execute(
+            select(model.stock_id, func.max(model.date)).where(model.stock_id.in_(stock_ids)).group_by(model.stock_id)
+        ).all()
+    last_map = {r[0]: r[1].isoformat() for r in rows if r[1] is not None}
+    return {sid: last_map.get(sid) for sid in stock_ids}
+
+
 def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size: int = 80) -> int:
     """將 DataFrame 分批寫入指定表（衝突時略過）。
 
@@ -137,8 +149,9 @@ def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
     end = date.today().isoformat()
     skipped = 0
 
+    last_dates = _batch_get_last_dates(StockValuation, stock_ids)
     for sid in stock_ids:
-        last = _get_last_date(StockValuation, sid)
+        last = last_dates.get(sid)
         # 如果 DB 已有 7 天內的資料，跳過
         if last and (date.today() - date.fromisoformat(last)).days < 7:
             skipped += 1
@@ -172,8 +185,9 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
     end = date.today().isoformat()
     skipped = 0
 
+    last_dates = _batch_get_last_dates(MonthlyRevenue, stock_ids)
     for sid in stock_ids:
-        last = _get_last_date(MonthlyRevenue, sid)
+        last = last_dates.get(sid)
         # 如果 DB 已有 30 天內的資料，跳過（月營收每月公布，確保月份更新時能重新補抓）
         if last and (date.today() - date.fromisoformat(last)).days < 30:
             skipped += 1
@@ -219,8 +233,9 @@ def sync_financial_statements(
     total = 0
     skipped = 0
 
+    last_dates = _batch_get_last_dates(FinancialStatement, watchlist)
     for sid in watchlist:
-        last = _get_last_date(FinancialStatement, sid)
+        last = last_dates.get(sid)
         # 如果 DB 已有 60 天內的資料，跳過
         if last and (date.today() - date.fromisoformat(last)).days < 60:
             skipped += 1
@@ -254,8 +269,9 @@ def sync_financial_for_stocks(stock_ids: list[str], quarters: int = 4) -> int:
     end = date.today().isoformat()
     skipped = 0
 
+    last_dates = _batch_get_last_dates(FinancialStatement, stock_ids)
     for sid in stock_ids:
-        last = _get_last_date(FinancialStatement, sid)
+        last = last_dates.get(sid)
         # 如果 DB 已有 60 天內的資料，跳過
         if last and (date.today() - date.fromisoformat(last)).days < 60:
             skipped += 1
@@ -547,9 +563,10 @@ def sync_broker_trades(
     start_date = end_date - timedelta(days=days + 3)
 
     total = 0
+    last_dates = _batch_get_last_dates(BrokerTrade, stock_ids)
     for sid in stock_ids:
-        with get_session() as session:
-            latest = session.execute(select(func.max(BrokerTrade.date)).where(BrokerTrade.stock_id == sid)).scalar()
+        latest_str = last_dates.get(sid)
+        latest = date.fromisoformat(latest_str) if latest_str else None
         if latest and (date.today() - latest).days < 2:
             logger.info("[分點] %s 已有最新資料（%s），跳過", sid, latest)
             continue
@@ -645,18 +662,21 @@ def sync_broker_bootstrap(
         return 0
 
     logger.info("[Bootstrap] 對 %d 支股票逐日補齊最近 %d 個交易日...", len(stock_ids), len(trading_dates))
+
+    # 一次查詢所有已存在的 (stock_id, date) 對，避免雙層迴圈內 N×M 次 EXISTS 查詢
+    with get_session() as session:
+        existing_pairs: set[tuple] = set(
+            session.execute(
+                select(BrokerTrade.stock_id, BrokerTrade.date).where(BrokerTrade.stock_id.in_(stock_ids))
+            ).all()
+        )
+
     total = 0
     for sid in stock_ids:
         sid_total = 0
         for trading_day in trading_dates:  # 從新到舊
-            # 已存在此日資料則跳過（UniqueConstraint 天然去重，此處加速判斷）
-            with get_session() as session:
-                existing = session.execute(
-                    select(func.count())
-                    .select_from(BrokerTrade)
-                    .where(BrokerTrade.stock_id == sid, BrokerTrade.date == trading_day)
-                ).scalar()
-            if existing and existing > 0:
+            # 已存在此日資料則跳過
+            if (sid, trading_day) in existing_pairs:
                 continue
 
             df = fetch_dj_broker_trades(sid, trading_day, trading_day)

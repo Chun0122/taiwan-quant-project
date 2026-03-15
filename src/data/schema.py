@@ -135,7 +135,7 @@ class Dividend(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
     date: Mapped[date] = mapped_column(Date, nullable=False, index=True)  # 除權息基準日
-    year: Mapped[str] = mapped_column(String(10), nullable=False)  # 股利所屬年度
+    year: Mapped[int] = mapped_column(Integer, nullable=False)  # 股利所屬年度
     cash_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 現金股利
     stock_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 股票股利
     cash_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 現金發放日
