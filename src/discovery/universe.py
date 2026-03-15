@@ -47,7 +47,7 @@ class UniverseConfig:
     """
 
     min_close: float = 10.0
-    min_available_days: int = 120
+    min_available_days: int = 20  # ATR14+SMA20 需至少 20 天；DB 初期歷史較短時不誤殺正常股票
     listing_types: tuple[str, ...] = ("twse", "tpex")
     security_type: str | None = "stock"
     avg_turnover_5d_min: float = 30_000_000.0
@@ -203,6 +203,16 @@ class UniverseFilter:
         stage3_ids = self._stage3_trend_filter(stage2_ids)
         stats["total_after_trend"] = len(stage3_ids)
         logger.info("UniverseFilter Stage 3: 趨勢過濾後 %d 支", len(stage3_ids))
+
+        # 安全防護：Stage 3 完全過濾時退回 Stage 2 結果（MA60 需 ~60 天，DB 初期資料不足時保護）
+        if not stage3_ids and stage2_ids:
+            logger.warning(
+                "UniverseFilter Stage 3: 趨勢資料不足（MA%s 需 ~%d 天），退回 Stage 2 的 %d 支",
+                self.config.trend_ma,
+                self.config.trend_ma or 60,
+                len(stage2_ids),
+            )
+            stage3_ids = stage2_ids
 
         # Candidate Memory: union 前一日推薦（降低每日換股率）
         memory_ids = set()
