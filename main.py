@@ -2438,7 +2438,8 @@ def cmd_suggest(args: argparse.Namespace) -> None:
     # ── 2. 計算 ATR14、SMA20、RSI14 ────────────────────────────────
     atr14 = _calc_atr14(df)
     close = float(df["close"].iloc[-1])
-    sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else close
+    # 資料不足 20 天時給 0.0，使後續 trigger/timing 判斷落入「均線下方」分支
+    sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else 0.0
     rsi14 = _calc_rsi14_from_series(df["close"])
 
     # ── 3. 偵測市場 Regime ─────────────────────────────────────────
@@ -2624,7 +2625,7 @@ def _watch_add(args: argparse.Namespace) -> None:
 
         close = float(df["close"].iloc[-1])
         atr14 = _calc_atr14(df)
-        sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else close
+        sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else 0.0
         atr_pct = atr14 / close if close > 0 else 0.0
 
         entry_price_val = round(float(args.price), 2) if args.price else round(close, 2)

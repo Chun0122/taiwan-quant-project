@@ -154,6 +154,7 @@ class FactorAttribution:
                 continue
             if data.index[idx] != entry_ts:
                 # 若進場日不在 index 中（例如休市），取最近前一交易日
+                logger.warning("Attribution: 進場日 %s 不在價格資料中，改用前一交易日", entry_date)
                 idx = max(0, idx - 1)
 
             trade_returns.append(return_pct)
@@ -162,9 +163,10 @@ class FactorAttribution:
             m_val = self._momentum(close, idx, self.LOOKBACK_MOMENTUM)
             momentum_vals.append(m_val if m_val is not None else float("nan"))
 
-            # --- reversal: 5 日反轉 ---
-            r_val = self._momentum(close, idx, self.LOOKBACK_REVERSAL)
-            reversal_vals.append(r_val if r_val is not None else float("nan"))
+            # --- reversal: 5 日短線反轉（負動能 = 超賣反彈機會，越負越高） ---
+            # 取負值：近 5 日跌幅越大 → reversal 值越正 → 反彈機會越高
+            _r = self._momentum(close, idx, self.LOOKBACK_REVERSAL)
+            reversal_vals.append(-_r if _r is not None else float("nan"))
 
             # --- quality: RSI ---
             q_val = self._rsi_at(data, rsi_col, idx)

@@ -10,9 +10,9 @@
 - TechnicalIndicator:      技術指標（EAV 長表）
 - Announcement:            MOPS 重大訊息公告
 - FinancialStatement:      季報財務資料（損益表+資產負債表+現金流量表）
-- HoldingDistribution:     大戶持股分級（週資料，FinMind TaiwanStockHoldingSharesPer）
+- HoldingDistribution:     大戶持股分級（週資料，TDCC 集保戶股權分散表，免費）
 - SecuritiesLending:       借券賣出彙總（日資料，TWSE TWT96U）
-- BrokerTrade:             分點交易資料（日資料，FinMind TaiwanStockTradingDailyReport）
+- BrokerTrade:             分點交易資料（日資料，DJ 分點端點，Big5 HTML，免費）
 - BacktestResult:          回測結果摘要
 - Trade:                   交易明細
 - StockInfo:               股票基本資料（產業分類 + security_type）
@@ -278,9 +278,9 @@ class SecuritiesLending(Base):
 
 
 class BrokerTrade(Base):
-    """分點交易資料（日資料，FinMind TaiwanStockTradingDailyReport）。
+    """分點交易資料（日資料，DJ 分點端點）。
 
-    來源：FinMind API（免費帳號支援逐股查詢）。
+    來源：DJ 分點端點（fubon-ebrokerdj.fbs.com.tw，免費，Big5 HTML）。
     每日更新，記錄各分點券商的買賣情況，用於計算主力集中度（HHI）與連續進場天數。
     """
 

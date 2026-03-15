@@ -134,7 +134,7 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
     else:
         vol_ok = pd.Series(True, index=latest.index)
 
-    # 3. 異常排除：近 5 日連續漲跌停
+    # 3. 異常排除：近 7 天內出現 3 次以上漲跌停（累計，非必連續）
     recent_5 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)]
     pct_chg = recent_5.sort_values("date").groupby("stock_id")["close"].pct_change().abs()
     limit_days = pct_chg >= 0.095

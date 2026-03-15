@@ -1039,9 +1039,9 @@ def fetch_tdcc_holding_all_market() -> pd.DataFrame:
     }
     df_raw = df_raw.rename(columns={k: v for k, v in col_map.items() if k in df_raw.columns})
 
-    # 僅保留 4 碼純數字普通股（排除 ETF 代號 0050、債券等）
+    # 僅保留 4 碼普通股（首碼 1-9，排除 ETF 如 0050、債券等首碼為 0 者）
     df_raw["stock_id"] = df_raw["stock_id"].astype(str).str.strip()
-    df_raw = df_raw[df_raw["stock_id"].str.fullmatch(r"\d{4}")].copy()
+    df_raw = df_raw[df_raw["stock_id"].str.fullmatch(r"[1-9]\d{3}")].copy()
 
     # 篩選有效分級（1-15），跳過 16（25大股東合計）和 17（合計）
     df_raw["tier"] = pd.to_numeric(df_raw["tier"], errors="coerce")

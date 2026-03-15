@@ -630,9 +630,11 @@ def sync_broker_bootstrap(
     except Exception:
         pass
 
-    # Fallback：若 DailyPrice 無資料，用平日曆法（跳過週末）
-    if not trading_dates:
-        d = date.today()
+    # Fallback：若 DailyPrice 無資料，或資料天數不足時，用平日曆法補足
+    if len(trading_dates) < days:
+        # 從最早已知交易日往前補，或從今日開始（完全無資料時）
+        earliest = min(trading_dates) if trading_dates else date.today()
+        d = earliest - timedelta(days=1)
         while len(trading_dates) < days:
             if d.weekday() < 5:  # 週一至週五
                 trading_dates.append(d)

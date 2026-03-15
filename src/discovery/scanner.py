@@ -3193,10 +3193,10 @@ class ValueScanner(MarketScanner):
 
         val = val.sort_values("date").groupby("stock_id").last().reset_index()
 
-        # PE 反向排名：PE 越低分數越高
-        pe_rank = val["pe_ratio"].fillna(val["pe_ratio"].max()).rank(pct=True, ascending=False)
-        # PB 反向排名：PB 越低分數越高
-        pb_rank = val["pb_ratio"].fillna(val["pb_ratio"].max()).rank(pct=True, ascending=False)
+        # PE 反向排名：PE 越低分數越高；缺值者給中間分（0.5），不因缺值受益
+        pe_rank = val["pe_ratio"].rank(pct=True, ascending=False, na_option="keep").fillna(0.5)
+        # PB 反向排名：PB 越低分數越高；缺值者給中間分
+        pb_rank = val["pb_ratio"].rank(pct=True, ascending=False, na_option="keep").fillna(0.5)
         # 殖利率正向排名：越高分數越高
         dy_rank = val["dividend_yield"].fillna(0).rank(pct=True)
 
@@ -3560,10 +3560,10 @@ class DividendScanner(MarketScanner):
 
         # 殖利率正向排名：越高分數越高
         dy_rank = val["dividend_yield"].fillna(0).rank(pct=True)
-        # PE 反向排名：PE 越低分數越高
-        pe_rank = val["pe_ratio"].fillna(val["pe_ratio"].max()).rank(pct=True, ascending=False)
-        # PB 反向排名：PB 越低分數越高
-        pb_rank = val["pb_ratio"].fillna(val["pb_ratio"].max()).rank(pct=True, ascending=False)
+        # PE 反向排名：PE 越低分數越高；缺值者給中間分（0.5），不因缺值受益
+        pe_rank = val["pe_ratio"].rank(pct=True, ascending=False, na_option="keep").fillna(0.5)
+        # PB 反向排名：PB 越低分數越高；缺值者給中間分
+        pb_rank = val["pb_ratio"].rank(pct=True, ascending=False, na_option="keep").fillna(0.5)
 
         val["dividend_score"] = dy_rank * 0.50 + pe_rank * 0.30 + pb_rank * 0.20
 
