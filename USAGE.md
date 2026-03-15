@@ -45,19 +45,19 @@ taiwan-quant-project/
 │   ├── config.py            # 設定管理模組
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義（15 張表，含 DiscoveryRecord、WatchEntry、StockValuation）
-│   │   ├── fetcher.py       # FinMind API 資料抓取
-│   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料抓取（全市場）
-│   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站重大訊息抓取
-│   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）
+│   │   ├── schema.py        # ORM 資料表定義（20 張表，含 DiscoveryRecord、WatchEntry、StockValuation、HoldingDistribution、SecuritiesLending、BrokerTrade、Watchlist、DailyFeature）
+│   │   ├── fetcher.py       # FinMind API 資料抓取（含財報 EAV pivot）
+│   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料（全市場）；TDCC 集保戶股權分散；分點交易 DJ 端點；借券賣出 TWT96U
+│   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站（重大訊息 + 全市場月營收）；情緒分類；事件類型分類
+│   │   ├── pipeline.py      # ETL Pipeline（抓取→清洗→寫入）；Feature Store 計算
 │   │   ├── validator.py     # 資料品質檢查（6 項檢查 + 報告）
 │   │   ├── io.py            # 通用匯出/匯入（CSV/Parquet）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
-│   │   ├── indicators.py   # 技術指標計算引擎（SMA/RSI/MACD/BB）
+│   │   ├── indicators.py   # 技術指標計算（SMA/RSI/MACD/BB）；週K聚合 aggregate_to_weekly()
 │   │   └── ml_features.py  # ML 特徵工程
 │   ├── strategy/
-│   │   ├── base.py          # 策略抽象基類
+│   │   ├── base.py          # 策略抽象基類（含除權息調整）
 │   │   ├── sma_cross.py     # SMA 均線交叉策略
 │   │   ├── rsi_threshold.py # RSI 超買超賣策略
 │   │   ├── bb_breakout.py   # 布林通道突破策略
@@ -69,20 +69,26 @@ taiwan-quant-project/
 │   │   ├── factors.py       # 因子定義（8 個因子）
 │   │   └── engine.py        # 多因子篩選引擎
 │   ├── discovery/
-│   │   └── scanner.py       # 全市場選股掃描器（四階段漏斗）
+│   │   ├── scanner.py       # 全市場選股掃描器（五模式四階段漏斗）
+│   │   ├── universe.py      # Universe Filtering 三層漏斗（UniverseConfig + UniverseFilter）
+│   │   └── performance.py   # Discover 推薦績效回測
 │   ├── report/
 │   │   ├── engine.py        # 每日選股報告引擎（四維度評分）
-│   │   └── formatter.py     # Discord 訊息格式化
+│   │   ├── formatter.py     # Discord 訊息格式化
+│   │   └── ai_report.py     # AI 選股摘要（Claude API claude-sonnet-4-6）
+│   ├── regime/
+│   │   └── detector.py      # 市場狀態偵測（bull/bear/sideways，三訊號多數決）
 │   ├── strategy_rank/
 │   │   └── engine.py        # 策略回測排名引擎
 │   ├── industry/
-│   │   └── analyzer.py      # 產業輪動分析引擎
+│   │   └── analyzer.py      # 產業輪動分析；產業同儕相對強度計算
 │   ├── notification/
 │   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
-│   │   ├── engine.py        # 回測引擎 + 風險管理 + 績效計算
-│   │   ├── portfolio.py     # 投資組合回測引擎
-│   │   └── walk_forward.py  # Walk-Forward 滾動驗證引擎
+│   │   ├── engine.py        # 回測引擎 + 風險管理 + 績效計算（含 ATR-based 止損止利）
+│   │   ├── portfolio.py     # 投資組合回測引擎（4 種配置模式）
+│   │   ├── walk_forward.py  # Walk-Forward 滾動驗證引擎
+│   │   └── attribution.py   # 五因子歸因分析（FactorAttribution）
 │   ├── optimization/
 │   │   └── grid_search.py   # Grid Search 參數優化
 │   ├── scheduler/
@@ -135,6 +141,10 @@ fetcher:
 # 日誌等級（DEBUG / INFO / WARNING / ERROR）
 logging:
   level: "INFO"
+
+# Anthropic API（AI 選股摘要功能，可選）
+anthropic:
+  api_key: "你的 anthropic api key"    # 需要 discover --ai-summary 功能時填入
 ```
 
 若要新增關注股票，在 `watchlist` 下加入股票代號，或使用 DB-based watchlist 管理（推薦）：
@@ -234,6 +244,9 @@ python main.py backtest --stock 2330 --strategy buy_and_hold
 
 # 指定回測期間
 python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --end 2025-12-31
+
+# 五因子歸因分析（momentum/reversal/quality/size/liquidity 因子暴露 × 期間報酬相關係數）
+python main.py backtest --stock 2330 --strategy sma_cross --attribution
 ```
 
 可用策略：
@@ -315,6 +328,7 @@ python main.py backtest --stock 2330 --strategy sma_cross --sizing atr
 | `--sizing MODE` | 部位大小計算：`all_in`（預設）/ `fixed_fraction` / `kelly` / `atr` |
 | `--fraction N` | `fixed_fraction` 模式的資金比例（0.0~1.0） |
 | `--adjust-dividend` | 啟用除權息還原（回溯調整價格 + 股利入帳） |
+| `--attribution` | 回測後輸出五因子歸因分析（momentum/reversal/quality/size/liquidity 因子暴露與報酬 Pearson 相關係數）；Dashboard 回測結果頁亦會顯示因子貢獻長條圖 |
 
 部位計算模式說明：
 | 模式 | 說明 |
@@ -379,12 +393,13 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含九個頁面：
+瀏覽器會自動開啟 `http://localhost:8501`，包含**十個頁面**：
 
 - **市場總覽**: TAIEX 走勢 K 線 + SMA60/120 + Regime 狀態、市場廣度（漲跌家數）、法人買賣超排行、產業熱度 Treemap
-- **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券
-- **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表
+- **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券 + MOPS 公告 vline 標記
+- **回測結果**: 績效摘要卡片（含進階指標）+ 權益曲線/回撤圖 + 交易明細（含出場原因）+ 回測比較表 + 五因子歸因分析圖
 - **投資組合**: 組合回測績效 + 個股配置圓餅圖 + 個股報酬柱狀圖 + 交易明細
+- **策略比較**: 多策略同場比較（1~5 個策略 × 1 支股票）— 績效指標表 + 累積報酬多線折線圖 + 進階指標長條圖
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 - **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
 - **產業輪動**: 產業綜合排名 + 泡泡圖（法人 vs 動能）+ 法人淨買超長條圖 + 精選個股
@@ -683,7 +698,11 @@ python main.py industry --notify
 
 **市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways），動態調整各模式的四維度因子權重（技術面 + 籌碼面 + 基本面 + 消息面）。多頭加重技術面，空頭加重基本面與消息面。
 
-**消息面評分（MOPS 重大訊息）：** 系統會自動從公開資訊觀測站抓取近期重大訊息，以關鍵字規則分類情緒（正面/中性/負面），並計算消息面分數。三因子加權：公告密度 30% + 正面訊號 40% + 負面懲罰 30%。
+**消息面評分（MOPS 重大訊息）：** 系統自動從公開資訊觀測站抓取近期重大訊息，採四項機制計算消息面分數：
+1. **事件類型加權**：governance_change=5.0（董監改選/市場派）、buyback=4.0（庫藏股）、earnings_call=3.0、investor_day=2.0、filing=1.5、revenue=1.2、general=1.0
+2. **時間衰減**：`exp(-0.2 × days_ago) × type_weight`，decay 常數 0.2（7 天後保留 ~25%）
+3. **異常公告率**：Z-Score vs 180 天基準期，Z > 2 乘數最高 +50%，Z < -1 降至 70%
+4. **Regex 上下文過濾**：優先以情境 pattern 判斷情緒（正確區分「處分利益」vs「處分持股」、「澄清衰退」vs「澄清報導」等）
 
 ```bash
 # 預設 momentum 模式（同步資料 + 篩選 Top 20）
@@ -738,6 +757,15 @@ python main.py discover swing --top 20 --ai-summary --notify
 
 每次執行 `discover` 時，推薦結果會自動存入 DB（`discovery_record` 表），供歷史追蹤使用。同日同模式重跑會覆蓋先前記錄。`all` 模式會將五個模式分別存入 DB。
 
+**`all` 模式輸出欄位說明：**
+
+| 欄位 | 說明 |
+|------|------|
+| `appearances` | 出現模式數（越多 = 越多模式確認） |
+| `avg_score` | 各模式 composite_score 加權平均（主要排序依據） |
+| `best_mode` | 最高分模式中文名稱（如「短線動能」） |
+| `chip_tier` | 籌碼評分最高 Tier（如「8F」、「7F」、「N/A"） |
+
 | 參數 | 說明 |
 |------|------|
 | `mode` | 掃描模式：`momentum`（短線動能）、`swing`（中期波段）、`value`（價值修復）、`dividend`（高息存股）、`growth`（高成長）、`all`（五模式綜合比較），預設 momentum |
@@ -753,6 +781,14 @@ python main.py discover swing --top 20 --ai-summary --notify
 | `--min-appearances N` | [all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示） |
 | `--weekly-confirm` | 啟用週線多時框確認：從 DB 讀取近 90 天日K 聚合週K，SMA13 + RSI14 週線信號同為多頭 → composite_score ×1.05（+5%），同為空頭 → ×0.95（-5%），預設關閉 |
 | `--ai-summary` | 掃描完成後呼叫 Claude API（`claude-sonnet-4-6`）生成約 300 字繁體中文摘要（市場狀態分析 + 前三名亮點 + 風險提示），需在 `config/settings.yaml` 設定 `anthropic.api_key` |
+
+**Regime 自適應進出場 ATR 參數（discover 輸出的 stop_loss / take_profit）：**
+
+| 市場狀態 | 止損倍數（ATR） | 目標倍數（ATR） | 說明 |
+|---------|--------------|--------------|------|
+| Bull（多頭） | 1.5× | 3.5× | 擴大獲利空間 |
+| Sideways（盤整，預設） | 1.5× | 3.0× | 標準風險報酬 1:2 |
+| Bear（空頭） | 1.2× | 2.5× | 縮緊止損，降低虧損 |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 
@@ -800,27 +836,27 @@ python main.py discover swing --top 20 --ai-summary --notify
 
 | 維度 | 權重 | 因子 |
 |------|------|------|
-| 基本面 | 50% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 基本面 | 50% | 營收YoY(40%)、ROE(25%)、毛利率QoQ(20%)、EPS YoY(15%)；財報資料不足時自動降回純營收分 |
 | 估值面 | 30% | PE反向排名(40%)、PB反向排名(30%)、殖利率排名(30%) |
 | 籌碼面 | 20% | 投信近期買超(50%)、法人累積買超(50%) |
-| 粗篩門檻 | — | PE > 0 且 < 30、殖利率 > 2% |
+| 粗篩門檻 | — | PE > 0 且 < **同業 PE 中位數 × 1.5**（同業 < 3 支時 fallback PE < 50）、殖利率 > 2% |
 | 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
 
 **Dividend 模式：**
 
 | 維度 | 權重 | 因子 |
 |------|------|------|
-| 基本面 | 35~45% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 基本面 | 35~45% | 營收YoY(40%)、EPS 穩定性（近4季無虧損，倒排）(35%)、配息率代理（正EPS比例）(25%)；財報不足時降回純營收分 |
 | 殖利率面 | 25~35% | 殖利率排名(50%)、PE反向排名(30%)、PB反向排名(20%) |
 | 籌碼面 | 10~20% | 投信近期買超(50%)、法人累積買超(50%) |
-| 粗篩門檻 | — | 殖利率 > 3%、PE > 0 |
+| 粗篩門檻 | — | 殖利率 > 3%、PE > 0、**EPS 連續性**（近4季任一季 EPS ≤ 0 者排除；無財報資料者 pass through 不誤殺） |
 | 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
 
 **Growth 模式：**
 
 | 維度 | 權重 | 因子 |
 |------|------|------|
-| 基本面 | 40~50% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
+| 基本面 | 40~50% | 營收YoY(40%)、加速度（本月YoY − 3個月前YoY）(25%)、毛利率YoY加速(20%)、EPS季增率(15%)；財報不足時降回純YoY+加速度 |
 | 技術面 | 15~30% | 5日動能、10日動能、20日突破、量比、成交量加速 |
 | 籌碼面 | 15~20% | 外資連續買超天數 + 買超佔量比 + 合計買超 + 券資比（有資料時） |
 | 粗篩門檻 | — | 營收 YoY > 10% |
@@ -849,6 +885,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | Stage 3 | 細評 | 四維度因子（技術+籌碼+基本面+消息面）+ Regime 動態權重評分 |
 | ↳ 籌碼面（Momentum） | 智慧分點計算 | 從 DB 載入候選股最近 365 天分點歷史（`buy_price`/`sell_price`），需 ≥ 20 個交易日才識別 Smart Broker（高勝率+高獲利因子）與 Accumulation Broker（蓄積型地緣分點），有資料時升級至 8-Factor |
 | Stage 3.3 | 產業加成 | 用 IndustryRotationAnalyzer 計算產業排名，熱門產業 +5%、冷門產業 -5% 線性加成到 composite_score |
+| Stage 3.3a | 產業同儕相對強度 | 個股近 20 日報酬率 vs 同產業中位數：超越 +20pp → composite_score ×1.03，落後 -20pp → ×0.97 |
 | Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
@@ -900,13 +937,22 @@ python main.py discover-backtest --mode momentum --export result.csv
 從公開資訊觀測站（MOPS）備援站抓取上市/上櫃公司最新重大訊息公告。資料用於 discover 的消息面評分。
 
 ```bash
-# 同步最新一天的重大訊息
+# 同步最近 7 天（預設）
 python main.py sync-mops
+
+# 同步最近 30 天
+python main.py sync-mops --days 30
 ```
 
-系統會自動對公告主旨進行關鍵字情緒分類（+1 正面 / 0 中性 / -1 負面），同步完成後顯示情緒分布統計。
+**參數說明：**
 
-> **注意**：MOPS 備援站僅提供最新一個交易日的公告，無法查詢歷史資料。建議搭配每日排程使用，逐日累積公告歷史。`discover` 命令的全市場同步也會自動附帶 MOPS 同步。
+| 參數 | 說明 |
+|------|------|
+| `--days N` | 同步最近 N 天的公告（預設 7） |
+
+系統會自動對公告主旨進行情緒分類（+1 正面 / 0 中性 / -1 負面）及事件類型分類（governance_change / buyback / earnings_call / investor_day / filing / revenue / general），分類使用 Regex 上下文比對，正確處理「處分利益」vs「處分持股」等模糊語境。同步完成後顯示情緒與事件類型分布統計。
+
+> **建議**：搭配每日排程使用，逐日累積公告歷史。`discover` 命令的全市場同步也會自動附帶 MOPS 同步。
 
 ### 4.16 同步全市場月營收 (`sync-revenue`)
 
@@ -1422,7 +1468,7 @@ python main.py sync-features --days 60
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。十五張核心表（另含 `stock_valuation` 估值表）：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。共 **20 張核心表**：
 
 ### daily_price（日K線）
 
@@ -1596,8 +1642,11 @@ python main.py sync-features --days 60
 | subject | String | 公告主旨 |
 | spoke_time | String | 發言時間 |
 | sentiment | Integer | 情緒分類（+1 正面 / 0 中性 / -1 負面） |
+| event_type | String | 事件類型（governance_change/buyback/earnings_call/investor_day/filing/revenue/general） |
 
 唯一鍵：`(stock_id, date, seq)`
+
+> **事件類型（event_type）枚舉**：`governance_change`（董監改選/市場派）、`buyback`（庫藏股決議）、`earnings_call`（法說會）、`investor_day`（投資人說明會）、`filing`（財報申報）、`revenue`（月營收）、`general`（其他一般公告）
 
 ### financial_statement（季報財務資料）
 
@@ -1628,7 +1677,7 @@ python main.py sync-features --days 60
 
 唯一鍵：`(stock_id, date)`
 
-### stock_info（股票基本資料，P8 新增）
+### stock_info（股票基本資料）
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
@@ -1636,6 +1685,7 @@ python main.py sync-features --days 60
 | stock_name | String | 股票名稱 |
 | industry_category | String | 產業分類 |
 | listing_type | String | 上市/上櫃 |
+| security_type | String | 證券類型（stock/etf/warrant/preferred/None） |
 | updated_at | DateTime | 更新時間 |
 
 唯一鍵：`(stock_id)`
@@ -1655,6 +1705,7 @@ python main.py sync-features --days 60
 | take_profit | Float | 建議目標價（entry + 3.0×ATR14） |
 | entry_trigger | String | 進場觸發說明（站上均線等） |
 | valid_until | Date | 建議有效日期（scan_date + 5 工作日） |
+| chip_tier | String | 籌碼評分 Tier（"8F"~"2F" 或 "N/A"） |
 
 唯一鍵：`(stock_id, scan_date, mode)`
 
@@ -1666,7 +1717,7 @@ python main.py sync-features --days 60
 | stock_id | String | 股票代號 |
 | stock_name | String | 股票名稱 |
 | entry_price | Float | 進場價格 |
-| stop_loss | Float | 止損價格 |
+| stop_loss | Float | 止損價格（移動止損時隨最高價自動上移） |
 | take_profit | Float | 目標價格 |
 | qty | Integer | 持倉股數（可選） |
 | status | String | 狀態：active/stopped_loss/taken_profit/expired/closed |
@@ -1677,6 +1728,9 @@ python main.py sync-features --days 60
 | source_mode | String | 來源模式（discover 模式或 manual） |
 | notes | String | 備註 |
 | created_at | DateTime | 建立時間 |
+| trailing_stop_enabled | Boolean | 是否啟用移動止損（`--trailing` 旗標設定） |
+| trailing_atr_multiplier | Float | 移動止損 ATR 倍數（預設 1.5） |
+| highest_price_since_entry | Float | 進場後歷史最高收盤價（移動止損追蹤用） |
 
 ### stock_valuation（估值資料 — TWSE/TPEX 官方）
 
@@ -1687,6 +1741,74 @@ python main.py sync-features --days 60
 | pe_ratio | Float | 本益比（P/E） |
 | pb_ratio | Float | 股價淨值比（P/B） |
 | dividend_yield | Float | 殖利率 (%) |
+
+唯一鍵：`(stock_id, date)`
+
+### holding_distribution（大戶持股分級 — TDCC 集保戶股權分散表）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 週資料日期（TDCC 每週發布） |
+| level | String | 持股級別（如 "400,000 ~ 800,000 股" 等） |
+| holder_count | Integer | 持股人數 |
+| share_count | BigInteger | 持股股數 |
+| share_pct | Float | 占總股本比例 (%) |
+
+唯一鍵：`(stock_id, date, level)`
+
+### securities_lending（借券賣出 — TWSE TWT96U）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 交易日 |
+| sbl_sell | BigInteger | 當日借券賣出股數 |
+| sbl_return | BigInteger | 當日借券還券股數 |
+| sbl_balance | BigInteger | 借券餘額股數 |
+| sbl_change | BigInteger | 借券餘額變化（正=增加借券壓力） |
+
+唯一鍵：`(stock_id, date)`
+
+### broker_trade（分點進出 — DJ 分點端點）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 交易日（DJ 端點為期間 end 日期） |
+| broker_id | String | 分點代號（BHID） |
+| broker_name | String | 分點名稱 |
+| buy | BigInteger | 買進股數 |
+| sell | BigInteger | 賣出股數 |
+| net | BigInteger | 淨買超股數（buy - sell） |
+| buy_price | Float | 均買價（DJ 端點目前為 NULL，以 DailyPrice 收盤代理） |
+| sell_price | Float | 均賣價（DJ 端點目前為 NULL，以 DailyPrice 收盤代理） |
+
+唯一鍵：`(stock_id, date, broker_id)`
+
+### watchlist（DB-based 觀察清單）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| stock_name | String | 股票名稱（選填） |
+| note | String | 備註（選填） |
+| added_at | DateTime | 加入時間 |
+
+唯一鍵：`(stock_id)`
+
+### daily_feature（Feature Store — Universe Filtering 快取）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| stock_id | String | 股票代號 |
+| date | Date | 交易日 |
+| ma20 | Float | 20 日收盤均線 |
+| ma60 | Float | 60 日收盤均線 |
+| volume_ma20 | Float | 20 日均量 |
+| turnover_ma5 | Float | 5 日均成交金額（流動性指標） |
+| momentum_20d | Float | 20 日報酬率 (%) |
+| volatility_20d | Float | 20 日年化波動率 (%) |
 
 唯一鍵：`(stock_id, date)`
 
