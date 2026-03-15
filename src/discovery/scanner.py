@@ -1196,10 +1196,12 @@ class MarketScanner:
         # 1) 成交量排名分數（量大加分）
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
-        # 2) 法人淨買超排名
+        # 2) 法人 5 日累積淨買超排名（比單日穩定，過濾換手雜訊）
         if not df_inst.empty:
-            inst_latest = df_inst[df_inst["date"] == df_inst["date"].max()]
-            inst_net = inst_latest.groupby("stock_id")["net"].sum().reset_index()
+            inst_dates = sorted(df_inst["date"].unique())
+            recent_5_dates = inst_dates[-5:]
+            inst_5d = df_inst[df_inst["date"].isin(recent_5_dates)]
+            inst_net = inst_5d.groupby("stock_id")["net"].sum().reset_index()
             inst_net.columns = ["stock_id", "inst_net"]
             filtered = filtered.merge(inst_net, on="stock_id", how="left")
             filtered["inst_net"] = filtered["inst_net"].fillna(0)
@@ -1208,14 +1210,15 @@ class MarketScanner:
             filtered["inst_net"] = 0
             filtered["inst_rank"] = 0.5
 
-        # 3) 動能：用最近日K的漲跌幅
+        # 3) 短期動能（5 日報酬，比單日漲跌更穩定）
         dates = sorted(df_price["date"].unique())
-        if len(dates) >= 2:
-            prev_date = dates[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date = dates[-5] if len(dates) >= 5 else (dates[0] if len(dates) >= 2 else None)
+        if ref_date is not None:
+            ref = df_price[df_price["date"] == ref_date][["stock_id", "close"]].rename(columns={"close": "ref_close"})
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
             filtered["mom_rank"] = filtered["momentum"].rank(pct=True)
         else:
             filtered["momentum"] = 0
@@ -1927,10 +1930,12 @@ class MomentumScanner(MarketScanner):
         # 1) 成交量排名
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
-        # 2) 法人淨買超排名
+        # 2) 法人 5 日累積淨買超排名（比單日穩定，過濾換手雜訊）
         if not df_inst.empty:
-            inst_latest = df_inst[df_inst["date"] == df_inst["date"].max()]
-            inst_net = inst_latest.groupby("stock_id")["net"].sum().reset_index()
+            inst_dates = sorted(df_inst["date"].unique())
+            recent_5_dates = inst_dates[-5:]
+            inst_5d = df_inst[df_inst["date"].isin(recent_5_dates)]
+            inst_net = inst_5d.groupby("stock_id")["net"].sum().reset_index()
             inst_net.columns = ["stock_id", "inst_net"]
             filtered = filtered.merge(inst_net, on="stock_id", how="left")
             filtered["inst_net"] = filtered["inst_net"].fillna(0)
@@ -1939,14 +1944,15 @@ class MomentumScanner(MarketScanner):
             filtered["inst_net"] = 0
             filtered["inst_rank"] = 0.5
 
-        # 3) 短期動能
+        # 3) 短期動能（5 日報酬，比單日漲跌更穩定）
         dates = sorted(df_price["date"].unique())
-        if len(dates) >= 2:
-            prev_date = dates[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date = dates[-5] if len(dates) >= 5 else (dates[0] if len(dates) >= 2 else None)
+        if ref_date is not None:
+            ref = df_price[df_price["date"] == ref_date][["stock_id", "close"]].rename(columns={"close": "ref_close"})
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
             filtered["mom_rank"] = filtered["momentum"].rank(pct=True)
         else:
             filtered["momentum"] = 0
@@ -2511,14 +2517,17 @@ class SwingScanner(MarketScanner):
         # 3) 成交量排名
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
-        # 動能欄位（用於 _rank_and_enrich 保留）
+        # 動能欄位（用於 _rank_and_enrich 保留，5 日報酬比單日穩定）
         dates_all = sorted(df_price["date"].unique())
-        if len(dates_all) >= 2:
-            prev_date = dates_all[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date_swing = dates_all[-5] if len(dates_all) >= 5 else (dates_all[0] if len(dates_all) >= 2 else None)
+        if ref_date_swing is not None:
+            ref = df_price[df_price["date"] == ref_date_swing][["stock_id", "close"]].rename(
+                columns={"close": "ref_close"}
+            )
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
         else:
             filtered["momentum"] = 0
 
@@ -2923,9 +2932,12 @@ class ValueScanner(MarketScanner):
         # 粗篩分數：成交量排名 + 法人
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
+        # 2) 法人 5 日累積淨買超排名（比單日穩定，過濾換手雜訊）
         if not df_inst.empty:
-            inst_latest = df_inst[df_inst["date"] == df_inst["date"].max()]
-            inst_net = inst_latest.groupby("stock_id")["net"].sum().reset_index()
+            inst_dates = sorted(df_inst["date"].unique())
+            recent_5_dates = inst_dates[-5:]
+            inst_5d = df_inst[df_inst["date"].isin(recent_5_dates)]
+            inst_net = inst_5d.groupby("stock_id")["net"].sum().reset_index()
             inst_net.columns = ["stock_id", "inst_net"]
             filtered = filtered.merge(inst_net, on="stock_id", how="left")
             filtered["inst_net"] = filtered["inst_net"].fillna(0)
@@ -2934,14 +2946,15 @@ class ValueScanner(MarketScanner):
             filtered["inst_net"] = 0
             filtered["inst_rank"] = 0.5
 
-        # 動能欄位
+        # 3) 短期動能（5 日報酬，比單日漲跌更穩定）
         dates = sorted(df_price["date"].unique())
-        if len(dates) >= 2:
-            prev_date = dates[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date = dates[-5] if len(dates) >= 5 else (dates[0] if len(dates) >= 2 else None)
+        if ref_date is not None:
+            ref = df_price[df_price["date"] == ref_date][["stock_id", "close"]].rename(columns={"close": "ref_close"})
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
         else:
             filtered["momentum"] = 0
 
@@ -3316,9 +3329,12 @@ class DividendScanner(MarketScanner):
         filtered["dy_rank"] = filtered["dividend_yield"].rank(pct=True)
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
+        # 2) 法人 5 日累積淨買超排名（比單日穩定，過濾換手雜訊）
         if not df_inst.empty:
-            inst_latest = df_inst[df_inst["date"] == df_inst["date"].max()]
-            inst_net = inst_latest.groupby("stock_id")["net"].sum().reset_index()
+            inst_dates = sorted(df_inst["date"].unique())
+            recent_5_dates = inst_dates[-5:]
+            inst_5d = df_inst[df_inst["date"].isin(recent_5_dates)]
+            inst_net = inst_5d.groupby("stock_id")["net"].sum().reset_index()
             inst_net.columns = ["stock_id", "inst_net"]
             filtered = filtered.merge(inst_net, on="stock_id", how="left")
             filtered["inst_net"] = filtered["inst_net"].fillna(0)
@@ -3327,14 +3343,15 @@ class DividendScanner(MarketScanner):
             filtered["inst_net"] = 0
             filtered["inst_rank"] = 0.5
 
-        # 動能欄位
+        # 3) 短期動能（5 日報酬，比單日漲跌更穩定）
         dates = sorted(df_price["date"].unique())
-        if len(dates) >= 2:
-            prev_date = dates[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date = dates[-5] if len(dates) >= 5 else (dates[0] if len(dates) >= 2 else None)
+        if ref_date is not None:
+            ref = df_price[df_price["date"] == ref_date][["stock_id", "close"]].rename(columns={"close": "ref_close"})
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
         else:
             filtered["momentum"] = 0
 
@@ -3557,6 +3574,10 @@ class GrowthScanner(MarketScanner):
         total_stocks = df_price["stock_id"].nunique()
         logger.info("Stage 1: 載入 %d 支股票的市場資料", total_stocks)
 
+        # 預填充 _coarse_revenue，避免 _coarse_filter() 重複查詢 DB（Problem 4 修正）
+        # _load_market_data() 已載入 4 個月營收，直接重用，無需再次查詢
+        self._coarse_revenue = df_revenue
+
         # Stage 2: 粗篩
         candidates = self._coarse_filter(df_price, df_inst)
         after_coarse = len(candidates)
@@ -3701,9 +3722,12 @@ class GrowthScanner(MarketScanner):
         filtered["yoy_rank"] = filtered["yoy_growth"].rank(pct=True)
         filtered["vol_rank"] = filtered["volume"].rank(pct=True)
 
+        # 2) 法人 5 日累積淨買超排名（比單日穩定，過濾換手雜訊）
         if not df_inst.empty:
-            inst_latest = df_inst[df_inst["date"] == df_inst["date"].max()]
-            inst_net = inst_latest.groupby("stock_id")["net"].sum().reset_index()
+            inst_dates = sorted(df_inst["date"].unique())
+            recent_5_dates = inst_dates[-5:]
+            inst_5d = df_inst[df_inst["date"].isin(recent_5_dates)]
+            inst_net = inst_5d.groupby("stock_id")["net"].sum().reset_index()
             inst_net.columns = ["stock_id", "inst_net"]
             filtered = filtered.merge(inst_net, on="stock_id", how="left")
             filtered["inst_net"] = filtered["inst_net"].fillna(0)
@@ -3712,14 +3736,15 @@ class GrowthScanner(MarketScanner):
             filtered["inst_net"] = 0
             filtered["inst_rank"] = 0.5
 
-        # 動能欄位
+        # 3) 短期動能（5 日報酬，比單日漲跌更穩定）
         dates = sorted(df_price["date"].unique())
-        if len(dates) >= 2:
-            prev_date = dates[-2]
-            prev = df_price[df_price["date"] == prev_date][["stock_id", "close"]].copy()
-            prev.columns = ["stock_id", "prev_close"]
-            filtered = filtered.merge(prev, on="stock_id", how="left")
-            filtered["momentum"] = ((filtered["close"] - filtered["prev_close"]) / filtered["prev_close"]).fillna(0)
+        ref_date = dates[-5] if len(dates) >= 5 else (dates[0] if len(dates) >= 2 else None)
+        if ref_date is not None:
+            ref = df_price[df_price["date"] == ref_date][["stock_id", "close"]].rename(columns={"close": "ref_close"})
+            filtered = filtered.merge(ref, on="stock_id", how="left")
+            filtered["momentum"] = (
+                (filtered["close"] - filtered["ref_close"]) / filtered["ref_close"].replace(0, float("nan"))
+            ).fillna(0)
         else:
             filtered["momentum"] = 0
 
