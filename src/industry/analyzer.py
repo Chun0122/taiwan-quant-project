@@ -19,30 +19,85 @@ from src.data.schema import DailyPrice, InstitutionalInvestor, StockInfo
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 法人分類常數
+# ---------------------------------------------------------------------------
+# InstitutionalInvestor.name 欄位可能出現的字串值（中英文並存）
+_FOREIGN_NAMES: frozenset[str] = frozenset({"外資", "外資及陸資", "Foreign_Investor"})
+_TRUST_NAMES: frozenset[str] = frozenset({"投信", "Investment_Trust"})
+
+# ---------------------------------------------------------------------------
+# 模組層級 Rank Cache（日期 TTL，同日重複呼叫直接命中）
+# ---------------------------------------------------------------------------
+_RANK_CACHE: dict[tuple, pd.DataFrame] = {}
+_RANK_CACHE_DATE: date | None = None
+
+
+def _rank_cache_key(
+    watchlist: list[str],
+    lookback_days: int,
+    momentum_days: int,
+    trust_weight: float,
+    foreign_weight: float,
+) -> tuple:
+    """生成 rank_sectors 快取 key。"""
+    return (
+        frozenset(watchlist),
+        lookback_days,
+        momentum_days,
+        round(trust_weight, 3),
+        round(foreign_weight, 3),
+    )
+
+
+def _get_cached_rank(key: tuple) -> pd.DataFrame | None:
+    """取得快取結果；日期不同時自動清除舊快取。"""
+    global _RANK_CACHE, _RANK_CACHE_DATE  # noqa: PLW0603
+    today = date.today()
+    if _RANK_CACHE_DATE != today:
+        _RANK_CACHE.clear()
+        _RANK_CACHE_DATE = today
+    return _RANK_CACHE.get(key)
+
+
+def _set_cached_rank(key: tuple, df: pd.DataFrame) -> None:
+    """寫入快取。"""
+    _RANK_CACHE[key] = df
+
+
+# ---------------------------------------------------------------------------
+# 模組層級純函數
+# ---------------------------------------------------------------------------
+
 
 def compute_sector_relative_strength(
     stock_ids: list[str],
     df_price: pd.DataFrame,
     industry_map: dict[str, str],
     lookback_days: int = 20,
-    threshold: float = 0.20,
+    threshold: float = 0.08,
     bonus: float = 0.03,
+    use_dynamic_threshold: bool = True,
 ) -> pd.DataFrame:
     """計算個股相對同產業中位數的相對強度加成（±3%）。
 
     計算邏輯：
       1. 計算每支股票近 lookback_days 個交易日的報酬率
       2. 計算每個產業的中位數報酬率
-      3. 若個股報酬率高於中位數超過 threshold → +bonus
-         若個股報酬率低於中位數超過 threshold → -bonus
+      3. 動態門檻（use_dynamic_threshold=True，預設）：
+         threshold_i = max(1.5 × σ_i, 0.05)，依各產業波動度自適應
+         靜態門檻（use_dynamic_threshold=False）：使用 threshold 參數
+      4. 若個股報酬率高於中位數超過門檻 → +bonus
+         若個股報酬率低於中位數超過門檻 → -bonus
 
     Args:
         stock_ids: 候選股代號清單
         df_price: DataFrame（需含 stock_id, date, close 欄位）
         industry_map: {stock_id: industry_category} 對照表
         lookback_days: 計算報酬率的回看天數（預設 20 日）
-        threshold: 超越/落後中位數的門檻（預設 0.20 = ±20 個百分點）
+        threshold: 靜態門檻，use_dynamic_threshold=False 時使用（預設 0.08 = ±8 個百分點）
         bonus: 加成幅度（預設 0.03 = ±3%）
+        use_dynamic_threshold: True 時改用 1.5×σ 動態門檻（預設 True）
 
     Returns:
         DataFrame(stock_id, relative_strength_bonus)  值域 {-bonus, 0.0, +bonus}
@@ -52,22 +107,25 @@ def compute_sector_relative_strength(
     if df_price.empty or not stock_ids:
         return default
 
-    # 計算每支股票的近期報酬率
-    returns: dict[str, float] = {}
-    for sid in stock_ids:
-        grp = df_price[df_price["stock_id"] == sid].sort_values("date")
-        grp = grp.tail(lookback_days)
-        if len(grp) < 2:
-            continue
-        first_close = float(grp.iloc[0]["close"])
-        last_close = float(grp.iloc[-1]["close"])
-        if first_close > 0:
-            returns[sid] = (last_close - first_close) / first_close
+    # --- 向量化計算每支股票的近期報酬率 ---
+    df = df_price[df_price["stock_id"].isin(stock_ids)].copy()
+    df = df.sort_values(["stock_id", "date"])
+    # 標記倒數第 N 筆（0 = 最新）
+    df["_ridx"] = df.groupby("stock_id").cumcount(ascending=False)
+    df_w = df[df["_ridx"] < lookback_days]
+    counts = df_w.groupby("stock_id")["close"].count()
+    first_close = df_w.groupby("stock_id")["close"].first()
+    last_close = df_w.groupby("stock_id")["close"].last()
+    valid_mask = (counts >= 2) & (first_close > 0)
+    valid_ids = valid_mask[valid_mask].index.tolist()
 
-    if not returns:
+    if not valid_ids:
         return default
 
-    # 計算每個產業的中位數報酬率
+    ret_series = (last_close[valid_ids] - first_close[valid_ids]) / first_close[valid_ids]
+    returns: dict[str, float] = ret_series.to_dict()
+
+    # 計算每個產業的中位數報酬率（與 σ，供動態門檻使用）
     sector_rets: dict[str, list[float]] = {}
     for sid, ret in returns.items():
         industry = industry_map.get(sid, "未分類")
@@ -75,20 +133,33 @@ def compute_sector_relative_strength(
 
     sector_median: dict[str, float] = {ind: float(pd.Series(rets).median()) for ind, rets in sector_rets.items()}
 
+    # 動態門檻：1.5 × σ，最小 0.05，樣本不足時 fallback 靜態門檻
+    if use_dynamic_threshold:
+        sector_threshold: dict[str, float] = {}
+        for ind, rets in sector_rets.items():
+            if len(rets) >= 3:
+                sigma = float(pd.Series(rets).std())
+                sector_threshold[ind] = max(1.5 * sigma, 0.05)
+            else:
+                sector_threshold[ind] = threshold
+    else:
+        sector_threshold = {}  # 空字典 → 全部使用靜態 threshold
+
     # 映射每支股票的加成
     records = []
     for sid in stock_ids:
         industry = industry_map.get(sid, "未分類")
         median = sector_median.get(industry)
         ret = returns.get(sid)
+        thr = sector_threshold.get(industry, threshold)
 
         if ret is None or median is None:
             bonus_val = 0.0
         else:
             diff = ret - median
-            if diff > threshold:
+            if diff > thr:
                 bonus_val = bonus
-            elif diff < -threshold:
+            elif diff < -thr:
                 bonus_val = -bonus
             else:
                 bonus_val = 0.0
@@ -102,6 +173,7 @@ def compute_flow_acceleration_from_df(
     df: pd.DataFrame,
     recent_days: int = 5,
     base_days: int = 15,
+    ema_span: int = 0,
 ) -> pd.Series:
     """計算各產業法人資金流加速度（純函數，不依賴 DB）。
 
@@ -116,6 +188,9 @@ def compute_flow_acceleration_from_df(
             date 可為 datetime.date 或 pd.Timestamp。
         recent_days: 近期窗口交易日數（預設 5）
         base_days: 前期窗口交易日數（預設 15）
+        ema_span: EMA 平滑窗口（0 = 不平滑，建議值 3）。
+            > 0 時先對每支股票的 net 序列做 EMA(span) 平滑，再計算加速度，
+            可降低單日法人大買賣的噪聲干擾，代價是 ~1 日訊號延遲。
 
     Returns:
         Series: index=industry, value=acceleration（浮點數）。
@@ -125,6 +200,11 @@ def compute_flow_acceleration_from_df(
         return pd.Series(dtype=float)
 
     all_industries = df["industry"].unique()
+
+    # EMA 平滑（P3）：對每支股票的 net 序列做指數移動平均後再算加速度
+    if ema_span > 0:
+        df = df.sort_values(["stock_id", "date"]).copy()
+        df["net"] = df.groupby("stock_id")["net"].transform(lambda s: s.ewm(span=ema_span, adjust=False).mean())
 
     # 取得全部交易日（降序）
     unique_dates = sorted(df["date"].unique(), reverse=True)
@@ -190,6 +270,7 @@ class IndustryRotationAnalyzer:
         self,
         recent_days: int = 5,
         base_days: int = 15,
+        ema_span: int = 0,
     ) -> pd.Series:
         """計算各產業法人資金流加速度（二階導數）。
 
@@ -198,6 +279,7 @@ class IndustryRotationAnalyzer:
         Args:
             recent_days: 近期窗口交易日數（預設 5）
             base_days: 前期窗口交易日數（預設 15）
+            ema_span: EMA 平滑窗口，傳入 compute_flow_acceleration_from_df（預設 0，不平滑）
 
         Returns:
             Series: index=industry_category, value=acceleration
@@ -226,13 +308,27 @@ class IndustryRotationAnalyzer:
         df = pd.DataFrame([{"stock_id": r.stock_id, "date": r.date, "net": r.net} for r in rows])
         df["industry"] = df["stock_id"].map(industry_map).fillna("未分類")
 
-        return compute_flow_acceleration_from_df(df, recent_days=recent_days, base_days=base_days)
+        return compute_flow_acceleration_from_df(df, recent_days=recent_days, base_days=base_days, ema_span=ema_span)
 
-    def compute_sector_institutional_flow(self) -> pd.DataFrame:
-        """計算各產業法人資金流向。
+    def compute_sector_institutional_flow(
+        self,
+        trust_weight: float = 0.7,
+        foreign_weight: float = 0.3,
+    ) -> pd.DataFrame:
+        """計算各產業法人資金流向（投信加權）。
+
+        將 InstitutionalInvestor 按法人類型分類後計算加權淨買超：
+        - 投信（trust_weight）：波段操作主力，輪動訊號較強
+        - 外資（foreign_weight）：偏長期，輪動敏感度較低
+        - 其他（剩餘權重）：自營商等
+
+        Args:
+            trust_weight: 投信在加權中的比重（預設 0.7）
+            foreign_weight: 外資在加權中的比重（預設 0.3）
 
         Returns:
             DataFrame: [industry, total_net, stock_count, avg_net_per_stock]
+            total_net 為加權後的產業淨買超代理值（可直接用於排名）
         """
         industry_map = self.get_industry_map()
         end_date = date.today()
@@ -264,8 +360,22 @@ class IndustryRotationAnalyzer:
         # 加入產業分類
         df["industry"] = df["stock_id"].map(industry_map).fillna("未分類")
 
-        # 按產業 + 股票加總
-        stock_net = df.groupby(["industry", "stock_id"])["net"].sum().reset_index()
+        # 計算法人類型加權係數（P1b）
+        other_weight = max(1.0 - trust_weight - foreign_weight, 0.0)
+
+        def _inst_weight(name: str) -> float:
+            if name in _TRUST_NAMES:
+                return trust_weight
+            if name in _FOREIGN_NAMES:
+                return foreign_weight
+            return other_weight
+
+        df["inst_weight"] = df["name"].apply(_inst_weight)
+        df["weighted_net"] = df["net"] * df["inst_weight"]
+
+        # 按產業 + 股票加總（使用加權 net）
+        stock_net = df.groupby(["industry", "stock_id"])["weighted_net"].sum().reset_index()
+        stock_net.columns = ["industry", "stock_id", "net"]
         sector_flow = (
             stock_net.groupby("industry")
             .agg(
@@ -281,6 +391,8 @@ class IndustryRotationAnalyzer:
 
     def compute_sector_price_momentum(self) -> pd.DataFrame:
         """計算各產業價格動能（期間漲跌幅均值）。
+
+        使用向量化運算取代逐股迴圈，效能顯著提升（P2b）。
 
         Returns:
             DataFrame: [industry, avg_return_pct, stock_count]
@@ -301,31 +413,29 @@ class IndustryRotationAnalyzer:
             return pd.DataFrame(columns=["industry", "avg_return_pct", "stock_count"])
 
         df = pd.DataFrame([{"stock_id": r[0], "date": r[1], "close": r[2]} for r in rows])
+        df = df.sort_values(["stock_id", "date"])
 
-        # 計算每支股票的期間漲跌幅
-        returns = []
-        for sid, grp in df.groupby("stock_id"):
-            grp = grp.sort_values("date")
-            if len(grp) < 2:
-                continue
-            # 取最近 momentum_days 個交易日
-            grp = grp.tail(self.momentum_days)
-            first_close = grp.iloc[0]["close"]
-            last_close = grp.iloc[-1]["close"]
-            if first_close > 0:
-                ret_pct = (last_close / first_close - 1) * 100
-                returns.append(
-                    {
-                        "stock_id": sid,
-                        "return_pct": ret_pct,
-                        "industry": industry_map.get(sid, "未分類"),
-                    }
-                )
+        # --- 向量化：取每支股票最近 momentum_days 筆 ---
+        df["_ridx"] = df.groupby("stock_id").cumcount(ascending=False)
+        df_w = df[df["_ridx"] < self.momentum_days]
 
-        if not returns:
+        counts = df_w.groupby("stock_id")["close"].count()
+        first_close = df_w.groupby("stock_id")["close"].first()
+        last_close = df_w.groupby("stock_id")["close"].last()
+
+        # 有效股票：≥2 筆 且 期初收盤 > 0
+        valid = (counts >= 2) & (first_close > 0)
+        valid_stocks = valid[valid].index
+
+        if valid_stocks.empty:
             return pd.DataFrame(columns=["industry", "avg_return_pct", "stock_count"])
 
-        df_ret = pd.DataFrame(returns)
+        ret_pct = ((last_close[valid_stocks] - first_close[valid_stocks]) / first_close[valid_stocks]) * 100
+        ret_pct.name = "return_pct"
+        df_ret = ret_pct.reset_index()
+        df_ret.columns = ["stock_id", "return_pct"]
+        df_ret["industry"] = df_ret["stock_id"].map(lambda s: industry_map.get(s, "未分類"))
+
         sector_momentum = (
             df_ret.groupby("industry")
             .agg(
@@ -344,8 +454,19 @@ class IndustryRotationAnalyzer:
         momentum_weight: float = 0.5,
         use_flow_acceleration: bool = True,
         accel_weight: float = 0.7,
+        trust_weight: float = 0.7,
+        foreign_weight: float = 0.3,
+        ema_span: int = 0,
+        use_cache: bool = True,
     ) -> pd.DataFrame:
         """綜合排名各產業（法人動能 + 價格動能）。
+
+        改進點：
+        - P1a：使用 Percentile Rank（rank(pct=True)）取代 Min-Max 標準化，
+          避免離群值（如半導體法人大量買超）壓縮其他產業分數
+        - P1b：法人分數依投信/外資分類加權（trust_weight / foreign_weight），
+          投信是台股輪動主力，預設給予更高權重
+        - P2a：加入 module-level 日期 TTL 快取，同日重複呼叫直接命中
 
         Args:
             inst_weight: 法人分數權重（相對於動能分數）
@@ -355,12 +476,26 @@ class IndustryRotationAnalyzer:
                 可捕捉資金「剛轉入」初升段，降低追高風險。
             accel_weight: 加速度信號在法人子分數中的權重（預設 0.7）；
                 level 信號權重 = 1 - accel_weight。
+            trust_weight: 投信在法人加權中的比重（預設 0.7）
+            foreign_weight: 外資在法人加權中的比重（預設 0.3）
+            ema_span: 加速度 EMA 平滑窗口（0 = 不平滑，預設 0）
+            use_cache: 是否使用 module-level 快取（預設 True）
 
         Returns:
             DataFrame: [rank, industry, sector_score, institutional_score,
                         momentum_score, total_net, avg_return_pct, stock_count]
         """
-        flow_df = self.compute_sector_institutional_flow()
+        # P2a：快取命中直接返回
+        if use_cache:
+            cache_key = _rank_cache_key(
+                self.watchlist, self.lookback_days, self.momentum_days, trust_weight, foreign_weight
+            )
+            cached = _get_cached_rank(cache_key)
+            if cached is not None:
+                logger.debug("rank_sectors() 命中快取（watchlist=%d 支）", len(self.watchlist))
+                return cached
+
+        flow_df = self.compute_sector_institutional_flow(trust_weight=trust_weight, foreign_weight=foreign_weight)
         mom_df = self.compute_sector_price_momentum()
 
         if flow_df.empty and mom_df.empty:
@@ -386,22 +521,23 @@ class IndustryRotationAnalyzer:
         if merged.empty:
             return pd.DataFrame()
 
-        # Min-Max 標準化
-        def _minmax(series: pd.Series) -> pd.Series:
-            mn, mx = series.min(), series.max()
-            if mx == mn:
+        # --- P1a：Percentile Rank 取代 Min-Max ---
+        # rank(pct=True) 將每個產業映射到 [0, 1] 的百分位，
+        # 對離群值（如半導體法人買超遠大於其他產業）具有天然 robust 性。
+        def _pct_rank(series: pd.Series) -> pd.Series:
+            if series.nunique() == 1:
                 return pd.Series(0.5, index=series.index)
-            return (series - mn) / (mx - mn)
+            return series.rank(pct=True)
 
         # 法人子分數：level 或 level + acceleration 混合
-        level_score = _minmax(merged["total_net"])
+        level_score = _pct_rank(merged["total_net"])
         if use_flow_acceleration:
-            accel_series = self.compute_sector_flow_acceleration()
+            accel_series = self.compute_sector_flow_acceleration(ema_span=ema_span)
             if not accel_series.empty:
                 # 對齊 merged 的 industry 索引
                 accel_aligned = accel_series.reindex(merged["industry"].values, fill_value=0.0)
                 accel_aligned.index = merged.index
-                accel_score = _minmax(accel_aligned)
+                accel_score = _pct_rank(accel_aligned)
                 inst_sub_score = (1.0 - accel_weight) * level_score + accel_weight * accel_score
             else:
                 inst_sub_score = level_score
@@ -409,7 +545,7 @@ class IndustryRotationAnalyzer:
             inst_sub_score = level_score
 
         merged["institutional_score"] = inst_sub_score
-        merged["momentum_score"] = _minmax(merged["avg_return_pct"])
+        merged["momentum_score"] = _pct_rank(merged["avg_return_pct"])
         merged["sector_score"] = (
             inst_weight * merged["institutional_score"] + momentum_weight * merged["momentum_score"]
         )
@@ -427,7 +563,13 @@ class IndustryRotationAnalyzer:
             "avg_return_pct",
             "stock_count",
         ]
-        return merged[[c for c in cols if c in merged.columns]]
+        result = merged[[c for c in cols if c in merged.columns]]
+
+        # P2a：寫入快取
+        if use_cache:
+            _set_cached_rank(cache_key, result)
+
+        return result
 
     def compute_sector_scores_for_stocks(
         self,
