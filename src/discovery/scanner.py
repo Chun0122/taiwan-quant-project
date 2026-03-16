@@ -1767,6 +1767,128 @@ class MarketScanner:
 
         return pd.DataFrame(results)
 
+    def _compute_value_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """價值/打底風格技術面 3 因子：120日低點距離 + RSI超賣 + 三均線糾結度。
+
+        設計理念：價值型投資者偏好「左側佈局」——股價接近中期低點、技術超賣但已出現回穩、
+        多條均線糾結收斂（代表蓄積能量），而非短線動能追高。
+        需 lookback_days >= 130（支援 SMA120 + RSI 預熱）。
+        """
+        from src.features.indicators import calc_rsi14_from_series
+
+        results = []
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
+        for sid in stock_ids:
+            stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
+            if len(stock_data) < 15:
+                results.append({"stock_id": sid, "technical_score": 0.5})
+                continue
+
+            closes = stock_data["close"].values
+            score = 0.0
+            n_factors = 0
+
+            # 1) 距 120 日低點幅度（接近低點 = 價值區間）
+            #    dist_ratio=0 → score=1.0（AT the low）；50% 以上偏離 → score=0.0
+            if len(closes) >= 120:
+                min_120d = closes[-120:].min()
+                if min_120d > 0:
+                    dist_ratio = (closes[-1] - min_120d) / min_120d
+                    score += max(0.0, 1.0 - dist_ratio / 0.50)
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            # 2) RSI(14) 超賣反轉：低 RSI = 超賣區，對價值型更有吸引力
+            #    score = max(0, (70 - RSI) / 70)：RSI=0→1.0、RSI=70→0.0、RSI>70→0.0
+            rsi_val = calc_rsi14_from_series(pd.Series(closes))
+            score += max(0.0, (70.0 - rsi_val) / 70.0)
+            n_factors += 1
+
+            # 3) 三均線糾結度（SMA20/SMA60/SMA120 變異係數，越低越收斂）
+            #    均線糾結代表股價進入盤整蓄積，潛在突破機率提高
+            if len(closes) >= 120:
+                sma20 = closes[-20:].mean()
+                sma60 = closes[-60:].mean()
+                sma120 = closes[-120:].mean()
+                ma_arr = np.array([sma20, sma60, sma120])
+                ma_mean = ma_arr.mean()
+                if ma_mean > 0:
+                    # CV > 6% 視為過度發散 → score=0；CV≈0 完美收斂 → score=1
+                    cv = ma_arr.std(ddof=0) / ma_mean
+                    score += max(0.0, 1.0 - cv / 0.06)
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            tech_score = score / max(n_factors, 1)
+            results.append({"stock_id": sid, "technical_score": tech_score})
+
+        return pd.DataFrame(results)
+
+    def _compute_dividend_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """高息存股風格技術面 3 因子：SMA60 斜率 + RSI 中性帶 + 三均線糾結度。
+
+        設計理念：高息型投資者偏好「穩健上漲或橫盤蓄積」——均線方向平穩向上、
+        RSI 在中性帶而非極端值、均線緩緩收斂（打底階段）。
+        與 Value 的差異：不追求「超賣反轉」，而是找「趨勢健康、估值未過熱」的存股。
+        需 lookback_days >= 130（支援 SMA120）。
+        """
+        from src.features.indicators import calc_rsi14_from_series
+
+        results = []
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+
+        for sid in stock_ids:
+            stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
+            if len(stock_data) < 15:
+                results.append({"stock_id": sid, "technical_score": 0.5})
+                continue
+
+            closes = stock_data["close"].values
+            score = 0.0
+            n_factors = 0
+
+            # 1) SMA60 方向斜率（長期趨勢穩健度）
+            #    slope = (SMA60_today - SMA60_20d_ago) / SMA60_20d_ago
+            #    平穩上升是存股安全感的核心指標；下滑趨勢則降分
+            if len(closes) >= 80:  # 60 + 20 buffer
+                sma60_today = closes[-60:].mean()
+                sma60_20d_ago = closes[-80:-20].mean()
+                if sma60_20d_ago > 0:
+                    slope = (sma60_today - sma60_20d_ago) / sma60_20d_ago
+                    # ±1% per 20 days → score ≈ 1.0/0.0；斜率=0 → 0.5
+                    score += max(0.0, min(1.0, 0.5 + slope * 50))
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            # 2) RSI(14) 中性帶：RSI 在 40~60 為最佳（穩定不過熱）
+            #    score = 1 - abs(RSI - 50) / 50：RSI=50→1.0，RSI=0或100→0.0
+            rsi_val = calc_rsi14_from_series(pd.Series(closes))
+            score += max(0.0, 1.0 - abs(rsi_val - 50.0) / 50.0)
+            n_factors += 1
+
+            # 3) 三均線糾結度（SMA20/SMA60/SMA120 變異係數，同 Value style）
+            if len(closes) >= 120:
+                sma20 = closes[-20:].mean()
+                sma60 = closes[-60:].mean()
+                sma120 = closes[-120:].mean()
+                ma_arr = np.array([sma20, sma60, sma120])
+                ma_mean = ma_arr.mean()
+                if ma_mean > 0:
+                    cv = ma_arr.std(ddof=0) / ma_mean
+                    score += max(0.0, 1.0 - cv / 0.06)
+                else:
+                    score += 0.5
+                n_factors += 1
+
+            tech_score = score / max(n_factors, 1)
+            results.append({"stock_id": sid, "technical_score": tech_score})
+
+        return pd.DataFrame(results)
+
     def _compute_chip_scores(
         self,
         stock_ids: list[str],
@@ -2008,74 +2130,77 @@ class MarketScanner:
             logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
 
     def _compute_momentum_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """動能風格技術面 5 因子：5日動能 + 10日動能 + 20日突破 + 量比 + 成交量加速。
+        """動能風格技術面 6 因子（橫截面排名版）。
+
+        5日動能 + 10日動能 + 20日突破 + 量比（20日）+ 成交量加速 + 風險調整後動能。
+        所有因子改用橫截面 rank(pct=True)，自動適應牛熊市（Regime Adaptable），
+        消除原本 clamp(0.5 + ret×5) 在強市場天花板化的鑑別度喪失問題。
+        第 6 因子（風險調整後動能）= Return_10d / Volatility_20d（類 Sharpe），
+        偏好「上漲過程平穩」的高品質動能股，過濾暴漲暴跌的妖股。
+        資料不足或缺失的因子以中性分 0.5 填補。
         供 MomentumScanner 與 GrowthScanner 共用。
         """
-        results = []
-        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
-        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+        if not stock_ids:
+            return pd.DataFrame(columns=["stock_id", "technical_score"])
 
-        for sid in stock_ids:
-            if sid not in grouped.groups:
-                results.append({"stock_id": sid, "technical_score": 0.5})
-                continue
-            stock_data = grouped.get_group(sid)
-            if len(stock_data) < 3:
-                results.append({"stock_id": sid, "technical_score": 0.5})
-                continue
+        df = df_price.sort_values(["stock_id", "date"])
+        g = df.groupby("stock_id", sort=False)
 
-            closes = stock_data["close"].values
-            volumes = stock_data["volume"].values.astype(float)
+        # ── 批次取各期收盤價 ──────────────────────────────────────────
+        # 使用 apply 確保結果以 stock_id 為 index（nth() 返回的是原始整數 index，
+        # 導致後續 reindex 全部得到 NaN）
+        latest_close = g["close"].last()
+        close_5d_ago = g["close"].apply(lambda s: float(s.iloc[-6]) if len(s) >= 6 else np.nan)  # 5 個交易日前
+        close_10d_ago = g["close"].apply(lambda s: float(s.iloc[-11]) if len(s) >= 11 else np.nan)  # 10 個交易日前
+        # 近 20 日最高收盤（突破因子分母）
+        close_20d_max = g["close"].apply(lambda s: float(s.iloc[-20:].max()) if len(s) >= 20 else np.nan)
 
-            score = 0.0
-            n_factors = 0
+        # ── 批次取量能序列 ────────────────────────────────────────────
+        latest_vol = g["volume"].last().astype(float)
+        vol_20d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-20:].mean()) if len(s) >= 20 else np.nan)
+        vol_3d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-3:].mean()) if len(s) >= 3 else np.nan)
+        vol_10d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-10:].mean()) if len(s) >= 10 else np.nan)
 
-            # 1) 5 日動能
-            if len(closes) >= 6:
-                ret_5d = (closes[-1] - closes[-6]) / closes[-6]
-                score += max(0.0, min(1.0, 0.5 + ret_5d * 5))
-                n_factors += 1
+        # ── 第 6 因子：20 日日報酬率標準差（Volatility_20d）────────────
+        # 計算 20 日滾動日報酬率的標準差，供風險調整後動能使用
+        vol_20d_std = g["close"].apply(
+            lambda s: float(s.pct_change().iloc[-20:].dropna().std()) if len(s) >= 21 else np.nan
+        )
 
-            # 2) 10 日動能
-            if len(closes) >= 11:
-                ret_10d = (closes[-1] - closes[-11]) / closes[-11]
-                score += max(0.0, min(1.0, 0.5 + ret_10d * 5))
-                n_factors += 1
+        # ── 限縮到候選股集合，計算原始因子值 ─────────────────────────
+        idx = pd.Index(stock_ids)
+        c0 = latest_close.reindex(idx)
+        c5 = close_5d_ago.reindex(idx).replace(0, np.nan)
+        c10 = close_10d_ago.reindex(idx).replace(0, np.nan)
+        c20m = close_20d_max.reindex(idx).replace(0, np.nan)
 
-            # 3) 20 日突破：close / max(close[-20:])
-            if len(closes) >= 20:
-                max_20 = closes[-20:].max()
-                if max_20 > 0:
-                    score += closes[-1] / max_20
-                else:
-                    score += 0.5
-                n_factors += 1
+        ret_5d = (c0 - c5) / c5
+        ret_10d = (c0 - c10) / c10
+        breakout_20d = c0 / c20m
 
-            # 4) 量比：volume[-1] / mean(volume[-20:])
-            if len(volumes) >= 20:
-                avg_vol_20 = volumes[-20:].mean()
-                if avg_vol_20 > 0:
-                    ratio = min(2.0, volumes[-1] / avg_vol_20)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
+        vol_20d = vol_20d_mean.reindex(idx).replace(0, np.nan)
+        vol_ratio_raw = latest_vol.reindex(idx) / vol_20d
+        vol_accel_raw = vol_3d_mean.reindex(idx) / vol_10d_mean.reindex(idx).replace(0, np.nan)
 
-            # 5) 成交量加速：mean(vol[-3:]) / mean(vol[-10:])
-            if len(volumes) >= 10:
-                avg_vol_3 = volumes[-3:].mean()
-                avg_vol_10 = volumes[-10:].mean()
-                if avg_vol_10 > 0:
-                    ratio = min(2.0, avg_vol_3 / avg_vol_10)
-                    score += ratio / 2.0
-                else:
-                    score += 0.5
-                n_factors += 1
+        # 風險調整後動能：Return_10d / Volatility_20d（類 Sharpe ratio）
+        vv = vol_20d_std.reindex(idx).replace(0, np.nan)
+        sharpe_proxy = ret_10d / vv
 
-            tech_score = score / max(n_factors, 1)
-            results.append({"stock_id": sid, "technical_score": tech_score})
+        # ── 橫截面百分位排名（Regime Adaptive）─────────────────────────
+        r5 = ret_5d.rank(pct=True)
+        r10 = ret_10d.rank(pct=True)
+        rb = breakout_20d.rank(pct=True)
+        rv = vol_ratio_raw.rank(pct=True)
+        ra = vol_accel_raw.rank(pct=True)
+        rs = sharpe_proxy.rank(pct=True)  # 風險調整後動能排名
 
-        return pd.DataFrame(results)
+        # NaN（資料不足）以中性 0.5 填補，取六因子等權平均
+        scores = pd.concat([r5, r10, rb, rv, ra, rs], axis=1)
+        scores.columns = ["r5", "r10", "rb", "rv", "ra", "rs"]
+        scores = scores.fillna(0.5)
+
+        tech_score = scores.mean(axis=1)
+        return pd.DataFrame({"stock_id": idx.tolist(), "technical_score": tech_score.to_numpy()})
 
     # ------------------------------------------------------------------ #
     #  Stage 4: 排名 + 產業標籤
@@ -2834,17 +2959,30 @@ class SwingScanner(MarketScanner):
             score = 0.0
             n_factors = 0
 
-            # 1) 趨勢確認：close > SMA60
-            if len(closes) >= 60:
-                sma60 = closes[-60:].mean()
-                score += 1.0 if closes[-1] > sma60 else 0.0
+            # 1) SMA60 方向斜率（消除 binary cliff：close > SMA60 的 0/1 → 連續分數）
+            #    衡量「SMA60 是否持續上揚」；slope = (SMA60_today - SMA60_5d_ago) / SMA60_5d_ago
+            #    上揚 +0.3%/5日 → ~1.0，持平 → 0.5，下滑 -0.3%/5日 → ~0.0
+            if len(closes) >= 65:
+                sma60_today = closes[-60:].mean()
+                sma60_5d_ago = closes[-65:-5].mean()
+                if sma60_5d_ago > 0:
+                    slope = (sma60_today - sma60_5d_ago) / sma60_5d_ago
+                    score += max(0.0, min(1.0, 0.5 + slope * 300))
+                else:
+                    score += 0.5
                 n_factors += 1
 
-            # 2) 均線排列：SMA20 > SMA60
+            # 2) SMA20/SMA60 乖離率（消除 binary cliff：SMA20 > SMA60 的 0/1 → 連續分數）
+            #    spread = (SMA20 - SMA60) / SMA60：正值=多頭排列，越大越強
+            #    乖離 +2.5% → 1.0，0% → 0.5，-2.5% → 0.0
             if len(closes) >= 60:
                 sma20 = closes[-20:].mean()
                 sma60 = closes[-60:].mean()
-                score += 1.0 if sma20 > sma60 else 0.0
+                if sma60 > 0:
+                    spread = (sma20 - sma60) / sma60
+                    score += max(0.0, min(1.0, 0.5 + spread * 20))
+                else:
+                    score += 0.5
                 n_factors += 1
 
             # 3) 60 日動能
@@ -2866,20 +3004,28 @@ class SwingScanner(MarketScanner):
                 score += count / 20.0
                 n_factors += 1
 
-            # 5) ADX(14) 趨勢強度：adx_score = min(1.0, max(0.0, (adx - 15) / 30))
-            #    ADX=15 → 0，ADX=45 → 1；需至少 28 根（2×14）才能取到有效值
+            # 5) ADX(14) + DMI 方向過濾
+            #    ADX 無方向性，空頭強跌時 ADX 同樣飆高；必須搭配 +DI / -DI 確認多頭方向
+            #    +DI > -DI（多頭趨勢）：score = (ADX - 15) / 30，ADX=15→0，ADX=45→1
+            #    +DI ≤ -DI（空頭趨勢）：此因子給 0 分，避免把主跌段評為高分
             if len(closes) >= 28:
                 window = min(len(closes), 60)
-                adx_series = _ADXIndicator(
+                adx_indicator = _ADXIndicator(
                     high=pd.Series(highs[-window:]),
                     low=pd.Series(lows[-window:]),
                     close=pd.Series(closes[-window:]),
                     n=14,
-                ).adx()
-                valid = adx_series.dropna()
-                if not valid.empty:
-                    adx_val = float(valid.iloc[-1])
-                    score += min(1.0, max(0.0, (adx_val - 15) / 30))
+                )
+                adx_s = adx_indicator.adx().dropna()
+                di_pos_s = adx_indicator.adx_pos().dropna()
+                di_neg_s = adx_indicator.adx_neg().dropna()
+                if not adx_s.empty and not di_pos_s.empty and not di_neg_s.empty:
+                    adx_val = float(adx_s.iloc[-1])
+                    di_pos = float(di_pos_s.iloc[-1])
+                    di_neg = float(di_neg_s.iloc[-1])
+                    if di_pos > di_neg:  # 多頭趨勢才給分
+                        score += min(1.0, max(0.0, (adx_val - 15) / 30))
+                    # else: 空頭趨勢（+DI ≤ -DI），ADX 加成為 0
                     n_factors += 1
 
             tech_score = score / max(n_factors, 1)
@@ -3268,9 +3414,13 @@ class ValueScanner(MarketScanner):
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.50, "inst_rank": 0.50}
 
     def __init__(self, **kwargs) -> None:
-        kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 120日低點計算
         kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
         super().__init__(**kwargs)
+
+    def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """價值模式技術面：採用打底/超賣反轉風格（120日低點距離 + RSI超賣 + 三均線糾結度）。"""
+        return self._compute_value_style_technical_scores(stock_ids, df_price)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """覆寫：value 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。"""
@@ -3708,9 +3858,13 @@ class DividendScanner(MarketScanner):
     _COARSE_WEIGHTS: dict[str, float] = {"dy_rank": 0.50, "vol_rank": 0.30, "inst_rank": 0.20}
 
     def __init__(self, **kwargs) -> None:
-        kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 均線糾結度計算
         kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
         super().__init__(**kwargs)
+
+    def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
+        """高息模式技術面：採用穩健存股風格（SMA60斜率 + RSI中性帶 + 三均線糾結度）。"""
+        return self._compute_dividend_style_technical_scores(stock_ids, df_price)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """覆寫：dividend 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。"""
