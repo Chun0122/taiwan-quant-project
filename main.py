@@ -1788,6 +1788,102 @@ def cmd_alert_check(args: argparse.Namespace) -> None:
         print(f"\nDiscord 通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
 
 
+def _compute_macro_stress_check() -> dict:
+    """宏觀壓力預檢：從 DB 讀取 TAIEX 計算快速崩盤訊號（純函數）。
+
+    Returns:
+        dict: {
+            "regime": str,               # "crisis" | "bear" | "sideways" | "bull"
+            "crisis_triggered": bool,
+            "taiex_close": float,
+            "fast_return_5d": float,     # 5 日報酬率
+            "consec_decline_days": int,  # 實際連跌天數
+            "vol_ratio": float,          # 波動率倍數
+            "signals": dict,             # 三個 bool flags
+            "summary": str,              # 中文摘要，用於 Discord / 終端輸出
+        }
+    """
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import DailyPrice
+    from src.regime.detector import MarketRegimeDetector, detect_crisis_signals
+
+    try:
+        with get_session() as session:
+            rows = session.execute(
+                select(DailyPrice.date, DailyPrice.close)
+                .where(DailyPrice.stock_id == "TAIEX")
+                .order_by(DailyPrice.date.desc())
+                .limit(130)
+            ).all()
+
+        if not rows or len(rows) < 10:
+            return {
+                "regime": "sideways",
+                "crisis_triggered": False,
+                "taiex_close": 0.0,
+                "fast_return_5d": 0.0,
+                "consec_decline_days": 0,
+                "vol_ratio": 0.0,
+                "signals": {},
+                "summary": "TAIEX 資料不足，跳過壓力檢查",
+            }
+
+        rows_sorted = sorted(rows, key=lambda r: r[0])
+        closes = pd.Series([float(r[1]) for r in rows_sorted])
+
+        crisis_info = detect_crisis_signals(closes)
+        regime_info = MarketRegimeDetector().detect()
+        regime = regime_info.get("regime", "sideways")
+
+        # 計算實際連跌天數（顯示用）
+        consec = 0
+        for i in range(len(closes) - 1, 0, -1):
+            if closes.iloc[i] < closes.iloc[i - 1]:
+                consec += 1
+            else:
+                break
+
+        taiex_close = float(closes.iloc[-1])
+        ret_5d = float((closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6]) if len(closes) >= 6 else 0.0
+
+        if regime == "crisis":
+            summary = (
+                f"⚠ CRISIS 崩盤訊號觸發！"
+                f"5日={ret_5d:+.1%}，連跌{consec}天，波動率={crisis_info.get('vol_ratio_val', 0.0):.1f}x"
+            )
+        elif regime == "bear":
+            summary = f"空頭市場 TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}"
+        else:
+            summary = f"市場狀態={regime} TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}"
+
+        return {
+            "regime": regime,
+            "crisis_triggered": crisis_info.get("crisis", False),
+            "taiex_close": taiex_close,
+            "fast_return_5d": ret_5d,
+            "consec_decline_days": consec,
+            "vol_ratio": crisis_info.get("vol_ratio_val", 0.0),
+            "signals": crisis_info.get("signals", {}),
+            "summary": summary,
+        }
+
+    except Exception as exc:
+        logging.warning("宏觀壓力預檢失敗: %s", exc)
+        return {
+            "regime": "sideways",
+            "crisis_triggered": False,
+            "taiex_close": 0.0,
+            "fast_return_5d": 0.0,
+            "consec_decline_days": 0,
+            "vol_ratio": 0.0,
+            "signals": {},
+            "summary": "壓力預檢失敗，跳過",
+        }
+
+
 def _compute_revenue_scan(
     watchlist: list[str],
     min_yoy: float,
@@ -3273,6 +3369,19 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
     lines: list[str] = [f"🌅 **早晨例行報告** ({today_str})", ""]
     today = datetime.date.fromisoformat(today_str)
 
+    # ── Step 0: 宏觀壓力預檢警示（crash/bear 時前置顯示）───────────
+    try:
+        stress = _compute_macro_stress_check()
+        if stress.get("crisis_triggered"):
+            lines.append("🚨 **CRISIS 崩盤警示已啟動**")
+            lines.append(f"  {stress.get('summary', '')}")
+            lines.append("")
+        elif stress.get("regime") == "bear":
+            lines.append(f"⚠️ **空頭市場** {stress.get('summary', '')}")
+            lines.append("")
+    except Exception:
+        pass
+
     # ── 1. 多模式選股（今日 DiscoveryRecord，出現 2+ 模式）──────────────
     with get_session() as session:
         disc_rows = session.execute(
@@ -3441,6 +3550,26 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     def _skip(reason: str) -> None:
         print(f"  >> 跳過（{reason}）")
+
+    # ── Step 0: 宏觀壓力預檢（Macro Stress Check）────────────────
+    print(f"\n{'═' * 64}")
+    print("  [Step 0] 宏觀壓力預檢（Macro Stress Check）")
+    print(f"{'═' * 64}")
+    stress_result: dict = {}
+    if dry_run:
+        _skip("dry-run")
+    else:
+        stress_result = _compute_macro_stress_check()
+        regime_now = stress_result.get("regime", "sideways")
+        print(f"  市場狀態: {regime_now.upper()}")
+        print(f"  {stress_result.get('summary', '')}")
+        if stress_result.get("crisis_triggered"):
+            print()
+            print("  !! CRISIS 模式啟動 — Discover 將使用最嚴格的過濾與保守參數 !!")
+            print(f"     5日報酬: {stress_result['fast_return_5d']:+.1%}")
+            print(f"     連跌天數: {stress_result['consec_decline_days']}")
+            print(f"     波動率倍數: {stress_result['vol_ratio']:.1f}x")
+            print()
 
     # ── Step 1: sync-sbl ─────────────────────────────────────────
     _step(1, "同步借券賣出資料（sync-sbl --days 3）")

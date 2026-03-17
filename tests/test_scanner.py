@@ -12,6 +12,7 @@ from src.discovery.scanner import (
     MomentumScanner,
     SwingScanner,
     ValueScanner,
+    compute_taiex_relative_strength,
 )
 from tests.scanner_helpers import (
     make_entry_exit_price_df,
@@ -4044,3 +4045,140 @@ class TestSwingBreakoutBonus:
         df = self._make_price_df("B", closes)
         result = scanner._compute_breakout_bonus(["B"], df)
         assert result.iloc[0]["breakout_bonus"] == pytest.approx(0.0)
+
+
+class TestComputeTaixRelativeStrength:
+    """compute_taiex_relative_strength 純函數測試。"""
+
+    def _make_df(self, stock_closes: dict[str, list[float]], n_days: int = 25) -> pd.DataFrame:
+        """建立含多支股票（含 TAIEX）的 df_price。"""
+        from datetime import date, timedelta
+
+        rows = []
+        base_date = date(2025, 1, 1)
+        for sid, closes in stock_closes.items():
+            for i, c in enumerate(closes):
+                rows.append({"stock_id": sid, "date": base_date + timedelta(days=i), "close": c})
+        return pd.DataFrame(rows)
+
+    def test_stock_outperforming_taiex(self):
+        """個股漲幅 15%，TAIEX 漲幅 5% → excess > 0（個股跑贏 TAIEX）。"""
+        n = 25
+        taiex = [10000.0 * (1 + 0.05 / n * i) for i in range(n + 1)]
+        stock = [100.0 * (1 + 0.15 / n * i) for i in range(n + 1)]
+        df = self._make_df({"TAIEX": taiex, "2330": stock})
+        result = compute_taiex_relative_strength(df, window=20)
+        assert "2330" in result.index
+        assert result["2330"] > 0.05  # 超額報酬為正且明顯 > 5%
+
+    def test_stock_underperforming_taiex(self):
+        """個股跌幅 8%，TAIEX 跌幅 2% → excess ≈ -6%。"""
+        n = 25
+        taiex = [10000.0 * (1 - 0.02 / n * i) for i in range(n + 1)]
+        stock = [100.0 * (1 - 0.08 / n * i) for i in range(n + 1)]
+        df = self._make_df({"TAIEX": taiex, "2317": stock})
+        result = compute_taiex_relative_strength(df, window=20)
+        assert result["2317"] == pytest.approx(-0.06, abs=0.02)
+
+    def test_no_taiex_data_returns_zeros(self):
+        """df_price 中無 TAIEX 資料時，所有個股返回 0.0（安全 fallback）。"""
+        n = 25
+        df = self._make_df({"2330": [100.0 + i for i in range(n + 1)]})
+        result = compute_taiex_relative_strength(df, window=20)
+        assert "2330" in result.index
+        assert result["2330"] == pytest.approx(0.0)
+
+    def test_taiex_excluded_from_output(self):
+        """TAIEX 本身不出現在返回的 Series index 中。"""
+        n = 25
+        taiex = [10000.0] * (n + 1)
+        stock = [100.0] * (n + 1)
+        df = self._make_df({"TAIEX": taiex, "2330": stock})
+        result = compute_taiex_relative_strength(df, window=20)
+        assert "TAIEX" not in result.index
+
+    def test_insufficient_data_returns_zero(self):
+        """個股資料不足 window+1 天時填 0.0（不懲罰新股）。"""
+        n = 25
+        taiex = [10000.0 * (1 + 0.05 / n * i) for i in range(n + 1)]
+        short_stock = [100.0 + i for i in range(10)]  # 僅 10 天
+        df = self._make_df({"TAIEX": taiex, "NEW": short_stock})
+        result = compute_taiex_relative_strength(df, window=20)
+        assert result.get("NEW", 0.0) == pytest.approx(0.0)
+
+    def test_empty_df_returns_empty(self):
+        """空 DataFrame 不拋例外，返回空 Series。"""
+        result = compute_taiex_relative_strength(pd.DataFrame())
+        assert len(result) == 0
+
+
+class TestApplyCrisisFilter:
+    """MarketScanner._apply_crisis_filter 方法測試。"""
+
+    def _make_price_df_with_taiex(
+        self,
+        stock_returns: dict[str, float],
+        taiex_return: float = -0.03,
+        n_days: int = 25,
+    ) -> pd.DataFrame:
+        """建立含 TAIEX 的 df_price，各股有指定 N 日報酬率。"""
+        from datetime import date, timedelta
+
+        base_date = date(2025, 1, 1)
+        rows = []
+        # TAIEX
+        for i in range(n_days + 1):
+            close = 10000.0 * (1 + taiex_return / n_days * i)
+            rows.append({"stock_id": "TAIEX", "date": base_date + timedelta(days=i), "close": close})
+        # 個股
+        for sid, ret in stock_returns.items():
+            for i in range(n_days + 1):
+                close = 100.0 * (1 + ret / n_days * i)
+                rows.append({"stock_id": sid, "date": base_date + timedelta(days=i), "close": close})
+        return pd.DataFrame(rows)
+
+    def _make_scored(self, stock_ids: list[str]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "stock_id": stock_ids,
+                "composite_score": [0.8 - 0.1 * i for i in range(len(stock_ids))],
+            }
+        )
+
+    def test_non_crisis_regime_no_filter(self):
+        """非 crisis regime 時不過濾任何股票（zero overhead）。"""
+        scanner = MomentumScanner()
+        scanner.regime = "bear"  # 非 crisis
+        df_price = self._make_price_df_with_taiex({"2330": -0.15, "2317": -0.12}, taiex_return=-0.03)
+        scored = self._make_scored(["2330", "2317"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert len(result) == 2
+
+    def test_crisis_regime_filters_weak(self):
+        """crisis regime 時剔除跑輸 TAIEX 超過 10% 的弱勢股。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        # TAIEX -5%；2330 -3%（超額 +2%，強勢留下）；2317 -25%（超額 -17%，剔除）
+        df_price = self._make_price_df_with_taiex({"2330": -0.03, "2317": -0.25}, taiex_return=-0.05)
+        scored = self._make_scored(["2330", "2317"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert "2330" in result["stock_id"].values
+        assert "2317" not in result["stock_id"].values
+
+    def test_crisis_all_strong_nothing_removed(self):
+        """crisis 模式但所有股票都強於 TAIEX 時無剔除。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        # TAIEX -5%；兩股各跌 3%（超額 +2%）
+        df_price = self._make_price_df_with_taiex({"A": -0.03, "B": -0.03}, taiex_return=-0.05)
+        scored = self._make_scored(["A", "B"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert len(result) == 2
+
+    def test_empty_scored_safe_fallback(self):
+        """空 DataFrame 時不拋例外。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        df_price = self._make_price_df_with_taiex({"A": -0.03}, taiex_return=-0.05)
+        result = scanner._apply_crisis_filter(pd.DataFrame(), df_price)
+        assert result.empty

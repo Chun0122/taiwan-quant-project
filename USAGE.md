@@ -888,9 +888,12 @@ python main.py discover swing --top 20 --ai-summary --notify
 | Stage 3.3a | 產業同儕相對強度 | 個股近 20 日報酬率 vs 同產業中位數：超越 +20pp → composite_score ×1.03，落後 -20pp → ×0.97 |
 | Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
+| Stage 3.5b | **Crisis 相對強度過濾** | 僅 crisis regime 執行：剔除 20 日超額報酬低於 TAIEX -10% 的弱勢股，只留能抵抗大盤跌勢的防禦標的 |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
 > **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）採自適應累積設計，需 ≥ 20 個交易日分點歷史資料（由 `morning-routine` 每日自動累積），資料不足時自動降回 7F。
+
+> **Crisis 模式**：當 TAIEX 觸發快速崩盤訊號（5 日跌幅 > 5% 且/或連跌 3 天、波動率飆升 1.8x，≥2 個訊號觸發），系統自動切換 crisis regime：評分權重向消息面/基本面傾斜（技術訊號在崩盤時失真），ATR 止損收緊（0.8x），只保留相對強勢股。`morning-routine` Step 0 會於掃描前顯示預警並推播 Discord。
 
 ### 4.14 Discover 推薦績效回測 (`discover-backtest`)
 

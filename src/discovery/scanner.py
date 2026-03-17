@@ -146,6 +146,56 @@ def compute_abnormal_announcement_rate(
     return pd.Series(z_scores).reindex(stock_ids).fillna(0.0)
 
 
+def compute_taiex_relative_strength(
+    df_price: pd.DataFrame,
+    taiex_stock_id: str = "TAIEX",
+    window: int = 20,
+) -> pd.Series:
+    """計算個股相對 TAIEX 的 N 日超額報酬（純函數，crisis 模式過濾用）。
+
+    Args:
+        df_price: DailyPrice DataFrame，需含 stock_id/date/close 欄位，
+                  且應包含 taiex_stock_id 的列
+        taiex_stock_id: TAIEX 識別代號（預設 "TAIEX"）
+        window: 計算報酬率的回溯天數（預設 20）
+
+    Returns:
+        pd.Series(index=stock_id, values=excess_return_Nd)
+        - 正值：跑贏 TAIEX，負值：跑輸 TAIEX
+        - 不含 TAIEX 本身
+        - 資料不足的股票填 0.0（不懲罰新股，避免冷啟動誤殺）
+        - TAIEX 資料不存在時返回全 0（不過濾，安全 fallback）
+    """
+    if df_price.empty:
+        return pd.Series(dtype=float)
+
+    # 取 TAIEX 近期收盤序列
+    taiex_df = df_price[df_price["stock_id"] == taiex_stock_id].sort_values("date")
+    if taiex_df.empty or len(taiex_df) < window + 1:
+        # TAIEX 資料不足：返回所有個股 0（不過濾）
+        stock_ids = df_price[df_price["stock_id"] != taiex_stock_id]["stock_id"].unique()
+        return pd.Series(0.0, index=stock_ids)
+
+    taiex_latest = float(taiex_df["close"].iloc[-1])
+    taiex_past = float(taiex_df["close"].iloc[-(window + 1)])
+    taiex_ret = (taiex_latest - taiex_past) / taiex_past if taiex_past > 0 else 0.0
+
+    # 計算各個股的 N 日報酬率
+    non_taiex = df_price[df_price["stock_id"] != taiex_stock_id]
+    results: dict[str, float] = {}
+    for sid, grp in non_taiex.groupby("stock_id"):
+        grp = grp.sort_values("date")
+        if len(grp) < window + 1:
+            results[sid] = 0.0  # 資料不足：不懲罰
+            continue
+        latest = float(grp["close"].iloc[-1])
+        past = float(grp["close"].iloc[-(window + 1)])
+        stock_ret = (latest - past) / past if past > 0 else 0.0
+        results[sid] = stock_ret - taiex_ret
+
+    return pd.Series(results)
+
+
 def compute_relative_pe_thresholds(
     industry_series: pd.Series,
     pe_series: pd.Series,
@@ -828,6 +878,9 @@ class MarketScanner:
 
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
+
+        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
+        scored = self._apply_crisis_filter(scored, df_price)
 
         # Stage 4: 排名 + 產業標籤
         rankings = self._rank_and_enrich(scored)
@@ -1630,6 +1683,7 @@ class MarketScanner:
         "bull": (1.5, 3.5),
         "sideways": (1.5, 3.0),
         "bear": (1.2, 2.5),
+        "crisis": (0.8, 1.8),  # 極緊止損，保守目標；崩盤跳空常突破止損，盡早平倉
     }
 
     def _compute_entry_exit_cols(
@@ -2062,6 +2116,52 @@ class MarketScanner:
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """風險過濾（基底類別不做任何過濾，子類覆寫）。"""
+        return scored
+
+    def _apply_crisis_filter(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+        underperform_threshold: float = -0.10,
+    ) -> pd.DataFrame:
+        """Stage 3.5b — crisis 模式相對強度過濾。
+
+        僅在 self.regime == "crisis" 時執行，剔除 20 日超額報酬（個股 − TAIEX）
+        低於 underperform_threshold 的弱勢股，只保留能抵抗大盤跌勢的防禦標的。
+
+        非 crisis regime 時零開銷直接回傳原 DataFrame。
+
+        Args:
+            scored: _score_candidates 後含 stock_id 欄位的 DataFrame
+            df_price: 含 "TAIEX" 的日K線資料（stock_id/date/close）
+            underperform_threshold: 相對跌幅門檻，預設 -0.10（跑輸 TAIEX 超過 10pp 即剔除）
+
+        Returns:
+            過濾後的 DataFrame
+        """
+        if getattr(self, "regime", "sideways") != "crisis":
+            return scored
+
+        if scored.empty or df_price.empty:
+            return scored
+
+        excess = compute_taiex_relative_strength(df_price, window=20)
+        if excess.empty:
+            return scored
+
+        weak_ids = set(excess[excess < underperform_threshold].index)
+        if not weak_ids:
+            return scored
+
+        before = len(scored)
+        scored = scored[~scored["stock_id"].isin(weak_ids)].copy()
+        removed = before - len(scored)
+        if removed > 0:
+            logger.info(
+                "Stage 3.5b Crisis 相對強度過濾：剔除 %d 支跑輸 TAIEX 超過 %.0f%% 的弱勢股",
+                removed,
+                abs(underperform_threshold) * 100,
+            )
         return scored
 
     # ------------------------------------------------------------------ #
@@ -3631,6 +3731,9 @@ class ValueScanner(MarketScanner):
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
 
+        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
+        scored = self._apply_crisis_filter(scored, df_price)
+
         # Stage 4
         rankings = self._rank_and_enrich(scored)
         sector_summary = self._compute_sector_summary(rankings)
@@ -4080,6 +4183,9 @@ class DividendScanner(MarketScanner):
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
 
+        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
+        scored = self._apply_crisis_filter(scored, df_price)
+
         # Stage 4
         rankings = self._rank_and_enrich(scored)
         sector_summary = self._compute_sector_summary(rankings)
@@ -4433,6 +4539,9 @@ class GrowthScanner(MarketScanner):
 
         # Stage 3.5: 風險過濾
         scored = self._apply_risk_filter(scored, df_price)
+
+        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
+        scored = self._apply_crisis_filter(scored, df_price)
 
         # Stage 4
         rankings = self._rank_and_enrich(scored)
