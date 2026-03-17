@@ -20,6 +20,7 @@ page = st.sidebar.radio(
         "🔍 選股篩選",
         "🤖 ML 策略分析",
         "🏭 產業輪動",
+        "🔖 概念輪動",
         "📋 推薦歷史",
         "👁️ 持倉監控",
     ],
@@ -55,6 +56,10 @@ elif page == "🤖 ML 策略分析":
     render()
 elif page == "🏭 產業輪動":
     from src.visualization.pages.industry_rotation import render
+
+    render()
+elif page == "🔖 概念輪動":
+    from src.visualization.pages.concept_rotation import render
 
     render()
 elif page == "📋 推薦歷史":

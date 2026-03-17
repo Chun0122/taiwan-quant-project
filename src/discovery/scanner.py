@@ -819,6 +819,9 @@ class MarketScanner:
         # Stage 3.3a: 產業同儕相對強度加成
         scored = self._apply_sector_relative_strength(scored)
 
+        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
+        scored = self._apply_concept_bonus(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -1409,6 +1412,58 @@ class MarketScanner:
             "Stage 3.3a: 產業相對強度加成已套用（範圍 %.3f ~ %.3f）",
             scored["relative_strength_bonus"].min(),
             scored["relative_strength_bonus"].max(),
+        )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.3b: 概念熱度加成
+    # ------------------------------------------------------------------ #
+
+    def _compute_concept_bonus(self, stock_ids: list[str]) -> pd.DataFrame:
+        """呼叫 ConceptRotationAnalyzer，取得每股概念熱度加成（±5%）。"""
+        try:
+            from src.industry.concept_analyzer import ConceptRotationAnalyzer
+
+            analyzer = ConceptRotationAnalyzer(
+                lookback_days=self.lookback_days,
+                momentum_days=self.momentum_days,
+            )
+            return analyzer.compute_concept_scores_for_stocks(stock_ids, bonus_range=0.05)
+        except Exception as exc:
+            logger.debug("Stage 3.3b: 概念加成計算失敗，降回 0（%s）", exc)
+            return pd.DataFrame({"stock_id": stock_ids, "concept_bonus": [0.0] * len(stock_ids)})
+
+    def _apply_concept_bonus(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """套用概念熱度加成（Stage 3.3b）。
+
+        Cap 機制：|sector_bonus| + |concept_bonus_raw| ≤ 8%
+        避免已獲高產業加成的股票被概念加成雙重推高。
+        """
+        if scored.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        concept_df = self._compute_concept_bonus(stock_ids)
+        scored = scored.merge(concept_df, on="stock_id", how="left")
+        scored["concept_bonus"] = scored["concept_bonus"].fillna(0.0)
+
+        # Cap：sector_bonus + concept_bonus 絕對值不超過 ±0.08
+        sector = scored.get("sector_bonus", None)
+        if sector is None:
+            sector = pd.Series(0.0, index=scored.index)
+        else:
+            sector = sector.fillna(0.0)
+
+        raw = scored["concept_bonus"]
+        remaining = (0.08 - sector.abs()).clip(lower=0.0)  # 剩餘可用加成空間
+        capped = raw.clip(lower=-remaining, upper=remaining)
+        scored["concept_bonus"] = capped
+
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["concept_bonus"])
+        logger.info(
+            "Stage 3.3b: 概念加成已套用（範圍 %.3f ~ %.3f）",
+            scored["concept_bonus"].min(),
+            scored["concept_bonus"].max(),
         )
         return scored
 
@@ -2244,6 +2299,7 @@ class MarketScanner:
             "fundamental_score",
             "news_score",
             "sector_bonus",
+            "concept_bonus",
             "industry_category",
             "momentum",
             "inst_net",
@@ -3565,6 +3621,9 @@ class ValueScanner(MarketScanner):
         # Stage 3.3a: 產業同儕相對強度加成
         scored = self._apply_sector_relative_strength(scored)
 
+        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
+        scored = self._apply_concept_bonus(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -4011,6 +4070,9 @@ class DividendScanner(MarketScanner):
         # Stage 3.3a: 產業同儕相對強度加成
         scored = self._apply_sector_relative_strength(scored)
 
+        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
+        scored = self._apply_concept_bonus(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -4361,6 +4423,9 @@ class GrowthScanner(MarketScanner):
 
         # Stage 3.3a: 產業同儕相對強度加成
         scored = self._apply_sector_relative_strength(scored)
+
+        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
+        scored = self._apply_concept_bonus(scored)
 
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:

@@ -97,6 +97,16 @@ python main.py watchlist add 2330            # 新增股票至 DB watchlist
 python main.py watchlist add 2330 --name 台積電 --note 核心持倉  # 含名稱與備註
 python main.py watchlist remove 2330        # 從 DB watchlist 移除股票
 python main.py watchlist import              # 從 settings.yaml 一次性匯入所有股票至 DB
+python main.py sync-concepts                 # 從 config/concepts.yaml 同步概念定義至 DB
+python main.py sync-concepts --purge         # 先清除舊 yaml 記錄再重新匯入（概念重組時使用）
+python main.py sync-concepts --from-mops     # 掃描近 90 天 MOPS 公告，以關鍵字自動標記概念成員
+python main.py sync-concepts --from-mops --days 30  # 指定掃描天數
+python main.py concepts list                 # 列出所有概念及成員股數
+python main.py concepts list CoWoS封裝       # 列出特定概念的成員清單
+python main.py concepts add CoWoS封裝 2330   # 手動新增成員（source=manual）
+python main.py concepts remove CoWoS封裝 2330 # 移除成員
+python main.py concept-expand CoWoS封裝 --threshold 0.7  # 以價格相關性找出候選股
+python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto  # 自動加入 DB（source=correlation）
 ```
 
 ### 測試
@@ -152,6 +162,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_anomaly.py`        | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個純函數（量能暴增/外資大買超/借券激增/主力集中）| 純函數 |
 | `tests/test_attribution.py`    | `FactorAttribution.compute()` / `compute_from_df()` 五因子歸因（momentum/reversal/quality/size/liquidity）純函數測試 | 純函數 |
 | `tests/test_universe.py`       | `filter_liquidity`/`filter_trend` 純函數 + `UniverseFilter._stage1_sql_filter()`（ETF 排除/天數不足/低價/掛牌類型/NULL fallback）+ Stage 2 DailyPrice fallback + Candidate Memory 模式隔離 + `compute_and_store_daily_features()` ETL（ma20/turnover_ma5/upsert 冪等） | 純函數 + in-memory SQLite |
+| `tests/test_concepts.py`       | `classify_concepts()` 關鍵字比對（10 個）+ `compute_concept_momentum()` 純函數（5 個）+ `compute_concept_institutional_flow()` 純函數（4 個）+ `compute_concept_correlation_candidates()` 純函數（5 個）+ `TestConceptBonusCap` cap 機制（4 個）+ `ConceptGroup/ConceptMembership` ORM CRUD（6 個） | 純函數 + in-memory SQLite |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。測試用資料建構函數（`make_price_df` 等 5 個）集中於 `tests/scanner_helpers.py`（因 `tests/` 有 `__init__.py`，conftest 不可直接 import）。
 
@@ -195,7 +206,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）；`fetch_twse_sbl()` 借券賣出彙總（TWT96U）；`fetch_dj_broker_trades()` 分點進出彙整（DJ 端點，替代 FinMind，Big5 HTML 解析，BHID 彙整，date=end，buy/sell 已換算為股）；**`fetch_tdcc_holding_all_market()`** TDCC 集保戶股權分散表（全市場，免費，替代 FinMind TaiwanStockHoldingSharesPer，CSV，tier 1-15 → level 字串） |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB；`_classify_security_type()` 純函數（stock_id 規則推斷 security_type）；`compute_and_store_daily_features(lookback_days=90)` 計算全市場 DailyFeature（ma20/ma60/volume_ma20/turnover_ma5/momentum_20d/volatility_20d）並以 upsert 寫入 Feature Store |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）；`classify_event_type()` 純函數（governance_change / buyback / earnings_call / investor_day / filing / revenue / general，優先序由高到低）；`classify_sentiment()` 使用 Regex 上下文比對（`_NEGATIVE_CONTEXT_PATTERNS` / `_POSITIVE_CONTEXT_PATTERNS`）優先於單詞比對，正確處理「處分利益/持股」、「澄清衰退/報導」等模糊語境 |
-| `src/data/schema.py`                | 20 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、HoldingDistribution、SecuritiesLending、BrokerTrade、WatchEntry、Watchlist、DailyFeature）；`StockInfo` 新增 `security_type` 欄位（stock/etf/warrant/preferred/None） |
+| `src/data/schema.py`                | 22 張 SQLAlchemy ORM 資料表（含 Announcement、DiscoveryRecord、FinancialStatement、HoldingDistribution、SecuritiesLending、BrokerTrade、WatchEntry、Watchlist、DailyFeature、ConceptGroup、ConceptMembership）；`StockInfo` 新增 `security_type` 欄位；`DiscoveryRecord` 新增 `concept_bonus` 欄位 |
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
@@ -218,6 +229,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/discovery/performance.py`      | Discover 推薦績效回測（讀取歷史推薦 vs DailyPrice，計算 N 日報酬率、勝率、三層聚合統計）                           |
 | `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率），輸出五模式四維度權重矩陣（技術+籌碼+基本面+消息面） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用；`compute_sector_relative_strength()` 模組級純函數（個股 20 日報酬率 vs 同產業中位數，超越 +20pp → +3%，落後 -20pp → -3%）               |
+| `src/industry/concept_analyzer.py`  | 概念股輪動分析引擎；`compute_concept_momentum()` / `compute_concept_institutional_flow()` / `compute_concept_correlation_candidates()` 純函數；`ConceptRotationAnalyzer` 類別（`rank_concepts()` Percentile Rank + `compute_concept_scores_for_stocks()` ±5% 加成供 scanner Stage 3.3b 使用） |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
 | `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |
 | `src/report/ai_report.py`           | AI 選股摘要（`generate_ai_summary()`，呼叫 Claude API `claude-sonnet-4-6`，生成約 300 字繁中摘要；`discover --ai-summary` 旗標觸發） |
@@ -228,7 +240,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
-| `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, discovery_history, position_monitoring） |
+| `src/visualization/pages/`          | 儀表板分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, concept_rotation, discovery_history, position_monitoring） |
 | `main.py`                           | CLI 調度器（argparse 子命令，33 個子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration` 四個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan）；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數） |
 
 ### 設定
@@ -310,6 +322,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 47 | ✅ | **DividendScanner 配息連續性篩選（問題七）** | `compute_eps_sustainability(df_financial, min_quarters=4) -> frozenset[str]` 模組級純函數：回傳近 min_quarters 季有任一 EPS ≤ 0 的 stock_id 集合（排除清單）；無財報資料者 pass through（避免冷啟動誤殺）；`DividendScanner._load_market_data()` 在 session 內額外查詢 `FinancialStatement.eps`（cutoff 400 天）存入 `self._df_eps_quarterly`；`_coarse_filter()` 在 `dy_ok & pe_ok` 後新增 EPS 連續性門（含 logger 計數）；`TestComputeEpsSustainability` 8 個純函數測試；864 測試通過 |
 | 48 | ✅ | **消息面評分升級（四項優化）** | **1. 異常公告率**：`compute_abnormal_announcement_rate()` 模組級純函數（scanner.py），以 180 天基準期計算 Z-Score，Z>2 乘數最高 +50%，Z<-1 降至 70%；`_load_announcement_data()` 改回傳 `(recent_df, history_df)` 供計算用；`_compute_news_scores()` 整合乘數；**2. 事件絕對加乘**：`_EVENT_TYPE_WEIGHTS` 新增 `governance_change=5.0`（董監改選/市場派）+ `buyback=4.0`（庫藏股決議）；`classify_event_type()` 優先序更新（governance_change > buyback > earnings_call > …）；`_EVENT_GOVERNANCE` / `_EVENT_BUYBACK` 關鍵字群組（mops_fetcher.py）；**3. Regex 上下文過濾**：`_NEGATIVE_CONTEXT_PATTERNS` / `_POSITIVE_CONTEXT_PATTERNS`（mops_fetcher.py），`classify_sentiment()` 先跑 regex 再走單詞比對，正確區分「處分利益」vs「處分持股」、「澄清衰退」vs「澄清報導」等；**4. 時間衰減常數**：decay 常數從 0.3 → 0.2，7 天後保留 ~25%（原 12%）；`TestClassifySentimentContextPairs`（6 個）+ `TestClassifyEventTypeV2`（8 個）+ `TestComputeNewsDecayWeightV2`（6 個）+ `TestComputeAbnormalAnnouncementRate`（5 個）+ `TestComputeNewsScoresV2`（5 個）+ `test_broker.py` mock 修正；938 測試通過 |
 | 49 | ✅ | **Discover Swing 強化（Items 1~6）** | **Item 1（財報整合）**：`SwingScanner._compute_fundamental_scores()` 升級為 YoY 30% + MoM 20% + 加速度 20% + ROE QoQ 15% + 毛利率趨勢 15%，財報不足降回純營收三因子；`TestSwingFinancialFundamentalScores` 4 個測試。**Item 2（SBL）**：`_load_sbl_data()` 移至 MarketScanner 基類；SwingScanner 籌碼面升至 5F（含借券逆向）；`TestSwingChipSblTier` 2 個測試。**Item 3（Smart Broker）**：`_load_broker_data_extended()` 移至 MarketScanner 基類；SwingScanner 籌碼面支援最高 6F（含智慧分點）；`TestSwingChipSmartBrokerTier` 2 個測試。**Item 4（ADX）**：`src/features/indicators.py` 新增 ADX(14) 計算（EAV 寫入 adx_14、`compute_indicators_from_df()` 寬表欄位）；`SwingScanner._compute_technical_scores()` 升至 5 因子（等權 0.20 each），ADX 計分 `min(1,(adx-15)/30)`；`TestComputeIndicatorsFromDf.test_adx14_*` 2 個測試 + `TestSwingAdxTechnicalFactor` 2 個測試。**Item 5（形態突破）**：`SwingScanner._compute_breakout_bonus()`（季線突破 +4% + 箱型突破 +3%）；`_post_score()` 取 VCP/季線突破/箱型突破三者最高加成；`TestSwingBreakoutBonus` 2 個測試。**Item 6（回測期間）**：`DiscoveryPerformance.MODE_HORIZONS` 字典（swing 預設 [20,40,60]）；`__init__` 依模式自動選預設持有期；`main.py --days` 改 `default=None`，swing 自動採 20/40/60；`TestSwingModeHorizons` 4 個測試；956 測試通過 |
+| 50 | ✅ | **概念股功能（P0+P1+P2）** | **P0（ORM+YAML+CLI+分析引擎）**：`ConceptGroup` + `ConceptMembership` ORM（22 張表）；`DiscoveryRecord.concept_bonus` 欄位（含 migration）；`config/concepts.yaml`（5 個初始概念：CoWoS封裝/散熱模組/低軌衛星/AI伺服器/車用電子）；`src/industry/concept_analyzer.py`（`compute_concept_momentum` / `compute_concept_institutional_flow` / `compute_concept_correlation_candidates` 純函數 + `ConceptRotationAnalyzer` 類別）；`pipeline.sync_concepts_from_yaml()` + `sync_concept_tags_from_mops()`；CLI `sync-concepts`（--purge/--from-mops/--days）+ `concepts list/add/remove`；**P1（Scanner Stage 3.3b）**：`mops_fetcher._CONCEPT_KEYWORDS` + `classify_concepts()` 純函數；scanner `_compute_concept_bonus()` + `_apply_concept_bonus()`（±5%，sector+concept ≤ ±8% cap）插入 Stage 3.3a 後；`_rank_and_enrich()` keep_cols 新增 `concept_bonus`；**P2（相關性候選+Dashboard）**：`compute_concept_correlation_candidates()` 純函數；CLI `concept-expand`（--threshold/--lookback/--auto）；Dashboard「🔖 概念輪動」頁（Tab1 排名/Tab2 Treemap/Tab3 箱型圖）；`tests/test_concepts.py` 34 個測試；1033 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 

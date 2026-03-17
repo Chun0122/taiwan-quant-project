@@ -1363,6 +1363,82 @@ python main.py watchlist import
 
 ---
 
+### sync-concepts / concepts / concept-expand — 概念股管理
+
+概念股（CoWoS封裝、散熱模組、低軌衛星等）以「疊加方式」在現有產業加成之上新增 ±5% 的概念熱度加成，sector + concept 合計上限 ±8%。
+
+#### 初次設定
+
+```bash
+# 1. 執行 migrate 確保 DB 有新表
+python main.py migrate
+
+# 2. 從 config/concepts.yaml 匯入概念定義
+python main.py sync-concepts
+
+# 3. 確認概念清單
+python main.py concepts list
+```
+
+#### concepts.yaml 管理
+
+```yaml
+# config/concepts.yaml — 概念定義（已納入 git，非敏感資料）
+concepts:
+  CoWoS封裝:
+    description: "台積電 CoWoS 先進封裝供應鏈"
+    stocks: ["2330", "3034", "5347"]
+```
+
+修改 YAML 後重新執行 `sync-concepts`；若要重組概念（清除舊記錄），加 `--purge`。
+
+#### 每日自動標記（MOPS 關鍵字）
+
+```bash
+# 掃描近 90 天 MOPS 公告，命中關鍵字時自動新增成員（source=mops）
+python main.py sync-concepts --from-mops
+
+# 自訂回溯天數
+python main.py sync-concepts --from-mops --days 30
+```
+
+#### 手動管理成員
+
+```bash
+# 列出所有概念
+python main.py concepts list
+
+# 列出特定概念成員
+python main.py concepts list CoWoS封裝
+
+# 手動新增成員（source=manual）
+python main.py concepts add CoWoS封裝 2330
+
+# 移除成員
+python main.py concepts remove CoWoS封裝 2330
+```
+
+#### 相關性候選推薦（P2）
+
+```bash
+# 找出與 CoWoS封裝 種子股相關係數 ≥ 0.7 的候選股
+python main.py concept-expand CoWoS封裝 --threshold 0.7
+
+# 自動加入 DB（source=correlation），無需確認
+python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto
+```
+
+**參數說明（concept-expand）：**
+
+| 參數 | 說明 |
+|------|------|
+| `concept_name` | 概念名稱（必填，例：CoWoS封裝）|
+| `--threshold` | 相關係數門檻（預設 0.7）|
+| `--lookback` | 相關性計算回溯天數（預設 60）|
+| `--auto` | 自動加入 DB，不需手動確認 |
+
+---
+
 ### morning-routine — 每日早晨例行流程
 
 一鍵執行七個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。

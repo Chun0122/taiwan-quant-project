@@ -1321,6 +1321,7 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 entry_trigger=str(row.get("entry_trigger", "")) or None,
                 valid_until=row.get("valid_until") if pd.notna(row.get("valid_until")) else None,
                 chip_tier=str(row.get("chip_tier", "")) or None,
+                concept_bonus=float(row.get("concept_bonus", 0.0)) if pd.notna(row.get("concept_bonus")) else None,
             )
         )
 
@@ -2979,6 +2980,203 @@ def cmd_watchlist(args: argparse.Namespace) -> None:
         print(f"未知動作：{action}。可用動作：add / remove / list / import")
 
 
+def cmd_sync_concepts(args: argparse.Namespace) -> None:
+    """將 concepts.yaml 同步至 DB（ConceptGroup + ConceptMembership）。
+
+    --purge      先清除 source=yaml 的舊記錄再重新匯入
+    --from-mops  掃描近期 MOPS 公告以關鍵字自動標記概念成員
+    --days N     MOPS 掃描回溯天數（預設 90，僅 --from-mops 有效）
+    """
+    from src.data.migrate import run_migrations
+    from src.data.pipeline import sync_concept_tags_from_mops, sync_concepts_from_yaml
+
+    run_migrations()
+
+    if getattr(args, "from_mops", False):
+        days = getattr(args, "days", 90)
+        added = sync_concept_tags_from_mops(days=days)
+        print(f"MOPS 關鍵字標記完成：新增 {added} 筆概念成員")
+    else:
+        purge = getattr(args, "purge", False)
+        stats = sync_concepts_from_yaml(purge_yaml=purge)
+        print(f"概念同步完成：新增概念組 {stats['groups']} 個，新增成員 {stats['members']} 筆")
+
+
+def cmd_concepts(args: argparse.Namespace) -> None:
+    """概念股管理（list / add / remove）。"""
+    from datetime import date as _date
+
+    from src.data.database import get_session, init_db
+    from src.data.schema import ConceptGroup, ConceptMembership
+
+    init_db()
+    action: str | None = getattr(args, "concept_action", None)
+
+    if action == "list" or action is None:
+        concept_name: str | None = getattr(args, "concept_name", None)
+        with get_session() as session:
+            if concept_name:
+                rows = (
+                    session.query(ConceptMembership)
+                    .filter(ConceptMembership.concept_name == concept_name)
+                    .order_by(ConceptMembership.source, ConceptMembership.stock_id)
+                    .all()
+                )
+                if not rows:
+                    print(f"概念「{concept_name}」無成員記錄（或不存在）")
+                    return
+                print(f"概念「{concept_name}」成員清單（共 {len(rows)} 支）：")
+                print(f"{'股票ID':<10} {'來源':<12} {'加入日期'}")
+                print("-" * 38)
+                for r in rows:
+                    print(f"{r.stock_id:<10} {r.source:<12} {r.added_date}")
+            else:
+                groups = session.query(ConceptGroup).order_by(ConceptGroup.name).all()
+                if not groups:
+                    print("DB 無概念定義，請先執行 sync-concepts")
+                    return
+                print(f"{'概念名稱':<16} {'說明':<32} 成員數")
+                print("-" * 60)
+                for g in groups:
+                    cnt = session.query(ConceptMembership).filter(ConceptMembership.concept_name == g.name).count()
+                    print(f"{g.name:<16} {(g.description or '')[:30]:<32} {cnt}")
+
+    elif action == "add":
+        concept_name = args.concept_name
+        stock_id: str = args.stock_id
+        with get_session() as session:
+            existing = (
+                session.query(ConceptMembership)
+                .filter(
+                    ConceptMembership.concept_name == concept_name,
+                    ConceptMembership.stock_id == stock_id,
+                )
+                .first()
+            )
+            if existing:
+                print(f"⚠️  {stock_id} 已在概念「{concept_name}」中（source={existing.source}）")
+                return
+            # 確保 ConceptGroup 存在
+            grp = session.query(ConceptGroup).filter(ConceptGroup.name == concept_name).first()
+            if not grp:
+                session.add(ConceptGroup(name=concept_name))
+                session.commit()
+            session.add(
+                ConceptMembership(
+                    concept_name=concept_name,
+                    stock_id=stock_id,
+                    source="manual",
+                    added_date=_date.today(),
+                )
+            )
+            session.commit()
+        print(f"✅ 已將 {stock_id} 新增至概念「{concept_name}」（source=manual）")
+
+    elif action == "remove":
+        concept_name = args.concept_name
+        stock_id = args.stock_id
+        with get_session() as session:
+            existing = (
+                session.query(ConceptMembership)
+                .filter(
+                    ConceptMembership.concept_name == concept_name,
+                    ConceptMembership.stock_id == stock_id,
+                )
+                .first()
+            )
+            if not existing:
+                print(f"⚠️  {stock_id} 不在概念「{concept_name}」中")
+                return
+            session.delete(existing)
+            session.commit()
+        print(f"✅ 已從概念「{concept_name}」移除 {stock_id}")
+
+    else:
+        print(f"未知動作：{action}。可用動作：list / add / remove")
+
+
+def cmd_concept_expand(args: argparse.Namespace) -> None:
+    """以價格相關性找出候選股，可選擇自動加入 DB（--auto）。"""
+    from src.data.database import get_session, init_db
+    from src.data.schema import ConceptMembership, DailyPrice
+    from src.industry.concept_analyzer import (
+        ConceptRotationAnalyzer,
+        compute_concept_correlation_candidates,
+    )
+
+    init_db()
+    concept_name: str = args.concept_name
+    threshold: float = getattr(args, "threshold", 0.7)
+    auto: bool = getattr(args, "auto", False)
+    lookback: int = getattr(args, "lookback", 60)
+
+    analyzer = ConceptRotationAnalyzer()
+    concept_stocks = analyzer.get_concept_stocks()
+    seed_stocks = concept_stocks.get(concept_name, [])
+    if not seed_stocks:
+        print(f"⚠️  概念「{concept_name}」無成員或不存在，請先執行 sync-concepts")
+        return
+
+    # 取所有有日K資料的股票為候選池
+    from datetime import date as _date
+    from datetime import timedelta
+
+    cutoff = _date.today() - timedelta(days=lookback + 10)
+    with get_session() as session:
+        rows = session.query(DailyPrice.stock_id).filter(DailyPrice.date >= cutoff).distinct().all()
+    all_stocks = [r[0] for r in rows]
+
+    df_price = analyzer._load_price_data(all_stocks, lookback)
+    result = compute_concept_correlation_candidates(
+        concept_name=concept_name,
+        seed_stocks=seed_stocks,
+        candidate_stocks=all_stocks,
+        df_price=df_price,
+        lookback_days=lookback,
+        threshold=threshold,
+    )
+
+    if result.empty:
+        print(f"未找到與「{concept_name}」相關係數 ≥ {threshold} 的候選股")
+        return
+
+    print(f"概念「{concept_name}」相關性候選（門檻 {threshold}，共 {len(result)} 支）：")
+    print(f"{'股票ID':<10} {'平均相關係數'}")
+    print("-" * 25)
+    for _, row in result.iterrows():
+        print(f"{row['stock_id']:<10} {row['avg_corr']:.4f}")
+
+    if auto:
+        from datetime import date as _date2
+
+        added = 0
+        with get_session() as session:
+            for _, row in result.iterrows():
+                sid = row["stock_id"]
+                existing = (
+                    session.query(ConceptMembership)
+                    .filter(
+                        ConceptMembership.concept_name == concept_name,
+                        ConceptMembership.stock_id == sid,
+                    )
+                    .first()
+                )
+                if not existing:
+                    session.add(
+                        ConceptMembership(
+                            concept_name=concept_name,
+                            stock_id=sid,
+                            source="correlation",
+                            added_date=_date2.today(),
+                        )
+                    )
+                    added += 1
+            session.commit()
+        print(f"\n✅ 已自動新增 {added} 支候選股至概念「{concept_name}」（source=correlation）")
+    else:
+        print("\n提示：加上 --auto 可自動將候選股寫入 DB")
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     """持倉監控管理（add / list / close / update-status）。"""
     _init_db()
@@ -3743,6 +3941,39 @@ def main() -> None:
         help="流程完成後推播 Discord 摘要",
     )
 
+    # sync-concepts 子命令
+    sp_sc = subparsers.add_parser("sync-concepts", help="從 concepts.yaml 同步概念定義至 DB，或以 MOPS 關鍵字自動標記")
+    sp_sc.add_argument("--purge", action="store_true", help="先清除 source=yaml 的舊記錄再重新匯入（概念重組時使用）")
+    sp_sc.add_argument(
+        "--from-mops", action="store_true", dest="from_mops", help="掃描近期 MOPS 公告以關鍵字自動標記概念成員"
+    )
+    sp_sc.add_argument("--days", type=int, default=90, help="MOPS 掃描回溯天數（搭配 --from-mops，預設 90）")
+
+    # concepts 子命令
+    sp_cpt = subparsers.add_parser("concepts", help="概念股管理（列出 / 新增成員 / 移除成員）")
+    cpt_sub = sp_cpt.add_subparsers(dest="concept_action")
+
+    # concepts list [concept_name]
+    sp_cpt_list = cpt_sub.add_parser("list", help="列出所有概念及成員數，或列出特定概念的成員清單")
+    sp_cpt_list.add_argument("concept_name", nargs="?", default=None, help="概念名稱（省略則列出全部概念）")
+
+    # concepts add <concept_name> <stock_id>
+    sp_cpt_add = cpt_sub.add_parser("add", help="手動新增成員至概念（source=manual）")
+    sp_cpt_add.add_argument("concept_name", help="概念名稱（例：CoWoS封裝）")
+    sp_cpt_add.add_argument("stock_id", help="股票代號（例：2330）")
+
+    # concepts remove <concept_name> <stock_id>
+    sp_cpt_rem = cpt_sub.add_parser("remove", help="從概念移除成員")
+    sp_cpt_rem.add_argument("concept_name", help="概念名稱")
+    sp_cpt_rem.add_argument("stock_id", help="股票代號")
+
+    # concept-expand 子命令（P2：相關性候選推薦）
+    sp_cexp = subparsers.add_parser("concept-expand", help="以價格相關性找出概念候選股（P2）")
+    sp_cexp.add_argument("concept_name", help="概念名稱（例：CoWoS封裝）")
+    sp_cexp.add_argument("--threshold", type=float, default=0.7, help="平均相關係數門檻（預設 0.7）")
+    sp_cexp.add_argument("--lookback", type=int, default=60, help="相關性計算回溯天數（預設 60）")
+    sp_cexp.add_argument("--auto", action="store_true", help="自動將候選股寫入 DB（source=correlation），無需確認")
+
     # status 子命令
     subparsers.add_parser("status", help="顯示資料庫概況")
 
@@ -3815,6 +4046,12 @@ def main() -> None:
         cmd_anomaly_scan(args)
     elif args.command == "morning-routine":
         cmd_morning_routine(args)
+    elif args.command == "sync-concepts":
+        cmd_sync_concepts(args)
+    elif args.command == "concepts":
+        cmd_concepts(args)
+    elif args.command == "concept-expand":
+        cmd_concept_expand(args)
     elif args.command == "watchlist":
         cmd_watchlist(args)
     elif args.command == "watch":

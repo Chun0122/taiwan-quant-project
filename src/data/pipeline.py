@@ -16,6 +16,8 @@ from src.data.schema import (
     Announcement,
     BacktestResult,
     BrokerTrade,
+    ConceptGroup,
+    ConceptMembership,
     DailyFeature,
     DailyPrice,
     Dividend,
@@ -1311,3 +1313,137 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
     written = _upsert_batch(DailyFeature, df_out, ["stock_id", "date"])
     logger.info("[DailyFeature] 已寫入 %d 筆（日期 %s）", written, latest_date)
     return written
+
+
+def sync_concepts_from_yaml(
+    concepts_path: str = "config/concepts.yaml",
+    purge_yaml: bool = False,
+) -> dict[str, int]:
+    """將 concepts.yaml 同步至 ConceptGroup + ConceptMembership。
+
+    Parameters
+    ----------
+    concepts_path:
+        概念定義 YAML 路徑（預設 config/concepts.yaml）。
+    purge_yaml:
+        True 時先刪除 source="yaml" 的舊記錄再重新匯入（概念重組時用）。
+
+    Returns
+    -------
+    dict
+        {"groups": N, "members": M} 新增/更新筆數統計。
+    """
+    import yaml
+
+    init_db()
+
+    with open(concepts_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    concepts: dict[str, dict] = raw.get("concepts", {})
+    if not concepts:
+        logger.warning("[sync-concepts] concepts.yaml 無概念定義，跳過。")
+        return {"groups": 0, "members": 0}
+
+    today = date.today()
+    groups_count = 0
+    members_count = 0
+
+    with get_session() as session:
+        if purge_yaml:
+            deleted = session.query(ConceptMembership).filter(ConceptMembership.source == "yaml").delete()
+            session.commit()
+            logger.info("[sync-concepts] 已清除舊 yaml 成員記錄 %d 筆", deleted)
+
+        for name, info in concepts.items():
+            desc = info.get("description", "")
+            stocks: list[str] = [str(s) for s in info.get("stocks", [])]
+
+            # Upsert ConceptGroup
+            existing_group = session.query(ConceptGroup).filter(ConceptGroup.name == name).first()
+            if existing_group:
+                existing_group.description = desc
+                existing_group.updated_at = date.today()
+            else:
+                session.add(ConceptGroup(name=name, description=desc))
+                groups_count += 1
+            session.commit()
+
+            # Upsert ConceptMembership（on_conflict_do_nothing）
+            for stock_id in stocks:
+                existing_member = (
+                    session.query(ConceptMembership)
+                    .filter(
+                        ConceptMembership.concept_name == name,
+                        ConceptMembership.stock_id == stock_id,
+                    )
+                    .first()
+                )
+                if not existing_member:
+                    session.add(
+                        ConceptMembership(
+                            concept_name=name,
+                            stock_id=stock_id,
+                            source="yaml",
+                            added_date=today,
+                        )
+                    )
+                    members_count += 1
+            session.commit()
+
+    logger.info("[sync-concepts] 新增概念 %d 個，新增成員 %d 筆", groups_count, members_count)
+    return {"groups": groups_count, "members": members_count}
+
+
+def sync_concept_tags_from_mops(days: int = 90) -> int:
+    """掃描近 days 天的 Announcement，以關鍵字比對更新 ConceptMembership（source="mops"）。
+
+    Parameters
+    ----------
+    days:
+        回溯天數（預設 90 天）。
+
+    Returns
+    -------
+    int
+        新增 ConceptMembership 筆數。
+    """
+    from src.data.mops_fetcher import classify_concepts
+
+    init_db()
+    cutoff = date.today() - timedelta(days=days)
+    today = date.today()
+    added = 0
+
+    with get_session() as session:
+        rows = session.query(Announcement.stock_id, Announcement.title).filter(Announcement.date >= cutoff).all()
+
+        for stock_id, title in rows:
+            if not title:
+                continue
+            matched_concepts = classify_concepts(title)
+            for concept_name in matched_concepts:
+                existing = (
+                    session.query(ConceptMembership)
+                    .filter(
+                        ConceptMembership.concept_name == concept_name,
+                        ConceptMembership.stock_id == stock_id,
+                    )
+                    .first()
+                )
+                if not existing:
+                    session.add(
+                        ConceptMembership(
+                            concept_name=concept_name,
+                            stock_id=stock_id,
+                            source="mops",
+                            added_date=today,
+                        )
+                    )
+                    added += 1
+
+        if added:
+            session.commit()
+
+    logger.info("[sync-concepts] MOPS 關鍵字標記新增 %d 筆成員", added)
+    return added

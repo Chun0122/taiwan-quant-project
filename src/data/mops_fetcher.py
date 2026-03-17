@@ -247,6 +247,47 @@ def classify_event_type(subject: str) -> str:
     return "general"
 
 
+# --- 概念股關鍵字字典 --- #
+# 由 sync_concept_tags_from_mops 使用，掃描公告標題自動標記概念成員。
+_CONCEPT_KEYWORDS: dict[str, list[str]] = {
+    "CoWoS封裝": ["CoWoS", "先進封裝", "SoIC", "CoCoS", "3D封裝", "Chiplet"],
+    "散熱模組": ["液冷", "散熱", "冷卻板", "熱管", "vapor chamber", "均溫板", "水冷"],
+    "低軌衛星": ["低軌衛星", "LEO", "Starlink", "SpaceX", "衛星通訊", "非地面網路", "NTN"],
+    "AI伺服器": ["GB200", "HGX", "NVL72", "AI伺服器", "AI Server", "AI加速", "推論加速"],
+    "車用電子": ["ADAS", "電動車", "EV ", "車用", "自駕", "車載", "車電"],
+}
+
+
+def classify_concepts(
+    title: str,
+    keywords: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """根據公告標題判斷屬於哪些概念分組（純函數）。
+
+    Parameters
+    ----------
+    title:
+        公告標題文字。
+    keywords:
+        自訂關鍵字字典（預設使用 _CONCEPT_KEYWORDS）。
+
+    Returns
+    -------
+    list[str]
+        命中的概念名稱清單（可能為空或多個）。
+    """
+    if not title:
+        return []
+
+    kw = keywords or _CONCEPT_KEYWORDS
+    title_lower = title.lower()
+    matched: list[str] = []
+    for concept, words in kw.items():
+        if any(w.lower() in title_lower for w in words):
+            matched.append(concept)
+    return matched
+
+
 def _find_last_trading_day(target: date, max_lookback: int = 7) -> date:
     """從 target 往前找最近的交易日（跳過週末）。"""
     d = target

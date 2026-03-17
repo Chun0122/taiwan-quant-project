@@ -40,6 +40,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("stock_info", "security_type", "VARCHAR(20)"),
     # 雙窗口流動性確認：DailyFeature 新增 20 日均成交金額（防短暫放量誘多）
     ("daily_feature", "turnover_ma20", "REAL"),
+    # 概念熱度加成（Stage 3.3b）
+    ("discovery_record", "concept_bonus", "REAL"),
 ]
 
 

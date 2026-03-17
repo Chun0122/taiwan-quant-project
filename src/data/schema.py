@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-二十一張核心表：
+二十三張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -21,6 +21,8 @@
 - WatchEntry:              持倉監控表（進出場追蹤 + 止損止利狀態）
 - Watchlist:               使用者自訂觀察清單（DB 驅動，取代 settings.yaml watchlist）
 - DailyFeature:            每日特徵快取（Feature Store，供 UniverseFilter 使用）
+- ConceptGroup:            概念股分組定義（CoWoS封裝、散熱模組等）
+- ConceptMembership:       概念股成員（多對多，stock_id ↔ concept_name）
 """
 
 from datetime import date, datetime
@@ -461,6 +463,7 @@ class DiscoveryRecord(Base):
     entry_trigger: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 進場觸發條件說明
     valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)  # 建議有效日（+5 工作日）
     chip_tier: Mapped[str | None] = mapped_column(String(5), nullable=True)  # 籌碼因子層級（3F~8F 或 N/A）
+    concept_bonus: Mapped[float | None] = mapped_column(Float, nullable=True)  # 概念熱度加成（Stage 3.3b）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
@@ -563,3 +566,45 @@ class DailyFeature(Base):
 
     def __repr__(self) -> str:
         return f"<DailyFeature {self.stock_id} {self.date} ma60={self.ma60}>"
+
+
+class ConceptGroup(Base):
+    """概念股分組定義（如 CoWoS封裝、散熱模組、低軌衛星）。
+
+    由 config/concepts.yaml 匯入，可透過 CLI sync-concepts 同步。
+    """
+
+    __tablename__ = "concept_group"
+    __table_args__ = (UniqueConstraint("name", name="uq_concept_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<ConceptGroup {self.name}>"
+
+
+class ConceptMembership(Base):
+    """概念股成員關聯表（多對多：concept_name ↔ stock_id）。
+
+    source 欄位標示成員來源：
+    - "yaml"        : 由 concepts.yaml 手動定義
+    - "mops"        : 由 MOPS 公告關鍵字自動標記
+    - "correlation" : 由價格相關性候選推薦（P2）
+    - "manual"      : 由 CLI concepts add 手動新增
+    """
+
+    __tablename__ = "concept_membership"
+    __table_args__ = (UniqueConstraint("concept_name", "stock_id", name="uq_concept_member"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    concept_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="yaml")  # yaml/mops/correlation/manual
+    added_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<ConceptMembership {self.concept_name} {self.stock_id} source={self.source}>"
