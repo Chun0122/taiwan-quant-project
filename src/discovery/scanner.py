@@ -1877,10 +1877,11 @@ class MarketScanner:
         return pd.DataFrame(results)
 
     def _compute_value_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """價值/打底風格技術面 3 因子：120日低點距離 + RSI超賣 + 三均線糾結度。
+        """價值/打底風格技術面 4 因子：120日低點距離 + RSI超賣 + 三均線糾結度 + SMA5右側確認。
 
         設計理念：價值型投資者偏好「左側佈局」——股價接近中期低點、技術超賣但已出現回穩、
         多條均線糾結收斂（代表蓄積能量），而非短線動能追高。
+        F4（右側確認）確保股票雖在低檔，但已有買盤點火，避免純左側接刀。
         需 lookback_days >= 130（支援 SMA120 + RSI 預熱）。
         """
         from src.features.indicators import calc_rsi14_from_series
@@ -1931,17 +1932,24 @@ class MarketScanner:
                     score += 0.5
                 n_factors += 1
 
+            # 4) 右側確認：收盤 > SMA5（打底後買盤點火確認，避免純左側接刀）
+            #    左側三因子找到低檔蓄積位置，此因子確認已有買盤啟動
+            if len(closes) >= 5:
+                sma5 = closes[-5:].mean()
+                score += 1.0 if closes[-1] > sma5 else 0.0
+                n_factors += 1
+
             tech_score = score / max(n_factors, 1)
             results.append({"stock_id": sid, "technical_score": tech_score})
 
         return pd.DataFrame(results)
 
     def _compute_dividend_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """高息存股風格技術面 3 因子：SMA60 斜率 + RSI 中性帶 + 三均線糾結度。
+        """高息存股風格技術面 4 因子：SMA60 斜率 + RSI 中性帶 + 三均線糾結度 + 低波動率。
 
         設計理念：高息型投資者偏好「穩健上漲或橫盤蓄積」——均線方向平穩向上、
-        RSI 在中性帶而非極端值、均線緩緩收斂（打底階段）。
-        與 Value 的差異：不追求「超賣反轉」，而是找「趨勢健康、估值未過熱」的存股。
+        RSI 在中性帶而非極端值、均線緩緩收斂（打底階段）、波動率低（存股安全感）。
+        與 Value 的差異：不追求「超賣反轉」，而是找「趨勢健康、估值未過熱、低波動」的存股。
         需 lookback_days >= 130（支援 SMA120）。
         """
         from src.features.indicators import calc_rsi14_from_series
@@ -1962,10 +1970,20 @@ class MarketScanner:
             # 1) SMA60 方向斜率（長期趨勢穩健度）
             #    slope = (SMA60_today - SMA60_20d_ago) / SMA60_20d_ago
             #    平穩上升是存股安全感的核心指標；下滑趨勢則降分
+            #    P3 除息缺口免疫：若近 45 日內出現單日跌幅 ≥ 4.5%（台股除息代理訊號），
+            #    SMA60 受除息缺口扭曲，改以中性分 0.5 替代，避免高息股被誤殺
             if len(closes) >= 80:  # 60 + 20 buffer
                 sma60_today = closes[-60:].mean()
                 sma60_20d_ago = closes[-80:-20].mean()
-                if sma60_20d_ago > 0:
+                # 除息缺口偵測：近 45 日是否有單日跌幅 ≥ 4.5%
+                window_45 = closes[max(0, len(closes) - 46) :]
+                has_ex_div_gap = False
+                if len(window_45) >= 2:
+                    daily_drops = np.diff(window_45) / window_45[:-1]
+                    has_ex_div_gap = bool((daily_drops <= -0.045).any())
+                if has_ex_div_gap:
+                    score += 0.5  # 除息缺口期間均線斜率不可靠，給中性分
+                elif sma60_20d_ago > 0:
                     slope = (sma60_today - sma60_20d_ago) / sma60_20d_ago
                     # ±1% per 20 days → score ≈ 1.0/0.0；斜率=0 → 0.5
                     score += max(0.0, min(1.0, 0.5 + slope * 50))
@@ -1991,6 +2009,15 @@ class MarketScanner:
                     score += max(0.0, 1.0 - cv / 0.06)
                 else:
                     score += 0.5
+                n_factors += 1
+
+            # 4) 歷史波動率（負向因子）：波動率越低，存股安全感越高
+            #    HV = 20 日日報酬率標準差；台灣穩健存股日 HV 約 0.5%~1.5%
+            #    以 3% 為上限門檻：HV=0→1.0，HV=3%→0.0，HV>3%→0.0
+            if len(closes) >= 21:
+                daily_rets = np.diff(closes[-21:]) / closes[-21:-1]
+                hv = float(np.std(daily_rets, ddof=1))
+                score += max(0.0, 1.0 - hv / 0.03)
                 n_factors += 1
 
             tech_score = score / max(n_factors, 1)
@@ -2305,10 +2332,13 @@ class MarketScanner:
         # 使用 apply 確保結果以 stock_id 為 index（nth() 返回的是原始整數 index，
         # 導致後續 reindex 全部得到 NaN）
         latest_close = g["close"].last()
+        close_1d_ago = g["close"].apply(
+            lambda s: float(s.iloc[-2]) if len(s) >= 2 else np.nan
+        )  # 前一交易日（漲停偵測用）
         close_5d_ago = g["close"].apply(lambda s: float(s.iloc[-6]) if len(s) >= 6 else np.nan)  # 5 個交易日前
         close_10d_ago = g["close"].apply(lambda s: float(s.iloc[-11]) if len(s) >= 11 else np.nan)  # 10 個交易日前
-        # 近 20 日最高收盤（突破因子分母）
-        close_20d_max = g["close"].apply(lambda s: float(s.iloc[-20:].max()) if len(s) >= 20 else np.nan)
+        # 近 60 日最高收盤（季線突破；20日易受短期雜訊干擾，延長至 60 日延續性更強）
+        close_60d_max = g["close"].apply(lambda s: float(s.iloc[-60:].max()) if len(s) >= 60 else np.nan)
 
         # ── 批次取量能序列 ────────────────────────────────────────────
         latest_vol = g["volume"].last().astype(float)
@@ -2327,11 +2357,11 @@ class MarketScanner:
         c0 = latest_close.reindex(idx)
         c5 = close_5d_ago.reindex(idx).replace(0, np.nan)
         c10 = close_10d_ago.reindex(idx).replace(0, np.nan)
-        c20m = close_20d_max.reindex(idx).replace(0, np.nan)
+        c60m = close_60d_max.reindex(idx).replace(0, np.nan)
 
         ret_5d = (c0 - c5) / c5
         ret_10d = (c0 - c10) / c10
-        breakout_20d = c0 / c20m
+        breakout_60d = c0 / c60m
 
         vol_20d = vol_20d_mean.reindex(idx).replace(0, np.nan)
         vol_ratio_raw = latest_vol.reindex(idx) / vol_20d
@@ -2344,10 +2374,18 @@ class MarketScanner:
         # ── 橫截面百分位排名（Regime Adaptive）─────────────────────────
         r5 = ret_5d.rank(pct=True)
         r10 = ret_10d.rank(pct=True)
-        rb = breakout_20d.rank(pct=True)
+        rb = breakout_60d.rank(pct=True)
         rv = vol_ratio_raw.rank(pct=True)
         ra = vol_accel_raw.rank(pct=True)
         rs = sharpe_proxy.rank(pct=True)  # 風險調整後動能排名
+
+        # ── 漲停板特殊處理（台股 10% 漲跌幅限制）────────────────────────
+        # 強勢「鎖漲停」時成交量急縮屬正常現象，不應懲罰量比/量能加速因子。
+        # 偵測：當日漲幅 ≥ 9.8%（台股實際漲停幅度因計算略低於 10%）
+        c1d = close_1d_ago.reindex(idx).replace(0, np.nan)
+        limit_up_mask = ((c0 - c1d) / c1d) >= 0.098
+        rv = rv.where(~limit_up_mask, other=1.0)
+        ra = ra.where(~limit_up_mask, other=1.0)
 
         # NaN（資料不足）以中性 0.5 填補，取六因子等權平均
         scores = pd.concat([r5, r10, rb, rv, ra, rs], axis=1)
@@ -2572,7 +2610,8 @@ class MomentumScanner(MarketScanner):
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
-        kwargs.setdefault("lookback_days", 25)
+        kwargs.setdefault("lookback_days", 80)  # F3 季線突破需 60 交易日（80 曆日）
+        kwargs.setdefault("universe_config", UniverseConfig(min_available_days=30))
         super().__init__(**kwargs)
 
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
@@ -2968,7 +3007,7 @@ class SwingScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)
-        kwargs.setdefault("universe_config", UniverseConfig(volume_ratio_min=1.2))
+        kwargs.setdefault("universe_config", UniverseConfig(volume_ratio_min=1.2, min_available_days=80))
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -3116,14 +3155,15 @@ class SwingScanner(MarketScanner):
             n_factors = 0
 
             # 1) SMA60 方向斜率（消除 binary cliff：close > SMA60 的 0/1 → 連續分數）
-            #    衡量「SMA60 是否持續上揚」；slope = (SMA60_today - SMA60_5d_ago) / SMA60_5d_ago
-            #    上揚 +0.3%/5日 → ~1.0，持平 → 0.5，下滑 -0.3%/5日 → ~0.0
-            if len(closes) >= 65:
+            #    衡量「SMA60 是否持續上揚」；slope = (SMA60_today - SMA60_20d_ago) / SMA60_20d_ago
+            #    SMA60 為慢線，採 20 日比較窗口（5 日窗口數值極小且充滿雜訊）
+            #    上揚 +1%/20日 → ~1.0，持平 → 0.5，下滑 -1%/20日 → ~0.0
+            if len(closes) >= 80:
                 sma60_today = closes[-60:].mean()
-                sma60_5d_ago = closes[-65:-5].mean()
-                if sma60_5d_ago > 0:
-                    slope = (sma60_today - sma60_5d_ago) / sma60_5d_ago
-                    score += max(0.0, min(1.0, 0.5 + slope * 300))
+                sma60_20d_ago = closes[-80:-20].mean()
+                if sma60_20d_ago > 0:
+                    slope = (sma60_today - sma60_20d_ago) / sma60_20d_ago
+                    score += max(0.0, min(1.0, 0.5 + slope * 50))
                 else:
                     score += 0.5
                 n_factors += 1
@@ -3147,17 +3187,28 @@ class SwingScanner(MarketScanner):
                 score += max(0.0, min(1.0, 0.5 + ret_60d * 2))
                 n_factors += 1
 
-            # 4) 量價齊揚：近 20 日 price_chg > 0 且 vol_chg > 0 的天數比例
+            # 4) 量價結構：漲日均量 / 跌日均量（VPT 概念）
+            #    健康多頭特徵：漲時放量、跌時縮量（洗盤）；比率越高越有利
+            #    ratio=2 → ~1.0，ratio=1（均衡）→ ~0.5，ratio=0.5 → ~0.25
+            #    「全漲日」罕見但給滿分，「全跌/平日」給 0 分
             if len(closes) >= 21 and len(volumes) >= 21:
                 recent_closes = closes[-21:]
                 recent_volumes = volumes[-21:]
-                count = 0
+                up_vols: list[float] = []
+                down_vols: list[float] = []
                 for i in range(1, 21):
-                    price_up = recent_closes[i] > recent_closes[i - 1]
-                    vol_up = recent_volumes[i] > recent_volumes[i - 1]
-                    if price_up and vol_up:
-                        count += 1
-                score += count / 20.0
+                    if recent_closes[i] > recent_closes[i - 1]:
+                        up_vols.append(float(recent_volumes[i]))
+                    else:
+                        down_vols.append(float(recent_volumes[i]))
+                if up_vols and down_vols:
+                    ratio = float(np.mean(up_vols)) / max(float(np.mean(down_vols)), 1.0)
+                    # ratio=2 → 1.0，ratio=1 → 0.5，ratio→0 → 0.0
+                    score += max(0.0, min(1.0, ratio / 2.0))
+                elif up_vols:  # 近 20 日全為漲日
+                    score += 1.0
+                else:  # 近 20 日全為跌/平日
+                    score += 0.0
                 n_factors += 1
 
             # 5) ADX(14) + DMI 方向過濾
@@ -3571,7 +3622,9 @@ class ValueScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 120日低點計算
-        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
+        kwargs.setdefault(
+            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=130)
+        )
         super().__init__(**kwargs)
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
@@ -4021,7 +4074,9 @@ class DividendScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 均線糾結度計算
-        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None))
+        kwargs.setdefault(
+            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=130)
+        )
         super().__init__(**kwargs)
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
@@ -4441,8 +4496,8 @@ class GrowthScanner(MarketScanner):
     _COARSE_WEIGHTS: dict[str, float] = {"yoy_rank": 0.40, "vol_rank": 0.30, "inst_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
-        kwargs.setdefault("lookback_days", 25)
-        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=20, volume_ratio_min=2.0))
+        kwargs.setdefault("lookback_days", 80)  # 共用動能技術面評分，F3 季線突破需 60 交易日（80 曆日）
+        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=20, volume_ratio_min=2.0, min_available_days=30))
         super().__init__(**kwargs)
 
     def run(self) -> DiscoveryResult:

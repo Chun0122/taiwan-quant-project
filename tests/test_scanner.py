@@ -4182,3 +4182,434 @@ class TestApplyCrisisFilter:
         df_price = self._make_price_df_with_taiex({"A": -0.03}, taiex_return=-0.05)
         result = scanner._apply_crisis_filter(pd.DataFrame(), df_price)
         assert result.empty
+
+
+# ====================================================================== #
+#  P0-1: Momentum F3 季線突破（60d）測試
+# ====================================================================== #
+
+
+class TestMomentumBreakout60d:
+    """MomentumScanner F3 突破因子改用 60 日最高（季線突破）。"""
+
+    def _make_df(self, sid: str, closes: list) -> pd.DataFrame:
+        rows = []
+        for d, c in enumerate(closes):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": c * 0.99,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                    "close": c,
+                    "volume": 500_000 + d * 1000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_near_60d_high_scores_higher_rank(self):
+        """60 日新高附近的股票 F3 排名應高於遠低於 60 日高點者。"""
+        scanner = MomentumScanner()
+        # HIGH_NEAR：前 60 天平均 100，最近一天 110（接近 60 日高）
+        c_near = [100.0] * 60 + [110.0]
+        # HIGH_FAR：前 60 天平均 100，最近一天 70（遠低於 60 日高）
+        c_far = [100.0] * 60 + [70.0]
+        df = pd.concat(
+            [self._make_df("NEAR", c_near), self._make_df("FAR", c_far)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["NEAR", "FAR"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["NEAR"] > scores["FAR"], (
+            f"接近 60 日高（{scores['NEAR']:.3f}）應高於遠低於 60 日高（{scores['FAR']:.3f}）"
+        )
+
+    def test_insufficient_60d_data_falls_back_to_neutral(self):
+        """資料不足 60 天時，F3 以中性分 0.5 填補（不影響整體結果有效性）。"""
+        scanner = MomentumScanner()
+        # 只有 25 天資料，無法計算 60 日最高，F3 應 fallback 為 0.5
+        df = self._make_df("SHORT", [100.0 + i * 0.5 for i in range(25)])
+        result = scanner._compute_technical_scores(["SHORT"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0, f"分數應在 [0, 1]，得到 {s}"
+
+    def test_scores_in_valid_range_with_full_data(self):
+        """65 天完整資料的技術分數應在 [0, 1]。"""
+        scanner = MomentumScanner()
+        df = self._make_df("X", [100.0 * (1 + 0.002 * d) for d in range(65)])
+        result = scanner._compute_technical_scores(["X"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0
+
+
+# ====================================================================== #
+#  P1-2: Momentum 漲停板量能免懲罰測試
+# ====================================================================== #
+
+
+class TestMomentumLimitUpVolume:
+    """漲停板（≥9.8% 單日漲幅）時 rv/ra 自動設為滿分（1.0），避免量縮誤判。"""
+
+    def _make_df_two_stocks(self) -> pd.DataFrame:
+        """
+        LU（漲停）：前 64 天穩定 100，第 65 天漲 10%（110），今日成交量極低（50,000）
+        NLU（普通）：前 64 天穩定 100，第 65 天漲 2%（102），今日成交量正常（1,500,000）
+        """
+        rows = []
+        base_vol = 1_000_000
+        for d in range(64):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            for sid, close in [("LU", 100.0), ("NLU", 100.0)]:
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": day,
+                        "open": close * 0.99,
+                        "high": close * 1.01,
+                        "low": close * 0.99,
+                        "close": close,
+                        "volume": base_vol,
+                    }
+                )
+        last_day = date(2025, 1, 1) + timedelta(days=64)
+        rows.append(
+            {
+                "stock_id": "LU",
+                "date": last_day,
+                "open": 100.0,
+                "high": 110.0,
+                "low": 100.0,
+                "close": 110.0,
+                "volume": 50_000,  # 漲停量縮
+            }
+        )
+        rows.append(
+            {
+                "stock_id": "NLU",
+                "date": last_day,
+                "open": 100.0,
+                "high": 102.0,
+                "low": 100.0,
+                "close": 102.0,
+                "volume": 1_500_000,  # 正常量能
+            }
+        )
+        return pd.DataFrame(rows)
+
+    def test_limit_up_not_penalized_vs_normal(self):
+        """漲停股即使量縮，技術分數仍應優於或不低於動能較弱的正常股。"""
+        scanner = MomentumScanner()
+        df = self._make_df_two_stocks()
+        result = scanner._compute_technical_scores(["LU", "NLU"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        # LU 動能（+10%）遠優於 NLU（+2%），應在保護後維持優勢
+        assert scores["LU"] >= scores["NLU"], f"漲停股（{scores['LU']:.3f}）不應低於普通股（{scores['NLU']:.3f}）"
+
+    def test_scores_in_valid_range(self):
+        """漲停保護後分數仍在 [0, 1]。"""
+        scanner = MomentumScanner()
+        df = self._make_df_two_stocks()
+        result = scanner._compute_technical_scores(["LU", "NLU"], df)
+        assert (result["technical_score"] >= 0.0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+
+# ====================================================================== #
+#  P1-1: Value SMA5 右側確認因子測試
+# ====================================================================== #
+
+
+class TestValueSMA5SparkFactor:
+    """Value 第 4 因子：收盤 > SMA5 右側確認，避免接刀。"""
+
+    def _make_df(self, sid: str, closes: list) -> pd.DataFrame:
+        rows = []
+        for d, c in enumerate(closes):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": c * 0.99,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                    "close": c,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_close_above_sma5_scores_higher(self):
+        """收盤 > SMA5 的股票（右側確認）技術分應高於收盤 < SMA5 的股票（仍在下跌）。
+
+        設計原則：F1/F2/F3 對兩支股票幾乎相同（基底 129 天一致），
+        只有最後一天的微小差異決定 F4（close vs SMA5），確保 F4 是決定性因子。
+        """
+        scanner = ValueScanner()
+        # 共用底部：前 100 天從 100 下跌至 90（製造超賣 + 接近低點），
+        # 再 29 天緩步回穩至 91（RSI/距低點 對兩股幾乎相同）
+        base_closes = [100.0 - i * 0.1 for i in range(100)] + [90.0 + i * (1.0 / 29) for i in range(29)]
+        # SMA5 = mean of last 5 base days ≈ 90.76
+        # ABOVE：最後一天微漲至 91.2（> SMA5），F4 = 1.0
+        c_above = base_closes + [91.2]
+        # BELOW：最後一天微跌至 90.3（< SMA5），F4 = 0.0
+        c_below = base_closes + [90.3]
+        df = pd.concat(
+            [self._make_df("ABOVE", c_above), self._make_df("BELOW", c_below)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["ABOVE", "BELOW"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["ABOVE"] > scores["BELOW"], (
+            f"右側確認（{scores['ABOVE']:.3f}）應高於跌破SMA5（{scores['BELOW']:.3f}）"
+        )
+
+    def test_score_range_with_four_factors(self):
+        """4 因子後分數仍在 [0, 1]。"""
+        scanner = ValueScanner()
+        closes = [100.0] * 130
+        df = self._make_df("X", closes)
+        result = scanner._compute_technical_scores(["X"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0
+
+
+# ====================================================================== #
+#  P0-2: Swing SMA60 斜率 20 日窗口測試
+# ====================================================================== #
+
+
+class TestSwingSma60Slope20d:
+    """SwingScanner F1 SMA60 斜率改用 20 日比較窗口。"""
+
+    def _make_df(self, sid: str, closes: list) -> pd.DataFrame:
+        rows = []
+        for d, c in enumerate(closes):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": c * 0.99,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                    "close": c,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_rising_sma60_over_20d_scores_higher(self):
+        """SMA60 過去 20 日上升的股票技術分應高於 SMA60 下滑者。"""
+        scanner = SwingScanner()
+        # RISING：前 60 天持平，後 80 天緩步上漲（SMA60_today > SMA60_20d_ago）
+        c_rising = [100.0] * 60 + [100.0 + d * 0.5 for d in range(80)]
+        # FALLING：前 60 天持平，後 80 天緩步下跌
+        c_falling = [100.0] * 60 + [100.0 - d * 0.5 for d in range(80)]
+        df = pd.concat(
+            [self._make_df("RISING", c_rising), self._make_df("FALLING", c_falling)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["RISING", "FALLING"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["RISING"] > scores["FALLING"], (
+            f"SMA60 上升（{scores['RISING']:.3f}）應高於下滑（{scores['FALLING']:.3f}）"
+        )
+
+    def test_fewer_than_80d_skips_f1(self):
+        """資料不足 80 天時 F1 被跳過，技術分仍在 [0, 1]。"""
+        scanner = SwingScanner()
+        df = self._make_df("SHORT", [100.0 + i * 0.2 for i in range(70)])
+        result = scanner._compute_technical_scores(["SHORT"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0
+
+
+# ====================================================================== #
+#  P2-2: Swing F4 量價結構（VPT）測試
+# ====================================================================== #
+
+
+class TestSwingVolumePriceRatio:
+    """SwingScanner F4 改為漲日均量/跌日均量比率（VPT 概念）。"""
+
+    def _make_vpt_df(self, sid: str, up_day_vol: float, down_day_vol: float) -> pd.DataFrame:
+        """建立近 21 天資料：前 20 天交替漲跌，分別帶入不同成交量。"""
+        rows = []
+        base = 100.0
+        for d in range(21):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            if d == 0:
+                close = base
+                vol = (up_day_vol + down_day_vol) / 2
+            elif d % 2 == 1:  # 漲日
+                close = base + 0.5 * ((d + 1) // 2)
+                vol = up_day_vol
+            else:  # 跌日
+                close = base + 0.5 * (d // 2) - 0.3
+                vol = down_day_vol
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": close * 0.99,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": int(vol),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_up_vol_greater_scores_higher(self):
+        """漲日均量 > 跌日均量（健康多頭）應比漲日均量 < 跌日均量得分高。"""
+        scanner = SwingScanner()
+        # HEALTH：漲日均量 1,000,000；跌日均量 300,000（ratio≈3.3）
+        df_h = self._make_vpt_df("HEALTH", 1_000_000, 300_000)
+        # WEAK：漲日均量 300,000；跌日均量 1,000,000（ratio≈0.3）
+        df_w = self._make_vpt_df("WEAK", 300_000, 1_000_000)
+        df = pd.concat([df_h, df_w], ignore_index=True)
+        result = scanner._compute_technical_scores(["HEALTH", "WEAK"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["HEALTH"] > scores["WEAK"], (
+            f"健康量價（{scores['HEALTH']:.3f}）應高於弱勢量價（{scores['WEAK']:.3f}）"
+        )
+
+    def test_score_in_valid_range(self):
+        """量價結構分數仍在 [0, 1]。"""
+        scanner = SwingScanner()
+        df = _make_swing_price_df(80, 3)
+        sids = df["stock_id"].unique().tolist()
+        result = scanner._compute_technical_scores(sids, df)
+        assert (result["technical_score"] >= 0.0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+
+# ====================================================================== #
+#  P2-3: Dividend 低波動率因子測試
+# ====================================================================== #
+
+
+class TestDividendLowVolatility:
+    """DividendScanner F4 新增低歷史波動率（負向）因子。"""
+
+    def _make_df(self, sid: str, closes: list) -> pd.DataFrame:
+        rows = []
+        for d, c in enumerate(closes):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": c * 0.99,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                    "close": c,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_low_vol_scores_higher_than_high_vol(self):
+        """低波動率（穩健存股）技術分應高於高波動率股票。"""
+        scanner = DividendScanner()
+        # LOW_VOL：130 天幾乎持平（HV ≈ 0）
+        c_low = [100.0 + i * 0.01 for i in range(130)]
+        # HIGH_VOL：130 天每天暴漲暴跌 5%（HV >> 3%）
+        c_high = [100.0 * (1 + 0.05 * (1 if i % 2 == 0 else -1)) for i in range(130)]
+        df = pd.concat(
+            [self._make_df("LOW_VOL", c_low), self._make_df("HIGH_VOL", c_high)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["LOW_VOL", "HIGH_VOL"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["LOW_VOL"] > scores["HIGH_VOL"], (
+            f"低波動（{scores['LOW_VOL']:.3f}）應高於高波動（{scores['HIGH_VOL']:.3f}）"
+        )
+
+    def test_score_in_valid_range(self):
+        """4 因子後分數仍在 [0, 1]。"""
+        scanner = DividendScanner()
+        closes = [100.0] * 130
+        df = self._make_df("X", closes)
+        result = scanner._compute_technical_scores(["X"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0
+
+
+# ====================================================================== #
+#  P3: Dividend 除息缺口免疫測試
+# ====================================================================== #
+
+
+class TestDividendExDivGap:
+    """DividendScanner F1 SMA60 斜率在偵測到除息缺口（近 45 日跌幅 ≥ 4.5%）時給中性 0.5。"""
+
+    def _make_df(self, sid: str, closes: list) -> pd.DataFrame:
+        rows = []
+        for d, c in enumerate(closes):
+            day = date(2025, 1, 1) + timedelta(days=d)
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": day,
+                    "open": c * 0.99,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                    "close": c,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_ex_div_gap_suppresses_slope_penalty(self):
+        """
+        下滑趨勢中若近 45 日出現 ≥4.5% 單日跌幅（除息代理），
+        F1 給 0.5（中性），使整體分數不會因斜率下彎被大幅懲罰。
+        """
+        scanner = DividendScanner()
+        # FALLING_WITH_GAP：前 80 天持平 100，第 81 天除息跌 -5%（95），後 49 天繼續持平
+        # 此後 SMA60 向下斜，但因偵測到除息缺口 F1 → 0.5（而非懲罰）
+        c_gap = [100.0] * 80 + [95.0] + [95.0] * 49
+        # FALLING_NO_GAP：前 80 天緩跌，後 50 天繼續緩跌，無單日 4.5% 跌幅
+        # SMA60 斜率下彎，F1 → 低分
+        c_no_gap = [100.0 - i * 0.15 for i in range(130)]
+        df = pd.concat(
+            [self._make_df("GAP", c_gap), self._make_df("NOGAP", c_no_gap)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["GAP", "NOGAP"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        # GAP 有除息免疫（F1=0.5，中性），NOGAP 無免疫（F1 因斜率下彎被懲罰）
+        assert scores["GAP"] >= scores["NOGAP"], (
+            f"除息免疫（{scores['GAP']:.3f}）應不低於純下滑（{scores['NOGAP']:.3f}）"
+        )
+
+    def test_no_gap_calculates_slope_normally(self):
+        """無除息缺口的股票，SMA60 斜率正常計算（上升股優於下滑股）。"""
+        scanner = DividendScanner()
+        # RISE：前 50 天持平，後 80 天緩步上漲（SMA60 穩健向上，RSI 不過熱）
+        c_rising = [100.0] * 50 + [100.0 + d * 0.3 for d in range(80)]
+        # FALL：前 50 天持平，後 80 天緩步下跌（SMA60 向下）
+        c_falling = [100.0] * 50 + [100.0 - d * 0.3 for d in range(80)]
+        df = pd.concat(
+            [self._make_df("RISE", c_rising), self._make_df("FALL", c_falling)],
+            ignore_index=True,
+        )
+        result = scanner._compute_technical_scores(["RISE", "FALL"], df)
+        scores = result.set_index("stock_id")["technical_score"]
+        assert scores["RISE"] >= scores["FALL"], (
+            f"SMA60 上升（{scores['RISE']:.3f}）應不低於下滑（{scores['FALL']:.3f}）"
+        )
+
+    def test_score_in_valid_range(self):
+        """除息缺口偵測後分數仍在 [0, 1]。"""
+        scanner = DividendScanner()
+        # 含一次大跌
+        c = [100.0] * 80 + [95.0] + [95.0] * 49
+        df = self._make_df("Z", c)
+        result = scanner._compute_technical_scores(["Z"], df)
+        s = result.iloc[0]["technical_score"]
+        assert 0.0 <= s <= 1.0
