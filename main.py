@@ -117,6 +117,22 @@ from src.entry_exit import assess_timing, compute_atr_stops, compute_entry_trigg
 from src.features.indicators import calc_rsi14_from_series as _calc_rsi14_from_series
 from src.notification.line_notify import format_suggest_discord as _format_suggest_discord
 
+# Windows cp950 終端無法輸出 emoji/特殊 Unicode，全域覆蓋 print 避免 UnicodeEncodeError
+_builtin_print = print
+
+
+def print(*args: object, **kwargs: object) -> None:  # noqa: A001
+    """print() wrapper — UnicodeEncodeError 時 fallback 至 UTF-8 buffer。"""
+    try:
+        _builtin_print(*args, **kwargs)  # type: ignore[arg-type]
+    except UnicodeEncodeError:
+        text = " ".join(str(a) for a in args)
+        end = kwargs.get("end", "\n")
+        sys.stdout.flush()
+        sys.stdout.buffer.write(text.encode("utf-8"))
+        sys.stdout.buffer.write(str(end).encode("utf-8"))
+        sys.stdout.buffer.flush()
+
 
 def setup_logging() -> None:
     logging.basicConfig(
@@ -1151,7 +1167,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
             )
         else:
             actual = len(result.rankings.head(args.top))
-            print(f" → Top {actual}")
+            print(f" -> Top {actual}")
             scan_summaries.append(
                 f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → Top {actual}"
             )
@@ -1169,7 +1185,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     n_modes = sum(1 for r in results.values() if r is not None and not r.rankings.empty)
 
     print(f"\n{'═' * 100}")
-    print(f"多模式綜合比較 — {today}  ｜  掃描 {n_modes} 個模式  ×  Top {args.top}  ｜  排序：avg_score ↓")
+    print(f"多模式綜合比較 -- {today}  |  掃描 {n_modes} 個模式 x Top {args.top}  |  排序: avg_score desc")
     print(f"{'═' * 100}")
 
     if df.empty:
@@ -1712,11 +1728,13 @@ def cmd_alert_check(args: argparse.Namespace) -> None:
 
     # 分類顯示
     _EVENT_LABELS = {
-        "earnings_call": "📣 法說會",
-        "investor_day": "🏢 投資人日",
-        "filing": "📋 財報發布",
-        "revenue": "💰 營收公告",
-        "general": "📰 一般公告",
+        "earnings_call": "[法說] 法說會",
+        "investor_day": "[投日] 投資人日",
+        "filing": "[財報] 財報發布",
+        "revenue": "[營收] 營收公告",
+        "governance_change": "[治理] 董監改選",
+        "buyback": "[庫藏] 庫藏股",
+        "general": "[公告] 一般公告",
     }
     _SENTIMENT_LABELS = {1: "▲", 0: "─", -1: "▼"}
 
@@ -2312,48 +2330,48 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
     print(f"\n=== 籌碼異動警報（{today_str}，共 {total} 筆）===")
 
     if not df_vol.empty:
-        print(f"\n【📊 量能暴增】（今日量 > {lookback}MA × {vol_mult}x，共 {len(df_vol)} 支）")
+        print(f"\n[量增] 量能暴增（今日量 > {lookback}MA x {vol_mult}x，共 {len(df_vol)} 支）")
         for _, row in df_vol.iterrows():
             today_lot = int(row["today_vol"]) // 1000
             avg_lot = int(row["avg_vol"]) // 1000
             print(f"  {row['stock_id']}  今日量 {today_lot:,} 張  均量 {avg_lot:,} 張  倍率 {row['vol_ratio']:.2f}x")
     else:
-        print(f"\n【📊 量能暴增】無（門檻: > {lookback}MA × {vol_mult}x）")
+        print(f"\n[量增] 量能暴增 -- 無（門檻: > {lookback}MA x {vol_mult}x）")
 
     if not df_inst.empty:
         thresh_lot = int(inst_threshold) // 1000
-        print(f"\n【🏦 外資大買超】（淨買超 > {thresh_lot:,} 張，共 {len(df_inst)} 支）")
+        print(f"\n[外資] 外資大買超（淨買超 > {thresh_lot:,} 張，共 {len(df_inst)} 支）")
         for _, row in df_inst.iterrows():
             lots = int(row["inst_net"]) // 1000
             print(f"  {row['stock_id']}  外資淨買 +{lots:,} 張（+{int(row['inst_net']):,} 股）")
     else:
-        print(f"\n【🏦 外資大買超】無（門檻: > {int(inst_threshold) // 1000:,} 張）")
+        print(f"\n[外資] 外資大買超 -- 無（門檻: > {int(inst_threshold) // 1000:,} 張）")
 
     if not df_sbl.empty:
-        print(f"\n【🔴 借券賣出激增】（sbl_change > mean + {sbl_sigma}σ，共 {len(df_sbl)} 支）")
+        print(f"\n[借券] 借券賣出激增（sbl_change > mean + {sbl_sigma}x std，共 {len(df_sbl)} 支）")
         for _, row in df_sbl.iterrows():
             chg_lot = int(row["sbl_change"]) // 1000
             print(
                 f"  {row['stock_id']}  借券增加 +{chg_lot:,} 張（均值 {row['sbl_mean']:.0f}  std {row['sbl_std']:.0f}）"
             )
     else:
-        print(f"\n【🔴 借券賣出激增】無（門檻: > mean + {sbl_sigma}σ）")
+        print(f"\n[借券] 借券賣出激增 -- 無（門檻: > mean + {sbl_sigma}x std）")
 
     if not df_broker.empty:
-        print(f"\n【🎯 主力分點集中買進】（HHI > {hhi_threshold:.2f}，共 {len(df_broker)} 支）")
+        print(f"\n[主力] 主力分點集中買進（HHI > {hhi_threshold:.2f}，共 {len(df_broker)} 支）")
         for _, row in df_broker.iterrows():
             net_lot = int(row["net_buy_total"]) // 1000
             print(f"  {row['stock_id']}  HHI={row['broker_hhi']:.3f}  淨買超 +{net_lot:,} 張")
     else:
-        print(f"\n【🎯 主力分點集中買進】無（門檻: HHI > {hhi_threshold:.2f}）")
+        print(f"\n[主力] 主力分點集中買進 -- 無（門檻: HHI > {hhi_threshold:.2f}）")
 
     if not df_dt.empty:
-        print(f"\n【⚡ 隔日沖風險】（penalty > {dt_threshold:.1f}，共 {len(df_dt)} 支）")
+        print(f"\n[隔沖] 隔日沖風險（penalty > {dt_threshold:.1f}，共 {len(df_dt)} 支）")
         for _, row in df_dt.iterrows():
             tags = row.get("top_dt_brokers", "")
             print(f"  {row['stock_id']}  penalty={row['daytrade_penalty']:.2f}  分點: {tags}")
     else:
-        print(f"\n【⚡ 隔日沖風險】無（門檻: penalty > {dt_threshold:.1f}）")
+        print(f"\n[隔沖] 隔日沖風險 -- 無（門檻: penalty > {dt_threshold:.1f}）")
 
     if notify:
         from src.notification.line_notify import send_message
@@ -2402,7 +2420,7 @@ def cmd_revenue_scan(args: argparse.Namespace) -> None:
     min_margin = getattr(args, "min_margin_improve", 0.0)
     notify = getattr(args, "notify", False)
 
-    print(f"掃描 {len(watchlist)} 支股票（YoY ≥ {min_yoy}%，毛利率 QoQ ≥ {min_margin:.1f} pp）...")
+    print(f"掃描 {len(watchlist)} 支股票（YoY >= {min_yoy}%，毛利率 QoQ >= {min_margin:.1f} pp）...")
 
     df = _compute_revenue_scan(watchlist, min_yoy=min_yoy, min_margin_improve=min_margin)
 
@@ -3027,7 +3045,7 @@ def cmd_watchlist(args: argparse.Namespace) -> None:
                 )
             )
             session.commit()
-        print(f"✅ 已新增 {stock_id} 至觀察清單")
+        print(f"[OK] 已新增 {stock_id} 至觀察清單")
         print(f"   目前有效 watchlist：{len(get_effective_watchlist())} 支")
 
     elif action == "remove":
@@ -3039,7 +3057,7 @@ def cmd_watchlist(args: argparse.Namespace) -> None:
                 return
             session.delete(existing)
             session.commit()
-        print(f"✅ 已從觀察清單移除 {stock_id}")
+        print(f"[OK] 已從觀察清單移除 {stock_id}")
         print(f"   目前有效 watchlist：{len(get_effective_watchlist())} 支")
 
     elif action == "import":
@@ -3060,7 +3078,7 @@ def cmd_watchlist(args: argparse.Namespace) -> None:
                     )
                     added += 1
             session.commit()
-        print(f"✅ 從 settings.yaml 匯入完成：新增 {added} 支，已存在 {skipped} 支跳過")
+        print(f"[OK] 從 settings.yaml 匯入完成：新增 {added} 支，已存在 {skipped} 支跳過")
         print(f"   DB watchlist 共 {added + skipped} 支")
 
     else:
@@ -3157,7 +3175,7 @@ def cmd_concepts(args: argparse.Namespace) -> None:
                 )
             )
             session.commit()
-        print(f"✅ 已將 {stock_id} 新增至概念「{concept_name}」（source=manual）")
+        print(f"[OK] 已將 {stock_id} 新增至概念 [{concept_name}]（source=manual）")
 
     elif action == "remove":
         concept_name = args.concept_name
@@ -3176,7 +3194,7 @@ def cmd_concepts(args: argparse.Namespace) -> None:
                 return
             session.delete(existing)
             session.commit()
-        print(f"✅ 已從概念「{concept_name}」移除 {stock_id}")
+        print(f"[OK] 已從概念 [{concept_name}] 移除 {stock_id}")
 
     else:
         print(f"未知動作：{action}。可用動作：list / add / remove")
@@ -3224,7 +3242,7 @@ def cmd_concept_expand(args: argparse.Namespace) -> None:
     )
 
     if result.empty:
-        print(f"未找到與「{concept_name}」相關係數 ≥ {threshold} 的候選股")
+        print(f"未找到與 [{concept_name}] 相關係數 >= {threshold} 的候選股")
         return
 
     print(f"概念「{concept_name}」相關性候選（門檻 {threshold}，共 {len(result)} 支）：")
@@ -3259,7 +3277,7 @@ def cmd_concept_expand(args: argparse.Namespace) -> None:
                     )
                     added += 1
             session.commit()
-        print(f"\n✅ 已自動新增 {added} 支候選股至概念「{concept_name}」（source=correlation）")
+        print(f"\n[OK] 已自動新增 {added} 支候選股至概念 [{concept_name}]（source=correlation）")
     else:
         print("\n提示：加上 --auto 可自動將候選股寫入 DB")
 
@@ -3340,7 +3358,7 @@ def cmd_import_data(args: argparse.Namespace) -> None:
     elif count == 0:
         print("無資料可匯入（檔案為空）")
     else:
-        print(f"匯入完成：{count:,} 筆 → {args.table}（重複資料自動略過）")
+        print(f"匯入完成：{count:,} 筆 -> {args.table}（重複資料自動略過）")
 
 
 def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
@@ -3504,6 +3522,100 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
     return msg[:1900] if len(msg) > 1900 else msg
 
 
+def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> list[str]:
+    """建立各模式 Top N 的 Discord 訊息列表（每個模式一則訊息）。
+
+    從 DiscoveryRecord 查詢今日各模式的推薦結果，
+    格式化為 Discord 推播訊息（含分數 + 進出場建議）。
+
+    Returns:
+        list[str]: 每個模式一則訊息，可能為空列表。
+    """
+    import datetime
+
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import DiscoveryRecord
+
+    today = datetime.date.fromisoformat(today_str)
+    mode_labels = {
+        "momentum": "動能掃描",
+        "swing": "波段掃描",
+        "value": "價值掃描",
+        "dividend": "高息掃描",
+        "growth": "成長掃描",
+    }
+
+    messages: list[str] = []
+
+    with get_session() as session:
+        for mode_key, label in mode_labels.items():
+            rows = session.execute(
+                select(
+                    DiscoveryRecord.rank,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.stock_name,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.composite_score,
+                    DiscoveryRecord.technical_score,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.fundamental_score,
+                    DiscoveryRecord.chip_tier,
+                    DiscoveryRecord.entry_price,
+                    DiscoveryRecord.stop_loss,
+                    DiscoveryRecord.take_profit,
+                    DiscoveryRecord.industry_category,
+                )
+                .where(
+                    DiscoveryRecord.scan_date == today,
+                    DiscoveryRecord.mode == mode_key,
+                )
+                .order_by(DiscoveryRecord.rank)
+                .limit(top_n_per_mode)
+            ).all()
+
+            if not rows:
+                continue
+
+            lines: list[str] = [f"**{label}** Top {len(rows)} ({today_str})", ""]
+            lines.append("```")
+            lines.append(
+                f"{'#':>2} {'代號':>6} {'名稱':<6} {'收盤':>7} {'綜合':>5} {'技術':>5} {'籌碼':>5} {'基本':>5} {'層':>3} {'產業':<8}"
+            )
+            lines.append("-" * 70)
+
+            for r in rows:
+                name = str(r.stock_name or "")[:6]
+                industry = str(r.industry_category or "")[:8]
+                chip_tier = str(r.chip_tier or "N/A")
+                comp = f"{r.composite_score:.2f}" if r.composite_score else "  -"
+                tech = f"{r.technical_score:.2f}" if r.technical_score else "  -"
+                chip = f"{r.chip_score:.2f}" if r.chip_score else "  -"
+                fund = f"{r.fundamental_score:.2f}" if r.fundamental_score else "  -"
+                lines.append(
+                    f"{r.rank:>2} {r.stock_id:>6} {name:<6} {r.close:>7.1f} {comp:>5} {tech:>5} {chip:>5} {fund:>5} {chip_tier:>3} {industry:<8}"
+                )
+            lines.append("```")
+
+            # 進出場建議（Top 3）
+            ee_rows = [r for r in rows[:3] if r.entry_price and r.stop_loss and r.take_profit]
+            if ee_rows:
+                lines.append("**進出場建議：**")
+                for r in ee_rows:
+                    sl_pct = (r.stop_loss - r.entry_price) / r.entry_price
+                    tp_pct = (r.take_profit - r.entry_price) / r.entry_price
+                    lines.append(
+                        f"  {r.stock_id} {r.stock_name or ''}: "
+                        f"進場 {r.entry_price:.1f} / 止損 {r.stop_loss:.1f}({sl_pct:+.1%}) / 止利 {r.take_profit:.1f}({tp_pct:+.1%})"
+                    )
+
+            msg = "\n".join(lines)
+            messages.append(msg[:1900] if len(msg) > 1900 else msg)
+
+    return messages
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
@@ -3650,18 +3762,31 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     # ── Discord 摘要推播（或 dry-run 預覽）────────────────────────
     if notify or dry_run:
         msg = _build_morning_discord_summary(today_str, top_n)
+        discover_msgs = _build_discover_discord_detail(today_str, top_n_per_mode=min(top_n, 10))
         if dry_run:
             # 使用 UTF-8 輸出，繞過 Windows cp950 對 emoji 的限制
             print("-- Discord Summary Preview (dry-run) --")
             sys.stdout.flush()
             sys.stdout.buffer.write(msg.encode("utf-8"))
             sys.stdout.buffer.write(b"\n--\n")
+            for i, dm in enumerate(discover_msgs, 1):
+                sys.stdout.buffer.write(f"-- Discover Detail {i}/{len(discover_msgs)} --\n".encode("utf-8"))
+                sys.stdout.buffer.write(dm.encode("utf-8"))
+                sys.stdout.buffer.write(b"\n--\n")
             sys.stdout.buffer.flush()
         else:
             from src.notification.line_notify import send_message
 
             ok = send_message(msg)
             print(f"Discord 摘要通知: {'成功' if ok else '失敗（請確認 Webhook 設定）'}")
+            # 逐模式發送 Discover 詳細推播
+            for dm in discover_msgs:
+                ok_d = send_message(dm)
+                if not ok_d:
+                    print("  (部分 Discover 詳細通知失敗)")
+                    break
+            if discover_msgs:
+                print(f"Discord Discover 詳細通知: 已發送 {len(discover_msgs)} 則")
 
 
 def main() -> None:
