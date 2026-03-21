@@ -3414,7 +3414,7 @@ class SwingScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)
-        kwargs.setdefault("universe_config", UniverseConfig(volume_ratio_min=1.2, min_available_days=80))
+        kwargs.setdefault("universe_config", UniverseConfig(volume_ratio_min=1.2, min_available_days=60))
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -3903,8 +3903,8 @@ class SwingScanner(MarketScanner):
         if "acceleration" in rev.columns:
             merge_cols.append("acceleration")
         df_metrics = df_metrics.merge(rev[merge_cols], on="stock_id", how="left")
-        df_metrics["yoy_growth"] = df_metrics["yoy_growth"].fillna(0)
-        df_metrics["mom_growth"] = df_metrics["mom_growth"].fillna(0)
+        df_metrics["yoy_growth"] = pd.to_numeric(df_metrics["yoy_growth"], errors="coerce").fillna(0)
+        df_metrics["mom_growth"] = pd.to_numeric(df_metrics["mom_growth"], errors="coerce").fillna(0)
         df_metrics["yoy_rank_val"] = df_metrics["yoy_growth"].rank(pct=True)
         df_metrics["mom_rank_val"] = df_metrics["mom_growth"].rank(pct=True)
         if "acceleration" in df_metrics.columns:
@@ -4041,7 +4041,7 @@ class ValueScanner(MarketScanner):
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 120日低點計算
         kwargs.setdefault(
-            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=130)
+            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=60)
         )
         super().__init__(**kwargs)
 
@@ -4507,7 +4507,7 @@ class DividendScanner(MarketScanner):
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 均線糾結度計算
         kwargs.setdefault(
-            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=130)
+            "universe_config", UniverseConfig(trend_ma=None, volume_ratio_min=None, min_available_days=60)
         )
         super().__init__(**kwargs)
 
