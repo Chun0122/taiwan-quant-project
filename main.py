@@ -113,6 +113,7 @@ from datetime import date
 import pandas as pd
 
 from src.config import settings
+from src.entry_exit import assess_timing, compute_atr_stops, compute_entry_trigger
 from src.features.indicators import calc_rsi14_from_series as _calc_rsi14_from_series
 from src.notification.line_notify import format_suggest_discord as _format_suggest_discord
 
@@ -1096,59 +1097,8 @@ def _compute_trailing_stop(highest_price: float, atr14: float, multiplier: float
     return round(highest_price - atr14 * multiplier, 2)
 
 
-def _assess_timing(
-    rsi14: float,
-    close: float,
-    sma20: float,
-    atr_pct: float,
-    regime: str,
-) -> str:
-    """評估單股進場時機（純函數）。
-
-    綜合 RSI14 超買/超賣位置、均線相對位置、ATR 波動率、市場 Regime，
-    輸出中文時機評估字串。
-
-    Args:
-        rsi14:    最新 RSI14 值（0.0 ~ 100.0）
-        close:    最新收盤價
-        sma20:    SMA20 值
-        atr_pct:  ATR14 / close（波動率比例）
-        regime:   市場狀態 "bull" | "bear" | "sideways"
-
-    Returns:
-        中文時機評估字串
-    """
-    above_sma = sma20 > 0 and close > sma20 * 1.005
-
-    # 波動率修飾符
-    if atr_pct < 0.015:
-        vol_tag = "，低波動"
-    elif atr_pct > 0.04:
-        vol_tag = "，高波動謹慎"
-    else:
-        vol_tag = ""
-
-    # 決策矩陣
-    if rsi14 >= 70:
-        timing = "謹慎觀望：RSI 超買，追高風險高"
-    elif rsi14 <= 30:
-        if regime in ("bull", "sideways"):
-            timing = "潛在反彈：RSI 超賣，留意止損"
-        else:
-            timing = "下跌趨勢中超賣，等待企穩訊號"
-    elif above_sma and regime == "bull":
-        if rsi14 >= 55:
-            timing = "積極做多：動能強勁 + 趨勢向上"
-        else:
-            timing = "順勢佈局：趨勢向上，動能待確認"
-    elif above_sma and regime == "sideways":
-        timing = "區間上軌，注意壓力，設好止損"
-    elif regime == "bear":
-        timing = "空頭環境，建議觀望或嚴守止損"
-    else:
-        timing = "等待訊號：尚未站上均線"
-
-    return timing + vol_tag
+# 向後相容別名：assess_timing 已遷移至 src.entry_exit
+_assess_timing = assess_timing
 
 
 def _cmd_discover_all(args: argparse.Namespace) -> None:
@@ -2622,9 +2572,9 @@ def cmd_suggest(args: argparse.Namespace) -> None:
     entry_price = round(close, 2)
     atr_pct = atr14 / close if close > 0 else 0.0
 
-    if atr14 > 0:
-        stop_loss = round(close - 1.5 * atr14, 2)
-        take_profit = round(close + 3.0 * atr14, 2)
+    stop_loss, take_profit = compute_atr_stops(close, atr14, regime)
+
+    if stop_loss is not None and take_profit is not None:
         risk_pct = (entry_price - stop_loss) / entry_price * 100
         reward_pct = (take_profit - entry_price) / entry_price * 100
         rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0.0
@@ -2640,27 +2590,14 @@ def cmd_suggest(args: argparse.Namespace) -> None:
         rr_str = "—"
         atr_str = "—"
 
-    # ── 5. 計算 entry_trigger（與 scanner.py 邏輯一致）────────────
-    if sma20 > 0:
-        if close > sma20 * 1.01:
-            trigger = "站上均線"
-        elif close >= sma20 * 0.99:
-            trigger = "貼近均線"
-        else:
-            trigger = "均線下方，等待確認"
-    else:
-        trigger = "均線下方，等待確認"
-
-    if atr_pct < 0.02:
-        trigger += "，低波動"
-    elif atr_pct > 0.04:
-        trigger += "，高波動謹慎"
+    # ── 5. 計算 entry_trigger（共用純函數，與 scanner.py 一致）────
+    trigger = compute_entry_trigger(close, sma20, atr_pct, regime)
 
     # ── 6. 時機評估 ────────────────────────────────────────────────
     timing = _assess_timing(rsi14, close, sma20, atr_pct, regime)
 
     # ── 7. 輸出 CLI ────────────────────────────────────────────────
-    regime_zh = {"bull": "多頭", "bear": "空頭", "sideways": "盤整"}.get(regime, regime)
+    regime_zh = {"bull": "多頭", "bear": "空頭", "sideways": "盤整", "crisis": "崩盤"}.get(regime, regime)
     taiex_str = f"TAIEX {taiex_close:,.0f}" if taiex_close > 0 else ""
 
     sep60 = "═" * 60
@@ -2792,33 +2729,20 @@ def _watch_add(args: argparse.Namespace) -> None:
         sma20 = float(df["close"].tail(20).mean()) if len(df) >= 20 else 0.0
         atr_pct = atr14 / close if close > 0 else 0.0
 
+        # Regime 偵測（與 suggest 一致）
+        try:
+            from src.regime.detector import MarketRegimeDetector
+
+            _regime: str = MarketRegimeDetector().detect()["regime"]
+        except Exception:
+            _regime = "sideways"
+
         entry_price_val = round(float(args.price), 2) if args.price else round(close, 2)
-        stop_loss_val = (
-            round(float(args.stop), 2)
-            if args.stop
-            else (round(entry_price_val - 1.5 * atr14, 2) if atr14 > 0 else None)
-        )
-        take_profit_val = (
-            round(float(args.target), 2)
-            if args.target
-            else (round(entry_price_val + 3.0 * atr14, 2) if atr14 > 0 else None)
-        )
+        _auto_sl, _auto_tp = compute_atr_stops(entry_price_val, atr14, _regime)
+        stop_loss_val = round(float(args.stop), 2) if args.stop else _auto_sl
+        take_profit_val = round(float(args.target), 2) if args.target else _auto_tp
 
-        if sma20 > 0:
-            if close > sma20 * 1.01:
-                entry_trigger_val: str | None = "站上均線"
-            elif close >= sma20 * 0.99:
-                entry_trigger_val = "貼近均線"
-            else:
-                entry_trigger_val = "均線下方，等待確認"
-        else:
-            entry_trigger_val = None
-
-        if entry_trigger_val and atr_pct > 0:
-            if atr_pct < 0.02:
-                entry_trigger_val += "，低波動"
-            elif atr_pct > 0.04:
-                entry_trigger_val += "，高波動謹慎"
+        entry_trigger_val: str | None = compute_entry_trigger(close, sma20, atr_pct, _regime)
 
         valid_until_val = (pd.Timestamp(today) + pd.offsets.BDay(5)).date()
         source_val = "manual"

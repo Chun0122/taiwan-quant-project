@@ -1184,11 +1184,14 @@ python main.py suggest 2317 --notify       # 附加 Discord 通知
 
 - **ATR14**：14 日 Average True Range（True Range 定義：max(H-L, |H-prev_C|, |L-prev_C|)）
 - **進場價**：最新收盤價
-- **止損價**：進場價 - 1.5 × ATR14（向下約 1.5 倍波動）
-- **目標價**：進場價 + 3.0 × ATR14（風險報酬比恆為 1:2）
+- **止損價**：進場價 - stop_mult × ATR14（**依 Regime 自適應調整**）
+- **目標價**：進場價 + target_mult × ATR14（**依 Regime 自適應調整**）
+- **Regime 自適應 ATR 倍數**：bull=(1.5, 3.5)、sideways=(1.5, 3.0)、bear=(1.2, 2.5)、crisis=(1.0, 1.8)
 - **SMA20**：最近 20 日收盤均線，判斷均線位置
 - **RSI14**：Wilder EWM 平滑，判斷超買（≥70）/ 超賣（≤30）
-- **市場 Regime**：讀取 TAIEX（加權指數）→ 多頭 / 空頭 / 盤整
+- **市場 Regime**：讀取 TAIEX（加權指數）→ 多頭 / 空頭 / 盤整 / 崩盤
+
+> **Regime 自適應**：suggest 與 discover 使用相同的 ATR 倍數常數（`src/entry_exit.py:REGIME_ATR_PARAMS`），確保止損/目標價在不同市場狀態下一致。crisis 模式止損更窄（1.0×）、目標更保守（1.8×），避免崩盤期過度曝險。
 
 **輸出範例：**
 
@@ -1224,7 +1227,7 @@ python main.py suggest 2317 --notify       # 附加 Discord 通知
 追蹤進場後的持倉狀態，自動比對最新收盤價標記止損/止利/過期。
 
 ```bash
-# 新增持倉（自動計算 ATR14-based 止損止利）
+# 新增持倉（自動計算 ATR14-based 止損止利，依 Regime 自適應調整）
 python main.py watch add 2330
 
 # 手動指定進場價/止損/目標/股數
@@ -1258,8 +1261,8 @@ python main.py watch update-status
 |------|------|
 | `stock_id` | 股票代號（必填） |
 | `--price P` | 進場價（預設使用最新收盤）|
-| `--stop S` | 止損價（預設 entry - 1.5×ATR14）|
-| `--target T` | 目標價（預設 entry + 3.0×ATR14）|
+| `--stop S` | 止損價（預設依 Regime 自適應：entry - stop_mult×ATR14）|
+| `--target T` | 目標價（預設依 Regime 自適應：entry + target_mult×ATR14）|
 | `--qty Q` | 股數（選填）|
 | `--from-discover MODE` | 從最新 discover 記錄匯入（MODE: momentum/swing/value/dividend/growth）|
 | `--notes TEXT` | 備註（選填）|

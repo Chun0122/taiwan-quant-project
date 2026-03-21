@@ -41,6 +41,7 @@ from src.data.schema import (
     StockValuation,
 )
 from src.discovery.universe import UniverseConfig, UniverseFilter
+from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -1943,13 +1944,8 @@ class MarketScanner:
         """hook：子類可在加權後做額外處理。"""
         return candidates
 
-    # Regime 自適應 ATR 止損/目標倍數
-    _REGIME_ATR_PARAMS: dict[str, tuple[float, float]] = {
-        "bull": (1.5, 3.5),
-        "sideways": (1.5, 3.0),
-        "bear": (1.2, 2.5),
-        "crisis": (1.0, 1.8),  # 崩盤期維持合理止損距離（≥1日波幅），避免日內波動頻繁洗出
-    }
+    # Regime 自適應 ATR 止損/目標倍數（引用共用常數）
+    _REGIME_ATR_PARAMS = REGIME_ATR_PARAMS
 
     def _compute_entry_exit_cols(
         self, stock_ids: list[str], df_price: pd.DataFrame, regime: str = "sideways"
@@ -1974,8 +1970,6 @@ class MarketScanner:
         Returns:
             DataFrame，index reset，欄位含 stock_id 及上述五欄
         """
-        stop_mult, target_mult = self._REGIME_ATR_PARAMS.get(regime, (1.5, 3.0))
-
         scan_date = getattr(self, "scan_date", date.today())
         valid_until = (pd.Timestamp(scan_date) + pd.offsets.BDay(5)).date()
 
@@ -2015,33 +2009,12 @@ class MarketScanner:
                 continue
 
             atr14 = _calc_atr14(stock_data)
-            stop_loss = round(close - stop_mult * atr14, 2) if atr14 > 0 else None
-            take_profit = round(close + target_mult * atr14, 2) if atr14 > 0 else None
+            stop_loss, take_profit = compute_atr_stops(close, atr14, regime)
 
             # SMA20 — 用 tail(20) 的平均收盤價
             sma20 = float(stock_data["close"].tail(20).mean())
-
-            # 均線位置判斷
-            if sma20 > 0:
-                if close > sma20 * 1.01:
-                    trigger = "站上均線"
-                elif close >= sma20 * 0.99:
-                    trigger = "貼近均線"
-                else:
-                    trigger = "均線下方，等待確認"
-            else:
-                trigger = "均線下方，等待確認"
-
-            # 附加波動率說明
             atr_pct = atr14 / close if close > 0 else 0.0
-            if atr_pct < 0.02:
-                trigger += "，低波動"
-            elif atr_pct > 0.04:
-                trigger += "，高波動謹慎"
-
-            # Crisis 模式提示降低部位
-            if regime == "crisis":
-                trigger += "｜⚠ 崩盤期建議降低部位規模"
+            trigger = compute_entry_trigger(close, sma20, atr_pct, regime)
 
             rows.append(
                 {

@@ -1,4 +1,4 @@
-"""測試 suggest 命令的純函數：calc_rsi14_from_series、_assess_timing、format_suggest_discord。
+"""測試 suggest 命令的純函數：calc_rsi14_from_series、assess_timing、format_suggest_discord。
 
 所有測試皆為純函數測試（零 mock），不需要 DB 或外部服務。
 """
@@ -10,7 +10,7 @@ import datetime
 import numpy as np
 import pandas as pd
 
-from main import _assess_timing
+from src.entry_exit import assess_timing as _assess_timing
 from src.features.indicators import calc_rsi14_from_series as _calc_rsi14_from_series
 from src.notification.line_notify import format_suggest_discord as _format_suggest_discord
 
@@ -173,6 +173,18 @@ class TestAssessTiming:
         result = _assess_timing(50.0, 100.0, 100.0, 0.03, "bull")
         assert isinstance(result, str)
         assert len(result) > 0
+
+    # ── Crisis Regime ──────────────────────────────────────────
+
+    def test_crisis_neutral_rsi_triggers_crisis_branch(self):
+        """crisis + RSI 中性 → 崩盤期專用分支。"""
+        result = _assess_timing(rsi14=50.0, close=103.0, sma20=100.0, atr_pct=0.03, regime="crisis")
+        assert "崩盤期" in result
+
+    def test_crisis_oversold_rsi_triggers_bear_path(self):
+        """crisis + RSI ≤ 30 → 走 bear 路徑（非 bull/sideways）。"""
+        result = _assess_timing(rsi14=25.0, close=90.0, sma20=100.0, atr_pct=0.03, regime="crisis")
+        assert "企穩" in result
 
 
 # ============================================================

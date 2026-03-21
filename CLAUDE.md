@@ -112,7 +112,7 @@ python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto  # 自動加入
 
 ### 測試
 
-使用 pytest 測試框架，1100 個測試覆蓋核心模組：
+使用 pytest 測試框架，1121 個測試覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -154,7 +154,8 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_financial.py`     | `src/data/fetcher.py` 財報 EAV pivot + 衍生比率 + pipeline upsert | 純函數 + mock API + in-memory SQLite |
 | `tests/test_market_overview.py` | `data_loader` 市場總覽查詢 + `charts` 4 個圖表函數 | in-memory SQLite + 純函數 |
 | `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
-| `tests/test_suggest.py`        | `src/features/indicators.py` `calc_rsi14_from_series` + `main.py` `_assess_timing` + `src/notification/line_notify.py` `format_suggest_discord` | 純函數 |
+| `tests/test_entry_exit.py`     | `src/entry_exit.py` `compute_atr_stops`（7 個）+ `compute_entry_trigger`（7 個）+ `assess_timing` crisis（3 個）+ `REGIME_ATR_PARAMS` 一致性（2 個） | 純函數 |
+| `tests/test_suggest.py`        | `src/features/indicators.py` `calc_rsi14_from_series` + `src/entry_exit.py` `assess_timing`（含 crisis 測試）+ `src/notification/line_notify.py` `format_suggest_discord` | 純函數 |
 | `tests/test_watch.py`          | `main.py` `_compute_watch_status` / `_compute_trailing_stop` 純函數 + `WatchEntry` ORM CRUD（含 trailing stop 欄位） | 純函數 + in-memory SQLite |
 | `tests/test_holding.py`        | `_extract_level_lower_bound` + `compute_whale_score` + `HoldingDistribution` ORM + `fetch_holding_distribution`（FinMind mock，舊接口相容） | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
@@ -211,6 +212,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
+| `src/entry_exit.py`                 | 進出場建議共用純函數：`REGIME_ATR_PARAMS` 常數（bull/sideways/bear/crisis ATR 倍數）、`compute_atr_stops()` ATR 止損止利、`compute_entry_trigger()` 進場觸發文字、`assess_timing()` 時機評估（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB/ADX(14) → EAV 格式 + `compute_indicators_from_df()` 純函數（除權息還原用，含 adx_14 欄位）+ `calc_rsi14_from_series()` 純函數（從 main.py 遷移）+ `aggregate_to_weekly()` 純函數（日K聚合週K + 週線 SMA13/RSI14/MACD） |
 | `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）                                                                                 |
@@ -327,6 +329,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 51 | ✅ | **地緣政治/崩盤情境 Crisis Regime（勝率優化）** | **Regime 第四狀態 crisis**：`detect_crisis_signals()` 純函數（detector.py）三訊號 2/3 觸發（5日跌>5% / 連跌≥3天 / 波動率1.8x），覆蓋多數決結果；`REGIME_WEIGHTS["crisis"]` 五模式保守權重（momentum：news=40%,tech=10%；swing：fund=50%,tech=5%）；**Crisis Scanner 行為**：`_REGIME_ATR_PARAMS["crisis"]=(1.0, 1.8)`（合理止損距離，避免日內波動洗出）；`compute_taiex_relative_strength()` 模組級純函數（個股 20 日超額報酬 vs TAIEX）；`_apply_crisis_filter()` Stage 3.5b（僅 crisis 模式：剔除跑輸 TAIEX 超過 10% 的弱勢股，四個 Scanner run() 均插入）；**morning-routine Step 0**：`_compute_macro_stress_check()` 純函數 + CRISIS 警示 banner + Discord 首部警示區塊；`TestDetectCrisisSignals`（8 個）+ `TestRegimeWeightsCrisis`（5 個）+ `TestComputeTaixRelativeStrength`（6 個）+ `TestApplyCrisisFilter`（4 個）；1056 測試通過 |
 | 52 | ✅ | **隔日沖偵測 + 扣分（Discover 籌碼面）** | `_KNOWN_DAYTRADE_BROKER_NAMES` 靜態黑名單（frozenset，broker_name 匹配）；`detect_daytrade_brokers()` 向量化行為偵測（T+1~T+3 shift 配對，sell_ratio≥0.5 + min_events≥2）；`compute_daytrade_penalty()` 三層扣分（行為偵測+黑名單+即時大量風險，group aggregation 全部隔沖分點合計）+ 流動性阻尼（daytrade_net_buy < 20日均量×5% 時 penalty 減半）；`_apply_daytrade_penalty()` 乘法修正 broker_rank（`rank *= 1 - penalty×0.5`）；四個 Scanner（Momentum/Swing/Value/Growth）`_compute_chip_scores()` 整合（DividendScanner 排除，2F 無分點因子）；`DiscoveryRecord` ORM 新增 `daytrade_penalty`/`daytrade_tags` 欄位（含 migration）；`anomaly-scan` 新增第 5 類 `daytrade_risk` + `--dt-threshold` CLI 參數；`detect_daytrade_risk()` 純函數（main.py）；morning-routine Discord 摘要含隔沖警示；`TestDetectDaytradeBrokers`（6 個）+ `TestComputeDaytradePenalty`（7 個）+ `TestDetectDaytradeRisk`（4 個）；1089 測試通過 |
 | 53 | ✅ | **Discover 風險過濾強化（五項優化）** | **1. Dividend 收緊波動度**：DividendScanner percentile 90→75（防禦性策略應收緊波動門檻，避免股價暴跌導致殖利率飆高的價值陷阱）；**2. Crisis 絕對趨勢濾網**：`_apply_crisis_filter()` 新增 MA60 絕對趨勢檢查（close < MA60 直接剔除），與既有相對強度（vs TAIEX）形成雙重濾網；**3. 波動率絕對值 cap**：`_apply_atr_risk_filter()` 新增 `absolute_cap=0.08`（ATR ratio > 8% 一律剔除）；`_apply_vol_risk_filter()` 新增 `absolute_cap`（年化 80% / 日波動 5%），取 percentile 門檻與絕對值 cap 的較嚴格者；**4. 資料不足防禦**：`_apply_vol_risk_filter()` 資料不足 10 天時 vol 從 0.0 改為 np.inf（確保被剔除），percentile 計算排除 inf 值；**5. Crisis 止損調整**：`_REGIME_ATR_PARAMS["crisis"]` 從 (0.8, 1.8) 調至 (1.0, 1.8)（維持合理止損距離避免日內波動洗出）；crisis 模式 `entry_trigger` 新增「建議降低部位規模」文字提示；`TestRiskFilterEnhancements`（4 個）+ `TestCrisisFilterMA60`（4 個）+ `TestCrisisEntryTriggerText`（3 個）；1100 測試通過 |
+
+| 54 | ✅ | **進出場建議邏輯統一重構（Task 54）** | 新建 `src/entry_exit.py` 共用純函數模組：`REGIME_ATR_PARAMS` 常數（bull/sideways/bear/crisis ATR 倍數）、`compute_atr_stops()` 依 Regime 計算 ATR 止損止利、`compute_entry_trigger()` 進場觸發文字、`assess_timing()` 時機評估（含 crisis 分支「崩盤期：大幅減碼或暫停進場」）；`scanner.py` `_REGIME_ATR_PARAMS` 改引用共用常數、`_compute_entry_exit_cols()` delegate 給共用函數；`main.py` `cmd_suggest` 改用 `compute_atr_stops(regime)` Regime 自適應止損（原硬編碼 1.5/3.0）+ `compute_entry_trigger()`；`_watch_add` manual 模式新增 Regime 偵測 + 共用函數；`_assess_timing` 改為 `assess_timing` 別名；`tests/test_entry_exit.py` 19 個純函數測試 + `tests/test_suggest.py` 新增 2 個 crisis 測試；1121 測試通過 |
 
 ## 已確認事項（規劃時勿重複提出）
 
