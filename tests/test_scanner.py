@@ -3720,7 +3720,9 @@ class TestSwingChipSmartBrokerTier:
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
         monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: _make_sbl_df(ids))
         monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
-        monkeypatch.setattr("src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+        monkeypatch.setattr(
+            "src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result
+        )
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert result.iloc[0]["chip_tier"] == "6F"
@@ -3741,7 +3743,9 @@ class TestSwingChipSmartBrokerTier:
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
         monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
         monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
-        monkeypatch.setattr("src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+        monkeypatch.setattr(
+            "src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result
+        )
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         # 沒有 broker/whale/sbl，smart_broker 單獨無法觸發 6F
