@@ -1948,7 +1948,7 @@ class MarketScanner:
         "bull": (1.5, 3.5),
         "sideways": (1.5, 3.0),
         "bear": (1.2, 2.5),
-        "crisis": (0.8, 1.8),  # 極緊止損，保守目標；崩盤跳空常突破止損，盡早平倉
+        "crisis": (1.0, 1.8),  # 崩盤期維持合理止損距離（≥1日波幅），避免日內波動頻繁洗出
     }
 
     def _compute_entry_exit_cols(
@@ -2038,6 +2038,10 @@ class MarketScanner:
                 trigger += "，低波動"
             elif atr_pct > 0.04:
                 trigger += "，高波動謹慎"
+
+            # Crisis 模式提示降低部位
+            if regime == "crisis":
+                trigger += "｜⚠ 崩盤期建議降低部位規模"
 
             rows.append(
                 {
@@ -2416,10 +2420,11 @@ class MarketScanner:
         df_price: pd.DataFrame,
         underperform_threshold: float = -0.10,
     ) -> pd.DataFrame:
-        """Stage 3.5b — crisis 模式相對強度過濾。
+        """Stage 3.5b — crisis 模式雙重過濾（相對強度 + 絕對趨勢）。
 
-        僅在 self.regime == "crisis" 時執行，剔除 20 日超額報酬（個股 − TAIEX）
-        低於 underperform_threshold 的弱勢股，只保留能抵抗大盤跌勢的防禦標的。
+        僅在 self.regime == "crisis" 時執行，兩道濾網：
+        1. 相對強度：剔除 20 日超額報酬（個股 − TAIEX）低於 underperform_threshold 的弱勢股
+        2. 絕對趨勢：剔除收盤價跌破 60 日均線的股票（防止選到隨大盤跳水的標的）
 
         非 crisis regime 時零開銷直接回傳原 DataFrame。
 
@@ -2437,23 +2442,53 @@ class MarketScanner:
         if scored.empty or df_price.empty:
             return scored
 
+        # --- 濾網 1：相對強度（vs TAIEX） ---
         excess = compute_taiex_relative_strength(df_price, window=20)
-        if excess.empty:
+        if not excess.empty:
+            weak_ids = set(excess[excess < underperform_threshold].index)
+            if weak_ids:
+                before = len(scored)
+                scored = scored[~scored["stock_id"].isin(weak_ids)].copy()
+                removed = before - len(scored)
+                if removed > 0:
+                    logger.info(
+                        "Stage 3.5b Crisis 相對強度過濾：剔除 %d 支跑輸 TAIEX 超過 %.0f%% 的弱勢股",
+                        removed,
+                        abs(underperform_threshold) * 100,
+                    )
+
+        # --- 濾網 2：絕對趨勢（close < MA60 剔除） ---
+        if scored.empty:
             return scored
 
-        weak_ids = set(excess[excess < underperform_threshold].index)
-        if not weak_ids:
+        non_taiex = df_price[df_price["stock_id"] != "TAIEX"]
+        if non_taiex.empty:
             return scored
 
-        before = len(scored)
-        scored = scored[~scored["stock_id"].isin(weak_ids)].copy()
-        removed = before - len(scored)
-        if removed > 0:
-            logger.info(
-                "Stage 3.5b Crisis 相對強度過濾：剔除 %d 支跑輸 TAIEX 超過 %.0f%% 的弱勢股",
-                removed,
-                abs(underperform_threshold) * 100,
-            )
+        candidate_ids = set(scored["stock_id"])
+        candidate_prices = non_taiex[non_taiex["stock_id"].isin(candidate_ids)]
+        if candidate_prices.empty:
+            return scored
+
+        below_ma60_ids: set[str] = set()
+        for sid, grp in candidate_prices.sort_values("date").groupby("stock_id"):
+            if len(grp) < 60:
+                continue  # 資料不足 60 天無法計算 MA60，不懲罰
+            ma60 = grp["close"].rolling(60, min_periods=60).mean().iloc[-1]
+            latest_close = grp["close"].iloc[-1]
+            if pd.notna(ma60) and latest_close < ma60:
+                below_ma60_ids.add(sid)
+
+        if below_ma60_ids:
+            before = len(scored)
+            scored = scored[~scored["stock_id"].isin(below_ma60_ids)].copy()
+            removed = before - len(scored)
+            if removed > 0:
+                logger.info(
+                    "Stage 3.5b Crisis 絕對趨勢過濾：剔除 %d 支收盤價跌破 MA60 的股票",
+                    removed,
+                )
+
         return scored
 
     # ------------------------------------------------------------------ #
@@ -2461,9 +2496,17 @@ class MarketScanner:
     # ------------------------------------------------------------------ #
 
     def _apply_atr_risk_filter(
-        self, scored: pd.DataFrame, df_price: pd.DataFrame, percentile: int = 80
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+        percentile: int = 80,
+        absolute_cap: float = 0.08,
     ) -> pd.DataFrame:
-        """ATR-based 風險過濾：ATR(14)/close > N-th percentile 的股票剔除。"""
+        """ATR-based 風險過濾：ATR(14)/close > N-th percentile 或 > absolute_cap 的股票剔除。
+
+        雙重門檻取嚴格者：相對 percentile + 絕對值上限（預設 8%），
+        避免市場整體高波動時 percentile 門檻過度上移。
+        """
         if scored.empty or df_price.empty:
             return scored
 
@@ -2477,14 +2520,16 @@ class MarketScanner:
             atr_ratios.append({"stock_id": sid, "atr_ratio": ratio})
 
         df_atr = pd.DataFrame(atr_ratios)
-        threshold = df_atr["atr_ratio"].quantile(percentile / 100)
+        pct_threshold = df_atr["atr_ratio"].quantile(percentile / 100)
+        # 取 percentile 門檻與絕對值 cap 的較嚴格者（較低值）
+        threshold = min(pct_threshold, absolute_cap)
         high_vol_ids = df_atr[df_atr["atr_ratio"] > threshold]["stock_id"].tolist()
 
         before_count = len(scored)
         scored = scored[~scored["stock_id"].isin(high_vol_ids)].copy()
         removed = before_count - len(scored)
         if removed > 0:
-            logger.info("Stage 3.5: ATR 風險過濾剔除 %d 支高波動股", removed)
+            logger.info("Stage 3.5: ATR 風險過濾剔除 %d 支高波動股（門檻 %.2f%%）", removed, threshold * 100)
         return scored
 
     def _apply_vol_risk_filter(
@@ -2494,23 +2539,31 @@ class MarketScanner:
         percentile: int,
         window: int = 20,
         annualize: bool = False,
+        absolute_cap: float | None = None,
     ) -> pd.DataFrame:
-        """波動率-based 風險過濾：N 日波動率 > M-th percentile 的股票剔除。
+        """波動率-based 風險過濾：N 日波動率 > M-th percentile 或 > absolute_cap 的股票剔除。
 
         Args:
             percentile: 剔除閾值（80 表示剔除波動率超過第 80 百分位數的股票）
             window: 計算波動率的回溯天數（預設 20）
             annualize: 是否年化（乘以 sqrt(252)）
+            absolute_cap: 絕對波動率上限（預設 None 自動推算：
+                          annualize=True 時 0.80（80%年化），
+                          annualize=False 時 0.05（5%日波動率））
         """
         if scored.empty or df_price.empty:
             return scored
+
+        if absolute_cap is None:
+            absolute_cap = 0.80 if annualize else 0.05
 
         grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
         vol_data = []
         for sid in scored["stock_id"].tolist():
             stock_data = grouped.get_group(sid) if sid in grouped.groups else pd.DataFrame()
             if len(stock_data) < 10:
-                vol_data.append({"stock_id": sid, "vol": 0.0})
+                # 資料不足：設為極大值以確保被剔除（防禦性設計）
+                vol_data.append({"stock_id": sid, "vol": np.inf})
                 continue
 
             closes = (
@@ -2525,7 +2578,9 @@ class MarketScanner:
             vol_data.append({"stock_id": sid, "vol": vol})
 
         df_vol = pd.DataFrame(vol_data)
-        threshold = df_vol["vol"].quantile(percentile / 100)
+        pct_threshold = df_vol[df_vol["vol"] < np.inf]["vol"].quantile(percentile / 100)
+        # 取 percentile 門檻與絕對值 cap 的較嚴格者
+        threshold = min(pct_threshold, absolute_cap) if pd.notna(pct_threshold) else absolute_cap
         high_vol_ids = df_vol[df_vol["vol"] > threshold]["stock_id"].tolist()
 
         before_count = len(scored)
@@ -4851,8 +4906,12 @@ class DividendScanner(MarketScanner):
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
-        """高息模式風險過濾：近 20 日波動率 > 90th percentile 剔除。"""
-        return self._apply_vol_risk_filter(scored, df_price, percentile=90)
+        """高息模式風險過濾：近 20 日波動率 > 75th percentile 剔除。
+
+        高股息策略具防禦性質，應收緊波動度門檻（而非放寬），
+        避免「股價暴跌導致殖利率飆高」的價值陷阱。
+        """
+        return self._apply_vol_risk_filter(scored, df_price, percentile=75)
 
 
 # ====================================================================== #

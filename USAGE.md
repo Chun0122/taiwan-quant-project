@@ -797,7 +797,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 技術面 | 45% | 5日動能、10日動能、20日突破、量比、成交量加速 |
 | 籌碼面 | 45% | 最高 8 因子，依資料可用性自動升降級（詳見下方「籌碼面因子分級」） |
 | 基本面 | 10% | 營收 YoY > 0 過濾（加分/不加分） |
-| 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
+| 風險過濾 | — | ATR(14)/close > 80th percentile 或 > 8% 剔除（取嚴格者） |
 
 **籌碼面因子分級（MomentumScanner，依資料可用性自動選擇最高 Tier）：**
 
@@ -830,7 +830,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 技術面 | 30% | 趨勢確認(close>SMA60)、均線排列(SMA20>SMA60)、60日動能、量價齊揚 |
 | 籌碼面 | 30% | 投信淨買超(50%)、法人20日累積買超(50%) |
 | 基本面 | 40% | 營收YoY(40%)、MoM(30%)、營收加速度(30%) |
-| 風險過濾 | — | 年化波動率 > 85th percentile 剔除 |
+| 風險過濾 | — | 年化波動率 > 85th percentile 或 > 80% 剔除（取嚴格者） |
 
 **Value 模式：**
 
@@ -840,7 +840,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 估值面 | 30% | PE反向排名(40%)、PB反向排名(30%)、殖利率排名(30%) |
 | 籌碼面 | 20% | 投信近期買超(50%)、法人累積買超(50%) |
 | 粗篩門檻 | — | PE > 0 且 < **同業 PE 中位數 × 1.5**（同業 < 3 支時 fallback PE < 50）、殖利率 > 2% |
-| 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
+| 風險過濾 | — | 近20日波動率 > 90th percentile 或 > 5%日波動率 剔除（取嚴格者） |
 
 **Dividend 模式：**
 
@@ -850,7 +850,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 殖利率面 | 25~35% | 殖利率排名(50%)、PE反向排名(30%)、PB反向排名(20%) |
 | 籌碼面 | 10~20% | 投信近期買超(50%)、法人累積買超(50%) |
 | 粗篩門檻 | — | 殖利率 > 3%、PE > 0、**EPS 連續性**（近4季任一季 EPS ≤ 0 者排除；無財報資料者 pass through 不誤殺） |
-| 風險過濾 | — | 近20日波動率 > 90th percentile 剔除 |
+| 風險過濾 | — | 近20日波動率 > **75th percentile** 或 > 5%日波動率 剔除（防禦性策略收緊波動門檻，避免價值陷阱） |
 
 **Growth 模式：**
 
@@ -860,7 +860,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 技術面 | 15~30% | 5日動能、10日動能、20日突破、量比、成交量加速 |
 | 籌碼面 | 15~20% | 外資連續買超天數 + 買超佔量比 + 合計買超 + 券資比（有資料時） |
 | 粗篩門檻 | — | 營收 YoY > 10% |
-| 風險過濾 | — | ATR(14)/close > 80th percentile 剔除 |
+| 風險過濾 | — | ATR(14)/close > 80th percentile 或 > 8% 剔除（取嚴格者） |
 
 **Regime 權重調整矩陣（系統自動偵測）：**
 
@@ -888,7 +888,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | Stage 3.3a | 產業同儕相對強度 | 個股近 20 日報酬率 vs 同產業中位數：超越 +20pp → composite_score ×1.03，落後 -20pp → ×0.97 |
 | Stage 3.4 | 週線趨勢加成（可選） | `--weekly-confirm` 啟用時：從 DB 讀取近 90 天日K → 聚合週K → SMA13 + RSI14 週線信號，同為多頭 → composite_score ×1.05，同為空頭 → ×0.95 |
 | Stage 3.5 | 風險過濾 | 剔除高波動股 |
-| Stage 3.5b | **Crisis 相對強度過濾** | 僅 crisis regime 執行：剔除 20 日超額報酬低於 TAIEX -10% 的弱勢股，只留能抵抗大盤跌勢的防禦標的 |
+| Stage 3.5b | **Crisis 雙重過濾** | 僅 crisis regime 執行：(1) 相對強度 — 剔除 20 日超額報酬低於 TAIEX -10% 的弱勢股；(2) 絕對趨勢 — 剔除收盤價跌破 MA60 的股票（防止選到隨大盤跳水的標的） |
 | Stage 4 | 排名輸出 | 加上產業標籤與股票名稱，統計產業分布 |
 
 > **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）採自適應累積設計，需 ≥ 20 個交易日分點歷史資料（由 `morning-routine` 每日自動累積），資料不足時自動降回 7F。

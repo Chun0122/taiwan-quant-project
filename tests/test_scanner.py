@@ -4855,3 +4855,266 @@ class TestComputeDaytradePenalty:
         df = pd.DataFrame()
         result = compute_daytrade_penalty(df)
         assert result.empty
+
+
+# ====================================================================== #
+#  風險過濾強化測試（Task 53）
+# ====================================================================== #
+
+
+class TestRiskFilterEnhancements:
+    """風險過濾強化：絕對值 cap、資料不足剔除、Dividend 收緊。"""
+
+    def _make_price_df(self, sids: list[str], n_days: int = 25, spread: float = 1.0) -> pd.DataFrame:
+        """建立 N 支股票的日K，spread 控制波動幅度。"""
+        rows = []
+        for sid in sids:
+            for d in range(n_days):
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": date(2025, 1, 1) + timedelta(days=d),
+                        "open": 100.0,
+                        "high": 100.0 + spread,
+                        "low": 100.0 - spread,
+                        "close": 100.0 + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_vol_filter_insufficient_data_excluded(self):
+        """資料不足 10 天的股票應被 vol 風險過濾剔除（vol=inf）。"""
+        scanner = MomentumScanner()
+        # 9 支正常股（25 天）+ 1 支只有 5 天
+        sids_normal = [f"N{i}" for i in range(9)]
+        df_normal = self._make_price_df(sids_normal, n_days=25, spread=1.0)
+        rows_short = []
+        for d in range(5):
+            rows_short.append(
+                {
+                    "stock_id": "SHORT",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 1_000_000,
+                }
+            )
+        df_price = pd.concat([df_normal, pd.DataFrame(rows_short)], ignore_index=True)
+        all_sids = sids_normal + ["SHORT"]
+        scored = pd.DataFrame({"stock_id": all_sids, "composite_score": [0.5] * len(all_sids)})
+        # SwingScanner 用 _apply_vol_risk_filter
+        swing = SwingScanner()
+        result = swing._apply_risk_filter(scored, df_price)
+        # SHORT 應被剔除（vol=inf 必超任何門檻）
+        assert "SHORT" not in result["stock_id"].values
+
+    def test_atr_filter_absolute_cap(self):
+        """ATR ratio 超過絕對值 cap 時即使 percentile 通過也應被剔除。"""
+        scanner = MomentumScanner()
+        # 10 支股票全部高波動（spread=10，ATR/close ≈ 10%）
+        sids = [f"H{i}" for i in range(10)]
+        df_price = self._make_price_df(sids, n_days=25, spread=10.0)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        # 全部股票 ATR ratio 約 10%，absolute_cap=0.08 應能剔除部分
+        result = scanner._apply_atr_risk_filter(scored, df_price, percentile=99, absolute_cap=0.08)
+        # percentile=99 理論上只剔除 1 支，但 absolute_cap=0.08 會剔除所有 >8%
+        assert len(result) < len(scored)
+
+    def test_vol_filter_absolute_cap_annualized(self):
+        """年化波動率超過絕對值 cap=80% 時應被剔除。"""
+        scanner = SwingScanner()
+        # 10 支股票高日波動（spread=8 → 日波動 ~8%，年化 ~127%）
+        sids = [f"V{i}" for i in range(10)]
+        df_price = self._make_price_df(sids, n_days=65, spread=8.0)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+        result = scanner._apply_vol_risk_filter(
+            scored, df_price, percentile=99, window=60, annualize=True, absolute_cap=0.80
+        )
+        # 年化波動 >> 80%，absolute_cap 應起作用
+        assert len(result) < len(scored)
+
+    def test_dividend_tighter_percentile(self):
+        """DividendScanner 風險過濾應使用 percentile=75（比 Value 的 90 更嚴格）。"""
+        # 製造 10 支股票，波動遞增
+        sids = [f"D{i}" for i in range(10)]
+        rows = []
+        for i, sid in enumerate(sids):
+            spread = 0.5 + i * 0.5  # 0.5 ~ 5.0
+            for d in range(25):
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": date(2025, 1, 1) + timedelta(days=d),
+                        "open": 100,
+                        "high": 100 + spread,
+                        "low": 100 - spread,
+                        "close": 100 + (spread if d % 2 == 0 else -spread),
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": sids, "composite_score": [0.5] * 10})
+
+        div_scanner = DividendScanner()
+        val_scanner = ValueScanner()
+        result_div = div_scanner._apply_risk_filter(scored.copy(), df_price)
+        result_val = val_scanner._apply_risk_filter(scored.copy(), df_price)
+        # Dividend (75th) 應剔除更多股票
+        assert len(result_div) <= len(result_val)
+
+
+class TestCrisisFilterMA60:
+    """Crisis 模式新增 MA60 絕對趨勢濾網測試。"""
+
+    def _make_price_df_with_taiex(
+        self,
+        stock_data: dict[str, dict],
+        taiex_return: float = -0.03,
+        n_days: int = 65,
+    ) -> pd.DataFrame:
+        """建立含 TAIEX + 個股的 df_price。
+
+        stock_data: {sid: {"return": float, "below_ma60": bool}}
+        below_ma60=True 的股票近期收盤會低於 MA60。
+        """
+        base_date = date(2025, 1, 1)
+        rows = []
+        # TAIEX
+        for i in range(n_days + 1):
+            close = 10000.0 * (1 + taiex_return / n_days * i)
+            rows.append({"stock_id": "TAIEX", "date": base_date + timedelta(days=i), "close": close})
+        # 個股
+        for sid, cfg in stock_data.items():
+            ret = cfg.get("return", 0.0)
+            below = cfg.get("below_ma60", False)
+            for i in range(n_days + 1):
+                if below and i > n_days - 10:
+                    # 最後 10 天大跌，使 close 遠低於 MA60
+                    close = 100.0 * (1 + ret / n_days * i) * 0.85
+                else:
+                    close = 100.0 * (1 + ret / n_days * i)
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": base_date + timedelta(days=i),
+                        "close": close,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def _make_scored(self, stock_ids: list[str]) -> pd.DataFrame:
+        return pd.DataFrame({"stock_id": stock_ids, "composite_score": [0.8 - 0.1 * i for i in range(len(stock_ids))]})
+
+    def test_crisis_ma60_filters_below(self):
+        """crisis 模式下收盤價跌破 MA60 的股票應被剔除。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        # A: 強勢（超越 TAIEX 且在 MA60 上方）; B: 超越 TAIEX 但跌破 MA60
+        df_price = self._make_price_df_with_taiex(
+            {
+                "A": {"return": 0.02, "below_ma60": False},
+                "B": {"return": 0.02, "below_ma60": True},
+            },
+            taiex_return=-0.05,
+        )
+        scored = self._make_scored(["A", "B"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert "A" in result["stock_id"].values
+        assert "B" not in result["stock_id"].values
+
+    def test_crisis_ma60_insufficient_data_passes(self):
+        """資料不足 60 天的股票不受 MA60 濾網懲罰（避免冷啟動誤殺）。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        # 只有 25 天資料 → MA60 無法計算 → 通過
+        base_date = date(2025, 1, 1)
+        rows = []
+        for i in range(26):
+            rows.append(
+                {"stock_id": "TAIEX", "date": base_date + timedelta(days=i), "close": 10000.0 * (1 - 0.02 / 25 * i)}
+            )
+            rows.append({"stock_id": "NEW", "date": base_date + timedelta(days=i), "close": 100.0})
+        df_price = pd.DataFrame(rows)
+        scored = self._make_scored(["NEW"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert "NEW" in result["stock_id"].values
+
+    def test_non_crisis_skips_ma60(self):
+        """非 crisis 模式不執行 MA60 濾網。"""
+        scanner = MomentumScanner()
+        scanner.regime = "bear"
+        df_price = self._make_price_df_with_taiex(
+            {"X": {"return": -0.10, "below_ma60": True}},
+            taiex_return=-0.05,
+        )
+        scored = self._make_scored(["X"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        # bear mode → 不過濾
+        assert len(result) == 1
+
+    def test_crisis_both_filters_combined(self):
+        """crisis 模式兩道濾網同時作用：相對弱勢 + 跌破 MA60。"""
+        scanner = MomentumScanner()
+        scanner.regime = "crisis"
+        # A: 跑贏 TAIEX + MA60 上方（保留）
+        # B: 跑贏 TAIEX 但跌破 MA60（MA60 濾網剔除）
+        # C: 跑輸 TAIEX 超過 10%（相對強度濾網剔除）
+        df_price = self._make_price_df_with_taiex(
+            {
+                "A": {"return": 0.05, "below_ma60": False},
+                "B": {"return": 0.02, "below_ma60": True},
+                "C": {"return": -0.20, "below_ma60": False},
+            },
+            taiex_return=-0.05,
+        )
+        scored = self._make_scored(["A", "B", "C"])
+        result = scanner._apply_crisis_filter(scored, df_price)
+        assert list(result["stock_id"]) == ["A"]
+
+
+class TestCrisisEntryTriggerText:
+    """Crisis 模式進場建議文字應包含部位規模提示。"""
+
+    def _make_price_df(self, sid: str = "1000") -> pd.DataFrame:
+        rows = []
+        for d in range(20):
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": 99.0,
+                    "high": 102.0,
+                    "low": 98.0,
+                    "close": 100.0,
+                    "volume": 500_000,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_crisis_trigger_includes_position_warning(self, scanner):
+        """crisis 模式 entry_trigger 應包含部位規模警示。"""
+        df = self._make_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df, regime="crisis")
+        trigger = result.iloc[0]["entry_trigger"]
+        assert "降低部位規模" in trigger
+
+    def test_non_crisis_trigger_no_position_warning(self, scanner):
+        """非 crisis 模式 entry_trigger 不含部位規模警示。"""
+        df = self._make_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df, regime="sideways")
+        trigger = result.iloc[0]["entry_trigger"]
+        assert "降低部位規模" not in trigger
+
+    def test_crisis_stop_loss_uses_1x_atr(self, scanner):
+        """crisis 模式止損倍數應為 1.0x ATR（非舊值 0.8x）。"""
+        df = self._make_price_df()
+        result = scanner._compute_entry_exit_cols(["1000"], df, regime="crisis")
+        row = result.iloc[0]
+        ep = row["entry_price"]
+        sl = row["stop_loss"]
+        # ATR14 ≈ 4.0（high-low=4，無跳空），stop = entry - 1.0 × ATR
+        stop_dist = ep - sl
+        assert stop_dist == pytest.approx(4.0, abs=0.5)  # 1.0 × ATR ≈ 4.0
