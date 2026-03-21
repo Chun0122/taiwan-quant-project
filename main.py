@@ -1322,6 +1322,10 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 valid_until=row.get("valid_until") if pd.notna(row.get("valid_until")) else None,
                 chip_tier=str(row.get("chip_tier", "")) or None,
                 concept_bonus=float(row.get("concept_bonus", 0.0)) if pd.notna(row.get("concept_bonus")) else None,
+                daytrade_penalty=float(row.get("daytrade_penalty", 0.0))
+                if pd.notna(row.get("daytrade_penalty"))
+                else None,
+                daytrade_tags=str(row.get("daytrade_tags", "")) or None,
             )
         )
 
@@ -2159,6 +2163,44 @@ def detect_broker_concentration(
     return pd.DataFrame(results).sort_values("broker_hhi", ascending=False).reset_index(drop=True)
 
 
+def detect_daytrade_risk(
+    df_broker: "pd.DataFrame",
+    df_volume: "pd.DataFrame | None" = None,
+    penalty_threshold: float = 0.3,
+) -> "pd.DataFrame":
+    """偵測隔日沖風險超過門檻的股票（純函數）。
+
+    Args:
+        df_broker: BrokerTrade DataFrame [stock_id, date, broker_id, broker_name, buy, sell]
+        df_volume: 各股 20 日均量 DataFrame [stock_id, avg_volume_20d]（可選）
+        penalty_threshold: 觸發門檻（預設 0.3）
+
+    Returns:
+        DataFrame [stock_id, daytrade_penalty, top_dt_brokers]（僅含超過門檻的股票）
+    """
+    import pandas as pd
+
+    from src.discovery.scanner import compute_daytrade_penalty
+
+    empty = pd.DataFrame(columns=["stock_id", "daytrade_penalty", "top_dt_brokers"])
+    if df_broker.empty:
+        return empty
+
+    result = compute_daytrade_penalty(df_broker, df_volume=df_volume)
+    if result.empty:
+        return empty
+
+    triggered = result[result["daytrade_penalty"] >= penalty_threshold].copy()
+    if triggered.empty:
+        return empty
+
+    return (
+        triggered[["stock_id", "daytrade_penalty", "top_dt_brokers"]]
+        .sort_values("daytrade_penalty", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 def _compute_anomaly_scan(
     watchlist: list[str],
     lookback: int = 10,
@@ -2166,10 +2208,11 @@ def _compute_anomaly_scan(
     inst_threshold: float = 3_000_000,
     sbl_sigma: float = 2.0,
     hhi_threshold: float = 0.4,
+    dt_threshold: float = 0.3,
 ) -> "dict[str, pd.DataFrame]":
-    """從 DB 讀取四類資料，呼叫四個純函數，回傳異常偵測結果（純函數）。
+    """從 DB 讀取五類資料，呼叫五個純函數，回傳異常偵測結果。
 
-    Keys: "volume_spike", "inst_buy", "sbl_spike", "broker_conc"
+    Keys: "volume_spike", "inst_buy", "sbl_spike", "broker_conc", "daytrade_risk"
     各值為 DataFrame；無資料時為空 DataFrame。
     """
     import datetime
@@ -2231,7 +2274,9 @@ def _compute_anomaly_scan(
     except Exception:
         df_sbl = pd.DataFrame()
 
-    # ── D. 主力分點集中買進 ───────────────────────────────────────────
+    # ── D. 主力分點集中買進 + E. 隔日沖偵測 ──────────────────────────
+    # 隔日沖需要 20 天歷史 + broker_name，比分點集中度的 5 天窗口更長
+    broker_cutoff = datetime.date.today() - datetime.timedelta(days=max(20, lookback + 5))
     try:
         with get_session() as session:
             broker_rows = session.execute(
@@ -2239,33 +2284,44 @@ def _compute_anomaly_scan(
                     BrokerTrade.stock_id,
                     BrokerTrade.date,
                     BrokerTrade.broker_id,
+                    BrokerTrade.broker_name,
                     BrokerTrade.buy,
                     BrokerTrade.sell,
                 ).where(
                     BrokerTrade.stock_id.in_(watchlist),
-                    BrokerTrade.date >= inst_cutoff,
+                    BrokerTrade.date >= broker_cutoff,
                 )
             ).all()
         df_broker = (
-            pd.DataFrame(broker_rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
+            pd.DataFrame(broker_rows, columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell"])
             if broker_rows
             else pd.DataFrame()
         )
     except Exception:
         df_broker = pd.DataFrame()
 
+    # 計算 20 日均量供隔日沖流動性閾值使用
+    df_vol_for_dt = None
+    if not df_price.empty:
+        avg_vol = (
+            df_price.sort_values("date").groupby("stock_id")["volume"].apply(lambda s: s.tail(20).mean()).reset_index()
+        )
+        avg_vol.columns = ["stock_id", "avg_volume_20d"]
+        df_vol_for_dt = avg_vol
+
     return {
         "volume_spike": detect_volume_spike(df_price, lookback=lookback, threshold=vol_mult),
         "inst_buy": detect_institutional_buy(df_inst, threshold=inst_threshold),
         "sbl_spike": detect_sbl_spike(df_sbl, lookback=lookback, sigma=sbl_sigma),
         "broker_conc": detect_broker_concentration(df_broker, hhi_threshold=hhi_threshold),
+        "daytrade_risk": detect_daytrade_risk(df_broker, df_volume=df_vol_for_dt, penalty_threshold=dt_threshold),
     }
 
 
 def cmd_anomaly_scan(args: argparse.Namespace) -> None:
     """掃描 watchlist 中成交量/籌碼異動的即時警報。
 
-    偵測四類異常：量能暴增、外資大買超、借券賣出激增、主力分點集中買進。
+    偵測五類異常：量能暴增、外資大買超、借券賣出激增、主力分點集中買進、隔日沖風險。
     資料直接從 DB 讀取（需先執行 sync / sync-sbl / sync-broker）。
     """
     import datetime
@@ -2280,6 +2336,7 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
     inst_threshold: float = getattr(args, "inst_threshold", 3_000_000)
     sbl_sigma: float = getattr(args, "sbl_sigma", 2.0)
     hhi_threshold: float = getattr(args, "hhi_threshold", 0.4)
+    dt_threshold: float = getattr(args, "dt_threshold", 0.3)
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -2292,14 +2349,16 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
         inst_threshold=inst_threshold,
         sbl_sigma=sbl_sigma,
         hhi_threshold=hhi_threshold,
+        dt_threshold=dt_threshold,
     )
 
     df_vol = results["volume_spike"]
     df_inst = results["inst_buy"]
     df_sbl = results["sbl_spike"]
     df_broker = results["broker_conc"]
+    df_dt = results["daytrade_risk"]
 
-    total = len(df_vol) + len(df_inst) + len(df_sbl) + len(df_broker)
+    total = len(df_vol) + len(df_inst) + len(df_sbl) + len(df_broker) + len(df_dt)
     print(f"\n=== 籌碼異動警報（{today_str}，共 {total} 筆）===")
 
     if not df_vol.empty:
@@ -2337,6 +2396,14 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
             print(f"  {row['stock_id']}  HHI={row['broker_hhi']:.3f}  淨買超 +{net_lot:,} 張")
     else:
         print(f"\n【🎯 主力分點集中買進】無（門檻: HHI > {hhi_threshold:.2f}）")
+
+    if not df_dt.empty:
+        print(f"\n【⚡ 隔日沖風險】（penalty > {dt_threshold:.1f}，共 {len(df_dt)} 支）")
+        for _, row in df_dt.iterrows():
+            tags = row.get("top_dt_brokers", "")
+            print(f"  {row['stock_id']}  penalty={row['daytrade_penalty']:.2f}  分點: {tags}")
+    else:
+        print(f"\n【⚡ 隔日沖風險】無（門檻: penalty > {dt_threshold:.1f}）")
 
     if notify:
         from src.notification.line_notify import send_message
@@ -3499,6 +3566,10 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
             if not _anomaly["broker_conc"].empty:
                 sids = ", ".join(_anomaly["broker_conc"]["stock_id"].head(3).tolist())
                 parts_a.append(f"🎯主力{len(_anomaly['broker_conc'])}({sids})")
+            if not _anomaly.get("daytrade_risk", pd.DataFrame()).empty:
+                df_dt = _anomaly["daytrade_risk"]
+                sids = ", ".join(df_dt["stock_id"].head(3).tolist())
+                parts_a.append(f"⚡隔沖{len(df_dt)}({sids})")
             lines.append(f"🚨 **籌碼異動** ({_total_anomaly}筆)  " + "  ".join(parts_a))
             lines.append("")
     except Exception:
@@ -4040,6 +4111,13 @@ def main() -> None:
         default=0.4,
         dest="hhi_threshold",
         help="主力分點集中度 HHI 門檻（預設 0.4）",
+    )
+    sp_anomaly.add_argument(
+        "--dt-threshold",
+        type=float,
+        default=0.3,
+        dest="dt_threshold",
+        help="隔日沖風險 penalty 門檻（預設 0.3）",
     )
     sp_anomaly.add_argument("--notify", action="store_true", help="推播 Discord 通知")
 

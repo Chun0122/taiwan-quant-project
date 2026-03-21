@@ -507,6 +507,258 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+# ====================================================================== #
+#  隔日沖大戶偵測 — 靜態黑名單 + 動態行為偵測 + 扣分計算
+# ====================================================================== #
+
+# 已知隔日沖券商分點名稱（broker_name 匹配，因同一券商所有分點共用同一 BHID）
+_KNOWN_DAYTRADE_BROKER_NAMES: frozenset[str] = frozenset(
+    {
+        "凱基-台北",
+        "凱基-虎尾",
+        "富邦-台南",
+        "元大-土城永寧",
+        "美林",
+    }
+)
+
+
+def detect_daytrade_brokers(
+    df_broker: pd.DataFrame,
+    short_hold_window: int = 3,
+    sell_buy_ratio_min: float = 0.70,
+    min_events: int = 3,
+) -> pd.DataFrame:
+    """從 BrokerTrade 歷史識別具有隔日沖行為模式的分點（純函數）。
+
+    演算法（向量化）：
+    1. 計算每筆 net = buy - sell
+    2. 以 groupby(['stock_id', 'broker_id']) + shift(-1/-2/-3) 建立未來 1~3 日 net
+    3. 買進事件（net > 0）+ T+1~T+3 內任一天 net < 0 且 |sell| >= net × sell_buy_ratio_min → 配對成功
+    4. daytrade_events >= min_events 的分點被標記為隔日沖
+
+    Args:
+        df_broker: BrokerTrade DataFrame，須含 [stock_id, date, broker_id, broker_name, buy, sell]
+        short_hold_window: 短持有配對窗口天數（預設 3，覆蓋 T+1~T+3）
+        sell_buy_ratio_min: 賣出量須達買入量的此比例才算配對（預設 0.70）
+        min_events: 配對成功至少 N 次才標記為隔日沖（預設 3）
+
+    Returns:
+        DataFrame [stock_id, broker_id, broker_name, daytrade_events, daytrade_ratio, avg_hold_days]
+        空結果時回傳空 DataFrame（含正確欄位）
+    """
+    _EMPTY = pd.DataFrame(
+        columns=["stock_id", "broker_id", "broker_name", "daytrade_events", "daytrade_ratio", "avg_hold_days"]
+    )
+    required = {"stock_id", "date", "broker_id", "buy", "sell"}
+    if df_broker.empty or not required.issubset(df_broker.columns):
+        return _EMPTY
+
+    df = df_broker.copy()
+    df["net"] = df["buy"].fillna(0).astype("int64") - df["sell"].fillna(0).astype("int64")
+    df = df.sort_values(["stock_id", "broker_id", "date"])
+
+    # 向量化：在每個 (stock_id, broker_id) 群組內 shift net 取得未來 1~3 天值
+    grp = df.groupby(["stock_id", "broker_id"], sort=False)
+    shift_cols = {}
+    for i in range(1, min(short_hold_window, 3) + 1):
+        col = f"net_t{i}"
+        df[col] = grp["net"].shift(-i)
+        shift_cols[i] = col
+
+    # 買進事件：今日 net > 0
+    buy_mask = df["net"] > 0
+
+    # 配對判定：T+1~T+3 內任一天 net < 0 且 |net_t| >= net_today × ratio
+    net_today = df["net"]
+    threshold = net_today * sell_buy_ratio_min
+
+    match_any = pd.Series(False, index=df.index)
+    best_hold = pd.Series(np.nan, index=df.index)
+
+    for i, col in shift_cols.items():
+        cond = buy_mask & (df[col] < 0) & (df[col].abs() >= threshold)
+        # 對於首次配對成功的，記錄持有天數
+        first_match = cond & ~match_any
+        best_hold = best_hold.where(~first_match, i)
+        match_any = match_any | cond
+
+    df["is_buy_event"] = buy_mask
+    df["is_daytrade_match"] = match_any & buy_mask
+    df["hold_days"] = best_hold
+
+    # 聚合：每個 (stock_id, broker_id) 的配對統計
+    agg = (
+        df[df["is_buy_event"]]
+        .groupby(["stock_id", "broker_id"], sort=False)
+        .agg(
+            total_buy_events=("is_buy_event", "sum"),
+            daytrade_events=("is_daytrade_match", "sum"),
+            avg_hold_days=("hold_days", "mean"),
+        )
+        .reset_index()
+    )
+
+    # 過濾 min_events
+    agg = agg[agg["daytrade_events"] >= min_events].copy()
+    if agg.empty:
+        return _EMPTY
+
+    agg["daytrade_ratio"] = agg["daytrade_events"] / agg["total_buy_events"].clip(lower=1)
+    agg["avg_hold_days"] = agg["avg_hold_days"].fillna(1.0)
+
+    # 補上 broker_name（取最後一筆）
+    if "broker_name" in df_broker.columns:
+        name_map = df_broker.groupby(["stock_id", "broker_id"])["broker_name"].last().reset_index()
+        agg = agg.merge(name_map, on=["stock_id", "broker_id"], how="left")
+    else:
+        agg["broker_name"] = ""
+
+    return agg[
+        ["stock_id", "broker_id", "broker_name", "daytrade_events", "daytrade_ratio", "avg_hold_days"]
+    ].reset_index(drop=True)
+
+
+def compute_daytrade_penalty(
+    df_broker: pd.DataFrame,
+    df_volume: pd.DataFrame | None = None,
+    known_broker_names: frozenset[str] | None = None,
+    short_hold_window: int = 3,
+    min_events: int = 3,
+    min_volume_ratio: float = 0.05,
+    instant_volume_ratio: float = 0.10,
+) -> pd.DataFrame:
+    """計算各股的隔日沖風險扣分值（純函數）。
+
+    三層邏輯：
+    1. 行為偵測層：呼叫 detect_daytrade_brokers() 找出動態隔日沖分點
+    2. 黑名單層：_KNOWN_DAYTRADE_BROKER_NAMES union known_broker_names
+    3. 即時風險層：黑名單分點單日買超 ≥ 總成交量 × instant_volume_ratio → 直接高風險
+
+    扣分計算：
+    - dt_brokers = 行為偵測 ∪ 黑名單中最新日有淨買超者
+    - dt_net_buy = 所有 dt_brokers 淨買超加總（群聚效應）
+    - raw_penalty = dt_net_buy / total_net_buy（total_net_buy <= 0 → penalty=0）
+    - 流動性閾值：dt_net_buy < avg_volume_20d × min_volume_ratio → penalty 降半
+    - daytrade_penalty = min(1.0, raw_penalty)
+
+    Args:
+        df_broker: BrokerTrade DataFrame [stock_id, date, broker_id, broker_name, buy, sell]
+        df_volume: 各股 20 日均量 DataFrame [stock_id, avg_volume_20d]（可選）
+        known_broker_names: 額外的隔日沖分點名稱集合（union 至預設黑名單）
+        short_hold_window: detect_daytrade_brokers 的配對窗口
+        min_events: detect_daytrade_brokers 的最低配對次數
+        min_volume_ratio: 流動性閾值（隔日沖買超 < 均量 × 此值 → penalty 降半）
+        instant_volume_ratio: 即時風險閾值（黑名單分點買超 ≥ 總量 × 此值 → 直接觸發）
+
+    Returns:
+        DataFrame [stock_id, daytrade_penalty, has_daytrade_risk, top_dt_brokers]
+        - daytrade_penalty: 0.0~1.0（0=無風險，1=極高風險）
+        - has_daytrade_risk: 布林值
+        - top_dt_brokers: 逗號分隔的隔日沖分點名稱
+    """
+    _EMPTY = pd.DataFrame(columns=["stock_id", "daytrade_penalty", "has_daytrade_risk", "top_dt_brokers"])
+    required = {"stock_id", "date", "broker_id", "buy", "sell"}
+    if df_broker.empty or not required.issubset(df_broker.columns):
+        # 回傳 0 penalty（無資料不扣分）
+        if df_broker.empty:
+            return _EMPTY
+        stock_ids = df_broker["stock_id"].unique()
+        return pd.DataFrame(
+            {"stock_id": stock_ids, "daytrade_penalty": 0.0, "has_daytrade_risk": False, "top_dt_brokers": ""}
+        )
+
+    # 合併黑名單
+    all_known = _KNOWN_DAYTRADE_BROKER_NAMES
+    if known_broker_names:
+        all_known = all_known | known_broker_names
+
+    # ── 1. 行為偵測 ──────────────────────────────────────────
+    detected = detect_daytrade_brokers(
+        df_broker,
+        short_hold_window=short_hold_window,
+        min_events=min_events,
+    )
+    # detected: [stock_id, broker_id, broker_name, daytrade_events, ...]
+    detected_pairs: set[tuple[str, str]] = set()
+    if not detected.empty:
+        detected_pairs = set(zip(detected["stock_id"], detected["broker_id"], strict=False))
+
+    # ── 2. 找出最新交易日各分點資料 ──────────────────────────
+    df = df_broker.copy()
+    df["net"] = df["buy"].fillna(0).astype("int64") - df["sell"].fillna(0).astype("int64")
+
+    results = []
+    for stock_id, stock_grp in df.groupby("stock_id", sort=False):
+        latest_date = stock_grp["date"].max()
+        day_df = stock_grp[stock_grp["date"] == latest_date].copy()
+
+        # 判定哪些分點是隔日沖
+        dt_mask = pd.Series(False, index=day_df.index)
+
+        # 黑名單匹配（broker_name）
+        if "broker_name" in day_df.columns:
+            for name in all_known:
+                dt_mask = dt_mask | (day_df["broker_name"].fillna("") == name)
+
+        # 行為偵測匹配（stock_id, broker_id）
+        for idx, row in day_df.iterrows():
+            if (stock_id, row["broker_id"]) in detected_pairs:
+                dt_mask.at[idx] = True
+
+        # 隔日沖分點的淨買超加總
+        dt_day = day_df[dt_mask]
+        dt_net_buy = max(0, dt_day["net"].sum()) if not dt_day.empty else 0
+
+        # 全部分點的淨買超加總（僅計算淨買超者）
+        buyers = day_df[day_df["net"] > 0]
+        total_net_buy = buyers["net"].sum() if not buyers.empty else 0
+
+        # 計算 raw penalty
+        if total_net_buy <= 0 or dt_net_buy <= 0:
+            penalty = 0.0
+        else:
+            penalty = min(1.0, dt_net_buy / total_net_buy)
+
+        # ── 3. 即時風險：黑名單分點佔當日總買量 ≥ instant_volume_ratio ──
+        total_buy = day_df["buy"].fillna(0).sum()
+        if total_buy > 0 and "broker_name" in day_df.columns:
+            for name in all_known:
+                name_mask = day_df["broker_name"].fillna("") == name
+                name_buy = day_df.loc[name_mask, "buy"].fillna(0).sum()
+                if name_buy / total_buy >= instant_volume_ratio:
+                    penalty = max(penalty, 0.5)  # 至少 0.5 penalty
+                    break
+
+        # ── 4. 流動性閾值：小量不扣重 ──────────────────────────
+        if penalty > 0 and df_volume is not None and not df_volume.empty:
+            vol_row = df_volume[df_volume["stock_id"] == stock_id]
+            if not vol_row.empty:
+                avg_vol = vol_row["avg_volume_20d"].values[0]
+                if avg_vol > 0 and dt_net_buy < avg_vol * min_volume_ratio:
+                    penalty *= 0.5  # 降半
+
+        # 收集隔日沖分點名稱
+        top_names = []
+        if not dt_day.empty and "broker_name" in dt_day.columns:
+            dt_sorted = dt_day.sort_values("net", ascending=False)
+            top_names = [n for n in dt_sorted["broker_name"].values if n and str(n) != "nan"][:3]
+
+        results.append(
+            {
+                "stock_id": stock_id,
+                "daytrade_penalty": round(penalty, 4),
+                "has_daytrade_risk": penalty > 0,
+                "top_dt_brokers": ",".join(top_names),
+            }
+        )
+
+    if not results:
+        return _EMPTY
+
+    return pd.DataFrame(results)
+
+
 def compute_smart_broker_score(
     df_broker: pd.DataFrame,
     current_prices: dict[str, float],
@@ -1647,6 +1899,19 @@ class MarketScanner:
         if "chip_tier" in candidates.columns:
             candidates["chip_tier"] = candidates["chip_tier"].fillna("N/A")
 
+        # 隔日沖欄位（從 _compute_chip_scores 暫存）
+        dt_df = getattr(self, "_daytrade_penalty_df", None)
+        if dt_df is not None and not dt_df.empty:
+            candidates = candidates.merge(
+                dt_df[["stock_id", "daytrade_penalty", "daytrade_tags"]], on="stock_id", how="left"
+            )
+        if "daytrade_penalty" not in candidates.columns:
+            candidates["daytrade_penalty"] = 0.0
+        if "daytrade_tags" not in candidates.columns:
+            candidates["daytrade_tags"] = ""
+        candidates["daytrade_penalty"] = candidates["daytrade_penalty"].fillna(0.0)
+        candidates["daytrade_tags"] = candidates["daytrade_tags"].fillna("")
+
         # 根據 regime 動態加權（weight key 直接映射 {key}_score 欄位）
         from src.regime.detector import MarketRegimeDetector
 
@@ -2438,6 +2703,8 @@ class MarketScanner:
             "news_score",
             "sector_bonus",
             "concept_bonus",
+            "daytrade_penalty",
+            "daytrade_tags",
             "industry_category",
             "momentum",
             "inst_net",
@@ -2482,6 +2749,7 @@ class MarketScanner:
                         BrokerTrade.stock_id,
                         BrokerTrade.date,
                         BrokerTrade.broker_id,
+                        BrokerTrade.broker_name,
                         BrokerTrade.buy,
                         BrokerTrade.sell,
                     ).where(
@@ -2491,7 +2759,7 @@ class MarketScanner:
                 ).all()
             if not rows:
                 return pd.DataFrame()
-            return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "buy", "sell"])
+            return pd.DataFrame(rows, columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell"])
         except Exception:
             return pd.DataFrame()
 
@@ -2548,6 +2816,7 @@ class MarketScanner:
                         BrokerTrade.stock_id,
                         BrokerTrade.date,
                         BrokerTrade.broker_id,
+                        BrokerTrade.broker_name,
                         BrokerTrade.buy,
                         BrokerTrade.sell,
                         BrokerTrade.buy_price,
@@ -2561,7 +2830,7 @@ class MarketScanner:
                 return pd.DataFrame()
             df = pd.DataFrame(
                 rows,
-                columns=["stock_id", "date", "broker_id", "buy", "sell", "buy_price", "sell_price"],
+                columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell", "buy_price", "sell_price"],
             )
             # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
             if df["buy_price"].isna().any() or df["sell_price"].isna().any():
@@ -2589,6 +2858,76 @@ class MarketScanner:
             return df
         except Exception:
             return pd.DataFrame()
+
+    def _apply_daytrade_penalty(
+        self,
+        broker_rank: pd.Series,
+        df_broker: pd.DataFrame,
+        stock_ids: list[str],
+        df_price: pd.DataFrame | None = None,
+        penalty_factor: float = 0.5,
+    ) -> tuple[pd.Series, pd.DataFrame]:
+        """對 broker_rank 施加隔日沖扣分，同時回傳 penalty_df 供持久化。
+
+        隔日沖分點（黑名單 + 行為偵測）的買超佔比越高，broker_rank 扣分越重。
+        最多扣除 penalty_factor（預設 50%），避免單一負面因子完全壓制分點因子。
+
+        Args:
+            broker_rank: 分點因子的 percentile rank Series（0~1），index 對齊 stock_ids
+            df_broker: BrokerTrade DataFrame（含 broker_name 欄位）
+            stock_ids: 候選股代號清單
+            df_price: 日K 線資料（可選，用於計算 20 日均量做流動性閾值）
+            penalty_factor: 最大扣分比例（預設 0.5，即 penalty=1.0 時 rank 打 5 折）
+
+        Returns:
+            (adjusted_broker_rank, penalty_df)
+            - adjusted_broker_rank: 扣分後的 rank Series
+            - penalty_df: DataFrame [stock_id, daytrade_penalty, daytrade_tags]
+        """
+        empty_penalty = pd.DataFrame({"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""})
+
+        if df_broker.empty or "broker_name" not in df_broker.columns:
+            return broker_rank, empty_penalty
+
+        # 計算 20 日均量（用於流動性閾值）
+        df_vol = None
+        if df_price is not None and not df_price.empty:
+            vol_data = df_price[df_price["stock_id"].isin(stock_ids)].copy()
+            if not vol_data.empty:
+                avg_vol = (
+                    vol_data.sort_values("date")
+                    .groupby("stock_id")["volume"]
+                    .apply(lambda s: s.tail(20).mean())
+                    .reset_index()
+                )
+                avg_vol.columns = ["stock_id", "avg_volume_20d"]
+                df_vol = avg_vol
+
+        penalty_df = compute_daytrade_penalty(
+            df_broker,
+            df_volume=df_vol,
+        )
+
+        if penalty_df.empty:
+            return broker_rank, empty_penalty
+
+        # 建立 stock_id → penalty 映射
+        penalty_map = dict(zip(penalty_df["stock_id"], penalty_df["daytrade_penalty"], strict=False))
+        tags_map = dict(zip(penalty_df["stock_id"], penalty_df["top_dt_brokers"], strict=False))
+
+        # 扣分：rank *= (1 - penalty × penalty_factor)
+        adjusted = broker_rank.copy()
+        dt_penalties = []
+        dt_tags = []
+        for i, sid in enumerate(stock_ids):
+            p = penalty_map.get(sid, 0.0)
+            dt_penalties.append(p)
+            dt_tags.append(tags_map.get(sid, ""))
+            if p > 0:
+                adjusted.iloc[i] = adjusted.iloc[i] * (1 - p * penalty_factor)
+
+        result_df = pd.DataFrame({"stock_id": stock_ids, "daytrade_penalty": dt_penalties, "daytrade_tags": dt_tags})
+        return adjusted, result_df
 
 
 # ====================================================================== #
@@ -2815,6 +3154,19 @@ class MomentumScanner(MarketScanner):
                 smr_rank = df["short_margin_ratio"].rank(pct=True)
             else:
                 has_margin = False
+
+        # ── 隔日沖扣分（broker_rank 修正）───────────────────────────
+        # 使用 _load_broker_data() 已取得的 7 天資料（含 broker_name）偵測隔日沖
+        # 若有 extended 資料則用範圍更廣的歷史做行為偵測
+        _dt_broker_src = df_broker_ext if not df_broker_ext.empty else df_broker_raw
+        if has_broker and not _dt_broker_src.empty and "broker_name" in _dt_broker_src.columns:
+            broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
+                broker_rank, _dt_broker_src, stock_ids, df_price
+            )
+        else:
+            self._daytrade_penalty_df = pd.DataFrame(
+                {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
+            )
 
         # ── 加權組合 ─────────────────────────────────────────────────
         if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
@@ -3345,6 +3697,17 @@ class SwingScanner(MarketScanner):
                 df = df.merge(smart_df[["stock_id", "smart_broker_factor"]], on="stock_id", how="left")
                 df["smart_broker_factor"] = df["smart_broker_factor"].fillna(0.0)
                 smart_broker_rank = df["smart_broker_factor"].rank(pct=True)
+
+        # ── 隔日沖扣分（broker_rank 修正）───────────────────────────
+        _dt_broker_src = df_broker_ext if not df_broker_ext.empty else df_broker_raw
+        if has_broker and not _dt_broker_src.empty and "broker_name" in _dt_broker_src.columns:
+            broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
+                broker_rank, _dt_broker_src, stock_ids, df_price
+            )
+        else:
+            self._daytrade_penalty_df = pd.DataFrame(
+                {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
+            )
 
         # ── 加權組合 ─────────────────────────────────────────────────
         if has_smart_broker and has_broker and has_sbl and has_whale:
@@ -4039,6 +4402,17 @@ class ValueScanner(MarketScanner):
             broker_conc_rank = df["broker_concentration"].rank(pct=True)
             broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
             broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+
+            # ── 隔日沖扣分 ──────────────────────────────────────
+            if "broker_name" in df_broker_raw.columns:
+                broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
+                    broker_rank, df_broker_raw, stock_ids, df_price
+                )
+            else:
+                self._daytrade_penalty_df = pd.DataFrame(
+                    {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
+                )
+
             # 3 因子：投信 40% + 累積 40% + 分點 20%
             df["chip_score"] = trust_rank * 0.40 + cum_rank * 0.40 + broker_rank * 0.20
             chip_tier = "3F"
@@ -4046,6 +4420,9 @@ class ValueScanner(MarketScanner):
             # 2 因子：投信 50% + 累積 50%
             df["chip_score"] = trust_rank * 0.50 + cum_rank * 0.50
             chip_tier = "2F"
+            self._daytrade_penalty_df = pd.DataFrame(
+                {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
+            )
 
         df["chip_tier"] = chip_tier
         return df[["stock_id", "chip_score", "chip_tier"]]
@@ -4827,6 +5204,16 @@ class GrowthScanner(MarketScanner):
             broker_conc_rank = df["broker_concentration"].rank(pct=True)
             broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
             broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
+
+        # ── 隔日沖扣分 ──────────────────────────────────────────
+        if has_broker and not df_broker_raw.empty and "broker_name" in df_broker_raw.columns:
+            broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
+                broker_rank, df_broker_raw, stock_ids, df_price
+            )
+        else:
+            self._daytrade_penalty_df = pd.DataFrame(
+                {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
+            )
 
         if has_margin and has_broker:
             # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 16% + 分點 15%

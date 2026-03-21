@@ -1292,7 +1292,7 @@ python main.py watch update-status
 
 ### 4.25 籌碼異動警報 (`anomaly-scan`)
 
-從 DB 現有資料（DailyPrice、InstitutionalInvestor、SecuritiesLending、BrokerTrade）偵測四類量化異常訊號，無需額外 API 呼叫。
+從 DB 現有資料（DailyPrice、InstitutionalInvestor、SecuritiesLending、BrokerTrade）偵測五類量化異常訊號，無需額外 API 呼叫。
 
 ```bash
 # 掃描 watchlist 中所有股票
@@ -1303,6 +1303,9 @@ python main.py anomaly-scan --stocks 2330 2317 2454
 
 # 自訂門檻
 python main.py anomaly-scan --vol-mult 3.0 --inst-threshold 5000000 --sbl-sigma 3.0 --hhi-threshold 0.5
+
+# 隔日沖風險門檻（預設 0.2）
+python main.py anomaly-scan --dt-threshold 0.3
 
 # 掃描並推播 Discord
 python main.py anomaly-scan --notify
@@ -1316,6 +1319,7 @@ python main.py anomaly-scan --notify
 | 🏦 外資大買超 | `InstitutionalInvestor` (外資) | 最新日外資淨買超 > 門檻 | inst-threshold=3,000,000 股（≈3,000張）|
 | 🔴 借券賣出激增 | `SecuritiesLending.sbl_change` | 最新日 sbl_change > mean + σ×std | sbl-sigma=2.0 |
 | 🎯 主力分點集中買進 | `BrokerTrade` | 最新日 HHI(淨買超分點) > 門檻 AND 淨買 > 0 | hhi-threshold=0.4 |
+| ⚡ 隔日沖風險 | `BrokerTrade` | 三層偵測（行為配對+黑名單+即時大量），penalty > 門檻 | dt-threshold=0.2 |
 
 **參數說明：**
 
@@ -1327,6 +1331,7 @@ python main.py anomaly-scan --notify
 | `--inst-threshold N` | 3000000 | 外資淨買超股數門檻（股）|
 | `--sbl-sigma F` | 2.0 | 借券激增標準差倍數 |
 | `--hhi-threshold F` | 0.4 | 主力集中度 HHI 門檻（0~1）|
+| `--dt-threshold F` | 0.2 | 隔日沖風險 penalty 門檻（0~1）|
 | `--notify` | False | 掃描完成後推播 Discord |
 
 > **資料準備**：需先執行 `python main.py sync`（DailyPrice/InstitutionalInvestor）、`python main.py sync-sbl`（借券）、`python main.py sync-broker`（分點）。`morning-routine` 已自動包含 Step 7 anomaly-scan。
@@ -1471,7 +1476,7 @@ python main.py morning-routine --top 30 --notify
 | Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
 | Step 6 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
-| Step 7 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力） |
+| Step 7 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
 
 **參數說明：**
 

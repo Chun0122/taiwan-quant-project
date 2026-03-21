@@ -4613,3 +4613,245 @@ class TestDividendExDivGap:
         result = scanner._compute_technical_scores(["Z"], df)
         s = result.iloc[0]["technical_score"]
         assert 0.0 <= s <= 1.0
+
+
+# ====================================================================== #
+#  TestDetectDaytradeBrokers — 隔日沖行為偵測純函數測試
+# ====================================================================== #
+
+
+class TestDetectDaytradeBrokers:
+    """detect_daytrade_brokers() 向量化配對邏輯測試。"""
+
+    _BASE = date(2026, 3, 10)
+
+    def _make_broker_df(self, stock_id: str, records: list[dict]) -> pd.DataFrame:
+        """records: list of {date_offset, broker_id, broker_name, buy, sell}"""
+        rows = []
+        for r in records:
+            rows.append(
+                {
+                    "stock_id": stock_id,
+                    "date": self._BASE + timedelta(days=r.get("date_offset", 0)),
+                    "broker_id": r.get("broker_id", "B001"),
+                    "broker_name": r.get("broker_name", "測試分點"),
+                    "buy": r.get("buy", 0),
+                    "sell": r.get("sell", 0),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_basic_t1_sell(self):
+        """T 日大量買進，T+1 對應賣出 → 配對成功。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        # 建構 5 次「買→隔日賣」模式
+        records = []
+        for i in range(5):
+            d = i * 2
+            records.append({"date_offset": d, "buy": 10000, "sell": 0})
+            records.append({"date_offset": d + 1, "buy": 0, "sell": 8000})
+
+        df = self._make_broker_df("2330", records)
+        result = detect_daytrade_brokers(df, min_events=3)
+        assert len(result) == 1
+        assert result.iloc[0]["daytrade_events"] == 5
+        assert result.iloc[0]["avg_hold_days"] == 1.0
+
+    def test_t3_delayed_sell(self):
+        """T+3 才賣出，仍在窗口內 → 配對成功。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        records = []
+        for i in range(4):
+            d = i * 4
+            records.append({"date_offset": d, "buy": 10000, "sell": 0})
+            records.append({"date_offset": d + 1, "buy": 500, "sell": 500})  # 中性
+            records.append({"date_offset": d + 2, "buy": 500, "sell": 500})  # 中性
+            records.append({"date_offset": d + 3, "buy": 0, "sell": 9000})  # T+3 賣出
+
+        df = self._make_broker_df("2330", records)
+        result = detect_daytrade_brokers(df, min_events=3)
+        assert len(result) == 1
+        assert result.iloc[0]["daytrade_events"] >= 3
+
+    def test_no_matching_sell(self):
+        """買進後無對應賣出 → 不標記。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        records = []
+        for i in range(5):
+            records.append({"date_offset": i, "buy": 10000, "sell": 0})  # 只買不賣
+
+        df = self._make_broker_df("2330", records)
+        result = detect_daytrade_brokers(df, min_events=1)
+        assert len(result) == 0
+
+    def test_sell_ratio_below_threshold(self):
+        """賣量 < 70% 買量 → 不配對。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        records = []
+        for i in range(5):
+            d = i * 2
+            records.append({"date_offset": d, "buy": 10000, "sell": 0})
+            records.append({"date_offset": d + 1, "buy": 0, "sell": 5000})  # 50% < 70%
+
+        df = self._make_broker_df("2330", records)
+        result = detect_daytrade_brokers(df, sell_buy_ratio_min=0.70, min_events=1)
+        assert len(result) == 0
+
+    def test_min_events_filter(self):
+        """僅 2 次配對 < min_events=3 → 不標記。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        records = [
+            {"date_offset": 0, "buy": 10000, "sell": 0},
+            {"date_offset": 1, "buy": 0, "sell": 9000},
+            {"date_offset": 2, "buy": 10000, "sell": 0},
+            {"date_offset": 3, "buy": 0, "sell": 9000},
+            # 只有 2 次配對
+        ]
+        df = self._make_broker_df("2330", records)
+        result = detect_daytrade_brokers(df, min_events=3)
+        assert len(result) == 0
+
+    def test_empty_input(self):
+        """空 DataFrame → 空結果。"""
+        from src.discovery.scanner import detect_daytrade_brokers
+
+        df = pd.DataFrame()
+        result = detect_daytrade_brokers(df)
+        assert result.empty
+        assert "daytrade_events" in result.columns
+
+
+# ====================================================================== #
+#  TestComputeDaytradePenalty — 隔日沖扣分計算純函數測試
+# ====================================================================== #
+
+
+class TestComputeDaytradePenalty:
+    """compute_daytrade_penalty() 三層邏輯測試。"""
+
+    _BASE = date(2026, 3, 10)
+
+    def _make_day_data(self, stock_id: str, brokers: list[dict]) -> pd.DataFrame:
+        """建構最新一日的分點資料。brokers: [{broker_id, broker_name, buy, sell}]"""
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": self._BASE,
+                "broker_id": b.get("broker_id", f"B{i:03d}"),
+                "broker_name": b.get("broker_name", f"一般分點{i}"),
+                "buy": b.get("buy", 0),
+                "sell": b.get("sell", 0),
+            }
+            for i, b in enumerate(brokers)
+        ]
+        return pd.DataFrame(rows)
+
+    def test_known_broker_penalty(self):
+        """黑名單分點大量買超 → penalty > 0。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 50000, "sell": 0},
+                {"broker_name": "一般分點A", "buy": 50000, "sell": 0},
+            ],
+        )
+        result = compute_daytrade_penalty(df)
+        row = result[result["stock_id"] == "2330"]
+        assert len(row) == 1
+        assert row.iloc[0]["daytrade_penalty"] > 0
+
+    def test_no_daytrade_zero_penalty(self):
+        """無隔日沖跡象 → penalty = 0。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "一般分點A", "buy": 50000, "sell": 0},
+                {"broker_name": "一般分點B", "buy": 30000, "sell": 0},
+            ],
+        )
+        result = compute_daytrade_penalty(df)
+        row = result[result["stock_id"] == "2330"]
+        assert row.iloc[0]["daytrade_penalty"] == 0.0
+
+    def test_penalty_capped_at_one(self):
+        """即使隔日沖分點佔比 100% → penalty ≤ 1.0。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 100000, "sell": 0},
+            ],
+        )
+        result = compute_daytrade_penalty(df)
+        row = result[result["stock_id"] == "2330"]
+        assert row.iloc[0]["daytrade_penalty"] <= 1.0
+
+    def test_group_aggregation(self):
+        """三個隔日沖分點加總佔比 → penalty 反映群聚效應。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 30000, "sell": 0},
+                {"broker_name": "美林", "buy": 20000, "sell": 0},
+                {"broker_name": "一般分點", "buy": 50000, "sell": 0},
+            ],
+        )
+        result = compute_daytrade_penalty(df)
+        row = result[result["stock_id"] == "2330"]
+        # 凱基台北 + 美林 = 50000 / 100000 = 0.5
+        assert row.iloc[0]["daytrade_penalty"] == pytest.approx(0.5, abs=0.05)
+
+    def test_volume_threshold_dampening(self):
+        """小量買超觸發流動性降半。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 100, "sell": 0},
+                {"broker_name": "一般分點", "buy": 100, "sell": 0},
+            ],
+        )
+        # 20 日均量 100 萬股，隔日沖買超 100 股 < 100萬 × 5% = 5 萬 → 降半
+        df_volume = pd.DataFrame({"stock_id": ["2330"], "avg_volume_20d": [1_000_000]})
+        result = compute_daytrade_penalty(df, df_volume=df_volume)
+        row = result[result["stock_id"] == "2330"]
+        # 原始 penalty = 100/200 = 0.5，降半 → 0.25
+        assert row.iloc[0]["daytrade_penalty"] == pytest.approx(0.25, abs=0.05)
+
+    def test_instant_risk_large_volume(self):
+        """黑名單分點佔當日總買量 ≥ 10% → 即時觸發至少 0.5。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = self._make_day_data(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 15000, "sell": 10000},  # 淨買 5000
+                {"broker_name": "一般分點A", "buy": 80000, "sell": 0},
+                {"broker_name": "一般分點B", "buy": 5000, "sell": 0},
+            ],
+        )
+        result = compute_daytrade_penalty(df, instant_volume_ratio=0.10)
+        row = result[result["stock_id"] == "2330"]
+        # 凱基台北 buy=15000 / 總buy=100000 = 15% ≥ 10% → 即時觸發
+        assert row.iloc[0]["daytrade_penalty"] >= 0.5
+
+    def test_empty_broker_data(self):
+        """空資料 → penalty = 0。"""
+        from src.discovery.scanner import compute_daytrade_penalty
+
+        df = pd.DataFrame()
+        result = compute_daytrade_penalty(df)
+        assert result.empty

@@ -180,3 +180,80 @@ def test_detect_broker_concentration_dispersed():
     df = _make_broker_df("2317", brokers)
     result = detect_broker_concentration(df, hhi_threshold=0.4)
     assert result.empty
+
+
+# ────────────────────────────────────────────────────────────
+#  TestDetectDaytradeRisk — 隔日沖風險偵測
+# ────────────────────────────────────────────────────────────
+
+
+class TestDetectDaytradeRisk:
+    """detect_daytrade_risk() 純函數測試。"""
+
+    def _make_dt_broker_df(self, stock_id: str, brokers: list[dict]) -> pd.DataFrame:
+        rows = [
+            {
+                "stock_id": stock_id,
+                "date": _BASE_DATE,
+                "broker_id": b.get("broker_id", f"B{i:03d}"),
+                "broker_name": b.get("broker_name", f"分點{i}"),
+                "buy": b.get("buy", 0),
+                "sell": b.get("sell", 0),
+            }
+            for i, b in enumerate(brokers)
+        ]
+        return pd.DataFrame(rows)
+
+    def test_risk_triggered(self):
+        """penalty > threshold → 觸發。"""
+        from main import detect_daytrade_risk
+
+        df = self._make_dt_broker_df(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 80000, "sell": 0},
+                {"broker_name": "一般分點", "buy": 20000, "sell": 0},
+            ],
+        )
+        result = detect_daytrade_risk(df, penalty_threshold=0.3)
+        assert len(result) == 1
+        assert result.iloc[0]["daytrade_penalty"] >= 0.3
+
+    def test_below_threshold(self):
+        """penalty < threshold → 不觸發。"""
+        from main import detect_daytrade_risk
+
+        df = self._make_dt_broker_df(
+            "2330",
+            [
+                {"broker_name": "一般分點A", "buy": 90000, "sell": 0},
+                {"broker_name": "一般分點B", "buy": 10000, "sell": 0},
+            ],
+        )
+        result = detect_daytrade_risk(df, penalty_threshold=0.3)
+        assert result.empty
+
+    def test_top_dt_brokers_returned(self):
+        """正確回傳隔日沖分點名稱。"""
+        from main import detect_daytrade_risk
+
+        df = self._make_dt_broker_df(
+            "2330",
+            [
+                {"broker_name": "凱基-台北", "buy": 60000, "sell": 0},
+                {"broker_name": "美林", "buy": 30000, "sell": 0},
+                {"broker_name": "一般分點", "buy": 10000, "sell": 0},
+            ],
+        )
+        result = detect_daytrade_risk(df, penalty_threshold=0.1)
+        assert len(result) == 1
+        tags = result.iloc[0]["top_dt_brokers"]
+        assert "凱基-台北" in tags
+
+    def test_empty_data(self):
+        """空資料 → 不觸發。"""
+        from main import detect_daytrade_risk
+
+        df = pd.DataFrame()
+        result = detect_daytrade_risk(df, penalty_threshold=0.3)
+        assert result.empty

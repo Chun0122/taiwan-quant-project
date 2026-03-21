@@ -42,6 +42,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("daily_feature", "turnover_ma20", "REAL"),
     # 概念熱度加成（Stage 3.3b）
     ("discovery_record", "concept_bonus", "REAL"),
+    # 隔日沖大戶偵測欄位
+    ("discovery_record", "daytrade_penalty", "REAL"),
+    ("discovery_record", "daytrade_tags", "VARCHAR(200)"),
 ]
 
 
