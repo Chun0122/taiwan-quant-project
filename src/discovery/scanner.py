@@ -818,6 +818,13 @@ def compute_smart_broker_score(
         grp = grp.sort_values("date").reset_index(drop=True)
         all_dates = sorted(grp["date"].unique())
 
+        # 使用 numpy 陣列取代 iterrows，避免 pandas 逐列 Python 迴圈開銷
+        buy_arr = grp["buy"].to_numpy(dtype=np.float64)
+        sell_arr = grp["sell"].to_numpy(dtype=np.float64)
+        bp_arr = grp["buy_price"].to_numpy(dtype=np.float64)
+        sp_arr = grp["sell_price"].to_numpy(dtype=np.float64)
+        net_buy_arr = grp["net_buy"].to_numpy(dtype=np.float64)
+
         avg_cost = 0.0
         net_position = 0.0
         total_profit = 0.0
@@ -826,11 +833,11 @@ def compute_smart_broker_score(
         sell_events = 0
         total_buy_value = 0.0
 
-        for _, row in grp.iterrows():
-            buy_sh = float(row["buy"])
-            sell_sh = float(row["sell"])
-            bp = float(row["buy_price"])
-            sp = float(row["sell_price"])
+        for i in range(len(buy_arr)):
+            buy_sh = buy_arr[i]
+            sell_sh = sell_arr[i]
+            bp = bp_arr[i]
+            sp = sp_arr[i]
 
             if buy_sh > 0 and bp > 0:
                 total_buy_value += buy_sh * bp
@@ -858,22 +865,27 @@ def compute_smart_broker_score(
             profit_factor = 0.0
         hist_pnl = total_profit - total_loss
 
-        # 近期活躍度（最後 recent_days 個交易日的淨買超）
-        recent_dates = set(all_dates[-recent_days:] if len(all_dates) >= recent_days else all_dates)
-        recent_net = float(grp[grp["date"].isin(recent_dates)]["net_buy"].sum())
+        # 近期活躍度（向量化：最後 recent_days 個交易日的淨買超）
+        n_dates = len(all_dates)
+        recent_start = max(0, n_dates - recent_days)
+        recent_date_set = set(all_dates[recent_start:])
+        recent_mask = grp["date"].isin(recent_date_set)
+        recent_net = float(net_buy_arr[recent_mask.to_numpy()].sum())
 
-        # 倉位趨勢（前後半段比較）
-        mid = len(all_dates) // 2
-        first_half = set(all_dates[:mid])
-        last_half = set(all_dates[mid:])
-        first_net = float(grp[grp["date"].isin(first_half)]["net_buy"].sum())
-        last_net = float(grp[grp["date"].isin(last_half)]["net_buy"].sum())
+        # 倉位趨勢（前後半段比較，向量化）
+        mid = n_dates // 2
+        first_half_set = set(all_dates[:mid])
+        last_half_set = set(all_dates[mid:])
+        first_mask = grp["date"].isin(first_half_set).to_numpy()
+        last_mask = grp["date"].isin(last_half_set).to_numpy()
+        first_net = float(net_buy_arr[first_mask].sum())
+        last_net = float(net_buy_arr[last_mask].sum())
         position_trend_up = last_net > first_net
 
-        # 賣出比例
-        total_buy_sh = float(grp["buy"].sum())
-        total_sell_sh = float(grp["sell"].sum())
-        sell_ratio = total_sell_sh / total_buy_sh if total_buy_sh > 0 else 1.0
+        # 賣出比例（向量化）
+        total_buy_sh = float(buy_arr.sum())
+        total_sell_sh = float(sell_arr.sum())
+        sell_ratio = total_sell_sh / total_buy_sh if total_buy_sh > 0 else 0.0
 
         broker_metrics.append(
             {
@@ -2854,30 +2866,33 @@ class MarketScanner:
                         BrokerTrade.date >= cutoff,
                     )
                 ).all()
-            if not rows:
-                return pd.DataFrame()
-            df = pd.DataFrame(
-                rows,
-                columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell", "buy_price", "sell_price"],
-            )
-            # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
-            if df["buy_price"].isna().any() or df["sell_price"].isna().any():
-                try:
-                    with get_session() as session:
+                if not rows:
+                    return pd.DataFrame()
+                df = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "stock_id", "date", "broker_id", "broker_name",
+                        "buy", "sell", "buy_price", "sell_price",
+                    ],
+                )
+                # ── 均價代理：以 DailyPrice.close 填補 NULL buy_price / sell_price ──
+                # 在同一 session 內查詢，避免開啟第二個連線
+                if df["buy_price"].isna().any() or df["sell_price"].isna().any():
+                    try:
                         price_rows = session.execute(
                             select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
                                 DailyPrice.stock_id.in_(stock_ids),
                                 DailyPrice.date >= cutoff,
                             )
                         ).all()
-                    if price_rows:
-                        price_df = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
-                        df = df.merge(price_df, on=["stock_id", "date"], how="left")
-                        df["buy_price"] = df["buy_price"].astype("float64").fillna(df["close"])
-                        df["sell_price"] = df["sell_price"].astype("float64").fillna(df["close"])
-                        df = df.drop(columns=["close"])
-                except Exception:
-                    pass  # 無法載入收盤價時保持原始 NULL，系統降回 7F
+                        if price_rows:
+                            price_df = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+                            df = df.merge(price_df, on=["stock_id", "date"], how="left")
+                            df["buy_price"] = df["buy_price"].astype("float64").fillna(df["close"])
+                            df["sell_price"] = df["sell_price"].astype("float64").fillna(df["close"])
+                            df = df.drop(columns=["close"])
+                    except Exception:
+                        pass  # 無法載入收盤價時保持原始 NULL，系統降回 7F
             # 過濾掉歷史資料不足的股票，避免以少量資料誤判分點行為
             if min_trading_days > 0 and not df.empty:
                 day_counts = df.groupby("stock_id")["date"].nunique()

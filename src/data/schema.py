@@ -27,7 +27,19 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.data.database import Base
@@ -37,7 +49,10 @@ class DailyPrice(Base):
     """個股日 K 線資料。"""
 
     __tablename__ = "daily_price"
-    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_daily_price"),)
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", name="uq_daily_price"),
+        Index("ix_daily_price_stock_date", "stock_id", "date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -58,7 +73,10 @@ class InstitutionalInvestor(Base):
     """三大法人買賣超資料。"""
 
     __tablename__ = "institutional_investor"
-    __table_args__ = (UniqueConstraint("stock_id", "date", "name", name="uq_institutional"),)
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", "name", name="uq_institutional"),
+        Index("ix_institutional_stock_date", "stock_id", "date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -265,7 +283,10 @@ class SecuritiesLending(Base):
     """
 
     __tablename__ = "securities_lending"
-    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_securities_lending"),)
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", name="uq_securities_lending"),
+        Index("ix_securities_lending_stock_date", "stock_id", "date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -287,7 +308,10 @@ class BrokerTrade(Base):
     """
 
     __tablename__ = "broker_trade"
-    __table_args__ = (UniqueConstraint("stock_id", "date", "broker_id", name="uq_broker_trade"),)
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", "broker_id", name="uq_broker_trade"),
+        Index("ix_broker_trade_stock_date", "stock_id", "date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
@@ -549,7 +573,10 @@ class DailyFeature(Base):
     """
 
     __tablename__ = "daily_feature"
-    __table_args__ = (UniqueConstraint("stock_id", "date", name="uq_daily_feature"),)
+    __table_args__ = (
+        UniqueConstraint("stock_id", "date", name="uq_daily_feature"),
+        Index("ix_daily_feature_stock_date", "stock_id", "date"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)

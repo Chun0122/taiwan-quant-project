@@ -1974,9 +1974,10 @@ def detect_volume_spike(
         return empty
 
     results = []
-    for stock_id, grp in df_price.groupby("stock_id"):
-        grp = grp.sort_values("date")
-        latest_date = grp["date"].max()
+    # 預先排序一次，避免每個 group 內重複排序
+    sorted_price = df_price.sort_values(["stock_id", "date"])
+    for stock_id, grp in sorted_price.groupby("stock_id", sort=False):
+        latest_date = grp["date"].iloc[-1]  # 已排序，最後一筆即最新
         today_row = grp[grp["date"] == latest_date]
         hist = grp[grp["date"] < latest_date].tail(lookback)
         if hist.empty or today_row.empty:
@@ -2193,23 +2194,26 @@ def _compute_anomaly_scan(
 
     cutoff = datetime.date.today() - datetime.timedelta(days=lookback + 5)
     inst_cutoff = datetime.date.today() - datetime.timedelta(days=5)
+    broker_cutoff = datetime.date.today() - datetime.timedelta(days=max(20, lookback + 5))
 
-    # ── A. 量能暴增 ──────────────────────────────────────────────────
+    # 合併為單一 DB session，減少 4 次額外的連線開關開銷
+    df_price = pd.DataFrame()
+    df_inst = pd.DataFrame()
+    df_sbl = pd.DataFrame()
+    df_broker = pd.DataFrame()
     try:
         with get_session() as session:
+            # A. 量能暴增
             price_rows = session.execute(
                 select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.volume).where(
                     DailyPrice.stock_id.in_(watchlist),
                     DailyPrice.date >= cutoff,
                 )
             ).all()
-        df_price = pd.DataFrame(price_rows, columns=["stock_id", "date", "volume"]) if price_rows else pd.DataFrame()
-    except Exception:
-        df_price = pd.DataFrame()
+            if price_rows:
+                df_price = pd.DataFrame(price_rows, columns=["stock_id", "date", "volume"])
 
-    # ── B. 外資大買超 ─────────────────────────────────────────────────
-    try:
-        with get_session() as session:
+            # B. 外資大買超
             inst_rows = session.execute(
                 select(
                     InstitutionalInvestor.stock_id,
@@ -2221,13 +2225,10 @@ def _compute_anomaly_scan(
                     InstitutionalInvestor.date >= inst_cutoff,
                 )
             ).all()
-        df_inst = pd.DataFrame(inst_rows, columns=["stock_id", "date", "name", "net"]) if inst_rows else pd.DataFrame()
-    except Exception:
-        df_inst = pd.DataFrame()
+            if inst_rows:
+                df_inst = pd.DataFrame(inst_rows, columns=["stock_id", "date", "name", "net"])
 
-    # ── C. 借券賣出激增 ───────────────────────────────────────────────
-    try:
-        with get_session() as session:
+            # C. 借券賣出激增
             sbl_rows = session.execute(
                 select(
                     SecuritiesLending.stock_id,
@@ -2238,15 +2239,10 @@ def _compute_anomaly_scan(
                     SecuritiesLending.date >= cutoff,
                 )
             ).all()
-        df_sbl = pd.DataFrame(sbl_rows, columns=["stock_id", "date", "sbl_change"]) if sbl_rows else pd.DataFrame()
-    except Exception:
-        df_sbl = pd.DataFrame()
+            if sbl_rows:
+                df_sbl = pd.DataFrame(sbl_rows, columns=["stock_id", "date", "sbl_change"])
 
-    # ── D. 主力分點集中買進 + E. 隔日沖偵測 ──────────────────────────
-    # 隔日沖需要 20 天歷史 + broker_name，比分點集中度的 5 天窗口更長
-    broker_cutoff = datetime.date.today() - datetime.timedelta(days=max(20, lookback + 5))
-    try:
-        with get_session() as session:
+            # D. 主力分點集中買進 + E. 隔日沖偵測
             broker_rows = session.execute(
                 select(
                     BrokerTrade.stock_id,
@@ -2260,13 +2256,12 @@ def _compute_anomaly_scan(
                     BrokerTrade.date >= broker_cutoff,
                 )
             ).all()
-        df_broker = (
-            pd.DataFrame(broker_rows, columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell"])
-            if broker_rows
-            else pd.DataFrame()
-        )
+            if broker_rows:
+                df_broker = pd.DataFrame(
+                    broker_rows, columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell"]
+                )
     except Exception:
-        df_broker = pd.DataFrame()
+        logging.exception("anomaly_scan DB 查詢失敗")
 
     # 計算 20 日均量供隔日沖流動性閾值使用
     df_vol_for_dt = None

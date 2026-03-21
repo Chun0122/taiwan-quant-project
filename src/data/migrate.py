@@ -47,6 +47,16 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("discovery_record", "daytrade_tags", "VARCHAR(200)"),
 ]
 
+# Phase 2 效能優化：複合索引加速頻繁查詢
+# (index_name, table_name, columns)
+INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("ix_daily_price_stock_date", "daily_price", "stock_id, date"),
+    ("ix_institutional_stock_date", "institutional_investor", "stock_id, date"),
+    ("ix_broker_trade_stock_date", "broker_trade", "stock_id, date"),
+    ("ix_securities_lending_stock_date", "securities_lending", "stock_id, date"),
+    ("ix_daily_feature_stock_date", "daily_feature", "stock_id, date"),
+]
+
 
 def run_migrations() -> list[str]:
     """執行所有 schema 遷移，回傳成功新增的欄位清單。"""
@@ -70,5 +80,14 @@ def run_migrations() -> list[str]:
             session.commit()
             added.append(f"{table}.{column}")
             logger.info("新增欄位: %s.%s (%s)", table, column, col_type)
+
+        # 複合索引遷移（CREATE INDEX IF NOT EXISTS）
+        for idx_name, table, columns in INDEX_MIGRATIONS:
+            try:
+                session.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({columns})"))
+                session.commit()
+                logger.debug("索引已確保存在: %s ON %s(%s)", idx_name, table, columns)
+            except Exception:
+                logger.debug("索引建立跳過: %s（可能已存在或表不存在）", idx_name)
 
     return added

@@ -67,11 +67,13 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
     if df.empty:
         return 0
 
-    # 先轉為 dict，再逐欄清理 NaN / NaT → None
-    # 注意：df.where(notna, None) 對 datetime64[ns] 欄位無效（None 會被轉回 NaT）
-    # 因此改用 to_dict 後逐欄位判斷
-    raw_records = df.to_dict("records")
-    records = [{k: None if pd.isna(v) else v for k, v in row.items()} for row in raw_records]
+    # 清理 NaN / NaT → None（SQLite 不認得 pandas 的 NaN/NaT）
+    # 先將 object 欄位的 NaN 轉 None（df.where 對 datetime64 欄位無效，需特殊處理）
+    clean = df.copy()
+    for col in clean.columns:
+        if clean[col].dtype == "datetime64[ns]":
+            clean[col] = clean[col].astype(object).where(clean[col].notna(), None)
+    records = clean.where(pd.notna(clean), None).to_dict("records")
     with get_session() as session:
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
