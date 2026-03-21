@@ -10,6 +10,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
 from src.strategy.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -20,9 +21,9 @@ class BacktestConfig:
     """回測參數（符合台股實際費用）。"""
 
     initial_capital: float = 1_000_000  # 初始資金
-    commission_rate: float = 0.001425  # 手續費 0.1425%
-    tax_rate: float = 0.003  # 交易稅 0.3%（賣出時）
-    slippage: float = 0.0005  # 滑價 0.05%
+    commission_rate: float = COMMISSION_RATE  # 手續費 0.1425%
+    tax_rate: float = TAX_RATE  # 交易稅 0.3%（賣出時）
+    slippage: float = SLIPPAGE_RATE  # 滑價 0.05%
 
 
 @dataclass

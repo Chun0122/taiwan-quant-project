@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import date, timedelta
 
 import pandas as pd
@@ -10,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
+from src.constants import UPSERT_BATCH_SIZE
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
@@ -59,7 +61,7 @@ def _batch_get_last_dates(model, stock_ids: list[str]) -> dict[str, str | None]:
     return {sid: last_map.get(sid) for sid in stock_ids}
 
 
-def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size: int = 80) -> int:
+def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size: int = UPSERT_BATCH_SIZE) -> int:
     """將 DataFrame 分批寫入指定表（衝突時略過）。
 
     SQLite 有 SQL 變數上限，必須分批 INSERT。
@@ -135,76 +137,77 @@ def _upsert_announcement(df: pd.DataFrame) -> int:
     return _upsert_batch(Announcement, df, ["stock_id", "date", "seq"])
 
 
-def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
-    """為指定股票補抓最新估值資料（PE/PB/殖利率）。
-
-    用於 discover value 模式：粗篩後候選股約 150 支，
-    在細評前自動從 FinMind 補抓估值資料。
+def _sync_per_stock(
+    *,
+    model,
+    stock_ids: list[str],
+    fetch_fn: Callable[[FinMindFetcher, str, str, str], pd.DataFrame],
+    upsert_fn: Callable[[pd.DataFrame], int],
+    cache_days: int,
+    lookback_days: int,
+    label: str,
+) -> int:
+    """通用逐股同步：cache 檢查 → fetch → upsert。
 
     Args:
-        stock_ids: 要補抓的股票代號清單
+        model:         ORM model（需有 stock_id, date 欄位）
+        stock_ids:     要同步的股票代號清單
+        fetch_fn:      擷取函數 (fetcher, stock_id, start, end) -> DataFrame
+        upsert_fn:     寫入函數 (df) -> int
+        cache_days:    DB 資料在此天數內視為新鮮，跳過
+        lookback_days: 回溯查詢天數
+        label:         日誌標籤（如 "估值補抓"）
 
     Returns:
-        新增的估值筆數
+        新增筆數
     """
     fetcher = FinMindFetcher()
     total = 0
-    start = (date.today() - timedelta(days=30)).isoformat()
+    start = (date.today() - timedelta(days=lookback_days)).isoformat()
     end = date.today().isoformat()
     skipped = 0
 
-    last_dates = _batch_get_last_dates(StockValuation, stock_ids)
+    last_dates = _batch_get_last_dates(model, stock_ids)
     for sid in stock_ids:
         last = last_dates.get(sid)
-        # 如果 DB 已有 7 天內的資料，跳過
-        if last and (date.today() - date.fromisoformat(last)).days < 7:
+        if last and (date.today() - date.fromisoformat(last)).days < cache_days:
             skipped += 1
             continue
         try:
-            df = fetcher.fetch_per_pbr(sid, last or start, end)
-            total += _upsert_valuation(df)
+            df = fetch_fn(fetcher, sid, last or start, end)
+            total += upsert_fn(df)
         except Exception:
-            logger.warning("[%s] 估值資料補抓失敗，跳過", sid)
+            logger.warning("[%s] %s失敗，跳過", sid, label)
 
     if skipped:
-        logger.info("[估值補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
+        logger.info("[%s] 跳過 %d 支（DB 已有近期資料）", label, skipped)
     return total
+
+
+def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
+    """為指定股票補抓最新估值資料（PE/PB/殖利率）。"""
+    return _sync_per_stock(
+        model=StockValuation,
+        stock_ids=stock_ids,
+        fetch_fn=lambda f, sid, s, e: f.fetch_per_pbr(sid, s, e),
+        upsert_fn=_upsert_valuation,
+        cache_days=7,
+        lookback_days=30,
+        label="估值補抓",
+    )
 
 
 def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
-    """為指定股票補抓最新月營收（跳過 DB 已有近期資料的）。
-
-    用於 discover 全市場掃描：粗篩後候選股約 150 支，
-    在細評前自動從 FinMind 補抓月營收，讓基本面分數不再 fallback 到 0.5。
-
-    Args:
-        stock_ids: 要補抓營收的股票代號清單
-
-    Returns:
-        新增的月營收筆數
-    """
-    fetcher = FinMindFetcher()
-    total = 0
-    start = (date.today() - timedelta(days=180)).isoformat()
-    end = date.today().isoformat()
-    skipped = 0
-
-    last_dates = _batch_get_last_dates(MonthlyRevenue, stock_ids)
-    for sid in stock_ids:
-        last = last_dates.get(sid)
-        # 如果 DB 已有 30 天內的資料，跳過（月營收每月公布，確保月份更新時能重新補抓）
-        if last and (date.today() - date.fromisoformat(last)).days < 30:
-            skipped += 1
-            continue
-        try:
-            df = fetcher.fetch_monthly_revenue(sid, last or start, end)
-            total += _upsert_monthly_revenue(df)
-        except Exception:
-            logger.warning("[%s] 月營收補抓失敗，跳過", sid)
-
-    if skipped:
-        logger.info("[營收補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
-    return total
+    """為指定股票補抓最新月營收。"""
+    return _sync_per_stock(
+        model=MonthlyRevenue,
+        stock_ids=stock_ids,
+        fetch_fn=lambda f, sid, s, e: f.fetch_monthly_revenue(sid, s, e),
+        upsert_fn=_upsert_monthly_revenue,
+        cache_days=30,
+        lookback_days=180,
+        label="營收補抓",
+    )
 
 
 def _upsert_financial(df: pd.DataFrame) -> int:
@@ -216,79 +219,26 @@ def sync_financial_statements(
     watchlist: list[str] | None = None,
     quarters: int = 4,
 ) -> int:
-    """同步 watchlist 財報資料（最近 N 季）。
-
-    Args:
-        watchlist: 股票代號清單（預設使用 settings.fetcher.watchlist）
-        quarters: 抓取最近幾季（預設 4 季 = 1 年）
-
-    Returns:
-        新增的財報筆數
-    """
+    """同步 watchlist 財報資料（最近 N 季）。"""
     if watchlist is None:
         watchlist = get_effective_watchlist()
-
     init_db()
-    fetcher = FinMindFetcher()
-
-    # 每季約 90 天，多抓一點確保覆蓋
-    start = (date.today() - timedelta(days=quarters * 95 + 30)).isoformat()
-    end = date.today().isoformat()
-    total = 0
-    skipped = 0
-
-    last_dates = _batch_get_last_dates(FinancialStatement, watchlist)
-    for sid in watchlist:
-        last = last_dates.get(sid)
-        # 如果 DB 已有 60 天內的資料，跳過
-        if last and (date.today() - date.fromisoformat(last)).days < 60:
-            skipped += 1
-            continue
-
-        try:
-            df = fetcher.fetch_financial_summary(sid, last or start, end)
-            total += _upsert_financial(df)
-        except Exception:
-            logger.warning("[%s] 財報同步失敗，跳過", sid)
-
-    if skipped:
-        logger.info("[財報同步] 跳過 %d 支（DB 已有近期資料）", skipped)
+    total = sync_financial_for_stocks(watchlist, quarters)
     logger.info("[財報同步] 完成，共寫入 %d 筆", total)
     return total
 
 
 def sync_financial_for_stocks(stock_ids: list[str], quarters: int = 4) -> int:
-    """為指定股票補抓財報資料（供 discover 或其他模組用）。
-
-    Args:
-        stock_ids: 要補抓財報的股票代號清單
-        quarters: 抓取最近幾季
-
-    Returns:
-        新增的財報筆數
-    """
-    fetcher = FinMindFetcher()
-    total = 0
-    start = (date.today() - timedelta(days=quarters * 95 + 30)).isoformat()
-    end = date.today().isoformat()
-    skipped = 0
-
-    last_dates = _batch_get_last_dates(FinancialStatement, stock_ids)
-    for sid in stock_ids:
-        last = last_dates.get(sid)
-        # 如果 DB 已有 60 天內的資料，跳過
-        if last and (date.today() - date.fromisoformat(last)).days < 60:
-            skipped += 1
-            continue
-        try:
-            df = fetcher.fetch_financial_summary(sid, last or start, end)
-            total += _upsert_financial(df)
-        except Exception:
-            logger.warning("[%s] 財報補抓失敗，跳過", sid)
-
-    if skipped:
-        logger.info("[財報補抓] 跳過 %d 支（DB 已有近期資料）", skipped)
-    return total
+    """為指定股票補抓財報資料。"""
+    return _sync_per_stock(
+        model=FinancialStatement,
+        stock_ids=stock_ids,
+        fetch_fn=lambda f, sid, s, e: f.fetch_financial_summary(sid, s, e),
+        upsert_fn=_upsert_financial,
+        cache_days=60,
+        lookback_days=quarters * 95 + 30,
+        label="財報補抓",
+    )
 
 
 def _upsert_holding(df: pd.DataFrame) -> int:

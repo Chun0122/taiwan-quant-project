@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from src.constants import COMMISSION_RATE, TAX_RATE
 from src.visualization.charts import (
     plot_strategy_comparison_curves,
     plot_strategy_metrics_bar,
@@ -66,7 +67,7 @@ def _build_equity_pct(
 
         elif dt_date in sell_dates and position > 0:
             sp = sell_dates[dt_date]
-            revenue = position * sp * (1 - 0.001425 - 0.003)
+            revenue = position * sp * (1 - COMMISSION_RATE - TAX_RATE)
             capital += revenue
             position = 0
 

@@ -113,6 +113,13 @@ from datetime import date
 import pandas as pd
 
 from src.config import settings
+from src.constants import (
+    DEFAULT_DT_THRESHOLD,
+    DEFAULT_HHI_THRESHOLD,
+    DEFAULT_INST_THRESHOLD,
+    DEFAULT_SBL_SIGMA,
+    DEFAULT_VOL_MULT,
+)
 from src.entry_exit import assess_timing, compute_atr_stops, compute_entry_trigger
 from src.features.indicators import calc_rsi14_from_series as _calc_rsi14_from_series
 from src.notification.line_notify import format_suggest_discord as _format_suggest_discord
@@ -2173,11 +2180,11 @@ def detect_daytrade_risk(
 def _compute_anomaly_scan(
     watchlist: list[str],
     lookback: int = 10,
-    vol_mult: float = 2.0,
-    inst_threshold: float = 3_000_000,
-    sbl_sigma: float = 2.0,
-    hhi_threshold: float = 0.4,
-    dt_threshold: float = 0.3,
+    vol_mult: float = DEFAULT_VOL_MULT,
+    inst_threshold: float = DEFAULT_INST_THRESHOLD,
+    sbl_sigma: float = DEFAULT_SBL_SIGMA,
+    hhi_threshold: float = DEFAULT_HHI_THRESHOLD,
+    dt_threshold: float = DEFAULT_DT_THRESHOLD,
 ) -> "dict[str, pd.DataFrame]":
     """從 DB 讀取五類資料，呼叫五個純函數，回傳異常偵測結果。
 
@@ -2295,11 +2302,11 @@ def cmd_anomaly_scan(args: argparse.Namespace) -> None:
 
     watchlist = args.stocks if args.stocks else get_effective_watchlist()
     lookback: int = getattr(args, "lookback", 10)
-    vol_mult: float = getattr(args, "vol_mult", 2.0)
-    inst_threshold: float = getattr(args, "inst_threshold", 3_000_000)
-    sbl_sigma: float = getattr(args, "sbl_sigma", 2.0)
-    hhi_threshold: float = getattr(args, "hhi_threshold", 0.4)
-    dt_threshold: float = getattr(args, "dt_threshold", 0.3)
+    vol_mult: float = getattr(args, "vol_mult", DEFAULT_VOL_MULT)
+    inst_threshold: float = getattr(args, "inst_threshold", DEFAULT_INST_THRESHOLD)
+    sbl_sigma: float = getattr(args, "sbl_sigma", DEFAULT_SBL_SIGMA)
+    hhi_threshold: float = getattr(args, "hhi_threshold", DEFAULT_HHI_THRESHOLD)
+    dt_threshold: float = getattr(args, "dt_threshold", DEFAULT_DT_THRESHOLD)
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -3673,80 +3680,87 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             print(f"     波動率倍數: {stress_result['vol_ratio']:.1f}x")
             print()
 
-    # ── Step 1: sync-sbl ─────────────────────────────────────────
-    _step(1, "同步借券賣出資料（sync-sbl --days 3）")
-    if dry_run or skip_sync:
-        _skip("dry-run" if dry_run else "--skip-sync")
-    else:
-        cmd_sync_sbl(argparse.Namespace(days=3))
+    # ── Step 1~7: 依序執行 ──────────────────────────────────────────
+    _steps = [
+        (
+            1,
+            "同步借券賣出資料（sync-sbl --days 3）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_sbl(argparse.Namespace(days=3)),
+        ),
+        (
+            2,
+            "同步分點交易資料（watchlist 歷史累積 + discover 補抓）",
+            {"dry_run", "skip_sync"},
+            lambda: (
+                cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=False)),
+                cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True)),
+            ),
+        ),
+        (
+            3,
+            f"五模式全市場掃描（discover all --skip-sync --top {top_n}）",
+            {"dry_run"},
+            lambda: _cmd_discover_all(
+                argparse.Namespace(
+                    skip_sync=True,
+                    sync_days=30,
+                    top=top_n,
+                    min_price=10.0,
+                    max_price=None,
+                    min_volume=1000,
+                    max_stocks=None,
+                    min_appearances=1,
+                    export=None,
+                    notify=False,
+                )
+            ),
+        ),
+        (
+            4,
+            "掃描近期重大事件（alert-check --days 3）",
+            {"dry_run"},
+            lambda: cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False)),
+        ),
+        (5, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
+        (
+            6,
+            "高成長掃描（revenue-scan --min-yoy 10 --top 5）",
+            {"dry_run"},
+            lambda: cmd_revenue_scan(
+                argparse.Namespace(stocks=None, top=5, min_yoy=10.0, min_margin_improve=0.0, notify=False)
+            ),
+        ),
+        (
+            7,
+            "籌碼異動掃描（anomaly-scan）",
+            {"dry_run"},
+            lambda: cmd_anomaly_scan(
+                argparse.Namespace(
+                    stocks=None,
+                    lookback=10,
+                    vol_mult=DEFAULT_VOL_MULT,
+                    inst_threshold=DEFAULT_INST_THRESHOLD,
+                    sbl_sigma=DEFAULT_SBL_SIGMA,
+                    hhi_threshold=DEFAULT_HHI_THRESHOLD,
+                    notify=False,
+                )
+            ),
+        ),
+    ]
 
-    # ── Step 2: sync-broker（watchlist 累積 + discover 補抓）────────
-    _step(2, "同步分點交易資料（watchlist 歷史累積 + discover 補抓）")
-    if dry_run or skip_sync:
-        _skip("dry-run" if dry_run else "--skip-sync")
-    else:
-        # 2a: 同步 watchlist 全部股票（5 日），每日累積歷史資料供 Smart Broker 使用
-        cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=False))
-        # 2b: 補抓最近 discover 推薦的股票（跳過 2a 已同步的 watchlist 股票，僅補非 watchlist 候選）
-        cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True))
-
-    # ── Step 3: discover all --skip-sync ─────────────────────────
-    _step(3, f"五模式全市場掃描（discover all --skip-sync --top {top_n}）")
+    active_flags: set[str] = set()
     if dry_run:
-        _skip("dry-run")
-    else:
-        _cmd_discover_all(
-            argparse.Namespace(
-                skip_sync=True,  # 不重複同步市場資料
-                sync_days=30,
-                top=top_n,
-                min_price=10.0,
-                max_price=None,
-                min_volume=1000,
-                max_stocks=None,
-                min_appearances=1,
-                export=None,
-                notify=False,  # 統一由 morning-routine 推播
-            )
-        )
+        active_flags.add("dry_run")
+    if skip_sync:
+        active_flags.add("skip_sync")
 
-    # ── Step 4: alert-check --days 3 ─────────────────────────────
-    _step(4, "掃描近期重大事件（alert-check --days 3）")
-    if dry_run:
-        _skip("dry-run")
-    else:
-        cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False))
-
-    # ── Step 5: watch update-status ──────────────────────────────
-    _step(5, "更新持倉狀態（watch update-status）")
-    if dry_run:
-        _skip("dry-run")
-    else:
-        _watch_update_status()
-
-    # ── Step 6: revenue-scan --top 5 ─────────────────────────────
-    _step(6, "高成長掃描（revenue-scan --min-yoy 10 --top 5）")
-    if dry_run:
-        _skip("dry-run")
-    else:
-        cmd_revenue_scan(argparse.Namespace(stocks=None, top=5, min_yoy=10.0, min_margin_improve=0.0, notify=False))
-
-    # ── Step 7: anomaly-scan ──────────────────────────────────────
-    _step(7, "籌碼異動掃描（anomaly-scan）")
-    if dry_run:
-        _skip("dry-run")
-    else:
-        cmd_anomaly_scan(
-            argparse.Namespace(
-                stocks=None,
-                lookback=10,
-                vol_mult=2.0,
-                inst_threshold=3_000_000,
-                sbl_sigma=2.0,
-                hhi_threshold=0.4,
-                notify=False,  # 統一由 morning-routine 推播
-            )
-        )
+    for num, title, skip_on, action in _steps:
+        _step(num, title)
+        if skip_on & active_flags:
+            _skip("dry-run" if dry_run else "--skip-sync")
+        else:
+            action()
 
     # ── 完成提示 ─────────────────────────────────────────────────
     suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""
@@ -4138,28 +4152,30 @@ def main() -> None:
     )
     sp_anomaly.add_argument("--stocks", nargs="+", help="指定股票代號（預設使用 watchlist）")
     sp_anomaly.add_argument("--lookback", type=int, default=10, help="計算均量/均值的天數（預設 10）")
-    sp_anomaly.add_argument("--vol-mult", type=float, default=2.0, dest="vol_mult", help="量能倍數門檻（預設 2.0）")
+    sp_anomaly.add_argument(
+        "--vol-mult", type=float, default=DEFAULT_VOL_MULT, dest="vol_mult", help="量能倍數門檻（預設 2.0）"
+    )
     sp_anomaly.add_argument(
         "--inst-threshold",
         type=float,
-        default=3_000_000,
+        default=DEFAULT_INST_THRESHOLD,
         dest="inst_threshold",
         help="外資淨買超股數門檻（預設 3,000,000 股 = 3,000 張）",
     )
     sp_anomaly.add_argument(
-        "--sbl-sigma", type=float, default=2.0, dest="sbl_sigma", help="借券激增標準差倍數（預設 2.0σ）"
+        "--sbl-sigma", type=float, default=DEFAULT_SBL_SIGMA, dest="sbl_sigma", help="借券激增標準差倍數（預設 2.0σ）"
     )
     sp_anomaly.add_argument(
         "--hhi-threshold",
         type=float,
-        default=0.4,
+        default=DEFAULT_HHI_THRESHOLD,
         dest="hhi_threshold",
         help="主力分點集中度 HHI 門檻（預設 0.4）",
     )
     sp_anomaly.add_argument(
         "--dt-threshold",
         type=float,
-        default=0.3,
+        default=DEFAULT_DT_THRESHOLD,
         dest="dt_threshold",
         help="隔日沖風險 penalty 門檻（預設 0.3）",
     )

@@ -7,6 +7,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from src.constants import COMMISSION_RATE, TAX_RATE
+
 # ------------------------------------------------------------------ #
 #  個股分析圖表
 # ------------------------------------------------------------------ #
@@ -411,7 +413,7 @@ def plot_equity_curve(
 
         elif dt_date in sell_dates and position > 0:
             sp = sell_dates[dt_date]
-            revenue = position * sp * (1 - 0.001425 - 0.003)
+            revenue = position * sp * (1 - COMMISSION_RATE - TAX_RATE)
             capital += revenue
             position = 0
 

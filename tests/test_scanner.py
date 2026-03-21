@@ -2377,7 +2377,10 @@ class TestScannerStage05:
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session.execute.return_value.scalar.return_value = val_count
-        monkeypatch.setattr("src.discovery.scanner.get_session", lambda: mock_session)
+        monkeypatch.setattr("src.discovery.scanner._base.get_session", lambda: mock_session)
+        # ValueScanner/DividendScanner 子模組也各自 import get_session
+        monkeypatch.setattr("src.discovery.scanner._value.get_session", lambda: mock_session)
+        monkeypatch.setattr("src.discovery.scanner._dividend.get_session", lambda: mock_session)
         return scanner
 
     def test_stage05_triggers_when_no_valuation_data(self, monkeypatch, ScannerCls):
@@ -3717,7 +3720,7 @@ class TestSwingChipSmartBrokerTier:
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: self._make_holding_df(ids))
         monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: _make_sbl_df(ids))
         monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
-        monkeypatch.setattr("src.discovery.scanner.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+        monkeypatch.setattr("src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         assert result.iloc[0]["chip_tier"] == "6F"
@@ -3738,7 +3741,7 @@ class TestSwingChipSmartBrokerTier:
         monkeypatch.setattr(scanner, "_load_holding_data", lambda ids: pd.DataFrame())
         monkeypatch.setattr(scanner, "_load_sbl_data", lambda ids: pd.DataFrame())
         monkeypatch.setattr(scanner, "_load_broker_data_extended", lambda ids, **kw: ext_df)
-        monkeypatch.setattr("src.discovery.scanner.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
+        monkeypatch.setattr("src.discovery.scanner._swing.compute_smart_broker_score", lambda df, prices, **kw: smart_result)
 
         result = scanner._compute_chip_scores(sids, _make_basic_inst_df(sids))
         # 沒有 broker/whale/sbl，smart_broker 單獨無法觸發 6F
