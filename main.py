@@ -1792,7 +1792,7 @@ def _compute_macro_stress_check() -> dict:
     try:
         with get_session() as session:
             rows = session.execute(
-                select(DailyPrice.date, DailyPrice.close)
+                select(DailyPrice.date, DailyPrice.close, DailyPrice.volume)
                 .where(DailyPrice.stock_id == "TAIEX")
                 .order_by(DailyPrice.date.desc())
                 .limit(130)
@@ -1808,12 +1808,15 @@ def _compute_macro_stress_check() -> dict:
                 "vol_ratio": 0.0,
                 "signals": {},
                 "summary": "TAIEX 資料不足，跳過壓力檢查",
+                "breadth_below_ma20_pct": None,
             }
 
         rows_sorted = sorted(rows, key=lambda r: r[0])
         closes = pd.Series([float(r[1]) for r in rows_sorted])
+        volumes_raw = pd.Series([float(r[2]) for r in rows_sorted])
+        volumes = volumes_raw if (volumes_raw > 0).any() else None
 
-        crisis_info = detect_crisis_signals(closes)
+        crisis_info = detect_crisis_signals(closes, volumes=volumes)
         regime_info = MarketRegimeDetector().detect()
         regime = regime_info.get("regime", "sideways")
 
@@ -1828,15 +1831,22 @@ def _compute_macro_stress_check() -> dict:
         taiex_close = float(closes.iloc[-1])
         ret_5d = float((closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6]) if len(closes) >= 6 else 0.0
 
+        breadth_pct = regime_info.get("breadth_below_ma20_pct")
+        breadth_downgraded = regime_info.get("breadth_downgraded", False)
+
         if regime == "crisis":
+            panic_tag = "，爆量長黑" if crisis_info.get("signals", {}).get("panic_volume") else ""
             summary = (
                 f"⚠ CRISIS 崩盤訊號觸發！"
                 f"5日={ret_5d:+.1%}，連跌{consec}天，波動率={crisis_info.get('vol_ratio_val', 0.0):.1f}x"
+                f"{panic_tag}"
             )
         elif regime == "bear":
-            summary = f"空頭市場 TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}"
+            breadth_tag = f"，MA20寬度={breadth_pct:.0%}" if breadth_pct is not None else ""
+            summary = f"空頭市場 TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}{breadth_tag}"
         else:
-            summary = f"市場狀態={regime} TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}"
+            breadth_tag = f"，MA20寬度={breadth_pct:.0%}" if breadth_pct is not None else ""
+            summary = f"市場狀態={regime} TAIEX={taiex_close:.0f}，5日={ret_5d:+.1%}{breadth_tag}"
 
         return {
             "regime": regime,
@@ -1847,6 +1857,8 @@ def _compute_macro_stress_check() -> dict:
             "vol_ratio": crisis_info.get("vol_ratio_val", 0.0),
             "signals": crisis_info.get("signals", {}),
             "summary": summary,
+            "breadth_below_ma20_pct": breadth_pct,
+            "breadth_downgraded": breadth_downgraded,
         }
 
     except Exception as exc:
@@ -1860,6 +1872,8 @@ def _compute_macro_stress_check() -> dict:
             "vol_ratio": 0.0,
             "signals": {},
             "summary": "壓力預檢失敗，跳過",
+            "breadth_below_ma20_pct": None,
+            "breadth_downgraded": False,
         }
 
 
@@ -3383,6 +3397,10 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
     # ── Step 0: 宏觀壓力預檢警示（crash/bear 時前置顯示）───────────
     try:
         stress = _compute_macro_stress_check()
+        if stress.get("breadth_downgraded"):
+            bpct = stress.get("breadth_below_ma20_pct", 0.0) or 0.0
+            lines.append(f"📊 **市場廣度警示**：{bpct:.0%} 股票跌破 MA20 → regime 降級")
+            lines.append("")
         if stress.get("crisis_triggered"):
             lines.append("🚨 **CRISIS 崩盤警示已啟動**")
             lines.append(f"  {stress.get('summary', '')}")
@@ -3672,12 +3690,18 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         regime_now = stress_result.get("regime", "sideways")
         print(f"  市場狀態: {regime_now.upper()}")
         print(f"  {stress_result.get('summary', '')}")
+        if stress_result.get("breadth_downgraded"):
+            bpct = stress_result.get("breadth_below_ma20_pct", 0.0) or 0.0
+            print(f"  📊 市場廣度警示：{bpct:.0%} 股票跌破 MA20 → regime 降級")
         if stress_result.get("crisis_triggered"):
             print()
             print("  !! CRISIS 模式啟動 — Discover 將使用最嚴格的過濾與保守參數 !!")
             print(f"     5日報酬: {stress_result['fast_return_5d']:+.1%}")
             print(f"     連跌天數: {stress_result['consec_decline_days']}")
             print(f"     波動率倍數: {stress_result['vol_ratio']:.1f}x")
+            sigs = stress_result.get("signals", {})
+            if sigs.get("panic_volume"):
+                print("     爆量長黑: ✓（成交量 > 20日均量 × 1.5 且下跌）")
             print()
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
