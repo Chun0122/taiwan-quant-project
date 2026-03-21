@@ -304,10 +304,12 @@ class FinMindFetcher(DataFetcher):
         df["date"] = pd.to_datetime(df["date"]).dt.date
         for col in ("cash_payment_date", "announcement_date"):
             if col in df.columns:
-                # 先轉換為 datetime，然後轉換為 date，最後將 NaT 替換為 None
-                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
-                # 將 NaT（pandas datetime NaT）替換為 None
-                df.loc[pd.isna(df[col]), col] = None
+                # 先轉換為 datetime，將 NaT 處理為 None，再轉 .date
+                # 注意：必須先處理 NaT 再呼叫 .dt.date，否則 NaT 可能變為無效日期
+                ts = pd.to_datetime(df[col], format="mixed", errors="coerce")
+                nat_mask = pd.isna(ts)
+                df[col] = ts.dt.date
+                df.loc[nat_mask, col] = None
         df["cash_dividend"] = df.get("cash_dividend", pd.Series(dtype=float)).fillna(0.0)
         df["stock_dividend"] = df.get("stock_dividend", pd.Series(dtype=float)).fillna(0.0)
         # 確保 year 欄位為整數，非數值轉為 NaN（由 _upsert_dividend 的 dropna 過濾）

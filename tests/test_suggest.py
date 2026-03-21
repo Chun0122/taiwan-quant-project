@@ -60,6 +60,15 @@ class TestCalcRsi14FromSeries:
         assert result != 50.0
         assert 0.0 <= result <= 100.0
 
+    def test_near_zero_loss_returns_100(self):
+        """avg_loss 極小（< 1e-10）時應回傳 100.0，不產生數值不穩定。"""
+        # 持續上漲但有一天微幅下跌（1e-12），使 avg_loss 趨近 0
+        closes = pd.Series([100.0 + i for i in range(30)])
+        closes.iloc[15] = closes.iloc[14] - 1e-12  # 極微下跌
+        result = _calc_rsi14_from_series(closes)
+        assert result == 100.0 or result > 99.0
+        assert 0.0 <= result <= 100.0
+
     def test_mixed_up_down_mid_range(self):
         """混合漲跌序列 RSI 應落在中間範圍（30~70）。"""
         closes = pd.Series([100.0 + (i % 2) * 2 for i in range(30)])

@@ -411,6 +411,9 @@ class BacktestEngine:
     def _compute_atr(self, data: pd.DataFrame, dt, use_raw: bool = False) -> float | None:
         """計算 ATR(N)，資料不足時回傳 None。
 
+        True Range 定義：TR = max(H-L, |H-PrevClose|, |L-PrevClose|)
+        其中 PrevClose 為每根 K 線的前一根收盤價，而非偏移視窗。
+
         Args:
             use_raw: True 時優先使用 raw_high/raw_low/raw_close（除權息還原模式下
                      確保 ATR 與 entry_price 在相同的原始價格尺度計算）。
@@ -426,10 +429,14 @@ class BacktestEngine:
         low_col = "raw_low" if use_raw and "raw_low" in data.columns else "low"
         close_col = "raw_close" if use_raw and "raw_close" in data.columns else "close"
 
+        # 取 period 根 K 線的 high/low，以及對應的 period 個 prev_close
+        # window[i] 的 prev_close 是 window[i-1] 的 close
+        # 所以需要 data[idx-period-1 : idx-1] 作為 prev_close（長度 = period）
         window = data.iloc[idx - period : idx]
         high = window[high_col].values
         low = window[low_col].values
-        prev_close = data.iloc[idx - period - 1 : idx - 1][close_col].values
+        # prev_close[i] 對應 window[i] 的前一根收盤價
+        prev_close = data[close_col].iloc[idx - period - 1 : idx - 1].values
 
         if len(prev_close) < period:
             return None
@@ -501,10 +508,14 @@ class BacktestEngine:
         # Sharpe Ratio (以每日報酬率計算，假設無風險利率 = 0)
         sharpe_ratio = None
         if len(equity_curve) > 1:
-            eq = np.array(equity_curve)
-            daily_returns = np.diff(eq) / eq[:-1]
-            if np.std(daily_returns) > 0:
-                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
+            eq = np.array(equity_curve, dtype=np.float64)
+            # 防止 equity 為 0 時產生 inf（爆倉情境）
+            prev_eq = eq[:-1]
+            safe_prev = np.where(prev_eq == 0, np.nan, prev_eq)
+            daily_returns = np.diff(eq) / safe_prev
+            daily_returns = daily_returns[np.isfinite(daily_returns)]
+            if len(daily_returns) > 1 and np.std(daily_returns) > 0:
+                sharpe_ratio = round(float(np.mean(daily_returns)) / float(np.std(daily_returns)) * math.sqrt(252), 4)
 
         # 最大回撤
         max_drawdown = 0.0
@@ -531,26 +542,34 @@ class BacktestEngine:
         profit_factor = None
 
         if len(equity_curve) > 1:
-            eq = np.array(equity_curve)
-            daily_returns = np.diff(eq) / eq[:-1]
+            eq = np.array(equity_curve, dtype=np.float64)
+            # 防止 equity 為 0 時產生 inf（爆倉情境）
+            prev_eq = eq[:-1]
+            safe_prev = np.where(prev_eq == 0, np.nan, prev_eq)
+            raw_daily_returns = np.diff(eq) / safe_prev
+            daily_returns = raw_daily_returns[np.isfinite(raw_daily_returns)]
 
             # Sortino Ratio: mean / downside_std × √252
-            neg_returns = daily_returns[daily_returns < 0]
-            if len(neg_returns) > 0 and np.std(neg_returns) > 0:
-                sortino_ratio = round(np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4)
+            if len(daily_returns) > 1:
+                neg_returns = daily_returns[daily_returns < 0]
+                if len(neg_returns) > 0 and np.std(neg_returns) > 0:
+                    sortino_ratio = round(
+                        float(np.mean(daily_returns)) / float(np.std(neg_returns)) * math.sqrt(252), 4
+                    )
 
             # Calmar Ratio: annual_return / max_drawdown
             if max_drawdown > 0:
                 calmar_ratio = round(annual_return / max_drawdown, 4)
 
             # VaR (95%): 5th percentile of daily returns
-            var_95 = round(float(np.percentile(daily_returns, 5)) * 100, 4)
+            if len(daily_returns) > 1:
+                var_95 = round(float(np.percentile(daily_returns, 5)) * 100, 4)
 
-            # CVaR (95%): mean of returns <= VaR
-            var_threshold = np.percentile(daily_returns, 5)
-            tail_returns = daily_returns[daily_returns <= var_threshold]
-            if len(tail_returns) > 0:
-                cvar_95 = round(float(np.mean(tail_returns)) * 100, 4)
+                # CVaR (95%): mean of returns <= VaR
+                var_threshold = np.percentile(daily_returns, 5)
+                tail_returns = daily_returns[daily_returns <= var_threshold]
+                if len(tail_returns) > 0:
+                    cvar_95 = round(float(np.mean(tail_returns)) * 100, 4)
 
         # Profit Factor: gross_profit / gross_loss
         if trades:

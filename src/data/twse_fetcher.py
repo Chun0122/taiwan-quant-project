@@ -921,7 +921,12 @@ def fetch_dj_broker_trades(stock_id: str, start: date, end: date) -> pd.DataFram
     try:
         resp = requests.get(url, params=params, headers=_HEADERS, timeout=15, verify=False)
         resp.raise_for_status()
-        html = resp.content.decode("big5", errors="replace")
+        # 優先以 strict 模式解碼，失敗時 fallback 至 replace 並記錄警告
+        try:
+            html = resp.content.decode("big5", errors="strict")
+        except UnicodeDecodeError:
+            logger.warning("[DJ分點] %s Big5 解碼含無效位元組，改用 replace 模式（部分分點名稱可能遺失）", stock_id)
+            html = resp.content.decode("big5", errors="replace")
     except Exception as exc:
         logger.warning("[DJ分點] %s 請求失敗: %s", stock_id, exc)
         return pd.DataFrame()

@@ -239,7 +239,8 @@ def calc_rsi14_from_series(closes: pd.Series) -> float:
     last_gain = float(avg_gain.iloc[-1])
     last_loss = float(avg_loss.iloc[-1])
 
-    if last_loss == 0.0:
+    # avg_loss 為零或極小值時直接回傳邊界值，避免除法不穩定
+    if last_loss < 1e-10:
         return 100.0 if last_gain > 0 else 50.0
 
     rs = last_gain / last_loss

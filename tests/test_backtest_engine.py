@@ -532,3 +532,113 @@ class TestAtrScaleAdjustedDividend:
         # 兩者應相等（皆 fallback 至 high/low/close）
         assert atr_with_flag is not None
         assert atr_with_flag == pytest.approx(atr_without_flag, abs=1e-9)
+
+
+# ─── Phase1 修復驗證：Sharpe/Sortino inf 防護 + ATR 對齊 ──────
+
+
+class TestPhase1SharpeInfGuard:
+    """A-03 修復驗證：equity 含零值時 Sharpe/Sortino 不應產生 inf/nan。"""
+
+    def test_sharpe_with_zero_equity(self):
+        """equity curve 含 0（爆倉）時 Sharpe 應為 None 或有限值。"""
+        import math
+
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        # 模擬爆倉：equity 跌至 0 再回升
+        equity = [1_000_000, 500_000, 0, 100_000, 200_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        # 不應為 nan 或 inf
+        if metrics["sharpe_ratio"] is not None:
+            assert math.isfinite(metrics["sharpe_ratio"])
+
+    def test_sortino_with_zero_equity(self):
+        """equity curve 含 0 時 Sortino 應為 None 或有限值。"""
+        import math
+
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 500_000, 0, 100_000, 200_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        if metrics["sortino_ratio"] is not None:
+            assert math.isfinite(metrics["sortino_ratio"])
+
+    def test_var_cvar_with_zero_equity(self):
+        """equity curve 含 0 時 VaR/CVaR 應為 None 或有限值。"""
+        import math
+
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000, 500_000, 0, 100_000, 200_000]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        if metrics["var_95"] is not None:
+            assert math.isfinite(metrics["var_95"])
+        if metrics["cvar_95"] is not None:
+            assert math.isfinite(metrics["cvar_95"])
+
+    def test_sharpe_normal_case_unchanged(self):
+        """正常 equity curve 的 Sharpe 計算不受影響。"""
+        config = BacktestConfig(initial_capital=1_000_000)
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        equity = [1_000_000 + i * 1000 for i in range(100)]
+        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        assert metrics["sharpe_ratio"] is not None
+        assert metrics["sharpe_ratio"] > 0
+
+
+class TestPhase1AtrAlignment:
+    """A-01 修復驗證：ATR 的 prev_close 對齊正確。"""
+
+    def test_atr_prev_close_alignment_with_varying_close(self):
+        """當 close 逐日遞增時，ATR 應反映真實 TR（含 prev_close 影響）。
+
+        設計：close 從 100 漲到 119（每天 +1），high/low 固定 ±5
+        TR[i] = max(H-L, |H-prev_close|, |L-prev_close|)
+            = max(10, |close+5 - (close-1)|, |close-5 - (close-1)|)
+            = max(10, 6, 4) = 10
+        所以 ATR(5) ≈ 10.0
+        """
+        n = 20
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        closes = [100.0 + i for i in range(n)]
+        data = pd.DataFrame(
+            {
+                "high": [c + 5 for c in closes],
+                "low": [c - 5 for c in closes],
+                "close": closes,
+            },
+            index=[d.date() for d in dates],
+        )
+        engine = _make_engine(data, pd.Series(), risk_config=RiskConfig(atr_period=5))
+        atr = engine._compute_atr(data, dates[10].date())
+        assert atr is not None
+        assert atr == pytest.approx(10.0, abs=0.5)
+
+    def test_atr_with_gap_up_reflects_prev_close(self):
+        """跳空高開時，TR 應包含 |High - PrevClose| 的貢獻。
+
+        設計：前 14 天 close=100，第 15 天跳空至 120
+        最後一根 TR = max(H-L, |H-100|, |L-100|) = max(10, 25, 15) = 25
+        前 13 根 TR = 10 → ATR(14) ≈ (13×10 + 25) / 14 ≈ 11.07
+        """
+        n = 20
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        closes = [100.0] * n
+        highs = [105.0] * n
+        lows = [95.0] * n
+        # 第 15 天（idx=14）跳空高開
+        closes[14] = 120.0
+        highs[14] = 125.0
+        lows[14] = 115.0
+
+        data = pd.DataFrame(
+            {"high": highs, "low": lows, "close": closes},
+            index=[d.date() for d in dates],
+        )
+        engine = _make_engine(data, pd.Series(), risk_config=RiskConfig(atr_period=14))
+        # dt = dates[15]，ATR 視窗 = idx[1..14]
+        atr = engine._compute_atr(data, dates[15].date())
+        assert atr is not None
+        # 含跳空的 ATR 應 > 純粹 H-L=10 的 ATR
+        assert atr > 10.0

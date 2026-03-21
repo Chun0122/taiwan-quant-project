@@ -129,3 +129,63 @@ class TestFinMindFetcher:
 
         df = fetcher._request_by_date("TaiwanStockPrice", "2024-01-01", "2024-01-31")
         assert df.empty
+
+
+class TestDividendNaTHandling:
+    """A-04 修復驗證：股利日期欄位中的 NaT 應正確轉為 None。"""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self, monkeypatch):
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = "test_token"
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+
+    def _make_fetcher(self):
+        from src.data.fetcher import FinMindFetcher
+
+        return FinMindFetcher(api_token="test_token")
+
+    def test_nat_cash_payment_date_becomes_none(self, monkeypatch):
+        """cash_payment_date 為空字串或無效日期時應轉為 None，不可為 1970-01-01。"""
+        from datetime import date
+
+        fetcher = self._make_fetcher()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "msg": "success",
+            "data": [
+                {
+                    "date": "2024-07-01",
+                    "stock_id": "2330",
+                    "year": 2024,
+                    "cash_dividend": 3.5,
+                    "stock_dividend": 0.0,
+                    "cash_payment_date": "",  # 空字串 → NaT → 應轉 None
+                    "announcement_date": "invalid-date",  # 無效日期 → NaT → 應轉 None
+                },
+                {
+                    "date": "2024-01-02",
+                    "stock_id": "2330",
+                    "year": 2024,
+                    "cash_dividend": 3.0,
+                    "stock_dividend": 0.0,
+                    "cash_payment_date": "2024-02-15",  # 有效日期
+                    "announcement_date": "2023-12-01",
+                },
+            ],
+        }
+        monkeypatch.setattr(fetcher._session, "get", lambda *a, **kw: mock_resp)
+        monkeypatch.setattr("src.data.fetcher.time.sleep", lambda x: None)
+
+        df = fetcher.fetch_dividend("2330", "2024-01-01")
+
+        # 第一筆：空/無效日期應為 None
+        assert df.iloc[0]["cash_payment_date"] is None
+        assert df.iloc[0]["announcement_date"] is None
+
+        # 第二筆：有效日期應正確轉換
+        assert df.iloc[1]["cash_payment_date"] == date(2024, 2, 15)
+        assert df.iloc[1]["announcement_date"] == date(2023, 12, 1)

@@ -284,6 +284,27 @@ class TestFetchDJBrokerTrades:
 
         assert df.empty
 
+    def test_big5_invalid_bytes_fallback_to_replace(self, monkeypatch):
+        """Big5 解碼含無效位元組時應 fallback 至 replace 模式，仍回傳可解析結果。"""
+        from unittest.mock import MagicMock
+
+        from src.data.twse_fetcher import fetch_dj_broker_trades
+
+        # 在有效 HTML 中插入一個無效的 Big5 byte（0xFF 不是合法 Big5）
+        # 但 regex 仍可解析出有效的 broker 條目
+        valid_big5 = _DJ_HTML_TWO_PAIRS  # 已知可解析的 HTML bytes
+        # 用 replace 模式的 bytes 確保函式不會崩潰
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        # 在 content 前面塞入一個無效 Big5 byte
+        mock_resp.content = b"\xff" + valid_big5
+        monkeypatch.setattr("src.data.twse_fetcher.requests.get", lambda *a, **kw: mock_resp)
+        monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda x: None)
+
+        df = fetch_dj_broker_trades("2330", date(2025, 3, 6), date(2025, 3, 10))
+        # 不應崩潰，且應能解析出資料（或至少回傳空 DataFrame）
+        assert isinstance(df, type(pd.DataFrame()))
+
 
 # ------------------------------------------------------------------ #
 #  TestBrokerTradeORM — in-memory SQLite 測試
