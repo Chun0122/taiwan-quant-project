@@ -36,6 +36,7 @@ from src.discovery.scanner._functions import (
     _calc_atr14,
     _extract_level_lower_bound,
     compute_abnormal_announcement_rate,
+    compute_adaptive_atr_multiplier,
     compute_broker_score,
     compute_chip_macd,
     compute_daytrade_penalty,
@@ -45,8 +46,12 @@ from src.discovery.scanner._functions import (
     compute_ic_weight_adjustments,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
+    compute_key_player_cost_basis,
+    compute_mfe_mae,
     compute_news_decay_weight,
+    compute_peer_fundamental_ranking,
     compute_relative_pe_thresholds,
+    compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_smart_broker_score,
     compute_taiex_relative_strength,
@@ -54,6 +59,7 @@ from src.discovery.scanner._functions import (
     compute_whale_score,
     compute_win_rate_threshold_adjustment,
     detect_daytrade_brokers,
+    score_key_player_cost,
 )
 from src.discovery.scanner._growth import GrowthScanner
 
@@ -85,6 +91,12 @@ __all__ = [
     "compute_win_rate_threshold_adjustment",
     "compute_factor_ic",
     "compute_ic_weight_adjustments",
+    "compute_key_player_cost_basis",
+    "score_key_player_cost",
+    "compute_adaptive_atr_multiplier",
+    "compute_revenue_acceleration_score",
+    "compute_peer_fundamental_ranking",
+    "compute_mfe_mae",
     # 資料容器
     "DiscoveryResult",
     # 類別

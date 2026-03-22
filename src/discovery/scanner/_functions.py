@@ -2004,6 +2004,500 @@ def compute_ic_weight_adjustments(
     return adjusted
 
 
+# ── P3-B2: 主力成本分析 ──────────────────────────────────────────────
+
+
+def compute_key_player_cost_basis(
+    df_broker: pd.DataFrame,
+    stock_ids: list[str],
+    top_n_brokers: int = 3,
+    lookback_days: int = 60,
+) -> pd.DataFrame:
+    """計算 Top-N 主力估計成本與現價的關係。
+
+    從分點歷史資料計算 top_n_brokers 個最大淨買超分點的加權平均成本，
+    與現價比較判斷主力是被套（護盤動力）還是獲利豐厚（出貨風險）。
+
+    評分規則：
+    - 現價 < 主力成本 × 0.95 → 主力被套，有護盤動力 = 0.8
+    - 現價 介於 0.95~1.10 × 主力成本 → 成本附近 = 0.5
+    - 現價 > 主力成本 × 1.10 → 主力已獲利，出貨風險 = 0.2
+    - 無法計算 → 中性 0.5
+
+    Args:
+        df_broker: BrokerTrade DataFrame（stock_id / date / broker_id /
+                   buy / sell / buy_price / sell_price）
+        stock_ids: 要評估的股票清單
+        top_n_brokers: 取淨買超前 N 大主力（預設 3）
+        lookback_days: 回溯天數（預設 60）
+
+    Returns:
+        DataFrame(stock_id, key_player_cost, key_player_score)
+    """
+    default = pd.DataFrame(
+        {
+            "stock_id": stock_ids,
+            "key_player_cost": [None] * len(stock_ids),
+            "key_player_score": [0.5] * len(stock_ids),
+        }
+    )
+
+    if df_broker.empty or not stock_ids:
+        return default
+
+    cutoff = None
+    if "date" in df_broker.columns and not df_broker.empty:
+        max_date = df_broker["date"].max()
+        if hasattr(max_date, "toordinal"):
+            cutoff = max_date - timedelta(days=lookback_days)
+
+    results: list[dict] = []
+    grouped = df_broker[df_broker["stock_id"].isin(stock_ids)].groupby("stock_id", sort=False)
+
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "key_player_cost": None, "key_player_score": 0.5})
+            continue
+
+        grp = grouped.get_group(sid)
+        if cutoff is not None:
+            grp = grp[grp["date"] >= cutoff]
+        if grp.empty:
+            results.append({"stock_id": sid, "key_player_cost": None, "key_player_score": 0.5})
+            continue
+
+        # 彙總每個分點的淨買超量和加權成本
+        broker_agg = (
+            grp.groupby("broker_id")
+            .agg(
+                total_buy=("buy", "sum"),
+                total_sell=("sell", "sum"),
+            )
+            .reset_index()
+        )
+        broker_agg["net_buy"] = broker_agg["total_buy"] - broker_agg["total_sell"]
+
+        # 取淨買超前 N 大的分點
+        top_brokers = broker_agg.nlargest(top_n_brokers, "net_buy")
+        top_brokers = top_brokers[top_brokers["net_buy"] > 0]
+
+        if top_brokers.empty:
+            results.append({"stock_id": sid, "key_player_cost": None, "key_player_score": 0.5})
+            continue
+
+        # 計算加權平均成本（使用 buy_price，若 NULL 則用同日收盤價代理）
+        top_broker_ids = top_brokers["broker_id"].tolist()
+        broker_details = grp[grp["broker_id"].isin(top_broker_ids)].copy()
+
+        # 取有效的買入價
+        if "buy_price" in broker_details.columns:
+            valid_buys = broker_details[(broker_details["buy"] > 0) & broker_details["buy_price"].notna()]
+        else:
+            valid_buys = pd.DataFrame()
+
+        if valid_buys.empty:
+            results.append({"stock_id": sid, "key_player_cost": None, "key_player_score": 0.5})
+            continue
+
+        # 加權平均成本 = Σ(buy × buy_price) / Σ(buy)
+        total_buy_value = (valid_buys["buy"] * valid_buys["buy_price"]).sum()
+        total_buy_qty = valid_buys["buy"].sum()
+        if total_buy_qty <= 0:
+            results.append({"stock_id": sid, "key_player_cost": None, "key_player_score": 0.5})
+            continue
+
+        avg_cost = float(total_buy_value / total_buy_qty)
+        results.append({"stock_id": sid, "key_player_cost": avg_cost, "key_player_score": 0.5})
+
+    # 第二步：用 df_broker 最新日期的收盤價代理（或直接 close）計算 score
+    result_df = pd.DataFrame(results)
+    # 需要呼叫端傳入 current_price → 在 _base.py 整合時處理
+    return result_df
+
+
+def score_key_player_cost(
+    cost_df: pd.DataFrame,
+    price_map: dict[str, float],
+) -> pd.DataFrame:
+    """根據主力成本與現價比較計算分數。
+
+    Args:
+        cost_df: compute_key_player_cost_basis 的輸出
+        price_map: {stock_id: latest_close_price}
+
+    Returns:
+        更新 key_player_score 後的 DataFrame
+    """
+    if cost_df.empty:
+        return cost_df
+
+    result = cost_df.copy()
+    scores = []
+    for _, row in result.iterrows():
+        sid = row["stock_id"]
+        cost = row.get("key_player_cost")
+        current_price = price_map.get(sid)
+
+        if cost is None or current_price is None or cost <= 0:
+            scores.append(0.5)
+            continue
+
+        ratio = current_price / cost
+        if ratio < 0.95:
+            scores.append(0.8)  # 主力被套，護盤動力
+        elif ratio > 1.10:
+            scores.append(0.2)  # 主力已獲利，出貨風險
+        else:
+            scores.append(0.5)  # 成本附近
+
+    result["key_player_score"] = scores
+    return result
+
+
+# ── P3-D1: 動態停損 ─────────────────────────────────────────────────
+
+
+def compute_adaptive_atr_multiplier(
+    df_price: pd.DataFrame,
+    stock_ids: list[str],
+    base_stop_mult: float = 1.5,
+    mdd_window: int = 20,
+) -> pd.DataFrame:
+    """根據個股歷史最大回撤（MDD）調整 ATR 止損倍數。
+
+    高 MDD 股票用更緊的止損（降低倍數），低 MDD 股票可用更寬的止損。
+
+    規則：
+    - MDD < 5% → 穩定股，倍數 × 1.2（放寬）
+    - MDD 5~10% → 正常，維持 base
+    - MDD 10~15% → 偏高，倍數 × 0.85
+    - MDD > 15% → 高波動，倍數 × 0.7
+
+    Args:
+        df_price: DailyPrice DataFrame（stock_id / date / close / high / low）
+        stock_ids: 要評估的股票清單
+        base_stop_mult: 基準 ATR 止損倍數（預設 1.5）
+        mdd_window: MDD 回溯天數（預設 20）
+
+    Returns:
+        DataFrame(stock_id, mdd_pct, adjusted_stop_mult)
+    """
+    if df_price.empty or not stock_ids:
+        return pd.DataFrame(
+            {
+                "stock_id": stock_ids,
+                "mdd_pct": [0.0] * len(stock_ids),
+                "adjusted_stop_mult": [base_stop_mult] * len(stock_ids),
+            }
+        )
+
+    results: list[dict] = []
+    filtered = df_price[df_price["stock_id"].isin(stock_ids)]
+    grouped = filtered.groupby("stock_id", sort=False)
+
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "mdd_pct": 0.0, "adjusted_stop_mult": base_stop_mult})
+            continue
+
+        grp = grouped.get_group(sid).sort_values("date").tail(mdd_window)
+        if len(grp) < 5:
+            results.append({"stock_id": sid, "mdd_pct": 0.0, "adjusted_stop_mult": base_stop_mult})
+            continue
+
+        closes = grp["close"].values.astype(float)
+        # 計算滾動最大回撤
+        peak = closes[0]
+        max_dd = 0.0
+        for c in closes:
+            if c > peak:
+                peak = c
+            dd = (c - peak) / peak if peak > 0 else 0.0
+            if dd < max_dd:
+                max_dd = dd
+
+        mdd_pct = abs(max_dd)  # 轉為正值百分比
+
+        if mdd_pct < 0.05:
+            mult = base_stop_mult * 1.2  # 穩定股，放寬
+        elif mdd_pct < 0.10:
+            mult = base_stop_mult  # 正常
+        elif mdd_pct < 0.15:
+            mult = base_stop_mult * 0.85  # 偏高，收緊
+        else:
+            mult = base_stop_mult * 0.70  # 高波動，大幅收緊
+
+        results.append({"stock_id": sid, "mdd_pct": round(mdd_pct, 4), "adjusted_stop_mult": round(mult, 3)})
+
+    return pd.DataFrame(results)
+
+
+# ── P3-C2: 營收加速度推廣 ────────────────────────────────────────────
+
+
+def compute_revenue_acceleration_score(
+    df_revenue: pd.DataFrame,
+    stock_ids: list[str],
+    consecutive_threshold: int = 3,
+) -> pd.DataFrame:
+    """計算營收 YoY 加速度分數（推廣至所有模式）。
+
+    指標：
+    1. acceleration = YoY_latest - YoY_3m_ago（已存在於營收資料）
+    2. consecutive_months: 連續 N 月 YoY 加速的計數（越長越好）
+    3. 綜合分數（0~1）：區分「可持續成長」vs「一次性基數效應」
+
+    評分規則：
+    - 連續 ≥ 3 月加速且 acceleration > 10pp → 0.9（強勁加速）
+    - 連續 ≥ 3 月加速 → 0.75（穩定加速）
+    - acceleration > 0 但未連續 → 0.6（單月加速）
+    - acceleration ≤ 0 → 0.3（減速）
+    - 無資料 → 0.5
+
+    Args:
+        df_revenue: MonthlyRevenue DataFrame
+            （stock_id / yoy_growth / yoy_3m_ago，最多 4 個月）
+        stock_ids: 要評估的股票清單
+        consecutive_threshold: 連續加速月數門檻（預設 3）
+
+    Returns:
+        DataFrame(stock_id, rev_accel_score, consecutive_accel_months)
+    """
+    if df_revenue.empty or not stock_ids:
+        return pd.DataFrame(
+            {
+                "stock_id": stock_ids,
+                "rev_accel_score": [0.5] * len(stock_ids),
+                "consecutive_accel_months": [0] * len(stock_ids),
+            }
+        )
+
+    results: list[dict] = []
+    grouped = df_revenue[df_revenue["stock_id"].isin(stock_ids)]
+
+    # 需要多個月的資料來計算連續性
+    if "yoy_growth" not in grouped.columns:
+        return pd.DataFrame(
+            {
+                "stock_id": stock_ids,
+                "rev_accel_score": [0.5] * len(stock_ids),
+                "consecutive_accel_months": [0] * len(stock_ids),
+            }
+        )
+
+    rev_grouped = grouped.groupby("stock_id", sort=False)
+
+    for sid in stock_ids:
+        if sid not in rev_grouped.groups:
+            results.append({"stock_id": sid, "rev_accel_score": 0.5, "consecutive_accel_months": 0})
+            continue
+
+        grp = rev_grouped.get_group(sid)
+        if "date" in grp.columns:
+            grp = grp.sort_values("date", ascending=False)
+        else:
+            grp = grp.reset_index(drop=True)
+        if grp.empty:
+            results.append({"stock_id": sid, "rev_accel_score": 0.5, "consecutive_accel_months": 0})
+            continue
+
+        # 計算加速度
+        latest_yoy = grp.iloc[0].get("yoy_growth")
+        yoy_3m = grp.iloc[0].get("yoy_3m_ago") if "yoy_3m_ago" in grp.columns else None
+
+        if pd.isna(latest_yoy):
+            results.append({"stock_id": sid, "rev_accel_score": 0.5, "consecutive_accel_months": 0})
+            continue
+
+        # 計算連續加速月數（YoY 遞增）
+        consec = 0
+        yoy_values = grp["yoy_growth"].dropna().values
+        if len(yoy_values) >= 2:
+            for i in range(len(yoy_values) - 1):
+                if yoy_values[i] > yoy_values[i + 1]:
+                    consec += 1
+                else:
+                    break
+
+        accel = (float(latest_yoy) - float(yoy_3m)) if yoy_3m is not None and not pd.isna(yoy_3m) else None
+
+        if accel is not None and accel > 10 and consec >= consecutive_threshold:
+            score = 0.9  # 強勁加速：連續多月 + 加速幅度大（>10 百分點）
+        elif consec >= consecutive_threshold:
+            score = 0.75  # 穩定加速
+        elif accel is not None and accel > 0:
+            score = 0.6  # 單月加速
+        elif accel is not None and accel <= 0:
+            score = 0.3  # 減速
+        else:
+            score = 0.5  # 無法判定
+
+        results.append({"stock_id": sid, "rev_accel_score": score, "consecutive_accel_months": consec})
+
+    return pd.DataFrame(results)
+
+
+# ── P3-C3: 同業基本面排名 ────────────────────────────────────────────
+
+
+def compute_peer_fundamental_ranking(
+    df_financial: pd.DataFrame,
+    stock_ids: list[str],
+    industry_map: dict[str, str],
+    bonus: float = 0.03,
+) -> pd.DataFrame:
+    """計算同產業基本面排名加成。
+
+    同產業 ROE/毛利率/營收成長率排名：
+    - 產業龍頭（基本面前 25%）→ +bonus
+    - 產業落後者（後 25%）→ -bonus
+    - 中間 50% → 0
+
+    三指標等權平均。樣本不足（<4 家同業）時不做加減分。
+
+    Args:
+        df_financial: FinancialStatement 最新一季
+            （stock_id / roe / gross_margin / revenue）
+        stock_ids: 候選股清單
+        industry_map: {stock_id: industry_category}
+        bonus: 加成幅度（預設 ±0.03）
+
+    Returns:
+        DataFrame(stock_id, peer_rank_bonus)  值域 {-bonus, 0.0, +bonus}
+    """
+    default = pd.DataFrame({"stock_id": stock_ids, "peer_rank_bonus": [0.0] * len(stock_ids)})
+
+    if df_financial.empty or not stock_ids:
+        return default
+
+    # 只取候選股
+    df = df_financial[df_financial["stock_id"].isin(stock_ids)].copy()
+    if df.empty:
+        return default
+
+    # 確保有產業映射
+    df["industry"] = df["stock_id"].map(industry_map)
+    df = df.dropna(subset=["industry"])
+    if df.empty:
+        return default
+
+    metrics = ["roe", "gross_margin", "revenue"]
+    available_metrics = [m for m in metrics if m in df.columns]
+    if not available_metrics:
+        return default
+
+    # 對每個指標計算產業內百分位排名
+    rank_cols = []
+    for metric in available_metrics:
+        col_name = f"_peer_{metric}_pctile"
+        df[col_name] = df.groupby("industry")[metric].rank(pct=True)
+        rank_cols.append(col_name)
+
+    # 計算同業中的平均排名
+    df["_avg_peer_rank"] = df[rank_cols].mean(axis=1)
+
+    # 計算每個產業的樣本數
+    industry_counts = df.groupby("industry")["stock_id"].transform("count")
+
+    # 加成規則
+    bonuses = []
+    for _, row in df.iterrows():
+        n_peers = industry_counts.loc[row.name]
+        if n_peers < 4:
+            bonuses.append(0.0)  # 同業太少，不加減分
+        elif row["_avg_peer_rank"] >= 0.75:
+            bonuses.append(bonus)  # 龍頭
+        elif row["_avg_peer_rank"] <= 0.25:
+            bonuses.append(-bonus)  # 落後者
+        else:
+            bonuses.append(0.0)
+
+    df["peer_rank_bonus"] = bonuses
+
+    result = pd.DataFrame({"stock_id": stock_ids})
+    result = result.merge(df[["stock_id", "peer_rank_bonus"]], on="stock_id", how="left")
+    result["peer_rank_bonus"] = result["peer_rank_bonus"].fillna(0.0)
+    return result
+
+
+# ── P3-E3: MFE/MAE 分析 ─────────────────────────────────────────────
+
+
+def compute_mfe_mae(
+    df_records: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    holding_days: int = 20,
+) -> pd.DataFrame:
+    """計算每筆推薦的最大有利偏移（MFE）和最大不利偏移（MAE）。
+
+    追蹤推薦從進場日到 holding_days 天的完整路徑：
+    - MFE (Maximum Favorable Excursion): 路徑中最高報酬率
+    - MAE (Maximum Adverse Excursion): 路徑中最大虧損幅度
+    - MFE/MAE 比率: > 1 表示有利偏移大於不利偏移（好的推薦）
+
+    Args:
+        df_records: 推薦記錄（scan_date / stock_id / close）
+        df_prices: 日K線（stock_id / date / close / high / low）
+        holding_days: 追蹤天數（預設 20）
+
+    Returns:
+        DataFrame(scan_date, stock_id, entry_close, mfe, mae, mfe_mae_ratio, final_return)
+    """
+    if df_records.empty or df_prices.empty:
+        return pd.DataFrame(
+            columns=["scan_date", "stock_id", "entry_close", "mfe", "mae", "mfe_mae_ratio", "final_return"]
+        )
+
+    results: list[dict] = []
+    for _, rec in df_records.iterrows():
+        scan_d = rec["scan_date"]
+        sid = rec["stock_id"]
+        entry_close = float(rec["close"])
+        if entry_close <= 0:
+            continue
+
+        future = (
+            df_prices[(df_prices["stock_id"] == sid) & (df_prices["date"] > scan_d)]
+            .sort_values("date")
+            .head(holding_days)
+        )
+
+        if future.empty:
+            continue
+
+        # 使用 high/low 計算日內最大偏移（若有），否則用 close
+        if "high" in future.columns and "low" in future.columns:
+            max_high = float(future["high"].max())
+            min_low = float(future["low"].min())
+        else:
+            max_high = float(future["close"].max())
+            min_low = float(future["close"].min())
+
+        mfe = (max_high - entry_close) / entry_close
+        mae = (min_low - entry_close) / entry_close  # 負值
+
+        # MFE/MAE 比率（MAE 取絕對值）
+        mfe_mae_ratio = mfe / abs(mae) if abs(mae) > 0.001 else float("inf")
+
+        # 最終報酬
+        final_close = float(future.iloc[-1]["close"])
+        final_return = (final_close - entry_close) / entry_close
+
+        results.append(
+            {
+                "scan_date": scan_d,
+                "stock_id": sid,
+                "entry_close": entry_close,
+                "mfe": round(mfe, 4),
+                "mae": round(mae, 4),
+                "mfe_mae_ratio": round(mfe_mae_ratio, 2),
+                "final_return": round(final_return, 4),
+            }
+        )
+
+    return pd.DataFrame(results)
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""

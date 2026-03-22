@@ -19,6 +19,7 @@ from src.discovery.scanner._functions import (
     compute_hhi_trend,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
+    compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_smart_broker_score,
     compute_value_weighted_inst_flow,
@@ -423,13 +424,16 @@ class MomentumScanner(MarketScanner):
             return pd.DataFrame()
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：四階梯短線爆發濾網（此 10% 權重不評長線品質，只捕捉短線催化劑）。
+        """動能模式基本面：四階梯 + 營收加速度連續性加成。
 
+        基礎分（80%）：四階梯短線爆發濾網
         Tier 1 (0.85)：MoM > 0 且 YoY > 0 且 YoY > yoy_3m_ago（月營收雙增 + YoY 近期創高）
         Tier 2 (0.72)：YoY > 0 且 YoY > yoy_3m_ago（YoY 正且加速）
         Tier 3 (0.55)：YoY > 0（YoY 正但未加速，或無加速度資料）
         Tier 4 (0.30)：YoY <= 0（YoY 衰退）
         無資料 fallback：0.50（中性）
+
+        加速度連續性加成（20%，C2）：連續 N 月 YoY 加速 → 可持續成長 vs 一次性暴增
         """
         if df_revenue.empty:
             return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
@@ -465,7 +469,18 @@ class MomentumScanner(MarketScanner):
 
             result_rows.append({"stock_id": sid, "fundamental_score": score})
 
-        return pd.DataFrame(result_rows)
+        base_df = pd.DataFrame(result_rows)
+
+        # C2: 營收加速度連續性加成（20% 權重混合）
+        accel_df = compute_revenue_acceleration_score(df_revenue, stock_ids, consecutive_threshold=3)
+        if not accel_df.empty:
+            base_df = base_df.merge(accel_df[["stock_id", "rev_accel_score"]], on="stock_id", how="left")
+            base_df["rev_accel_score"] = base_df["rev_accel_score"].fillna(0.5)
+            # 混合：基礎 Tier 80% + 加速度連續性 20%
+            base_df["fundamental_score"] = base_df["fundamental_score"] * 0.80 + base_df["rev_accel_score"] * 0.20
+            base_df = base_df.drop(columns=["rev_accel_score"])
+
+        return base_df
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """動能模式風險過濾：ATR(14)/close > 80th percentile 剔除。"""

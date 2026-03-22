@@ -33,16 +33,20 @@ from src.discovery.scanner._functions import (
     DiscoveryResult,
     _calc_atr14,
     compute_abnormal_announcement_rate,
+    compute_adaptive_atr_multiplier,
     compute_chip_macd,
     compute_daytrade_penalty,
     compute_factor_ic,
     compute_institutional_acceleration,
+    compute_key_player_cost_basis,
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
     compute_news_decay_weight,
+    compute_peer_fundamental_ranking,
     compute_taiex_relative_strength,
     compute_volume_price_divergence,
     compute_win_rate_threshold_adjustment,
+    score_key_player_cost,
 )
 from src.discovery.universe import UniverseConfig, UniverseFilter
 from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
@@ -178,6 +182,9 @@ class MarketScanner:
         # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
         scored = self._apply_concept_bonus(scored)
 
+        # Stage 3.3c: 同業基本面排名（C3 — 同產業 ROE/毛利率/營收排名 ±3%）
+        scored = self._apply_peer_fundamental_ranking(scored)
+
         # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
@@ -199,6 +206,9 @@ class MarketScanner:
 
         # Stage 3.5f: 籌碼面 MACD（法人淨買超短期 vs 長期 EMA 交叉 → 加/減分）
         scored = self._apply_chip_macd(scored, df_inst)
+
+        # Stage 3.5g: 主力成本分析（B2 — 現價 vs 主力估計成本 → 加/減分）
+        scored = self._apply_key_player_cost(scored, df_price)
 
         # Stage 3.6: 量價背離偵測（價漲量縮 → 降分）
         scored = self._apply_volume_price_divergence(scored, df_price)
@@ -870,6 +880,50 @@ class MarketScanner:
         return scored
 
     # ------------------------------------------------------------------ #
+    #  Stage 3.3c: 同業基本面排名（C3）
+    # ------------------------------------------------------------------ #
+
+    def _apply_peer_fundamental_ranking(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """Stage 3.3c — 同產業 ROE/毛利率/營收排名 → composite_score ±3%。
+
+        產業龍頭（前 25%）加分，落後者（後 25%）減分。
+        同業不足 4 家時不加減分。
+        """
+        if scored.empty or "industry_category" not in scored.columns:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+
+        # 建立 industry_map
+        industry_map: dict[str, str] = {}
+        if "industry_category" in scored.columns:
+            for _, row in scored[["stock_id", "industry_category"]].dropna().iterrows():
+                industry_map[row["stock_id"]] = row["industry_category"]
+
+        if not industry_map:
+            return scored
+
+        # 載入最新一季財報
+        df_fin = self._load_financial_data(stock_ids, quarters=1)
+        if df_fin.empty:
+            return scored
+
+        peer_df = compute_peer_fundamental_ranking(df_fin, stock_ids, industry_map, bonus=0.03)
+        scored = scored.merge(peer_df, on="stock_id", how="left")
+        scored["peer_rank_bonus"] = scored["peer_rank_bonus"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["peer_rank_bonus"])
+
+        n_leader = (scored["peer_rank_bonus"] > 0).sum()
+        n_laggard = (scored["peer_rank_bonus"] < 0).sum()
+        if n_leader > 0 or n_laggard > 0:
+            logger.info(
+                "Stage 3.3c: 同業基本面排名 — %d 支龍頭加分 / %d 支落後減分",
+                n_leader,
+                n_laggard,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
     #  Stage 2: 粗篩
     # ------------------------------------------------------------------ #
 
@@ -1149,7 +1203,22 @@ class MarketScanner:
                 continue
 
             atr14 = _calc_atr14(stock_data)
-            stop_loss, take_profit = compute_atr_stops(close, atr14, regime)
+
+            # D1: 動態停損 — 根據個股 MDD 調整 ATR 倍數
+            base_stop_mult, base_target_mult = REGIME_ATR_PARAMS.get(regime, REGIME_ATR_PARAMS["sideways"])
+            mdd_df = compute_adaptive_atr_multiplier(stock_data, [sid], base_stop_mult=base_stop_mult, mdd_window=20)
+            if not mdd_df.empty:
+                adj_mult = float(mdd_df.iloc[0]["adjusted_stop_mult"])
+                # 按比例調整 target_mult
+                ratio = adj_mult / base_stop_mult if base_stop_mult > 0 else 1.0
+                adj_target = base_target_mult * ratio
+                if atr14 > 0:
+                    stop_loss = round(close - adj_mult * atr14, 2)
+                    take_profit = round(close + adj_target * atr14, 2)
+                else:
+                    stop_loss, take_profit = None, None
+            else:
+                stop_loss, take_profit = compute_atr_stops(close, atr14, regime)
 
             # SMA20 — 用 tail(20) 的平均收盤價
             sma20 = float(stock_data["close"].tail(20).mean())
@@ -1874,6 +1943,62 @@ class MarketScanner:
                 "Stage 3.5f: 籌碼面 MACD — %d 支加分（吸籌加速）/ %d 支降分（出貨信號）",
                 n_boost,
                 n_penalty,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.5g: 主力成本分析（B2）
+    # ------------------------------------------------------------------ #
+
+    def _apply_key_player_cost(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.5g — 主力估計成本 vs 現價 → composite_score 調整。
+
+        現價 < 主力成本（被套）→ +2%（護盤動力）
+        現價 > 主力成本 ×1.10（已獲利）→ -2%（出貨風險）
+        """
+        if scored.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+
+        # 載入分點資料（使用 extended 取得更長歷史）
+        try:
+            df_broker = self._load_broker_data_extended(stock_ids, days=60, min_trading_days=5)
+        except Exception:
+            df_broker = self._load_broker_data(stock_ids)
+
+        if df_broker.empty:
+            return scored
+
+        cost_df = compute_key_player_cost_basis(df_broker, stock_ids, top_n_brokers=3, lookback_days=60)
+        if cost_df.empty or cost_df["key_player_cost"].isna().all():
+            return scored
+
+        # 取最新收盤價
+        price_map: dict[str, float] = {}
+        if not df_price.empty:
+            latest = df_price.sort_values("date").groupby("stock_id").last()
+            price_map = latest["close"].to_dict()
+
+        cost_scored = score_key_player_cost(cost_df, price_map)
+        scored = scored.merge(cost_scored[["stock_id", "key_player_score"]], on="stock_id", how="left")
+        scored["key_player_score"] = scored["key_player_score"].fillna(0.5)
+
+        # 分數調整：0.8 → +2%，0.2 → -2%，0.5 → 0%
+        scored["kp_adj"] = (scored["key_player_score"] - 0.5) * 0.067
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["kp_adj"])
+
+        n_protect = (scored["kp_adj"] > 0.005).sum()
+        n_risk = (scored["kp_adj"] < -0.005).sum()
+        if n_protect > 0 or n_risk > 0:
+            logger.info(
+                "Stage 3.5g: 主力成本分析 — %d 支護盤加分 / %d 支出貨風險降分",
+                n_protect,
+                n_risk,
             )
         return scored
 

@@ -15,15 +15,21 @@ from src.discovery.scanner import (
     compute_taiex_relative_strength,
 )
 from src.discovery.scanner._functions import (
+    compute_adaptive_atr_multiplier,
     compute_chip_macd,
     compute_earnings_quality,
     compute_factor_ic,
     compute_ic_weight_adjustments,
     compute_institutional_acceleration,
+    compute_key_player_cost_basis,
+    compute_mfe_mae,
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
+    compute_peer_fundamental_ranking,
+    compute_revenue_acceleration_score,
     compute_value_weighted_inst_flow,
     compute_win_rate_threshold_adjustment,
+    score_key_player_cost,
 )
 from tests.scanner_helpers import (
     make_entry_exit_price_df,
@@ -698,7 +704,8 @@ class TestChipTier:
 
 class TestMomentumFundamentalScores:
     def test_yoy_positive_gets_higher(self, momentum_scanner):
-        """YoY > 0 且無加速度資料 → Tier 3 (0.55)；YoY <= 0 → Tier 4 (0.30)。"""
+        """YoY > 0 且無加速度資料 → 基礎 Tier 3 (0.55)×80% + 加速度中性(0.5)×20% = 0.54；
+        YoY <= 0 → 基礎 Tier 4 (0.30)×80% + 加速度中性(0.5)×20% = 0.34。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000", "1001"],
@@ -708,8 +715,9 @@ class TestMomentumFundamentalScores:
         )
         result = momentum_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
         scores = result.set_index("stock_id")["fundamental_score"]
-        assert scores["1000"] == pytest.approx(0.55)
-        assert scores["1001"] == pytest.approx(0.30)
+        # C2: 80% base tier + 20% acceleration (neutral=0.5 when no acceleration data)
+        assert scores["1000"] == pytest.approx(0.55 * 0.80 + 0.5 * 0.20)
+        assert scores["1001"] == pytest.approx(0.30 * 0.80 + 0.5 * 0.20)
 
     def test_no_data_fallback(self, momentum_scanner):
         result = momentum_scanner._compute_fundamental_scores(
@@ -728,7 +736,8 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.85)
+        # C2 混合：base 0.85 × 80% + rev_accel 0.6（accel=10>0, 單月）× 20% = 0.80
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.80)
 
     def test_acceleration_bonus_negative(self, momentum_scanner):
         """YoY > 0、MoM > 0 但減速（yoy < yoy_3m_ago）→ Tier 3: 0.55。"""
@@ -741,7 +750,8 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.55)
+        # C2 混合：base 0.55 × 80% + rev_accel 0.3（accel=-20≤0, 減速）× 20% = 0.50
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.50)
 
     def test_tier2_yoy_accelerating_mom_negative(self, momentum_scanner):
         """YoY > 0 且加速，但 MoM <= 0 → Tier 2: 0.72（非雙增故不升 Tier 1）。"""
@@ -754,7 +764,8 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.72)
+        # C2 混合：base 0.72 × 80% + rev_accel 0.6（accel=10>0, 單月）× 20% = 0.696
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.696)
 
     def test_tier3_yoy_positive_no_yoy3m(self, momentum_scanner):
         """YoY > 0 但無 yoy_3m_ago → 無法判斷加速 → Tier 3: 0.55。"""
@@ -766,7 +777,8 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.55)
+        # C2 混合：base 0.55 × 80% + rev_accel 0.5（無 yoy_3m, 中性）× 20% = 0.54
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.54)
 
     def test_tier4_yoy_negative_regardless_mom(self, momentum_scanner):
         """YoY <= 0 → Tier 4: 0.30（MoM 正也無法拉升）。"""
@@ -779,7 +791,8 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.30)
+        # C2 混合：base 0.30 × 80% + rev_accel 0.6（accel=3>0, 單月）× 20% = 0.36
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.36)
 
     def test_tier1_highest_tier2_second(self, momentum_scanner):
         """四階梯排序：Tier 1 > Tier 2 > Tier 3 > Tier 4。"""
@@ -5154,15 +5167,17 @@ class TestCrisisEntryTriggerText:
         assert "降低部位規模" not in trigger
 
     def test_crisis_stop_loss_uses_1x_atr(self, scanner):
-        """crisis 模式止損倍數應為 1.0x ATR（非舊值 0.8x）。"""
+        """crisis 模式止損基準為 1.0x ATR，D1 自適應可能微調。"""
         df = self._make_price_df()
         result = scanner._compute_entry_exit_cols(["1000"], df, regime="crisis")
         row = result.iloc[0]
         ep = row["entry_price"]
         sl = row["stop_loss"]
-        # ATR14 ≈ 4.0（high-low=4，無跳空），stop = entry - 1.0 × ATR
+        # ATR14 ≈ 4.0（high-low=4，無跳空）
+        # D1: MDD=0%（close 恆定）→ 穩定股 → base×1.2 = 1.0×1.2 = 1.2
+        # stop = entry - 1.2 × ATR ≈ 4.8
         stop_dist = ep - sl
-        assert stop_dist == pytest.approx(4.0, abs=0.5)  # 1.0 × ATR ≈ 4.0
+        assert stop_dist == pytest.approx(4.8, abs=0.5)  # 1.0×1.2（D1 穩定股放寬）× ATR ≈ 4.8
 
 
 # ====================================================================== #
@@ -6859,3 +6874,426 @@ class TestComputeIcWeightAdjustments:
         base = {"technical_score": 0.40, "chip_score": 0.30, "fundamental_score": 0.30}
         result = compute_ic_weight_adjustments(ic_df, base)
         assert sum(result.values()) == pytest.approx(1.0)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P3-B2: compute_key_player_cost_basis + score_key_player_cost
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestKeyPlayerCostBasis:
+    """測試主力成本分析純函數。"""
+
+    @staticmethod
+    def _make_broker_df(stock_id: str, brokers: dict[str, tuple[int, int, float]]) -> pd.DataFrame:
+        """建立分點資料。brokers: {broker_id: (buy, sell, buy_price)}"""
+        rows = []
+        d = date.today() - timedelta(days=5)
+        for bid, (buy, sell, bp) in brokers.items():
+            rows.append(
+                {
+                    "stock_id": stock_id,
+                    "date": d,
+                    "broker_id": bid,
+                    "buy": buy,
+                    "sell": sell,
+                    "buy_price": bp,
+                    "sell_price": bp,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_empty_returns_default(self):
+        """空資料 → 預設 0.5。"""
+        result = compute_key_player_cost_basis(pd.DataFrame(), ["2330"])
+        assert len(result) == 1
+        assert result.iloc[0]["key_player_score"] == 0.5
+
+    def test_top3_brokers_selected(self):
+        """取淨買超前 3 大主力。"""
+        df = self._make_broker_df(
+            "2330",
+            {
+                "B1": (5000, 1000, 100.0),  # net=4000
+                "B2": (3000, 500, 100.0),  # net=2500
+                "B3": (2000, 300, 100.0),  # net=1700
+                "B4": (1000, 800, 100.0),  # net=200
+            },
+        )
+        result = compute_key_player_cost_basis(df, ["2330"], top_n_brokers=3)
+        assert result.iloc[0]["key_player_cost"] is not None
+
+    def test_no_net_buyer_returns_default(self):
+        """所有分點淨賣超 → 無法計算。"""
+        df = self._make_broker_df(
+            "2330",
+            {
+                "B1": (100, 5000, 100.0),
+                "B2": (200, 3000, 100.0),
+            },
+        )
+        result = compute_key_player_cost_basis(df, ["2330"])
+        assert result.iloc[0]["key_player_cost"] is None
+
+    def test_score_trapped_players(self):
+        """現價 < 主力成本（被套）→ 0.8。"""
+        cost_df = pd.DataFrame(
+            {
+                "stock_id": ["2330"],
+                "key_player_cost": [100.0],
+                "key_player_score": [0.5],
+            }
+        )
+        result = score_key_player_cost(cost_df, {"2330": 90.0})
+        assert result.iloc[0]["key_player_score"] == 0.8
+
+    def test_score_profitable_players(self):
+        """現價 > 主力成本 × 1.1（已獲利）→ 0.2。"""
+        cost_df = pd.DataFrame(
+            {
+                "stock_id": ["2330"],
+                "key_player_cost": [100.0],
+                "key_player_score": [0.5],
+            }
+        )
+        result = score_key_player_cost(cost_df, {"2330": 115.0})
+        assert result.iloc[0]["key_player_score"] == 0.2
+
+    def test_score_near_cost(self):
+        """現價 ≈ 主力成本 → 0.5。"""
+        cost_df = pd.DataFrame(
+            {
+                "stock_id": ["2330"],
+                "key_player_cost": [100.0],
+                "key_player_score": [0.5],
+            }
+        )
+        result = score_key_player_cost(cost_df, {"2330": 103.0})
+        assert result.iloc[0]["key_player_score"] == 0.5
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P3-D1: compute_adaptive_atr_multiplier 動態停損
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestAdaptiveAtrMultiplier:
+    """測試動態 ATR 倍數調整。"""
+
+    @staticmethod
+    def _make_price_df(stock_id: str, closes: list[float]) -> pd.DataFrame:
+        base = date.today() - timedelta(days=len(closes))
+        rows = []
+        for i, c in enumerate(closes):
+            rows.append(
+                {
+                    "stock_id": stock_id,
+                    "date": base + timedelta(days=i),
+                    "close": c,
+                    "high": c * 1.01,
+                    "low": c * 0.99,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_empty_returns_base(self):
+        """空資料 → 維持 base multiplier。"""
+        result = compute_adaptive_atr_multiplier(pd.DataFrame(), ["2330"], base_stop_mult=1.5)
+        assert result.iloc[0]["adjusted_stop_mult"] == 1.5
+
+    def test_stable_stock_widens(self):
+        """穩定股（MDD < 5%）→ 倍數放寬 ×1.2。"""
+        closes = [100 + i * 0.1 for i in range(25)]  # 穩定上升，幾乎無回撤
+        df = self._make_price_df("2330", closes)
+        result = compute_adaptive_atr_multiplier(df, ["2330"], base_stop_mult=1.5)
+        assert result.iloc[0]["adjusted_stop_mult"] == pytest.approx(1.8)
+
+    def test_volatile_stock_tightens(self):
+        """高波動股（MDD > 15%）→ 倍數收緊 ×0.7。"""
+        # 先漲後暴跌 20%
+        closes = [100] * 10 + [100 - i * 2.5 for i in range(10)]  # 最低 75
+        df = self._make_price_df("2330", closes)
+        result = compute_adaptive_atr_multiplier(df, ["2330"], base_stop_mult=1.5)
+        assert result.iloc[0]["adjusted_stop_mult"] == pytest.approx(1.05)
+
+    def test_moderate_mdd_normal(self):
+        """中等 MDD (5~10%) → 維持基準。"""
+        # 先漲後回檔 ~7%
+        closes = [100] * 10 + [100 - i * 0.7 for i in range(10)]  # 最低 93
+        df = self._make_price_df("2330", closes)
+        result = compute_adaptive_atr_multiplier(df, ["2330"], base_stop_mult=1.5)
+        assert result.iloc[0]["adjusted_stop_mult"] == pytest.approx(1.5)
+
+    def test_insufficient_data(self):
+        """資料不足 → 維持基準。"""
+        df = self._make_price_df("2330", [100, 99, 98])
+        result = compute_adaptive_atr_multiplier(df, ["2330"], base_stop_mult=1.5)
+        assert result.iloc[0]["adjusted_stop_mult"] == 1.5
+
+    def test_multiple_stocks(self):
+        """多股各自獨立計算。"""
+        stable = [100 + i * 0.1 for i in range(25)]
+        volatile = [100] * 10 + [100 - i * 2.5 for i in range(10)]
+        df1 = self._make_price_df("2330", stable)
+        df2 = self._make_price_df("2317", volatile)
+        df = pd.concat([df1, df2], ignore_index=True)
+        result = compute_adaptive_atr_multiplier(df, ["2330", "2317"], base_stop_mult=1.5)
+        r = dict(zip(result["stock_id"], result["adjusted_stop_mult"]))
+        assert r["2330"] > r["2317"]  # 穩定股放寬 > 波動股收緊
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P3-C2: compute_revenue_acceleration_score 營收加速度推廣
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestRevenueAccelerationScore:
+    """測試營收加速度分數。"""
+
+    @staticmethod
+    def _make_rev_df(stock_id: str, yoy_values: list[float], yoy_3m_ago: float | None = None) -> pd.DataFrame:
+        """建立多月營收資料。yoy_values: 由新到舊。"""
+        rows = []
+        base = date.today()
+        for i, yoy in enumerate(yoy_values):
+            rows.append(
+                {
+                    "stock_id": stock_id,
+                    "date": base - timedelta(days=30 * i),
+                    "yoy_growth": yoy,
+                    "yoy_3m_ago": yoy_3m_ago,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_empty_returns_default(self):
+        """空資料 → 預設 0.5。"""
+        result = compute_revenue_acceleration_score(pd.DataFrame(), ["2330"])
+        assert result.iloc[0]["rev_accel_score"] == 0.5
+
+    def test_strong_acceleration(self):
+        """連續 3 月加速且加速幅度 > 10pp → 0.9。"""
+        # yoy: 30, 25, 20, 15 → 連續遞增 3 次，accel = 30 - 15 = 15pp > 10pp
+        df = self._make_rev_df("2330", [30, 25, 20, 15], yoy_3m_ago=15.0)
+        result = compute_revenue_acceleration_score(df, ["2330"])
+        assert result.iloc[0]["rev_accel_score"] == 0.9
+
+    def test_stable_acceleration(self):
+        """連續 3 月加速但幅度 ≤ 10pp → 0.75。"""
+        df = self._make_rev_df("2330", [20, 18, 16, 14], yoy_3m_ago=14.0)
+        result = compute_revenue_acceleration_score(df, ["2330"])
+        assert result.iloc[0]["rev_accel_score"] == 0.75
+
+    def test_single_month_acceleration(self):
+        """acceleration > 0 但未連續 → 0.6。"""
+        # yoy: 20, 15, 18, 10 → 不連續（15 < 18 中斷了）
+        df = self._make_rev_df("2330", [20, 15, 18, 10], yoy_3m_ago=10.0)
+        result = compute_revenue_acceleration_score(df, ["2330"])
+        assert result.iloc[0]["rev_accel_score"] == 0.6
+
+    def test_deceleration(self):
+        """acceleration ≤ 0 → 0.3。"""
+        df = self._make_rev_df("2330", [10, 15, 20, 25], yoy_3m_ago=25.0)
+        result = compute_revenue_acceleration_score(df, ["2330"])
+        assert result.iloc[0]["rev_accel_score"] == 0.3
+
+    def test_consecutive_months_counted(self):
+        """consecutive_accel_months 正確計算。"""
+        df = self._make_rev_df("2330", [30, 25, 20, 15], yoy_3m_ago=15.0)
+        result = compute_revenue_acceleration_score(df, ["2330"])
+        assert result.iloc[0]["consecutive_accel_months"] == 3
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P3-C3: compute_peer_fundamental_ranking 同業基本面排名
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestPeerFundamentalRanking:
+    """測試同業基本面排名。"""
+
+    def test_empty_returns_zero(self):
+        """空資料 → 全部 0。"""
+        result = compute_peer_fundamental_ranking(pd.DataFrame(), ["2330"], {})
+        assert result.iloc[0]["peer_rank_bonus"] == 0.0
+
+    def test_leader_gets_bonus(self):
+        """產業龍頭（前 25%）→ +0.03。"""
+        df = pd.DataFrame(
+            {
+                "stock_id": ["S1", "S2", "S3", "S4", "S5"],
+                "roe": [25, 20, 15, 10, 5],
+                "gross_margin": [40, 35, 30, 25, 20],
+            }
+        )
+        imap = {f"S{i}": "半導體" for i in range(1, 6)}
+        result = compute_peer_fundamental_ranking(df, ["S1", "S2", "S3", "S4", "S5"], imap)
+        r = dict(zip(result["stock_id"], result["peer_rank_bonus"]))
+        assert r["S1"] == 0.03  # 龍頭
+        assert r["S5"] == -0.03  # 落後者
+        assert r["S3"] == 0.0  # 中間
+
+    def test_too_few_peers_no_bonus(self):
+        """同業不足 4 家 → 不加減分。"""
+        df = pd.DataFrame(
+            {
+                "stock_id": ["S1", "S2", "S3"],
+                "roe": [25, 15, 5],
+            }
+        )
+        imap = {"S1": "A", "S2": "A", "S3": "A"}
+        result = compute_peer_fundamental_ranking(df, ["S1", "S2", "S3"], imap)
+        assert (result["peer_rank_bonus"] == 0.0).all()
+
+    def test_multiple_industries(self):
+        """不同產業各自獨立排名。"""
+        df = pd.DataFrame(
+            {
+                "stock_id": [f"S{i}" for i in range(1, 9)],
+                "roe": [30, 25, 20, 15, 10, 8, 5, 3],
+            }
+        )
+        imap = {f"S{i}": "A" for i in range(1, 5)}
+        imap.update({f"S{i}": "B" for i in range(5, 9)})
+        result = compute_peer_fundamental_ranking(df, [f"S{i}" for i in range(1, 9)], imap)
+        r = dict(zip(result["stock_id"], result["peer_rank_bonus"]))
+        assert r["S1"] == 0.03  # A 產業龍頭
+        assert r["S5"] == 0.03  # B 產業龍頭（ROE 10 是 B 中最高）
+
+    def test_missing_stock_gets_zero(self):
+        """stock_ids 中有 DB 無資料的股票 → 0。"""
+        df = pd.DataFrame(
+            {
+                "stock_id": ["S1", "S2", "S3", "S4"],
+                "roe": [25, 20, 15, 10],
+            }
+        )
+        imap = {f"S{i}": "A" for i in range(1, 5)}
+        result = compute_peer_fundamental_ranking(df, ["S1", "S2", "S3", "S4", "S99"], imap)
+        r = dict(zip(result["stock_id"], result["peer_rank_bonus"]))
+        assert r["S99"] == 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P3-E3: compute_mfe_mae MFE/MAE 分析
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestComputeMfeMae:
+    """測試 MFE/MAE 分析。"""
+
+    @staticmethod
+    def _make_data(
+        entry_close: float, highs: list[float], lows: list[float], closes: list[float]
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """建立推薦記錄和後續價格。"""
+        scan_d = date.today() - timedelta(days=30)
+        records = pd.DataFrame(
+            {
+                "scan_date": [scan_d],
+                "stock_id": ["2330"],
+                "close": [entry_close],
+            }
+        )
+        prices = []
+        for i in range(len(closes)):
+            prices.append(
+                {
+                    "stock_id": "2330",
+                    "date": scan_d + timedelta(days=i + 1),
+                    "close": closes[i],
+                    "high": highs[i],
+                    "low": lows[i],
+                }
+            )
+        return records, pd.DataFrame(prices)
+
+    def test_empty_returns_empty(self):
+        """空資料 → 空 DataFrame。"""
+        result = compute_mfe_mae(pd.DataFrame(), pd.DataFrame())
+        assert result.empty
+
+    def test_profitable_trade(self):
+        """獲利交易：MFE > 0，MAE 接近 0。"""
+        records, prices = self._make_data(
+            100.0,
+            highs=[102, 104, 106, 108, 110],
+            lows=[99, 101, 103, 105, 107],
+            closes=[101, 103, 105, 107, 109],
+        )
+        result = compute_mfe_mae(records, prices, holding_days=5)
+        assert len(result) == 1
+        assert result.iloc[0]["mfe"] > 0
+        assert result.iloc[0]["mfe_mae_ratio"] > 1.0
+        assert result.iloc[0]["final_return"] > 0
+
+    def test_losing_trade(self):
+        """虧損交易：MAE < 0 且絕對值大，MFE/MAE < 1。"""
+        records, prices = self._make_data(
+            100.0,
+            highs=[101, 100, 99, 98, 97],
+            lows=[98, 96, 94, 92, 90],
+            closes=[99, 97, 95, 93, 91],
+        )
+        result = compute_mfe_mae(records, prices, holding_days=5)
+        assert len(result) == 1
+        assert result.iloc[0]["mae"] < 0
+        assert result.iloc[0]["final_return"] < 0
+
+    def test_mfe_mae_ratio_calculation(self):
+        """MFE/MAE 比率正確計算。"""
+        records, prices = self._make_data(
+            100.0,
+            highs=[105, 103, 102, 101, 100],  # MFE = +5%
+            lows=[97, 98, 99, 100, 99],  # MAE = -3%
+            closes=[103, 101, 100, 100, 99],
+        )
+        result = compute_mfe_mae(records, prices, holding_days=5)
+        assert result.iloc[0]["mfe"] == pytest.approx(0.05)
+        assert result.iloc[0]["mae"] == pytest.approx(-0.03)
+        assert result.iloc[0]["mfe_mae_ratio"] == pytest.approx(0.05 / 0.03, rel=0.1)
+
+    def test_insufficient_future_data(self):
+        """未來價格不足 → 使用可用資料。"""
+        records, prices = self._make_data(
+            100.0,
+            highs=[105],
+            lows=[95],
+            closes=[102],
+        )
+        result = compute_mfe_mae(records, prices, holding_days=20)
+        assert len(result) == 1  # 仍會計算（用 head(20) 取可用的）
+
+    def test_multiple_recommendations(self):
+        """多筆推薦各自獨立計算。"""
+        scan_d1 = date.today() - timedelta(days=30)
+        scan_d2 = date.today() - timedelta(days=25)
+        records = pd.DataFrame(
+            {
+                "scan_date": [scan_d1, scan_d2],
+                "stock_id": ["2330", "2317"],
+                "close": [100.0, 200.0],
+            }
+        )
+        prices = []
+        for d_off in range(1, 10):
+            prices.append(
+                {
+                    "stock_id": "2330",
+                    "date": scan_d1 + timedelta(days=d_off),
+                    "close": 105.0,
+                    "high": 106.0,
+                    "low": 104.0,
+                }
+            )
+            prices.append(
+                {
+                    "stock_id": "2317",
+                    "date": scan_d2 + timedelta(days=d_off),
+                    "close": 195.0,
+                    "high": 196.0,
+                    "low": 190.0,
+                }
+            )
+        result = compute_mfe_mae(records, pd.DataFrame(prices), holding_days=5)
+        assert len(result) == 2
