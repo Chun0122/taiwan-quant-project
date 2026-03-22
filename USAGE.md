@@ -36,16 +36,19 @@ taiwan-quant-project/
 ├── main.py                  # CLI 主程式入口
 ├── requirements.txt         # Python 套件清單
 ├── config/
-│   └── settings.yaml        # 系統設定檔
+│   ├── settings.yaml        # 系統設定檔
+│   └── concepts.yaml        # 概念股定義（CoWoS封裝/散熱模組/低軌衛星/AI伺服器/車用電子）
 ├── data/
 │   ├── stock.db             # SQLite 資料庫
 │   ├── raw/                 # 原始資料（保留）
 │   └── processed/           # 處理後資料（保留）
 ├── src/
 │   ├── config.py            # 設定管理模組
+│   ├── constants.py         # 全系統共用常數（交易成本/DB/ETL/籌碼門檻）
+│   ├── entry_exit.py        # 進出場共用純函數（ATR 止損止利/進場觸發/時機評估，Discover/Suggest/Watch 三系統共用）
 │   ├── data/
 │   │   ├── database.py      # 資料庫引擎與 Session 管理
-│   │   ├── schema.py        # ORM 資料表定義（20 張表，含 DiscoveryRecord、WatchEntry、StockValuation、HoldingDistribution、SecuritiesLending、BrokerTrade、Watchlist、DailyFeature）
+│   │   ├── schema.py        # ORM 資料表定義（23 張表，含 DiscoveryRecord、WatchEntry、StockValuation、HoldingDistribution、SecuritiesLending、BrokerTrade、Watchlist、DailyFeature、ConceptGroup、ConceptMembership）
 │   │   ├── fetcher.py       # FinMind API 資料抓取（含財報 EAV pivot）
 │   │   ├── twse_fetcher.py  # TWSE/TPEX 官方開放資料（全市場）；TDCC 集保戶股權分散；分點交易 DJ 端點；借券賣出 TWT96U
 │   │   ├── mops_fetcher.py  # MOPS 公開資訊觀測站（重大訊息 + 全市場月營收）；情緒分類；事件類型分類
@@ -54,7 +57,7 @@ taiwan-quant-project/
 │   │   ├── io.py            # 通用匯出/匯入（CSV/Parquet）
 │   │   └── migrate.py       # SQLite Schema 遷移
 │   ├── features/
-│   │   ├── indicators.py   # 技術指標計算（SMA/RSI/MACD/BB）；週K聚合 aggregate_to_weekly()
+│   │   ├── indicators.py   # 技術指標計算（SMA/RSI/MACD/BB/ADX）；週K聚合 aggregate_to_weekly()
 │   │   └── ml_features.py  # ML 特徵工程
 │   ├── strategy/
 │   │   ├── base.py          # 策略抽象基類（含除權息調整）
@@ -69,7 +72,7 @@ taiwan-quant-project/
 │   │   ├── factors.py       # 因子定義（8 個因子）
 │   │   └── engine.py        # 多因子篩選引擎
 │   ├── discovery/
-│   │   ├── scanner.py       # 全市場選股掃描器（五模式四階段漏斗）
+│   │   ├── scanner/         # 全市場選股 package（_base.py 基類 + 五模式 + _functions.py 共用純函數）
 │   │   ├── universe.py      # Universe Filtering 三層漏斗（UniverseConfig + UniverseFilter）
 │   │   └── performance.py   # Discover 推薦績效回測
 │   ├── report/
@@ -77,11 +80,12 @@ taiwan-quant-project/
 │   │   ├── formatter.py     # Discord 訊息格式化
 │   │   └── ai_report.py     # AI 選股摘要（Claude API claude-sonnet-4-6）
 │   ├── regime/
-│   │   └── detector.py      # 市場狀態偵測（bull/bear/sideways，三訊號多數決）
+│   │   └── detector.py      # 市場狀態偵測（bull/bear/sideways/crisis 四狀態，三訊號多數決 + 市場寬度降級 + Crisis 覆蓋 + Hysteresis 狀態機）
 │   ├── strategy_rank/
 │   │   └── engine.py        # 策略回測排名引擎
 │   ├── industry/
-│   │   └── analyzer.py      # 產業輪動分析；產業同儕相對強度計算
+│   │   ├── analyzer.py      # 產業輪動分析；產業同儕相對強度計算
+│   │   └── concept_analyzer.py  # 概念股輪動分析引擎（動能/法人流/相關性候選）
 │   ├── notification/
 │   │   └── line_notify.py   # Discord Webhook 通知
 │   ├── backtest/
@@ -98,14 +102,16 @@ taiwan-quant-project/
 │       ├── app.py            # Streamlit 儀表板入口
 │       ├── data_loader.py    # 資料查詢模組
 │       ├── charts.py         # Plotly 圖表元件
-│       └── pages/            # 頁面模組
+│       └── pages/            # 頁面模組（12 頁）
+│           ├── market_overview.py     # 市場總覽首頁
 │           ├── stock_analysis.py      # 個股分析頁
 │           ├── backtest_review.py     # 回測結果頁
-│           ├── screener_results.py    # 選股篩選頁
 │           ├── portfolio_review.py    # 投資組合頁
+│           ├── strategy_comparison.py # 策略比較頁
+│           ├── screener_results.py    # 選股篩選頁
 │           ├── ml_analysis.py         # ML 策略分析頁
-│           ├── market_overview.py     # 市場總覽首頁
 │           ├── industry_rotation.py   # 產業輪動分析頁
+│           ├── concept_rotation.py    # 概念輪動分析頁
 │           ├── discovery_history.py   # 推薦歷史頁
 │           └── position_monitoring.py # 持倉監控頁
 ├── notebooks/               # Jupyter 分析筆記本
@@ -221,6 +227,7 @@ python main.py compute --stocks 2330 2317
 | RSI | rsi_14 | 相對強弱指標 (14日) |
 | MACD | macd, macd_signal, macd_hist | 指數平滑異同移動平均線 (12,26,9) |
 | Bollinger Bands | bb_upper, bb_middle, bb_lower | 布林通道 (20日, 2倍標準差) |
+| ADX | adx_14 | 平均方向性指標 (14日，SwingScanner 趨勢強度因子) |
 
 ### 4.3 執行回測 (`backtest`)
 
@@ -393,7 +400,7 @@ python main.py backtest --stocks 2330 2317 2454 --strategy rsi_threshold --stop-
 python main.py dashboard
 ```
 
-瀏覽器會自動開啟 `http://localhost:8501`，包含**十個頁面**：
+瀏覽器會自動開啟 `http://localhost:8501`，包含**十二個頁面**：
 
 - **市場總覽**: TAIEX 走勢 K 線 + SMA60/120 + Regime 狀態、市場廣度（漲跌家數）、法人買賣超排行、產業熱度 Treemap
 - **個股分析**: K線圖 + SMA/BB/RSI/MACD 疊加 + 成交量 + 法人買賣超 + 融資融券 + MOPS 公告 vline 標記
@@ -403,6 +410,7 @@ python main.py dashboard
 - **選股篩選**: 多因子條件篩選 + 因子分數排名 + CSV 匯出
 - **ML 策略分析**: 模型訓練（準確率、特徵重要性、預測機率分佈）+ Walk-Forward 滾動驗證
 - **產業輪動**: 產業綜合排名 + 泡泡圖（法人 vs 動能）+ 法人淨買超長條圖 + 精選個股
+- **概念輪動**: 概念股排名（動能+法人流 Percentile Rank）+ Treemap + 箱型圖
 - **推薦歷史**: Discover 推薦歷史視覺化（日曆熱圖、績效分析、個股排行、歷史明細 CSV 匯出）
 - **持倉監控**: 持倉總覽（狀態/損益/距目標%）+ 個股 K 線走勢（含進場/止損/目標水平線）+ 預警列表（觸發止損/止利/過期）
 
@@ -696,7 +704,7 @@ python main.py industry --notify
 2. FinMind 批次 API（需付費帳號）
 3. FinMind 逐股抓取（免費帳號備案，較慢）
 
-**市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways），動態調整各模式的四維度因子權重（技術面 + 籌碼面 + 基本面 + 消息面）。多頭加重技術面，空頭加重基本面與消息面。
+**市場狀態（Regime）自動偵測：** 系統自動根據加權指數（TAIEX）判斷市場狀態（bull/bear/sideways/crisis 四狀態），動態調整各模式的四維度因子權重（技術面 + 籌碼面 + 基本面 + 消息面）。多頭加重技術面，空頭加重基本面與消息面，崩盤（crisis）大幅加重消息面。偵測機制：三訊號多數決 + 市場寬度降級（>60% 股票跌破 MA20 降一級）+ Crisis 快速覆蓋（4 訊號 ≥2 觸發：5 日跌>5%、連跌≥3 天、波動率 1.8x、爆量長黑）+ Hysteresis 狀態機（sideways→bull 需 3 天確認，bull→sideways 快速降級 1 天，crisis 退出需低點遞增+波動率回落）。
 
 **消息面評分（MOPS 重大訊息）：** 系統自動從公開資訊觀測站抓取近期重大訊息，採四項機制計算消息面分數：
 1. **事件類型加權**：governance_change=5.0（董監改選/市場派）、buyback=4.0（庫藏股）、earnings_call=3.0、investor_day=2.0、filing=1.5、revenue=1.2、general=1.0
@@ -789,6 +797,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | Bull（多頭） | 1.5× | 3.5× | 擴大獲利空間 |
 | Sideways（盤整，預設） | 1.5× | 3.0× | 標準風險報酬 1:2 |
 | Bear（空頭） | 1.2× | 2.5× | 縮緊止損，降低虧損 |
+| Crisis（崩盤） | 1.0× | 1.8× | 合理止損距離，避免日內波動洗出；建議降低部位規模 |
 
 **Momentum 模式（sideways 基準權重，bull/bear 自動微調）：**
 
@@ -864,13 +873,13 @@ python main.py discover swing --top 20 --ai-summary --notify
 
 **Regime 權重調整矩陣（系統自動偵測）：**
 
-| 模式 | 面向 | 多頭 | 盤整 | 空頭 |
-|------|------|------|------|------|
-| Momentum | Tech / Chip / Fund / News | 45/35/10/10 | 40/40/10/10 | 30/40/15/15 |
-| Swing | Tech / Chip / Fund / News | 30/20/40/10 | 25/25/35/15 | 15/25/45/15 |
-| Value | Fund / Val / Chip / News | 40/35/15/10 | 45/25/15/15 | 50/20/10/20 |
-| Dividend | Fund / Div / Chip / News | 35/35/20/10 | 40/30/15/15 | 45/25/10/20 |
-| Growth | Fund / Tech / Chip / News | 45/30/15/10 | 40/25/20/15 | 50/15/15/20 |
+| 模式 | 面向 | 多頭 | 盤整 | 空頭 | 崩盤 (crisis) |
+|------|------|------|------|------|---------------|
+| Momentum | Tech / Chip / Fund / News | 45/35/10/10 | 40/40/10/10 | 30/40/15/15 | 10/30/20/40 |
+| Swing | Tech / Chip / Fund / News | 30/20/40/10 | 25/25/35/15 | 15/25/45/15 | 5/20/50/25 |
+| Value | Fund / Val / Chip / News | 40/35/15/10 | 45/25/15/15 | 50/20/10/20 | 55/15/10/20 |
+| Dividend | Fund / Div / Chip / News | 35/35/20/10 | 40/30/15/15 | 45/25/10/20 | 55/15/10/20 |
+| Growth | Fund / Tech / Chip / News | 45/30/15/10 | 40/25/20/15 | 50/15/15/20 | 55/5/15/25 |
 
 **篩選流程說明：**
 
@@ -893,7 +902,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 
 > **注意**：Stage 2.5 補抓月營收需要 FinMind API Token；若無 Token，基本面分數 fallback 到 0.5（中性值），不影響其他維度評分。智慧分點（8F）採自適應累積設計，需 ≥ 20 個交易日分點歷史資料（由 `morning-routine` 每日自動累積），資料不足時自動降回 7F。
 
-> **Crisis 模式**：當 TAIEX 觸發快速崩盤訊號（5 日跌幅 > 5% 且/或連跌 3 天、波動率飆升 1.8x，≥2 個訊號觸發），系統自動切換 crisis regime：評分權重向消息面/基本面傾斜（技術訊號在崩盤時失真），ATR 止損收緊（0.8x），只保留相對強勢股。`morning-routine` Step 0 會於掃描前顯示預警並推播 Discord。
+> **Crisis 模式**：當 TAIEX 觸發快速崩盤訊號（5 日跌幅 > 5%、連跌 ≥3 天、波動率飆升 1.8x、爆量長黑，4 訊號 ≥2 觸發），系統自動切換 crisis regime：評分權重向消息面/基本面傾斜（技術訊號在崩盤時失真），ATR 止損收窄至 1.0×（避免日內波動洗出），只保留相對強勢股（剔除跑輸 TAIEX >10% 及跌破 MA60 者）。`morning-routine` Step 0 會於掃描前顯示預警並推播 Discord。
 
 ### 4.14 Discover 推薦績效回測 (`discover-backtest`)
 
@@ -1186,7 +1195,7 @@ python main.py suggest 2317 --notify       # 附加 Discord 通知
 - **進場價**：最新收盤價
 - **止損價**：進場價 - stop_mult × ATR14（**依 Regime 自適應調整**）
 - **目標價**：進場價 + target_mult × ATR14（**依 Regime 自適應調整**）
-- **Regime 自適應 ATR 倍數**：bull=(1.5, 3.5)、sideways=(1.5, 3.0)、bear=(1.2, 2.5)、crisis=(1.0, 1.8)
+- **Regime 自適應 ATR 倍數**：bull=(1.5×, 3.5×)、sideways=(1.5×, 3.0×)、bear=(1.2×, 2.5×)、crisis=(1.0×, 1.8×)
 - **SMA20**：最近 20 日收盤均線，判斷均線位置
 - **RSI14**：Wilder EWM 平滑，判斷超買（≥70）/ 超賣（≤30）
 - **市場 Regime**：讀取 TAIEX（加權指數）→ 多頭 / 空頭 / 盤整 / 崩盤
@@ -1314,7 +1323,7 @@ python main.py anomaly-scan --dt-threshold 0.3
 python main.py anomaly-scan --notify
 ```
 
-**四類異常訊號：**
+**五類異常訊號：**
 
 | 訊號 | 資料來源 | 邏輯 | 預設門檻 |
 |------|---------|------|---------|
@@ -1468,10 +1477,11 @@ python main.py morning-routine --dry-run
 python main.py morning-routine --top 30 --notify
 ```
 
-**七個執行步驟：**
+**八個執行步驟：**
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
+| Step 0 | Macro Stress Check | 偵測 TAIEX crisis 訊號（5日跌>5%/連跌/波動率/爆量長黑），觸發時顯示 CRISIS 警示 banner + Discord 預警 |
 | Step 1 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
 | Step 2a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
 | Step 2b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
@@ -1558,7 +1568,7 @@ python main.py sync-features --days 60
 
 ## 5. 資料庫 Schema
 
-資料庫使用 SQLite，檔案位於 `data/stock.db`。共 **20 張核心表**：
+資料庫使用 SQLite，檔案位於 `data/stock.db`。共 **23 張核心表**：
 
 ### daily_price（日K線）
 
@@ -1796,6 +1806,9 @@ python main.py sync-features --days 60
 | entry_trigger | String | 進場觸發說明（站上均線等） |
 | valid_until | Date | 建議有效日期（scan_date + 5 工作日） |
 | chip_tier | String | 籌碼評分 Tier（"8F"~"2F" 或 "N/A"） |
+| concept_bonus | Float | 概念股加成分數（±5%，sector+concept ≤ ±8% cap） |
+| daytrade_penalty | Float | 隔日沖扣分（0~1） |
+| daytrade_tags | String | 隔日沖標記（行為/黑名單/即時風險分點名稱） |
 
 唯一鍵：`(stock_id, scan_date, mode)`
 
@@ -1902,6 +1915,30 @@ python main.py sync-features --days 60
 
 唯一鍵：`(stock_id, date)`
 
+### concept_group（概念股群組定義）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| id | Integer | 自增主鍵 |
+| name | String | 概念名稱（如 CoWoS封裝、散熱模組） |
+| description | String | 概念描述 |
+| source | String | 來源（yaml / manual） |
+| created_at | DateTime | 建立時間 |
+
+唯一鍵：`(name)`
+
+### concept_membership（概念股成員）
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| id | Integer | 自增主鍵 |
+| concept_id | Integer | 關聯的概念群組 ID (FK) |
+| stock_id | String | 股票代號 |
+| source | String | 來源（yaml / manual / mops / correlation） |
+| added_at | DateTime | 加入時間 |
+
+唯一鍵：`(concept_id, stock_id)`
+
 ---
 
 ## 6. 在 Python 中直接查詢資料
@@ -1948,7 +1985,7 @@ print(df.tail())
 
 ### Q: 如何新增要追蹤的股票？
 
-編輯 `config/settings.yaml`，在 `fetcher.watchlist` 下新增股票代號，然後執行 `python main.py sync`。
+推薦使用 DB watchlist 管理（`python main.py watchlist add 2330 --name 台積電`），或編輯 `config/settings.yaml` 的 `fetcher.watchlist`。DB 非空時優先使用 DB 清單。首次可執行 `python main.py watchlist import` 從 YAML 批次匯入。
 
 ### Q: 資料多久更新一次？
 
