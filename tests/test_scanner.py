@@ -15,9 +15,11 @@ from src.discovery.scanner import (
     compute_taiex_relative_strength,
 )
 from src.discovery.scanner._functions import (
+    compute_earnings_quality,
     compute_institutional_acceleration,
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
+    compute_value_weighted_inst_flow,
 )
 from tests.scanner_helpers import (
     make_entry_exit_price_df,
@@ -2760,6 +2762,9 @@ def _make_fin_df(rows: list[dict]) -> pd.DataFrame:
         "roe": None,
         "gross_margin": None,
         "debt_ratio": None,
+        "revenue": None,
+        "net_income": None,
+        "operating_cf": None,
     }
     result = []
     for r in rows:
@@ -2855,7 +2860,19 @@ class TestValueFinancialFundamentalScores:
         """無財報資料時應降回純營收分（不崩潰，分數在 0~1）。"""
         df_revenue = self._make_revenue()
         value_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
-            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+            columns=[
+                "stock_id",
+                "date",
+                "year",
+                "quarter",
+                "eps",
+                "roe",
+                "gross_margin",
+                "debt_ratio",
+                "revenue",
+                "net_income",
+                "operating_cf",
+            ]
         )
         result = value_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
         assert "fundamental_score" in result.columns
@@ -2907,7 +2924,19 @@ class TestValueFinancialFundamentalScores:
     def test_output_schema(self, value_scanner):
         """回傳應有 stock_id + fundamental_score 兩欄。"""
         value_scanner._load_financial_data = lambda sids, quarters=5: pd.DataFrame(
-            columns=["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
+            columns=[
+                "stock_id",
+                "date",
+                "year",
+                "quarter",
+                "eps",
+                "roe",
+                "gross_margin",
+                "debt_ratio",
+                "revenue",
+                "net_income",
+                "operating_cf",
+            ]
         )
         result = value_scanner._compute_fundamental_scores(
             ["1000", "1001"],
@@ -6237,3 +6266,273 @@ class TestComputeMultiTimeframeAlignment:
                 result = compute_multi_timeframe_alignment({"X": daily}, {"X": weekly})
                 val = result.iloc[0]["mtf_alignment"]
                 assert -0.04 <= val <= 0.04
+
+
+# ======================================================================== #
+#  P1-A2: 多時框強制共振排除
+# ======================================================================== #
+
+
+class TestMultiTimeframeForceExclude:
+    """測試 momentum 模式日多週空矛盾時直接排除。"""
+
+    def test_momentum_excludes_daily_bull_weekly_bear(self):
+        """momentum 模式：日線多頭 + 週線空頭 → 排除。"""
+        scanner = MomentumScanner(top_n_results=20)
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["A", "B", "C"],
+                "composite_score": [0.8, 0.7, 0.6],
+                "technical_score": [0.70, 0.70, 0.30],  # A,B 日線多頭; C 日線空頭
+                "weekly_bonus": [-0.05, 0.05, -0.05],  # A 週空; B 週多; C 週空
+            }
+        )
+        result = scanner._apply_multi_timeframe_alignment(scored)
+        # A: 日多+週空 → 排除（mtf=-0.03）
+        # B: 日多+週多 → 保留加分
+        # C: 日空+週空 → 保留（日週一致空頭）
+        assert "A" not in result["stock_id"].values
+        assert "B" in result["stock_id"].values
+        assert "C" in result["stock_id"].values
+
+    def test_value_mode_keeps_conflict(self):
+        """value 模式：日多週空矛盾時只降分，不排除。"""
+        scanner = ValueScanner(top_n_results=20)
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["A"],
+                "composite_score": [0.8],
+                "technical_score": [0.70],
+                "weekly_bonus": [-0.05],
+            }
+        )
+        result = scanner._apply_multi_timeframe_alignment(scored)
+        assert "A" in result["stock_id"].values  # 未排除
+        assert result.iloc[0]["composite_score"] < 0.8  # 但有降分
+
+    def test_no_weekly_bonus_skips(self):
+        """無 weekly_bonus 欄位 → 跳過。"""
+        scanner = MomentumScanner(top_n_results=20)
+        scored = pd.DataFrame({"stock_id": ["A"], "composite_score": [0.8], "technical_score": [0.70]})
+        result = scanner._apply_multi_timeframe_alignment(scored)
+        assert len(result) == 1
+        assert result.iloc[0]["composite_score"] == 0.8
+
+
+# ======================================================================== #
+#  P1-B1: compute_value_weighted_inst_flow
+# ======================================================================== #
+
+
+class TestComputeValueWeightedInstFlow:
+    """測試法人金額加權連續性。"""
+
+    def _make_inst_data(self, stock_id: str, daily_nets: list[float]) -> pd.DataFrame:
+        dates = pd.bdate_range(end=date.today(), periods=len(daily_nets))
+        return pd.DataFrame({"stock_id": stock_id, "date": dates, "name": "外資", "net": daily_nets})
+
+    def test_large_recent_buy_scores_higher(self):
+        """近期大額買超 → 加權值高。"""
+        # A: 前 7 天 100，後 3 天 1000
+        # B: 前 7 天 100，後 3 天 100
+        df_a = self._make_inst_data("A", [100] * 7 + [1000] * 3)
+        df_b = self._make_inst_data("B", [100] * 10)
+        df = pd.concat([df_a, df_b])
+        result = compute_value_weighted_inst_flow(df, ["A", "B"])
+        vals = dict(zip(result["stock_id"], result["inst_flow_weighted"]))
+        assert vals["A"] > vals["B"]
+
+    def test_consistent_buy_beats_old_spike(self):
+        """持續小額 > 早期單次大額（衰減後權重低）。"""
+        # A: 10 天每天 300（持續累積）
+        # B: 第 1 天 3000（最早），之後 0（衰減至 3000×0.85^9 ≈ 694）
+        df_a = self._make_inst_data("A", [300] * 10)
+        df_b = self._make_inst_data("B", [3000] + [0] * 9)
+        df = pd.concat([df_a, df_b])
+        result = compute_value_weighted_inst_flow(df, ["A", "B"])
+        vals = dict(zip(result["stock_id"], result["inst_flow_weighted"]))
+        assert vals["A"] > vals["B"]
+
+    def test_selling_produces_negative(self):
+        """持續賣超 → 負值。"""
+        df = self._make_inst_data("X", [-500] * 10)
+        result = compute_value_weighted_inst_flow(df, ["X"])
+        assert result.iloc[0]["inst_flow_weighted"] < 0
+
+    def test_empty_inst(self):
+        """空資料 → 0.0。"""
+        result = compute_value_weighted_inst_flow(pd.DataFrame(), ["X"])
+        assert result.iloc[0]["inst_flow_weighted"] == 0.0
+
+    def test_missing_stock(self):
+        """stock_id 不在資料中 → 0.0。"""
+        df = self._make_inst_data("A", [100] * 10)
+        result = compute_value_weighted_inst_flow(df, ["Z"])
+        assert result.iloc[0]["inst_flow_weighted"] == 0.0
+
+    def test_decay_effect(self):
+        """衰減係數生效：最近一天權重最大。"""
+        # 第 1 天（最早）1000，其餘 0 → 加權值 = 1000 × 0.85^9 ≈ 232
+        # 最後一天 1000，其餘 0 → 加權值 = 1000 × 0.85^0 = 1000
+        df_early = self._make_inst_data("E", [1000] + [0] * 9)
+        df_late = self._make_inst_data("L", [0] * 9 + [1000])
+        df = pd.concat([df_early, df_late])
+        result = compute_value_weighted_inst_flow(df, ["E", "L"])
+        vals = dict(zip(result["stock_id"], result["inst_flow_weighted"]))
+        assert vals["L"] > vals["E"]
+
+
+# ======================================================================== #
+#  P1-C1: compute_earnings_quality
+# ======================================================================== #
+
+
+class TestComputeEarningsQuality:
+    """測試盈餘品質分數。"""
+
+    def _make_financial_df(self, stock_id: str, **kwargs) -> pd.DataFrame:
+        """建立單季財報資料。"""
+        defaults = {
+            "stock_id": stock_id,
+            "date": date(2025, 3, 31),
+            "operating_cf": 100,
+            "net_income": 80,
+            "revenue": 1000,
+            "debt_ratio": 40.0,
+        }
+        defaults.update(kwargs)
+        return pd.DataFrame([defaults])
+
+    def test_high_quality(self):
+        """OCF > NI, 低負債 → 品質高。"""
+        df = self._make_financial_df("X", operating_cf=150, net_income=80, debt_ratio=30.0)
+        result = compute_earnings_quality(df, ["X"])
+        assert result.iloc[0]["earnings_quality"] > 0.6
+
+    def test_low_quality_negative_ocf(self):
+        """OCF < 0 → 品質低。"""
+        df = self._make_financial_df("X", operating_cf=-50, net_income=80, debt_ratio=75.0)
+        result = compute_earnings_quality(df, ["X"])
+        assert result.iloc[0]["earnings_quality"] < 0.5
+
+    def test_high_debt_penalized(self):
+        """高負債 → 品質下降。"""
+        df_low = self._make_financial_df("A", debt_ratio=30.0)
+        df_high = self._make_financial_df("B", debt_ratio=80.0)
+        df = pd.concat([df_low, df_high])
+        result = compute_earnings_quality(df, ["A", "B"])
+        vals = dict(zip(result["stock_id"], result["earnings_quality"]))
+        assert vals["A"] > vals["B"]
+
+    def test_empty_financial(self):
+        """無財報 → 預設 0.5。"""
+        result = compute_earnings_quality(pd.DataFrame(), ["X"])
+        assert result.iloc[0]["earnings_quality"] == 0.5
+
+    def test_missing_stock(self):
+        """stock_id 不在資料中 → 0.5。"""
+        df = self._make_financial_df("A")
+        result = compute_earnings_quality(df, ["Z"])
+        assert result.iloc[0]["earnings_quality"] == 0.5
+
+    def test_two_quarters_revenue_quality(self):
+        """兩季資料：淨利增速遠超營收 → 品質下降。"""
+        df = pd.DataFrame(
+            [
+                {
+                    "stock_id": "X",
+                    "date": date(2025, 3, 31),
+                    "operating_cf": 100,
+                    "net_income": 200,
+                    "revenue": 1000,
+                    "debt_ratio": 40.0,
+                },
+                {
+                    "stock_id": "X",
+                    "date": date(2024, 12, 31),
+                    "operating_cf": 80,
+                    "net_income": 50,
+                    "revenue": 950,
+                    "debt_ratio": 42.0,
+                },
+            ]
+        )
+        result = compute_earnings_quality(df, ["X"])
+        # NI 成長 300% vs 營收成長 5% → 灌水嫌疑
+        quality = result.iloc[0]["earnings_quality"]
+        assert quality < 0.7  # 被懲罰
+
+    def test_quality_range(self):
+        """品質在 [0.0, 1.0]。"""
+        df = self._make_financial_df("X")
+        result = compute_earnings_quality(df, ["X"])
+        val = result.iloc[0]["earnings_quality"]
+        assert 0.0 <= val <= 1.0
+
+
+# ======================================================================== #
+#  P1-D3: 回撤降頻
+# ======================================================================== #
+
+
+class TestDrawdownAdjustedTopN:
+    """測試回撤降頻機制。"""
+
+    def _make_taiex_price(self, drawdown_pct: float) -> pd.DataFrame:
+        """建立 TAIEX 模擬資料，最後一天相對 20 日最高點下跌 drawdown_pct%。"""
+        n = 30
+        dates = pd.bdate_range(end=date.today(), periods=n)
+        # 先漲到高點，最後跌 drawdown_pct
+        high_val = 20000.0
+        closes = [high_val] * n
+        closes[-1] = high_val * (1 + drawdown_pct / 100)
+        return pd.DataFrame({"stock_id": "TAIEX", "date": dates, "close": closes})
+
+    def test_normal_market_no_change(self):
+        """正常市場（回撤 -5%）→ top_n 不變。"""
+        scanner = MomentumScanner(top_n_results=20)
+        df_price = self._make_taiex_price(-5.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result == 20
+
+    def test_moderate_drawdown_halves(self):
+        """中度回撤（-12%）→ momentum 砍半。"""
+        scanner = MomentumScanner(top_n_results=20)
+        df_price = self._make_taiex_price(-12.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result == 10
+
+    def test_severe_drawdown_thirds(self):
+        """嚴重回撤（-18%）→ momentum 砍至 1/3。"""
+        scanner = MomentumScanner(top_n_results=20)
+        df_price = self._make_taiex_price(-18.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result <= 7  # 20 // 3 = 6
+
+    def test_defensive_mode_unaffected(self):
+        """value 模式不受嚴重回撤影響。"""
+        scanner = ValueScanner(top_n_results=20)
+        df_price = self._make_taiex_price(-18.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result == 20
+
+    def test_dividend_mode_unaffected(self):
+        """dividend 模式不受嚴重回撤影響。"""
+        scanner = DividendScanner(top_n_results=20)
+        df_price = self._make_taiex_price(-18.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result == 20
+
+    def test_no_taiex_data_returns_original(self):
+        """無 TAIEX 資料 → 不變。"""
+        scanner = MomentumScanner(top_n_results=20)
+        df_price = pd.DataFrame({"stock_id": ["2330"], "date": [date.today()], "close": [600]})
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result == 20
+
+    def test_min_top_n_is_3(self):
+        """即使砍到極限，至少保留 3。"""
+        scanner = MomentumScanner(top_n_results=5)
+        df_price = self._make_taiex_price(-20.0)
+        result = scanner._compute_drawdown_adjusted_top_n(df_price)
+        assert result >= 3

@@ -1510,6 +1510,170 @@ def compute_multi_timeframe_alignment(
     return pd.DataFrame(results)
 
 
+def compute_value_weighted_inst_flow(
+    df_inst: pd.DataFrame,
+    stock_ids: list[str],
+    window: int = 10,
+    decay: float = 0.85,
+) -> pd.DataFrame:
+    """計算法人金額加權連續性分數（Value-Weighted Institutional Flow）。
+
+    替代單純的「連續買超天數」，改用「Σ(net_buy × decay^days_ago)」衰減加權：
+    - 大額且持續 > 小額且持續 > 大額一次性
+    - decay=0.85 → 10 天前保留 20% 權重
+
+    回傳 percentile rank（0~1），供替代或補充 consec_rank。
+
+    Args:
+        df_inst: 三大法人 DataFrame（stock_id / date / name / net）
+        stock_ids: 要評估的股票清單
+        window: 回溯天數（預設 10）
+        decay: 衰減係數（預設 0.85）
+
+    Returns:
+        DataFrame(stock_id, inst_flow_weighted)  值域為原始加權值（呼叫端 rank）
+    """
+    if df_inst.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "inst_flow_weighted": [0.0] * len(stock_ids)})
+
+    # 按 stock_id+date 彙總全部法人淨買超
+    inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
+    if inst_filtered.empty:
+        return pd.DataFrame({"stock_id": stock_ids, "inst_flow_weighted": [0.0] * len(stock_ids)})
+
+    daily_net = inst_filtered.groupby(["stock_id", "date"])["net"].sum().reset_index()
+    daily_net = daily_net.sort_values(["stock_id", "date"])
+    grouped = daily_net.groupby("stock_id", sort=False)
+
+    results: list[dict] = []
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "inst_flow_weighted": 0.0})
+            continue
+
+        grp = grouped.get_group(sid).tail(window)
+        if grp.empty:
+            results.append({"stock_id": sid, "inst_flow_weighted": 0.0})
+            continue
+
+        # 從最近一天 (days_ago=0) 到最早 (days_ago=n-1)
+        nets = grp["net"].values[::-1]  # 反轉：index 0 = 最近一天
+        weighted_sum = 0.0
+        for i, net_val in enumerate(nets):
+            weighted_sum += float(net_val) * (decay**i)
+
+        results.append({"stock_id": sid, "inst_flow_weighted": weighted_sum})
+
+    return pd.DataFrame(results)
+
+
+def compute_earnings_quality(
+    df_financial: pd.DataFrame,
+    stock_ids: list[str],
+) -> pd.DataFrame:
+    """計算盈餘品質分數（Earnings Quality Score）。
+
+    三個子指標（等權平均），分數越高品質越好：
+    1. 現金流品質：operating_cf / net_income > 1.0 → 高品質（1.0），
+       0.5~1.0 → 中等（0.6），< 0.5 或負 → 低品質（0.2）
+    2. 應收帳款品質：應收帳款增速 < 營收增速 → 正常（0.8），
+       反之 → 可能灌水（0.3）。（需兩季資料，無資料 → 0.5）
+    3. 負債穩定性：debt_ratio < 50% → 穩健（0.8），50~70% → 中等（0.5），
+       > 70% → 高風險（0.2）
+
+    Args:
+        df_financial: FinancialStatement 查詢結果
+            （stock_id / date / operating_cf / net_income / revenue / debt_ratio / total_assets）
+        stock_ids: 要評估的股票清單
+
+    Returns:
+        DataFrame(stock_id, earnings_quality)  值域 [0.0, 1.0]
+    """
+    default = pd.DataFrame({"stock_id": stock_ids, "earnings_quality": [0.5] * len(stock_ids)})
+
+    if df_financial.empty or not stock_ids:
+        return default
+
+    grouped = df_financial.sort_values("date", ascending=False).groupby("stock_id", sort=False)
+
+    results: list[dict] = []
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "earnings_quality": 0.5})
+            continue
+
+        grp = grouped.get_group(sid)
+        sub_scores: list[float] = []
+
+        # 1. 現金流品質：OCF / Net Income
+        latest = grp.iloc[0]
+        ocf = latest.get("operating_cf")
+        ni = latest.get("net_income")
+        if pd.notna(ocf) and pd.notna(ni) and ni != 0:
+            ocf_ratio = float(ocf) / float(ni)
+            if ocf_ratio > 1.0:
+                sub_scores.append(1.0)
+            elif ocf_ratio > 0.5:
+                sub_scores.append(0.6)
+            else:
+                sub_scores.append(0.2)
+        else:
+            sub_scores.append(0.5)
+
+        # 2. 應收帳款品質（需兩季比較營收增速 vs 應收帳款增速）
+        # 以 total_assets 作為規模代理（FinancialStatement 無 accounts_receivable）
+        # 改用 revenue 增速 vs net_income 增速差異（盈餘灌水代理指標）
+        if len(grp) >= 2:
+            cur_rev = grp.iloc[0].get("revenue")
+            prev_rev = grp.iloc[1].get("revenue")
+            cur_ni = grp.iloc[0].get("net_income")
+            prev_ni = grp.iloc[1].get("net_income")
+            if (
+                pd.notna(cur_rev)
+                and pd.notna(prev_rev)
+                and pd.notna(cur_ni)
+                and pd.notna(prev_ni)
+                and prev_rev != 0
+                and prev_ni != 0
+            ):
+                rev_growth = (float(cur_rev) - float(prev_rev)) / abs(float(prev_rev))
+                ni_growth = (float(cur_ni) - float(prev_ni)) / abs(float(prev_ni))
+                # 淨利增速遠超營收增速 → 可能灌水
+                if ni_growth > rev_growth + 0.2:
+                    sub_scores.append(0.3)
+                else:
+                    sub_scores.append(0.8)
+            else:
+                sub_scores.append(0.5)
+        else:
+            sub_scores.append(0.5)
+
+        # 3. 負債穩定性
+        debt = latest.get("debt_ratio")
+        if pd.notna(debt):
+            d = float(debt)
+            if d < 50:
+                sub_scores.append(0.8)
+            elif d < 70:
+                sub_scores.append(0.5)
+            else:
+                sub_scores.append(0.2)
+        else:
+            sub_scores.append(0.5)
+
+        quality = float(np.mean(sub_scores))
+        results.append({"stock_id": sid, "earnings_quality": quality})
+
+    return pd.DataFrame(results)
+
+
+# 回撤降頻常數：TAIEX 回撤閾值 → 推薦數量調整
+DRAWDOWN_FREQUENCY_RULES: dict[str, dict] = {
+    "severe": {"threshold": -0.15, "allowed_modes": {"value", "dividend"}},
+    "moderate": {"threshold": -0.10, "multiplier": 0.5},
+}
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""

@@ -23,6 +23,7 @@ from src.discovery.scanner._base import MarketScanner
 from src.discovery.scanner._functions import (
     DiscoveryResult,
     compute_broker_score,
+    compute_earnings_quality,
     compute_relative_pe_thresholds,
 )
 from src.discovery.universe import UniverseConfig
@@ -345,13 +346,19 @@ class ValueScanner(MarketScanner):
         gm_qoq_rank = df_metrics["gm_qoq"].rank(pct=True).fillna(0.5)
         eps_yoy_rank = df_metrics["eps_yoy"].rank(pct=True).fillna(0.5)
 
+        # ── 盈餘品質因子（C1：現金流品質 + 收入品質 + 負債穩定性）──
+        eq_df = compute_earnings_quality(df_fin, stock_ids)
+        df_metrics = df_metrics.merge(eq_df, on="stock_id", how="left")
+        df_metrics["earnings_quality"] = df_metrics["earnings_quality"].fillna(0.5)
+        eq_rank = df_metrics["earnings_quality"].rank(pct=True).fillna(0.5)
+
         # 合併營收基礎分
         df_metrics = df_metrics.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
         df_metrics["rev_base"] = df_metrics["rev_base"].fillna(0.5)
 
-        # 加權：營收 40% + ROE 25% + 毛利率 QoQ 20% + EPS YoY 15%
+        # 加權：營收 35% + ROE 20% + 毛利率 QoQ 15% + EPS YoY 15% + 盈餘品質 15%
         df_metrics["fundamental_score"] = (
-            df_metrics["rev_base"] * 0.40 + roe_rank * 0.25 + gm_qoq_rank * 0.20 + eps_yoy_rank * 0.15
+            df_metrics["rev_base"] * 0.35 + roe_rank * 0.20 + gm_qoq_rank * 0.15 + eps_yoy_rank * 0.15 + eq_rank * 0.15
         )
 
         result = pd.DataFrame({"stock_id": stock_ids})

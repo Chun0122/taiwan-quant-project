@@ -204,11 +204,14 @@ class MarketScanner:
 
         # Stage 4.1: 同產業分散化（限制同產業推薦數量）
         rankings = self._apply_sector_diversification(rankings)
+
+        # Stage 4.2: 回撤降頻（D3 — Bear/Crisis 市場減少推薦數量）
+        effective_top_n = self._compute_drawdown_adjusted_top_n(df_price)
         sector_summary = self._compute_sector_summary(rankings)
-        logger.info("Stage 4: 輸出 Top %d", min(self.top_n_results, len(rankings)))
+        logger.info("Stage 4: 輸出 Top %d（原始 Top %d）", min(effective_top_n, len(rankings)), self.top_n_results)
 
         return DiscoveryResult(
-            rankings=rankings.head(self.top_n_results),
+            rankings=rankings.head(effective_top_n),
             total_stocks=total_stocks,
             after_coarse=after_coarse,
             sector_summary=sector_summary,
@@ -388,18 +391,31 @@ class MarketScanner:
         return pd.DataFrame(result_rows)
 
     def _load_financial_data(self, stock_ids: list[str], quarters: int = 5) -> pd.DataFrame:
-        """從 DB 查詢最近 N 季財務資料（EPS / ROE / 毛利率 / 負債比）。
+        """從 DB 查詢最近 N 季財務資料。
 
         Args:
             stock_ids: 限定查詢的股票清單
             quarters: 每支股票取最近幾季（預設 5 季，足以計算 YoY + QoQ）
 
         Returns:
-            DataFrame(stock_id, date, year, quarter, eps, roe, gross_margin, debt_ratio)
+            DataFrame(stock_id, date, year, quarter, eps, roe, gross_margin, debt_ratio,
+                      revenue, net_income, operating_cf)
             每支股票最多 quarters 筆，按 date desc 排列。無資料時回傳空 DataFrame。
         """
-        _cols = ["stock_id", "date", "year", "quarter", "eps", "roe", "gross_margin", "debt_ratio"]
-        cutoff = date.today() - timedelta(days=quarters * 100)  # ~100 天/季，5 季 ≈ 500 天
+        _cols = [
+            "stock_id",
+            "date",
+            "year",
+            "quarter",
+            "eps",
+            "roe",
+            "gross_margin",
+            "debt_ratio",
+            "revenue",
+            "net_income",
+            "operating_cf",
+        ]
+        cutoff = date.today() - timedelta(days=quarters * 100)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -412,6 +428,9 @@ class MarketScanner:
                         FinancialStatement.roe,
                         FinancialStatement.gross_margin,
                         FinancialStatement.debt_ratio,
+                        FinancialStatement.revenue,
+                        FinancialStatement.net_income,
+                        FinancialStatement.operating_cf,
                     )
                     .where(
                         FinancialStatement.stock_id.in_(stock_ids),
@@ -1742,14 +1761,22 @@ class MarketScanner:
     #  Stage 3.5e: 多時框一致性
     # ------------------------------------------------------------------ #
 
+    # 多時框強制共振：Momentum 模式日週矛盾（短多長空）直接排除
+    _MTF_FORCE_EXCLUDE_MODES: set[str] = {"momentum", "growth"}
+
     def _apply_multi_timeframe_alignment(
         self,
         scored: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Stage 3.5e — 日線 + 週線方向一致性 → composite_score 加減分。
+        """Stage 3.5e — 日線 + 週線多時框共振過濾。
 
         需要 weekly_confirm=True 時才有週線資料。
-        日線趨勢取自技術面（close vs SMA20），週線趨勢取自 weekly_bonus。
+        日線趨勢取自 technical_score (>0.55 = 多頭)，週線趨勢取自 weekly_bonus。
+
+        **強制共振（A2 升級）**：
+        - momentum / growth 模式：日線多頭 + 週線空頭（短多長空）→ **直接排除**（追高風險最大）
+        - 其他模式：矛盾時僅降分（-2%~-4%），不排除
+        - 日週一致時加分 +4%
         若 weekly_bonus 不存在（未啟用週線確認），此 Stage 跳過。
         """
         if scored.empty:
@@ -1759,14 +1786,12 @@ class MarketScanner:
 
         stock_ids = scored["stock_id"].tolist()
 
-        # 日線趨勢：從 scored 中推斷（close > entry_price 的近似，或直接看 technical_score）
-        # 更精確的方式：如果有 technical_score > 0.5 視為日線多頭
         daily_trend: dict[str, bool | None] = {}
         for _, row in scored.iterrows():
             sid = row["stock_id"]
             tech = row.get("technical_score")
             if pd.notna(tech):
-                daily_trend[sid] = float(tech) > 0.55  # 略高於中性門檻
+                daily_trend[sid] = float(tech) > 0.55
             else:
                 daily_trend[sid] = None
 
@@ -1775,15 +1800,32 @@ class MarketScanner:
         mtf_df = compute_multi_timeframe_alignment(daily_trend, weekly_map)
         scored = scored.merge(mtf_df, on="stock_id", how="left")
         scored["mtf_alignment"] = scored["mtf_alignment"].fillna(0.0)
+
+        # 強制共振排除：momentum/growth 模式中「日線多頭 + 週線空頭」直接剔除
+        n_excluded = 0
+        if self.mode_name in self._MTF_FORCE_EXCLUDE_MODES:
+            # mtf_alignment == -0.03 代表「短多長空」矛盾（最危險的追高情境）
+            exclude_mask = scored["mtf_alignment"] == -0.03
+            n_excluded = int(exclude_mask.sum())
+            if n_excluded > 0:
+                scored = scored[~exclude_mask].copy()
+                logger.info(
+                    "Stage 3.5e: 多時框強制共振排除 %d 支（%s 模式日多週空矛盾）",
+                    n_excluded,
+                    self.mode_name,
+                )
+
+        # 非排除的候選股：加減分
         scored["composite_score"] = scored["composite_score"] * (1 + scored["mtf_alignment"])
 
         n_aligned = (scored["mtf_alignment"] > 0).sum()
         n_conflict = (scored["mtf_alignment"] < 0).sum()
-        if n_aligned > 0 or n_conflict > 0:
+        if n_aligned > 0 or n_conflict > 0 or n_excluded > 0:
             logger.info(
-                "Stage 3.5e: 多時框一致性 — %d 支加分（+4%%），%d 支降分（-2%%~-4%%）",
+                "Stage 3.5e: 多時框一致性 — %d 支加分，%d 支降分，%d 支排除",
                 n_aligned,
                 n_conflict,
+                n_excluded,
             )
         return scored
 
@@ -2077,6 +2119,72 @@ class MarketScanner:
             "valid_until",
         ]
         return scored[[c for c in keep_cols if c in scored.columns]]
+
+    # ------------------------------------------------------------------ #
+    #  Stage 4.2: 回撤降頻
+    # ------------------------------------------------------------------ #
+
+    # 防禦型模式：嚴重回撤時仍允許正常推薦
+    _DEFENSIVE_MODES: set[str] = {"value", "dividend"}
+
+    def _compute_drawdown_adjusted_top_n(self, df_price: pd.DataFrame) -> int:
+        """Stage 4.2 — 根據 TAIEX 20 日回撤幅度調整推薦數量。
+
+        規則（D3）：
+        - TAIEX 20 日回撤 > -10% → 正常推薦（top_n_results）
+        - TAIEX 20 日回撤 -10%~-15% → 推薦數量砍半
+        - TAIEX 20 日回撤 < -15% → 僅防禦型模式（value/dividend）正常推薦，
+          其他模式（momentum/swing/growth）推薦數砍至 1/3
+
+        Returns:
+            調整後的 top_n
+        """
+        original = self.top_n_results
+
+        # 計算 TAIEX 20 日回撤
+        try:
+            taiex = df_price[df_price["stock_id"] == "TAIEX"]
+            if taiex.empty:
+                return original
+
+            taiex_sorted = taiex.sort_values("date")
+            if len(taiex_sorted) < 20:
+                return original
+
+            recent_close = float(taiex_sorted["close"].iloc[-1])
+            high_20d = float(taiex_sorted["close"].iloc[-20:].max())
+            drawdown = (recent_close - high_20d) / high_20d if high_20d > 0 else 0.0
+
+        except Exception:
+            return original
+
+        if drawdown > -0.10:
+            return original  # 正常市場
+
+        is_defensive = self.mode_name in self._DEFENSIVE_MODES
+
+        if drawdown > -0.15:
+            # 中度回撤：砍半（防禦型不受影響）
+            adjusted = original if is_defensive else max(3, original // 2)
+            logger.info(
+                "Stage 4.2: TAIEX 20 日回撤 %.1f%%，%s 推薦數 %d → %d",
+                drawdown * 100,
+                self.mode_name,
+                original,
+                adjusted,
+            )
+            return adjusted
+        else:
+            # 嚴重回撤：非防禦型砍至 1/3
+            adjusted = original if is_defensive else max(3, original // 3)
+            logger.info(
+                "Stage 4.2: TAIEX 20 日回撤 %.1f%%（嚴重），%s 推薦數 %d → %d",
+                drawdown * 100,
+                self.mode_name,
+                original,
+                adjusted,
+            )
+            return adjusted
 
     def _compute_sector_summary(self, rankings: pd.DataFrame) -> pd.DataFrame:
         """統計推薦結果的產業分布。"""

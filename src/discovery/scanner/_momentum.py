@@ -21,6 +21,7 @@ from src.discovery.scanner._functions import (
     compute_institutional_persistence,
     compute_sbl_score,
     compute_smart_broker_score,
+    compute_value_weighted_inst_flow,
     compute_whale_score,
 )
 from src.discovery.universe import UniverseConfig
@@ -152,9 +153,17 @@ class MomentumScanner(MarketScanner):
 
         df = pd.DataFrame(rows)
 
-        consec_rank = df["consec_foreign_days"].rank(pct=True)
+        consec_days_rank = df["consec_foreign_days"].rank(pct=True)
         bvr_rank = df["buy_vol_ratio"].rank(pct=True)
         total_rank = df["total_net"].rank(pct=True)
+
+        # ── 法人金額加權因子（B1：衰減加權取代純天數）──────────────
+        flow_df = compute_value_weighted_inst_flow(df_inst, stock_ids, window=10, decay=0.85)
+        df = df.merge(flow_df, on="stock_id", how="left")
+        df["inst_flow_weighted"] = df["inst_flow_weighted"].fillna(0.0)
+        flow_rank = df["inst_flow_weighted"].rank(pct=True)
+        # 混合排名：金額加權 60% + 天數 40%（大額持續 > 小額持續 > 大額一次）
+        consec_rank = flow_rank * 0.60 + consec_days_rank * 0.40
 
         # ── 法人連續性因子（近 10 日正淨買超天數比例）──────────────
         persist_df = compute_institutional_persistence(df_inst, stock_ids, window=10)

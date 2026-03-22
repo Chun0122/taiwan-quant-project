@@ -22,6 +22,7 @@ from src.data.schema import (
 from src.discovery.scanner._base import MarketScanner
 from src.discovery.scanner._functions import (
     DiscoveryResult,
+    compute_earnings_quality,
     compute_eps_sustainability,
 )
 from src.discovery.universe import UniverseConfig
@@ -367,9 +368,15 @@ class DividendScanner(MarketScanner):
         df_metrics = df_metrics.merge(rev[["stock_id", "rev_base"]], on="stock_id", how="left")
         df_metrics["rev_base"] = df_metrics["rev_base"].fillna(0.5)
 
-        # 加權：營收 40% + EPS 穩定性 35% + 配息率代理 25%
+        # ── 盈餘品質因子（C1：現金流品質 + 收入品質 + 負債穩定性）──
+        eq_df = compute_earnings_quality(df_fin, stock_ids)
+        df_metrics = df_metrics.merge(eq_df, on="stock_id", how="left")
+        df_metrics["earnings_quality"] = df_metrics["earnings_quality"].fillna(0.5)
+        eq_rank = df_metrics["earnings_quality"].rank(pct=True).fillna(0.5)
+
+        # 加權：營收 35% + EPS 穩定性 25% + 配息率代理 25% + 盈餘品質 15%
         df_metrics["fundamental_score"] = (
-            df_metrics["rev_base"] * 0.40 + eps_stability_rank * 0.35 + payout_proxy_rank * 0.25
+            df_metrics["rev_base"] * 0.35 + eps_stability_rank * 0.25 + payout_proxy_rank * 0.25 + eq_rank * 0.15
         )
 
         result = pd.DataFrame({"stock_id": stock_ids})
