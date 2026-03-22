@@ -1159,6 +1159,101 @@ def compute_smart_broker_score(
     return res[["stock_id", "smart_broker_score", "accum_broker_score", "smart_broker_factor"]].reset_index(drop=True)
 
 
+# ------------------------------------------------------------------ #
+#  量價背離偵測（Volume-Price Divergence）
+# ------------------------------------------------------------------ #
+
+# Regime 別最低 composite_score 門檻（低於此分數的推薦不輸出）
+MIN_SCORE_THRESHOLDS: dict[str, float] = {
+    "bull": 0.45,
+    "sideways": 0.50,
+    "bear": 0.55,
+    "crisis": 0.60,
+}
+
+# 同產業推薦上限（top_n_results 對應的最大同產業數量比例）
+SECTOR_MAX_RATIO: float = 0.25  # 同產業最多佔推薦總數 25%
+SECTOR_MIN_CAP: int = 3  # 同產業至少保留 3 檔（小推薦數時避免過度限制）
+
+
+def compute_volume_price_divergence(
+    df_price: pd.DataFrame,
+    stock_ids: list[str],
+    window: int = 5,
+) -> pd.DataFrame:
+    """計算量價背離分數（純函數）。
+
+    衡量近 N 日價格方向與成交量方向的一致性：
+    - 健康上漲 = 價漲量增（correlation > 0）→ 加分
+    - 危險信號 = 價漲量縮（correlation < 0）→ 減分
+
+    計算方式：
+        1. 取近 window+1 日 close 與 volume
+        2. 計算逐日變化率（pct_change）
+        3. 求 Pearson 相關係數
+        4. 映射為 penalty/bonus：
+           - corr < -0.3  → penalty = -0.05（嚴重背離）
+           - corr < 0     → penalty = -0.02（輕度背離）
+           - corr >= 0.3  → bonus = +0.02（量價齊揚）
+           - 其餘 → 0（中性）
+
+    Args:
+        df_price: 含 stock_id / date / close / volume 欄位的 DataFrame
+        stock_ids: 要評估的股票清單
+        window: 背離計算的回溯天數（預設 5）
+
+    Returns:
+        DataFrame(stock_id, vp_divergence)  值域 [-0.05, +0.02]
+    """
+    if df_price.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "vp_divergence": [0.0] * len(stock_ids)})
+
+    sorted_price = df_price.sort_values(["stock_id", "date"])
+    grouped = sorted_price.groupby("stock_id", sort=False)
+
+    results: list[dict] = []
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "vp_divergence": 0.0})
+            continue
+
+        grp = grouped.get_group(sid)
+        # 需要 window+1 筆資料才能算 window 筆 pct_change
+        if len(grp) < window + 2:
+            results.append({"stock_id": sid, "vp_divergence": 0.0})
+            continue
+
+        recent = grp.tail(window + 1)
+        close_chg = recent["close"].pct_change().dropna()
+        vol_chg = recent["volume"].astype(float).pct_change().dropna()
+
+        if len(close_chg) < 3 or vol_chg.std() == 0 or close_chg.std() == 0:
+            results.append({"stock_id": sid, "vp_divergence": 0.0})
+            continue
+
+        corr = float(
+            np.corrcoef(
+                close_chg.values[-window:],
+                vol_chg.values[-window:],
+            )[0, 1]
+        )
+
+        if np.isnan(corr):
+            adj = 0.0
+        elif corr < -0.3:
+            adj = -0.05  # 嚴重背離
+        elif corr < 0:
+            adj = -0.02  # 輕度背離
+        elif corr >= 0.3:
+            adj = 0.02  # 量價齊揚
+        else:
+            adj = 0.0
+
+        results.append({"stock_id": sid, "vp_divergence": adj})
+
+    return pd.DataFrame(results)
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""

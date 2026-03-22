@@ -26,12 +26,16 @@ from src.data.schema import (
     StockValuation,
 )
 from src.discovery.scanner._functions import (
+    MIN_SCORE_THRESHOLDS,
+    SECTOR_MAX_RATIO,
+    SECTOR_MIN_CAP,
     DiscoveryResult,
     _calc_atr14,
     compute_abnormal_announcement_rate,
     compute_daytrade_penalty,
     compute_news_decay_weight,
     compute_taiex_relative_strength,
+    compute_volume_price_divergence,
 )
 from src.discovery.universe import UniverseConfig, UniverseFilter
 from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
@@ -177,8 +181,17 @@ class MarketScanner:
         # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
         scored = self._apply_crisis_filter(scored, df_price)
 
+        # Stage 3.6: 量價背離偵測（價漲量縮 → 降分）
+        scored = self._apply_volume_price_divergence(scored, df_price)
+
+        # Stage 3.7: 動態評分閾值（Regime 越差門檻越高，寧缺勿濫）
+        scored = self._apply_score_threshold(scored)
+
         # Stage 4: 排名 + 產業標籤
         rankings = self._rank_and_enrich(scored)
+
+        # Stage 4.1: 同產業分散化（限制同產業推薦數量）
+        rankings = self._apply_sector_diversification(rankings)
         sector_summary = self._compute_sector_summary(rankings)
         logger.info("Stage 4: 輸出 Top %d", min(self.top_n_results, len(rankings)))
 
@@ -1649,6 +1662,115 @@ class MarketScanner:
             logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
         return scored
 
+    # ------------------------------------------------------------------ #
+    #  Stage 3.6: 量價背離偵測
+    # ------------------------------------------------------------------ #
+
+    def _apply_volume_price_divergence(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.6 — 量價背離調整 composite_score。
+
+        價漲量縮 → 降分（假突破風險）；量價齊揚 → 加分。
+        調整方式：composite_score *= (1 + vp_divergence)，
+        vp_divergence ∈ [-0.05, +0.02]。
+        """
+        if scored.empty or df_price.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        vp_df = compute_volume_price_divergence(df_price, stock_ids, window=5)
+        scored = scored.merge(vp_df, on="stock_id", how="left")
+        scored["vp_divergence"] = scored["vp_divergence"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["vp_divergence"])
+
+        n_penalty = (scored["vp_divergence"] < 0).sum()
+        n_bonus = (scored["vp_divergence"] > 0).sum()
+        logger.info(
+            "Stage 3.6: 量價背離調整 — %d 支降分 / %d 支加分",
+            n_penalty,
+            n_bonus,
+        )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.7: 動態評分閾值
+    # ------------------------------------------------------------------ #
+
+    def _apply_score_threshold(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """Stage 3.7 — 依 Regime 剔除 composite_score 低於門檻的候選股。
+
+        門檻：bull=0.45, sideways=0.50, bear=0.55, crisis=0.60。
+        Regime 越差門檻越高，寧缺勿濫，確保推薦品質。
+        """
+        if scored.empty:
+            return scored
+
+        regime = getattr(self, "regime", "sideways")
+        threshold = MIN_SCORE_THRESHOLDS.get(regime, 0.50)
+
+        before = len(scored)
+        scored = scored[scored["composite_score"] >= threshold].copy()
+        removed = before - len(scored)
+        if removed > 0:
+            logger.info(
+                "Stage 3.7: 動態評分閾值 (regime=%s, threshold=%.2f) 剔除 %d 支低分股",
+                regime,
+                threshold,
+                removed,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 4.1: 同產業分散化
+    # ------------------------------------------------------------------ #
+
+    def _apply_sector_diversification(self, rankings: pd.DataFrame) -> pd.DataFrame:
+        """Stage 4.1 — 限制同產業推薦數量，降低集中風險。
+
+        同產業最多佔推薦總數 25%（至少 3 檔），超出部分依 composite_score
+        從低到高剔除。被剔除的位置由下一順位（不同產業）遞補。
+        """
+        if rankings.empty or "industry_category" not in rankings.columns:
+            return rankings
+
+        top_n = self.top_n_results
+        sector_cap = max(SECTOR_MIN_CAP, int(top_n * SECTOR_MAX_RATIO))
+
+        # 先取比 top_n 更多的候選（讓遞補有空間）
+        pool = rankings.head(top_n * 2) if len(rankings) > top_n else rankings.copy()
+
+        kept: list[int] = []  # 保留的 row index
+        sector_counts: dict[str, int] = {}
+
+        for idx, row in pool.iterrows():
+            sector = row.get("industry_category", "")
+            if not sector:
+                sector = "未分類"
+            count = sector_counts.get(sector, 0)
+            if count < sector_cap:
+                kept.append(idx)
+                sector_counts[sector] = count + 1
+                if len(kept) >= top_n:
+                    break
+
+        result = pool.loc[kept].copy()
+        result["rank"] = range(1, len(result) + 1)
+
+        displaced = len(rankings.head(top_n)) - len(result)
+        if displaced > 0 or sector_counts:
+            capped = [s for s, c in sector_counts.items() if c >= sector_cap]
+            if capped:
+                logger.info(
+                    "Stage 4.1: 同產業分散化 — 產業上限 %d，觸及上限：%s",
+                    sector_cap,
+                    ", ".join(capped),
+                )
+
+        return result
+
     def _reload_valuation(self, stock_ids: list[str]) -> None:
         """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
@@ -1817,6 +1939,7 @@ class MarketScanner:
             "news_score",
             "sector_bonus",
             "concept_bonus",
+            "vp_divergence",
             "daytrade_penalty",
             "daytrade_tags",
             "industry_category",

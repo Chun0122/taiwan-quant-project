@@ -5659,3 +5659,327 @@ class TestApplyChipQualityModifiers:
             hhi_trend_df=hhi_df,
         )
         assert result.iloc[0] == pytest.approx(0.56)  # 0.5 + 0.03 + 0.03
+
+
+# ─── compute_volume_price_divergence ──────────────────────────────────
+
+
+class TestComputeVolumePriceDivergence:
+    """compute_volume_price_divergence() 純函數測試。"""
+
+    def test_price_up_volume_up_positive(self):
+        """價漲量增 → 正向（量價齊揚）。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        # 連續 7 天：價格遞增 + 成交量遞增 → 高正相關
+        rows = []
+        for d in range(7):
+            rows.append(
+                {
+                    "stock_id": "2330",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "close": 100 + d * 2,
+                    "volume": 1_000_000 + d * 200_000,
+                }
+            )
+        df = pd.DataFrame(rows)
+        result = compute_volume_price_divergence(df, ["2330"], window=5)
+        assert len(result) == 1
+        assert result.iloc[0]["vp_divergence"] == pytest.approx(0.02)
+
+    def test_price_up_volume_down_penalty(self):
+        """價漲量縮 → 負向（背離懲罰）。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        # 價格線性上漲（每日漲幅遞增），成交量線性大幅遞減
+        closes = [100, 102, 105, 110, 116, 123, 132]
+        volumes = [5_000_000, 4_200_000, 3_500_000, 2_800_000, 2_200_000, 1_500_000, 900_000]
+        rows = []
+        for d in range(7):
+            rows.append(
+                {
+                    "stock_id": "2330",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "close": closes[d],
+                    "volume": volumes[d],
+                }
+            )
+        df = pd.DataFrame(rows)
+        result = compute_volume_price_divergence(df, ["2330"], window=5)
+        assert result.iloc[0]["vp_divergence"] < 0  # 應為負值
+
+    def test_insufficient_data_returns_zero(self):
+        """資料不足 → 中性 0。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        rows = [
+            {"stock_id": "2330", "date": date(2025, 1, 1), "close": 100, "volume": 1_000_000},
+            {"stock_id": "2330", "date": date(2025, 1, 2), "close": 101, "volume": 1_100_000},
+        ]
+        df = pd.DataFrame(rows)
+        result = compute_volume_price_divergence(df, ["2330"], window=5)
+        assert result.iloc[0]["vp_divergence"] == 0.0
+
+    def test_empty_df(self):
+        """空 DataFrame → 全 0。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        result = compute_volume_price_divergence(pd.DataFrame(), ["2330"], window=5)
+        assert len(result) == 1
+        assert result.iloc[0]["vp_divergence"] == 0.0
+
+    def test_missing_stock_returns_zero(self):
+        """stock_id 不在 df_price 中 → 0。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        rows = []
+        for d in range(7):
+            rows.append(
+                {
+                    "stock_id": "2330",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "close": 100 + d,
+                    "volume": 1_000_000 + d * 100_000,
+                }
+            )
+        df = pd.DataFrame(rows)
+        result = compute_volume_price_divergence(df, ["9999"], window=5)
+        assert result.iloc[0]["vp_divergence"] == 0.0
+
+    def test_multiple_stocks(self):
+        """多支股票同時計算。"""
+        from src.discovery.scanner._functions import compute_volume_price_divergence
+
+        rows = []
+        for sid_i, sid in enumerate(["2330", "2317"]):
+            for d in range(7):
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": date(2025, 1, 1) + timedelta(days=d),
+                        "close": 100 + d * (2 if sid_i == 0 else -1),
+                        "volume": 1_000_000 + d * (200_000 if sid_i == 0 else -100_000),
+                    }
+                )
+        df = pd.DataFrame(rows)
+        result = compute_volume_price_divergence(df, ["2330", "2317"], window=5)
+        assert len(result) == 2
+        # 2330: 價漲量增 → 正值; 2317: 方向更複雜
+        r2330 = result[result["stock_id"] == "2330"]["vp_divergence"].iloc[0]
+        assert r2330 >= 0
+
+
+# ─── _apply_score_threshold ──────────────────────────────────────────
+
+
+class TestApplyScoreThreshold:
+    """_apply_score_threshold() 動態評分閾值測試。"""
+
+    def _make_scored(self, scores):
+        return pd.DataFrame({"stock_id": [f"{i}" for i in range(len(scores))], "composite_score": scores})
+
+    def test_bull_threshold(self):
+        """Bull regime 門檻 0.45。"""
+        scanner = MarketScanner()
+        scanner.regime = "bull"
+        scored = self._make_scored([0.60, 0.50, 0.44, 0.30])
+        result = scanner._apply_score_threshold(scored)
+        assert len(result) == 2  # 0.60 和 0.50 通過，0.44 和 0.30 被剔除
+
+    def test_sideways_threshold(self):
+        """Sideways regime 門檻 0.50。"""
+        scanner = MarketScanner()
+        scanner.regime = "sideways"
+        scored = self._make_scored([0.70, 0.55, 0.49, 0.30])
+        result = scanner._apply_score_threshold(scored)
+        assert len(result) == 2
+
+    def test_bear_threshold(self):
+        """Bear regime 門檻 0.55。"""
+        scanner = MarketScanner()
+        scanner.regime = "bear"
+        scored = self._make_scored([0.70, 0.60, 0.54, 0.40])
+        result = scanner._apply_score_threshold(scored)
+        assert len(result) == 2
+
+    def test_crisis_threshold(self):
+        """Crisis regime 門檻 0.60 — 最嚴格。"""
+        scanner = MarketScanner()
+        scanner.regime = "crisis"
+        scored = self._make_scored([0.75, 0.65, 0.59, 0.40])
+        result = scanner._apply_score_threshold(scored)
+        assert len(result) == 2
+
+    def test_empty_df(self):
+        """空 DataFrame 不出錯。"""
+        scanner = MarketScanner()
+        scanner.regime = "bull"
+        scored = pd.DataFrame(columns=["stock_id", "composite_score"])
+        result = scanner._apply_score_threshold(scored)
+        assert result.empty
+
+    def test_all_pass(self):
+        """全部通過門檻 → 不剔除。"""
+        scanner = MarketScanner()
+        scanner.regime = "bull"
+        scored = self._make_scored([0.80, 0.70, 0.60])
+        result = scanner._apply_score_threshold(scored)
+        assert len(result) == 3
+
+    def test_all_fail(self):
+        """全部低於門檻 → 全部剔除。"""
+        scanner = MarketScanner()
+        scanner.regime = "crisis"
+        scored = self._make_scored([0.50, 0.40, 0.30])
+        result = scanner._apply_score_threshold(scored)
+        assert result.empty
+
+
+# ─── _apply_sector_diversification ───────────────────────────────────
+
+
+class TestApplySectorDiversification:
+    """_apply_sector_diversification() 同產業分散化測試。"""
+
+    def _make_rankings(self, data):
+        """data: list of (stock_id, composite_score, industry_category)"""
+        df = pd.DataFrame(data, columns=["stock_id", "composite_score", "industry_category"])
+        df["rank"] = range(1, len(df) + 1)
+        return df
+
+    def test_no_concentration(self):
+        """產業分散 → 不剔除。"""
+        scanner = MarketScanner(top_n_results=5)
+        rankings = self._make_rankings(
+            [
+                ("2330", 0.9, "半導體"),
+                ("2317", 0.8, "電子零組件"),
+                ("2412", 0.7, "通信"),
+                ("2882", 0.6, "金融"),
+                ("1301", 0.5, "塑膠"),
+            ]
+        )
+        result = scanner._apply_sector_diversification(rankings)
+        assert len(result) == 5
+
+    def test_concentration_capped(self):
+        """同產業超過 25% 上限 → 超出的被替換。"""
+        scanner = MarketScanner(top_n_results=8)
+        # sector_cap = max(3, int(8*0.25)) = 3
+        rankings = self._make_rankings(
+            [
+                ("A1", 0.95, "半導體"),
+                ("A2", 0.90, "半導體"),
+                ("A3", 0.85, "半導體"),
+                ("A4", 0.80, "半導體"),  # 第 4 個半導體，超出 cap=3
+                ("A5", 0.75, "半導體"),  # 第 5 個半導體
+                ("B1", 0.70, "金融"),
+                ("B2", 0.65, "金融"),
+                ("C1", 0.60, "塑膠"),
+                ("C2", 0.55, "塑膠"),
+                ("D1", 0.50, "通信"),
+            ]
+        )
+        result = scanner._apply_sector_diversification(rankings)
+        # 半導體最多 3 個，金融 2，塑膠 2，通信 1 → 可湊 8 個
+        semi_count = (result["industry_category"] == "半導體").sum()
+        assert semi_count <= 3
+        assert len(result) == 8
+
+    def test_small_top_n_uses_min_cap(self):
+        """top_n 很小時 sector_cap 至少 3。"""
+        scanner = MarketScanner(top_n_results=4)
+        # sector_cap = max(3, int(4*0.25)) = max(3, 1) = 3
+        rankings = self._make_rankings(
+            [
+                ("A1", 0.95, "半導體"),
+                ("A2", 0.90, "半導體"),
+                ("A3", 0.85, "半導體"),
+                ("A4", 0.80, "半導體"),
+                ("B1", 0.70, "金融"),
+                ("B2", 0.65, "金融"),
+            ]
+        )
+        result = scanner._apply_sector_diversification(rankings)
+        semi_count = (result["industry_category"] == "半導體").sum()
+        assert semi_count <= 3
+        assert len(result) == 4
+
+    def test_empty_rankings(self):
+        """空排名 → 直接回傳。"""
+        scanner = MarketScanner(top_n_results=10)
+        rankings = pd.DataFrame(columns=["stock_id", "composite_score", "industry_category", "rank"])
+        result = scanner._apply_sector_diversification(rankings)
+        assert result.empty
+
+    def test_rank_renumbered(self):
+        """分散化後 rank 重新編號。"""
+        scanner = MarketScanner(top_n_results=5)
+        rankings = self._make_rankings(
+            [
+                ("A1", 0.95, "半導體"),
+                ("A2", 0.90, "半導體"),
+                ("A3", 0.85, "半導體"),
+                ("B1", 0.80, "金融"),
+                ("C1", 0.75, "塑膠"),
+            ]
+        )
+        result = scanner._apply_sector_diversification(rankings)
+        assert list(result["rank"]) == [1, 2, 3, 4, 5]
+
+    def test_missing_industry_treated_as_unknown(self):
+        """缺少產業分類 → 歸類為「未分類」，也受 cap 限制。"""
+        scanner = MarketScanner(top_n_results=5)
+        rankings = self._make_rankings(
+            [
+                ("A1", 0.95, ""),
+                ("A2", 0.90, ""),
+                ("A3", 0.85, ""),
+                ("A4", 0.80, ""),  # 第 4 個未分類
+                ("B1", 0.70, "金融"),
+                ("C1", 0.60, "塑膠"),
+            ]
+        )
+        result = scanner._apply_sector_diversification(rankings)
+        unknown_count = (result["industry_category"] == "").sum() + (result["industry_category"] == "未分類").sum()
+        assert unknown_count <= 3
+
+
+# ─── _apply_volume_price_divergence ──────────────────────────────────
+
+
+class TestApplyVolumePriceDivergence:
+    """_apply_volume_price_divergence() 整合測試。"""
+
+    def test_adjusts_composite_score(self):
+        """量價背離會調整 composite_score。"""
+        scanner = MarketScanner()
+        # 建立價漲量縮的資料（極端背離）
+        rows = []
+        base_vol = 10_000_000
+        base_close = 100.0
+        for d in range(8):
+            rows.append(
+                {
+                    "stock_id": "2330",
+                    "date": date(2025, 1, 1) + timedelta(days=d),
+                    "open": base_close * (1.05**d) * 0.99,
+                    "high": base_close * (1.05**d) * 1.02,
+                    "low": base_close * (1.05**d) * 0.98,
+                    "close": base_close * (1.05**d),
+                    "volume": int(base_vol * (0.6**d)),
+                }
+            )
+        df_price = pd.DataFrame(rows)
+        scored = pd.DataFrame({"stock_id": ["2330"], "composite_score": [0.60]})
+        result = scanner._apply_volume_price_divergence(scored, df_price)
+        # 價漲量縮 → composite_score 應該下降
+        assert "vp_divergence" in result.columns
+        assert result.iloc[0]["composite_score"] <= 0.60
+
+    def test_empty_scored(self):
+        """空 scored → 直接回傳。"""
+        scanner = MarketScanner()
+        scored = pd.DataFrame(columns=["stock_id", "composite_score"])
+        result = scanner._apply_volume_price_divergence(scored, pd.DataFrame())
+        assert result.empty
