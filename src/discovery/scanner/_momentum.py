@@ -16,6 +16,9 @@ from src.data.schema import HoldingDistribution
 from src.discovery.scanner._base import MarketScanner
 from src.discovery.scanner._functions import (
     compute_broker_score,
+    compute_hhi_trend,
+    compute_inst_net_buy_slope,
+    compute_institutional_persistence,
     compute_sbl_score,
     compute_smart_broker_score,
     compute_whale_score,
@@ -85,15 +88,16 @@ class MomentumScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
+        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 法人連續性 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
 
-        權重組合（由資料可用性決定）：
-        - 8 因子（含智慧分點）: 外資18%+量比16%+法人16%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
-        - 7 因子（含分點）: 外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
-        - 6 因子（含借券）: 外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
-        - 5 因子（含大戶持股，無借券）: 外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
-        - 4 因子（含券資比，無大戶/借券）: 外資 30% + 量比 25% + 法人 25% + 券資比 20%
-        - 3 因子（基本）: 外資 40% + 量比 30% + 法人 30%
+        **法人連續性因子**（persist_rank, 6%）始終啟用，衡量近 10 日法人淨買超為正的天數比例。
+        連續性高 = 法人持續布局（真波段），連續性低 = 一日行情（假主力）。
+        同時用於調節隔日沖扣分 — 法人連續買超越強，隔沖扣分越輕。
+
+        權重組合（由資料可用性決定，皆含連續性 6%）：
+        - 8F: 外資16%+量比14%+法人14%+連續性6%+券資比10%+大戶12%+借券7%+分點11%+智慧分點10%
+        - 7F: 外資18%+量比16%+法人16%+連續性6%+券資比11%+大戶13%+借券8%+分點12%
+        - 3F: 外資37%+量比27%+法人27%+連續性9%
 
         回傳欄位：stock_id, chip_score, chip_tier（因子層級字串，如 "8F"/"3F"/"N/A"）
         """
@@ -148,6 +152,12 @@ class MomentumScanner(MarketScanner):
         consec_rank = df["consec_foreign_days"].rank(pct=True)
         bvr_rank = df["buy_vol_ratio"].rank(pct=True)
         total_rank = df["total_net"].rank(pct=True)
+
+        # ── 法人連續性因子（近 10 日正淨買超天數比例）──────────────
+        persist_df = compute_institutional_persistence(df_inst, stock_ids, window=10)
+        df = df.merge(persist_df, on="stock_id", how="left")
+        df["inst_persistence"] = df["inst_persistence"].fillna(0.5)
+        persist_rank = df["inst_persistence"].rank(pct=True)
 
         # ── 大戶持股因子（從 DB 查詢最近 2 週資料）──────────────────
         df_whale = self._load_holding_data(stock_ids)
@@ -226,20 +236,25 @@ class MomentumScanner(MarketScanner):
         _dt_broker_src = df_broker_ext if not df_broker_ext.empty else df_broker_raw
         if has_broker and not _dt_broker_src.empty and "broker_name" in _dt_broker_src.columns:
             broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
-                broker_rank, _dt_broker_src, stock_ids, df_price
+                broker_rank,
+                _dt_broker_src,
+                stock_ids,
+                df_price,
+                persistence_scores=persist_df,
             )
         else:
             self._daytrade_penalty_df = pd.DataFrame(
                 {"stock_id": stock_ids, "daytrade_penalty": 0.0, "daytrade_tags": ""}
             )
 
-        # ── 加權組合 ─────────────────────────────────────────────────
+        # ── 加權組合（含法人連續性 persist_rank）──────────────────────
         if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
-            # 8 因子：外資18%+量比16%+法人16%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
+            # 8F+P：外資16%+量比14%+法人14%+連續性6%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
             df["chip_score"] = (
-                consec_rank * 0.18
-                + bvr_rank * 0.16
-                + total_rank * 0.16
+                consec_rank * 0.16
+                + bvr_rank * 0.14
+                + total_rank * 0.14
+                + persist_rank * 0.06
                 + smr_rank * 0.10
                 + whale_rank * 0.12
                 + sbl_rank * 0.07
@@ -248,11 +263,12 @@ class MomentumScanner(MarketScanner):
             )
             chip_tier = "8F"
         elif has_broker and has_sbl and has_margin and has_whale:
-            # 7 因子：外資20%+量比18%+法人18%+券資比11%+大戶13%+借券8%+分點12%
+            # 7F+P：外資18%+量比16%+法人16%+連續性6%+券資比11%+大戶13%+借券8%+分點12%
             df["chip_score"] = (
-                consec_rank * 0.20
-                + bvr_rank * 0.18
-                + total_rank * 0.18
+                consec_rank * 0.18
+                + bvr_rank * 0.16
+                + total_rank * 0.16
+                + persist_rank * 0.06
                 + smr_rank * 0.11
                 + whale_rank * 0.13
                 + sbl_rank * 0.08
@@ -260,71 +276,111 @@ class MomentumScanner(MarketScanner):
             )
             chip_tier = "7F"
         elif has_broker and has_sbl and has_margin:
-            # 6 因子（有分點、無大戶）：外資22%+量比20%+法人20%+券資比14%+借券12%+分點12%
+            # 6F+P：外資20%+量比18%+法人18%+連續性6%+券資比14%+借券12%+分點12%
             df["chip_score"] = (
-                consec_rank * 0.22
-                + bvr_rank * 0.20
-                + total_rank * 0.20
+                consec_rank * 0.20
+                + bvr_rank * 0.18
+                + total_rank * 0.18
+                + persist_rank * 0.06
                 + smr_rank * 0.14
                 + sbl_rank * 0.12
                 + broker_rank * 0.12
             )
             chip_tier = "6F"
         elif has_broker and has_sbl:
-            # 5 因子（有分點+借券、無大戶/融資券）：外資28%+量比22%+法人22%+借券14%+分點14%
+            # 5F+P：外資26%+量比20%+法人20%+連續性6%+借券14%+分點14%
             df["chip_score"] = (
-                consec_rank * 0.28 + bvr_rank * 0.22 + total_rank * 0.22 + sbl_rank * 0.14 + broker_rank * 0.14
+                consec_rank * 0.26
+                + bvr_rank * 0.20
+                + total_rank * 0.20
+                + persist_rank * 0.06
+                + sbl_rank * 0.14
+                + broker_rank * 0.14
             )
             chip_tier = "5F"
         elif has_broker:
-            # 4 因子（僅分點）：外資32%+量比24%+法人24%+分點20%
-            df["chip_score"] = consec_rank * 0.32 + bvr_rank * 0.24 + total_rank * 0.24 + broker_rank * 0.20
+            # 4F+P：外資30%+量比22%+法人22%+連續性6%+分點20%
+            df["chip_score"] = (
+                consec_rank * 0.30 + bvr_rank * 0.22 + total_rank * 0.22 + persist_rank * 0.06 + broker_rank * 0.20
+            )
             chip_tier = "4F"
         elif has_sbl and has_margin and has_whale:
-            # 6 因子：外資 22% + 量比 20% + 法人 20% + 券資比 13% + 大戶 15% + 借券(逆) 10%
+            # 6F+P：外資20%+量比18%+法人18%+連續性6%+券資比13%+大戶15%+借券10%
             df["chip_score"] = (
-                consec_rank * 0.22
-                + bvr_rank * 0.20
-                + total_rank * 0.20
+                consec_rank * 0.20
+                + bvr_rank * 0.18
+                + total_rank * 0.18
+                + persist_rank * 0.06
                 + smr_rank * 0.13
                 + whale_rank * 0.15
                 + sbl_rank * 0.10
             )
             chip_tier = "6F"
         elif has_sbl and has_margin:
-            # 5 因子（有借券、無大戶）：外資 25% + 量比 22% + 法人 22% + 券資比 16% + 借券(逆) 15%
+            # 5F+P：外資23%+量比20%+法人20%+連續性6%+券資比16%+借券15%
             df["chip_score"] = (
-                consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.16 + sbl_rank * 0.15
+                consec_rank * 0.23
+                + bvr_rank * 0.20
+                + total_rank * 0.20
+                + persist_rank * 0.06
+                + smr_rank * 0.16
+                + sbl_rank * 0.15
             )
             chip_tier = "5F"
         elif has_sbl and has_whale:
-            # 5 因子（有借券、無券資比）：外資 28% + 量比 20% + 法人 20% + 大戶 22% + 借券(逆) 10%
+            # 5F+P：外資26%+量比18%+法人18%+連續性6%+大戶22%+借券10%
             df["chip_score"] = (
-                consec_rank * 0.28 + bvr_rank * 0.20 + total_rank * 0.20 + whale_rank * 0.22 + sbl_rank * 0.10
+                consec_rank * 0.26
+                + bvr_rank * 0.18
+                + total_rank * 0.18
+                + persist_rank * 0.06
+                + whale_rank * 0.22
+                + sbl_rank * 0.10
             )
             chip_tier = "5F"
         elif has_sbl:
-            # 4 因子（僅借券）：外資 35% + 量比 25% + 法人 25% + 借券(逆) 15%
-            df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + sbl_rank * 0.15
+            # 4F+P：外資33%+量比23%+法人23%+連續性6%+借券15%
+            df["chip_score"] = (
+                consec_rank * 0.33 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + sbl_rank * 0.15
+            )
             chip_tier = "4F"
         elif has_margin and has_whale:
-            # 5 因子：外資 25% + 量比 22% + 法人 22% + 券資比 15% + 大戶 16%
+            # 5F+P：外資23%+量比20%+法人20%+連續性6%+券資比15%+大戶16%
             df["chip_score"] = (
-                consec_rank * 0.25 + bvr_rank * 0.22 + total_rank * 0.22 + smr_rank * 0.15 + whale_rank * 0.16
+                consec_rank * 0.23
+                + bvr_rank * 0.20
+                + total_rank * 0.20
+                + persist_rank * 0.06
+                + smr_rank * 0.15
+                + whale_rank * 0.16
             )
             chip_tier = "5F"
         elif has_margin:
-            # 4 因子：外資 30% + 量比 25% + 法人 25% + 券資比 20%
-            df["chip_score"] = consec_rank * 0.30 + bvr_rank * 0.25 + total_rank * 0.25 + smr_rank * 0.20
+            # 4F+P：外資28%+量比23%+法人23%+連續性6%+券資比20%
+            df["chip_score"] = (
+                consec_rank * 0.28 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + smr_rank * 0.20
+            )
             chip_tier = "4F"
         elif has_whale:
-            # 4 因子：外資 35% + 量比 25% + 法人 25% + 大戶 15%
-            df["chip_score"] = consec_rank * 0.35 + bvr_rank * 0.25 + total_rank * 0.25 + whale_rank * 0.15
+            # 4F+P：外資33%+量比23%+法人23%+連續性6%+大戶15%
+            df["chip_score"] = (
+                consec_rank * 0.33 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + whale_rank * 0.15
+            )
             chip_tier = "4F"
         else:
-            # 3 因子：外資 40% + 量比 30% + 法人 30%
-            df["chip_score"] = consec_rank * 0.40 + bvr_rank * 0.30 + total_rank * 0.30
+            # 3F+P：外資37%+量比27%+法人27%+連續性9%
+            df["chip_score"] = consec_rank * 0.37 + bvr_rank * 0.27 + total_rank * 0.27 + persist_rank * 0.09
             chip_tier = "3F"
+
+        # ── 籌碼品質修正（法人斜率 ±3% + HHI 趨勢 ±3%）───────────
+        slope_df = compute_inst_net_buy_slope(df_inst, stock_ids, window=10)
+        hhi_trend_df = compute_hhi_trend(df_broker_raw, stock_ids) if not df_broker_raw.empty else None
+        df["chip_score"] = self._apply_chip_quality_modifiers(
+            df["chip_score"],
+            stock_ids,
+            slope_df=slope_df,
+            hhi_trend_df=hhi_trend_df,
+        )
 
         df["chip_tier"] = chip_tier
         return df[["stock_id", "chip_score", "chip_tier"]]

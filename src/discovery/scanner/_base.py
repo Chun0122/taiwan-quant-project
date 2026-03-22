@@ -1982,6 +1982,63 @@ class MarketScanner:
         except Exception:
             return pd.DataFrame()
 
+    @staticmethod
+    def _apply_chip_quality_modifiers(
+        chip_score: pd.Series,
+        stock_ids: list[str],
+        slope_df: pd.DataFrame | None = None,
+        hhi_trend_df: pd.DataFrame | None = None,
+        slope_bonus: float = 0.03,
+        hhi_bonus: float = 0.03,
+        hhi_high_threshold: float = 0.25,
+    ) -> pd.Series:
+        """對 chip_score 施加籌碼品質修正（斜率 + HHI 趨勢）。
+
+        - 法人斜率正 → chip_score +bonus；斜率負 → -bonus
+        - HHI 趨勢上升 且 HHI 水位高 → +bonus（吸籌）；趨勢下降 → -bonus（出貨）
+
+        修正以 clip(0, 1) 確保 chip_score 不越界。
+
+        Args:
+            chip_score: 原始 chip_score Series（0~1），index 對齊 stock_ids
+            stock_ids: 候選股代號清單
+            slope_df: compute_inst_net_buy_slope() 回傳，[stock_id, inst_slope]
+            hhi_trend_df: compute_hhi_trend() 回傳，[stock_id, hhi_trend, hhi_short_avg]
+            slope_bonus: 斜率修正幅度（預設 ±3%）
+            hhi_bonus: HHI 趨勢修正幅度（預設 ±3%）
+            hhi_high_threshold: HHI 絕對值需 ≥ 此門檻才施加趨勢修正（預設 0.25）
+
+        Returns:
+            修正後的 chip_score Series
+        """
+        adjusted = chip_score.copy().astype(float)
+
+        # ── 法人斜率修正 ──────────────────────────────────────────
+        if slope_df is not None and not slope_df.empty:
+            slope_map = dict(zip(slope_df["stock_id"], slope_df["inst_slope"], strict=False))
+            for i, sid in enumerate(stock_ids):
+                slope = slope_map.get(sid, 0.0)
+                if slope > 0:
+                    adjusted.iloc[i] += slope_bonus
+                elif slope < 0:
+                    adjusted.iloc[i] -= slope_bonus
+
+        # ── HHI 趨勢修正 ─────────────────────────────────────────
+        if hhi_trend_df is not None and not hhi_trend_df.empty:
+            trend_map = dict(zip(hhi_trend_df["stock_id"], hhi_trend_df["hhi_trend"], strict=False))
+            hhi_map = dict(zip(hhi_trend_df["stock_id"], hhi_trend_df["hhi_short_avg"], strict=False))
+            for i, sid in enumerate(stock_ids):
+                trend = trend_map.get(sid, 0.0)
+                hhi_val = hhi_map.get(sid, 0.0)
+                # 只有 HHI 水位高時，趨勢才有意義（低 HHI = 散戶市，趨勢無意義）
+                if hhi_val >= hhi_high_threshold:
+                    if trend > 0:
+                        adjusted.iloc[i] += hhi_bonus  # 集中化 = 吸籌
+                    elif trend < 0:
+                        adjusted.iloc[i] -= hhi_bonus  # 分散化 = 出貨
+
+        return adjusted.clip(0.0, 1.0)
+
     def _apply_daytrade_penalty(
         self,
         broker_rank: pd.Series,
@@ -1989,11 +2046,15 @@ class MarketScanner:
         stock_ids: list[str],
         df_price: pd.DataFrame | None = None,
         penalty_factor: float = 0.5,
+        persistence_scores: pd.DataFrame | None = None,
     ) -> tuple[pd.Series, pd.DataFrame]:
         """對 broker_rank 施加隔日沖扣分，同時回傳 penalty_df 供持久化。
 
         隔日沖分點（黑名單 + 行為偵測）的買超佔比越高，broker_rank 扣分越重。
         最多扣除 penalty_factor（預設 50%），避免單一負面因子完全壓制分點因子。
+
+        若提供 persistence_scores（法人連續性），則以 ``(1 - persistence)`` 調節
+        penalty — 法人連續買超越強的股票，隔沖扣分越小（隔沖只是來抬轎）。
 
         Args:
             broker_rank: 分點因子的 percentile rank Series（0~1），index 對齊 stock_ids
@@ -2001,6 +2062,7 @@ class MarketScanner:
             stock_ids: 候選股代號清單
             df_price: 日K 線資料（可選，用於計算 20 日均量做流動性閾值）
             penalty_factor: 最大扣分比例（預設 0.5，即 penalty=1.0 時 rank 打 5 折）
+            persistence_scores: DataFrame [stock_id, inst_persistence]（可選，法人連續性 0~1）
 
         Returns:
             (adjusted_broker_rank, penalty_df)
@@ -2034,11 +2096,19 @@ class MarketScanner:
         if penalty_df.empty:
             return broker_rank, empty_penalty
 
-        # 建立 stock_id → penalty 映射
+        # 建立 stock_id → penalty / tags 映射
         penalty_map = dict(zip(penalty_df["stock_id"], penalty_df["daytrade_penalty"], strict=False))
         tags_map = dict(zip(penalty_df["stock_id"], penalty_df["top_dt_brokers"], strict=False))
 
-        # 扣分：rank *= (1 - penalty × penalty_factor)
+        # 建立 stock_id → persistence 映射（用於調節 penalty）
+        persist_map: dict[str, float] = {}
+        if persistence_scores is not None and not persistence_scores.empty:
+            persist_map = dict(
+                zip(persistence_scores["stock_id"], persistence_scores["inst_persistence"], strict=False)
+            )
+
+        # 扣分：adjusted_penalty = penalty × (1 - persistence)
+        #       rank *= (1 - adjusted_penalty × penalty_factor)
         adjusted = broker_rank.copy()
         dt_penalties = []
         dt_tags = []
@@ -2047,7 +2117,9 @@ class MarketScanner:
             dt_penalties.append(p)
             dt_tags.append(tags_map.get(sid, ""))
             if p > 0:
-                adjusted.iloc[i] = adjusted.iloc[i] * (1 - p * penalty_factor)
+                persistence = persist_map.get(sid, 0.0)
+                effective_penalty = p * (1.0 - persistence)
+                adjusted.iloc[i] = adjusted.iloc[i] * (1 - effective_penalty * penalty_factor)
 
         result_df = pd.DataFrame({"stock_id": stock_ids, "daytrade_penalty": dt_penalties, "daytrade_tags": dt_tags})
         return adjusted, result_df

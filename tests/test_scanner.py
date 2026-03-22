@@ -5125,3 +5125,537 @@ class TestCrisisEntryTriggerText:
         # ATR14 ≈ 4.0（high-low=4，無跳空），stop = entry - 1.0 × ATR
         stop_dist = ep - sl
         assert stop_dist == pytest.approx(4.0, abs=0.5)  # 1.0 × ATR ≈ 4.0
+
+
+# ====================================================================== #
+#  TestComputeInstitutionalPersistence — 法人連續性因子純函數測試
+# ====================================================================== #
+
+
+class TestComputeInstitutionalPersistence:
+    """compute_institutional_persistence() 純函數測試。"""
+
+    def test_empty_df_returns_neutral(self):
+        """空 df_inst 時，所有股票回傳中性值 0.5。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        result = compute_institutional_persistence(pd.DataFrame(), ["2330", "2317"], window=10)
+        assert len(result) == 2
+        assert result[result["stock_id"] == "2330"].iloc[0]["inst_persistence"] == 0.5
+        assert result[result["stock_id"] == "2317"].iloc[0]["inst_persistence"] == 0.5
+        assert result[result["stock_id"] == "2330"].iloc[0]["inst_positive_days"] == 0
+
+    def test_all_positive_days(self):
+        """10/10 天淨買超為正 → persistence = 1.0。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100 + i})
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_persistence"] == pytest.approx(1.0)
+        assert result.iloc[0]["inst_positive_days"] == 10
+
+    def test_all_negative_days(self):
+        """10/10 天淨買超為負 → persistence = 0.0。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": -100})
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_persistence"] == pytest.approx(0.0)
+        assert result.iloc[0]["inst_positive_days"] == 0
+
+    def test_partial_positive_days(self):
+        """6/10 天淨買超為正 → persistence = 0.6。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            net = 100 if i < 6 else -100  # 前 6 天正，後 4 天負
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": net})
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_persistence"] == pytest.approx(0.6)
+        assert result.iloc[0]["inst_positive_days"] == 6
+
+    def test_fewer_days_than_window(self):
+        """僅 5 天資料但 window=10 → 以實際天數為分母，5/5 = 1.0。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = []
+        for i in range(5):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100})
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_persistence"] == pytest.approx(1.0)
+        assert result.iloc[0]["inst_positive_days"] == 5
+
+    def test_multiple_stocks_independent(self):
+        """多檔股票各自獨立計算。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100})  # 全正
+            rows.append({"stock_id": "2317", "date": d, "name": "外資", "net": -100})  # 全負
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330", "2317"], window=10)
+        r_2330 = result[result["stock_id"] == "2330"].iloc[0]
+        r_2317 = result[result["stock_id"] == "2317"].iloc[0]
+        assert r_2330["inst_persistence"] == pytest.approx(1.0)
+        assert r_2317["inst_persistence"] == pytest.approx(0.0)
+
+    def test_missing_stock_returns_neutral(self):
+        """stock_id 不在 df_inst 中時回傳中性值 0.5。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        rows = [{"stock_id": "2330", "date": date(2026, 3, 1), "name": "外資", "net": 100}]
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330", "9999"], window=10)
+        r_9999 = result[result["stock_id"] == "9999"].iloc[0]
+        assert r_9999["inst_persistence"] == pytest.approx(0.5)
+
+    def test_multiple_institutions_aggregated(self):
+        """同日多法人合計 — 外資+100 + 投信-200 → 日合計 -100（負）。"""
+        from src.discovery.scanner import compute_institutional_persistence
+
+        d = date(2026, 3, 1)
+        rows = [
+            {"stock_id": "2330", "date": d, "name": "外資", "net": 100},
+            {"stock_id": "2330", "date": d, "name": "投信", "net": -200},
+        ]
+        df = pd.DataFrame(rows)
+        result = compute_institutional_persistence(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_persistence"] == pytest.approx(0.0)  # -100 合計為負
+        assert result.iloc[0]["inst_positive_days"] == 0
+
+
+# ====================================================================== #
+#  TestDaytradePersistenceDampening — 隔日沖×連續性交互測試
+# ====================================================================== #
+
+
+class TestDaytradePersistenceDampening:
+    """_apply_daytrade_penalty() 法人連續性調節測試。"""
+
+    def _make_broker_df(self) -> pd.DataFrame:
+        """建立含已知隔日沖分點（凱基-台北）的 BrokerTrade。
+
+        凱基-台北在最新日仍有淨買超（即時風險），確保 penalty > 0。
+        """
+        d1 = date(2026, 3, 10)
+        d2 = date(2026, 3, 11)
+        d3 = date(2026, 3, 12)  # 最新日
+        return pd.DataFrame(
+            [
+                # 凱基-台北：T 日買、T+1 日賣（隔日沖模式），但最新日仍有淨買超
+                {
+                    "date": d1,
+                    "stock_id": "2330",
+                    "broker_id": "B001",
+                    "broker_name": "凱基-台北",
+                    "buy": 5000,
+                    "sell": 0,
+                },
+                {
+                    "date": d2,
+                    "stock_id": "2330",
+                    "broker_id": "B001",
+                    "broker_name": "凱基-台北",
+                    "buy": 0,
+                    "sell": 5000,
+                },
+                {
+                    "date": d3,
+                    "stock_id": "2330",
+                    "broker_id": "B001",
+                    "broker_name": "凱基-台北",
+                    "buy": 6000,
+                    "sell": 500,
+                },
+                # 正常主力
+                {
+                    "date": d1,
+                    "stock_id": "2330",
+                    "broker_id": "M001",
+                    "broker_name": "元大-台北",
+                    "buy": 8000,
+                    "sell": 1000,
+                },
+                {
+                    "date": d2,
+                    "stock_id": "2330",
+                    "broker_id": "M001",
+                    "broker_name": "元大-台北",
+                    "buy": 7000,
+                    "sell": 1000,
+                },
+                {
+                    "date": d3,
+                    "stock_id": "2330",
+                    "broker_id": "M001",
+                    "broker_name": "元大-台北",
+                    "buy": 7000,
+                    "sell": 1000,
+                },
+            ]
+        )
+
+    def test_no_persistence_full_penalty(self):
+        """persistence=0.0 時隔沖扣分全額施加。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        scanner = MarketScanner()
+        broker_rank = pd.Series([0.8])
+        persist_df = pd.DataFrame({"stock_id": ["2330"], "inst_persistence": [0.0]})
+
+        adjusted, _ = scanner._apply_daytrade_penalty(
+            broker_rank,
+            self._make_broker_df(),
+            ["2330"],
+            persistence_scores=persist_df,
+        )
+        # penalty > 0, persistence=0 → effective_penalty = penalty × 1.0 → 全額扣分
+        assert adjusted.iloc[0] < 0.8
+
+    def test_full_persistence_zero_penalty(self):
+        """persistence=1.0 時隔沖扣分完全取消。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        scanner = MarketScanner()
+        broker_rank = pd.Series([0.8])
+        persist_df = pd.DataFrame({"stock_id": ["2330"], "inst_persistence": [1.0]})
+
+        adjusted, _ = scanner._apply_daytrade_penalty(
+            broker_rank,
+            self._make_broker_df(),
+            ["2330"],
+            persistence_scores=persist_df,
+        )
+        # persistence=1.0 → effective_penalty = penalty × (1 - 1.0) = 0 → rank 不變
+        assert adjusted.iloc[0] == pytest.approx(0.8)
+
+    def test_half_persistence_reduces_penalty(self):
+        """persistence=0.5 時隔沖扣分減半。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        scanner = MarketScanner()
+        broker_rank = pd.Series([0.8])
+        df_broker = self._make_broker_df()
+
+        # 無連續性
+        persist_0 = pd.DataFrame({"stock_id": ["2330"], "inst_persistence": [0.0]})
+        adj_0, _ = scanner._apply_daytrade_penalty(
+            broker_rank.copy(),
+            df_broker,
+            ["2330"],
+            persistence_scores=persist_0,
+        )
+
+        # 半連續性
+        persist_half = pd.DataFrame({"stock_id": ["2330"], "inst_persistence": [0.5]})
+        adj_half, _ = scanner._apply_daytrade_penalty(
+            broker_rank.copy(),
+            df_broker,
+            ["2330"],
+            persistence_scores=persist_half,
+        )
+
+        # adj_half 的扣分幅度應為 adj_0 的一半
+        deduction_0 = 0.8 - adj_0.iloc[0]
+        deduction_half = 0.8 - adj_half.iloc[0]
+        assert deduction_half == pytest.approx(deduction_0 * 0.5, abs=0.01)
+
+    def test_none_persistence_scores_no_dampening(self):
+        """persistence_scores=None 時行為與舊版一致（全額扣分）。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        scanner = MarketScanner()
+        broker_rank = pd.Series([0.8])
+        df_broker = self._make_broker_df()
+
+        # None（舊行為）
+        adj_none, _ = scanner._apply_daytrade_penalty(
+            broker_rank.copy(),
+            df_broker,
+            ["2330"],
+            persistence_scores=None,
+        )
+
+        # persistence=0.0（等效舊行為）
+        persist_0 = pd.DataFrame({"stock_id": ["2330"], "inst_persistence": [0.0]})
+        adj_0, _ = scanner._apply_daytrade_penalty(
+            broker_rank.copy(),
+            df_broker,
+            ["2330"],
+            persistence_scores=persist_0,
+        )
+
+        assert adj_none.iloc[0] == pytest.approx(adj_0.iloc[0], abs=0.01)
+
+
+# ====================================================================== #
+#  TestComputeInstNetBuySlope — 法人淨買超斜率純函數測試
+# ====================================================================== #
+
+
+class TestComputeInstNetBuySlope:
+    """compute_inst_net_buy_slope() 純函數測試。"""
+
+    def test_empty_df_returns_zero(self):
+        """空 df_inst 時回傳 0.0。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        result = compute_inst_net_buy_slope(pd.DataFrame(), ["2330"], window=10)
+        assert len(result) == 1
+        assert result.iloc[0]["inst_slope"] == pytest.approx(0.0)
+
+    def test_increasing_net_buy_positive_slope(self):
+        """淨買超逐日遞增 → 斜率為正。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100 + i * 50})
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_slope"] > 0
+
+    def test_decreasing_net_buy_negative_slope(self):
+        """淨買超逐日遞減 → 斜率為負。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 500 - i * 50})
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_slope"] < 0
+
+    def test_constant_net_buy_zero_slope(self):
+        """淨買超恆定 → 斜率為 0。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = []
+        for i in range(10):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100})
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_slope"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_fewer_than_3_days_returns_zero(self):
+        """資料不足 3 天時回傳 0.0（無法算斜率）。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = [
+            {"stock_id": "2330", "date": date(2026, 3, 1), "name": "外資", "net": 100},
+            {"stock_id": "2330", "date": date(2026, 3, 2), "name": "外資", "net": 200},
+        ]
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_slope"] == pytest.approx(0.0)
+
+    def test_multiple_stocks_independent(self):
+        """多股票各自獨立計算斜率。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = []
+        for i in range(5):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"stock_id": "2330", "date": d, "name": "外資", "net": 100 + i * 100})  # 遞增
+            rows.append({"stock_id": "2317", "date": d, "name": "外資", "net": 500 - i * 100})  # 遞減
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330", "2317"], window=10)
+        r_2330 = result[result["stock_id"] == "2330"].iloc[0]["inst_slope"]
+        r_2317 = result[result["stock_id"] == "2317"].iloc[0]["inst_slope"]
+        assert r_2330 > 0
+        assert r_2317 < 0
+
+    def test_missing_stock_returns_zero(self):
+        """stock_id 不在資料中時回傳 0.0。"""
+        from src.discovery.scanner import compute_inst_net_buy_slope
+
+        rows = [{"stock_id": "2330", "date": date(2026, 3, 1), "name": "外資", "net": 100}]
+        df = pd.DataFrame(rows)
+        result = compute_inst_net_buy_slope(df, ["2330", "9999"], window=10)
+        r_9999 = result[result["stock_id"] == "9999"].iloc[0]
+        assert r_9999["inst_slope"] == pytest.approx(0.0)
+
+
+# ====================================================================== #
+#  TestComputeHhiTrend — HHI 集中度趨勢純函數測試
+# ====================================================================== #
+
+
+class TestComputeHhiTrend:
+    """compute_hhi_trend() 純函數測試。"""
+
+    def test_empty_df_returns_zero(self):
+        """空 df_broker 時回傳 0.0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        result = compute_hhi_trend(pd.DataFrame(), ["2330"])
+        assert len(result) == 1
+        assert result.iloc[0]["hhi_trend"] == pytest.approx(0.0)
+        assert result.iloc[0]["hhi_short_avg"] == pytest.approx(0.0)
+
+    def test_concentrating_positive_trend(self):
+        """主力越來越集中 → hhi_trend > 0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        rows = []
+        # 前 4 天：2 個分點各買一半（HHI≈0.5）
+        for i in range(4):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "A", "buy": 5000, "sell": 0})
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "B", "buy": 5000, "sell": 0})
+        # 後 3 天：只剩 1 個分點（HHI=1.0）
+        for i in range(3):
+            d = date(2026, 3, 5) + timedelta(days=i)
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "A", "buy": 10000, "sell": 0})
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "B", "buy": 0, "sell": 1000})
+        df = pd.DataFrame(rows)
+        result = compute_hhi_trend(df, ["2330"], short_window=3, long_window=7)
+        assert result.iloc[0]["hhi_trend"] > 0  # 近期更集中
+        assert result.iloc[0]["hhi_short_avg"] > 0.5  # 近期 HHI 高
+
+    def test_dispersing_negative_trend(self):
+        """主力分散出貨 → hhi_trend < 0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        rows = []
+        # 前 4 天：1 個主力獨佔（HHI=1.0）
+        for i in range(4):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "A", "buy": 10000, "sell": 0})
+        # 後 3 天：分散到 5 個分點（HHI≈0.2）
+        for i in range(3):
+            d = date(2026, 3, 5) + timedelta(days=i)
+            for b_id in ["A", "B", "C", "D", "E"]:
+                rows.append({"date": d, "stock_id": "2330", "broker_id": b_id, "buy": 2000, "sell": 0})
+        df = pd.DataFrame(rows)
+        result = compute_hhi_trend(df, ["2330"], short_window=3, long_window=7)
+        assert result.iloc[0]["hhi_trend"] < 0  # 近期分散化
+
+    def test_stable_hhi_zero_trend(self):
+        """HHI 穩定不變 → trend ≈ 0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        rows = []
+        for i in range(7):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "A", "buy": 7000, "sell": 0})
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "B", "buy": 3000, "sell": 0})
+        df = pd.DataFrame(rows)
+        result = compute_hhi_trend(df, ["2330"], short_window=3, long_window=7)
+        assert abs(result.iloc[0]["hhi_trend"]) < 0.01  # 幾乎為 0
+
+    def test_missing_stock_returns_zero(self):
+        """stock_id 不在資料中時回傳 0.0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        rows = [{"date": date(2026, 3, 1), "stock_id": "2330", "broker_id": "A", "buy": 1000, "sell": 0}]
+        df = pd.DataFrame(rows)
+        result = compute_hhi_trend(df, ["2330", "9999"])
+        r_9999 = result[result["stock_id"] == "9999"].iloc[0]
+        assert r_9999["hhi_trend"] == pytest.approx(0.0)
+
+    def test_no_net_buyers_hhi_zero(self):
+        """全部分點都是淨賣超 → HHI = 0。"""
+        from src.discovery.scanner import compute_hhi_trend
+
+        rows = []
+        for i in range(5):
+            d = date(2026, 3, 1) + timedelta(days=i)
+            rows.append({"date": d, "stock_id": "2330", "broker_id": "A", "buy": 0, "sell": 5000})
+        df = pd.DataFrame(rows)
+        result = compute_hhi_trend(df, ["2330"])
+        assert result.iloc[0]["hhi_trend"] == pytest.approx(0.0)
+        assert result.iloc[0]["hhi_short_avg"] == pytest.approx(0.0)
+
+
+# ====================================================================== #
+#  TestApplyChipQualityModifiers — 籌碼品質修正測試
+# ====================================================================== #
+
+
+class TestApplyChipQualityModifiers:
+    """_apply_chip_quality_modifiers() 靜態方法測試。"""
+
+    def test_positive_slope_adds_bonus(self):
+        """正斜率 → chip_score 增加。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.5])
+        slope_df = pd.DataFrame({"stock_id": ["2330"], "inst_slope": [0.1]})
+        result = MarketScanner._apply_chip_quality_modifiers(chip, ["2330"], slope_df=slope_df)
+        assert result.iloc[0] == pytest.approx(0.53)  # 0.5 + 0.03
+
+    def test_negative_slope_subtracts(self):
+        """負斜率 → chip_score 減少。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.5])
+        slope_df = pd.DataFrame({"stock_id": ["2330"], "inst_slope": [-0.2]})
+        result = MarketScanner._apply_chip_quality_modifiers(chip, ["2330"], slope_df=slope_df)
+        assert result.iloc[0] == pytest.approx(0.47)  # 0.5 - 0.03
+
+    def test_hhi_high_concentrating_adds_bonus(self):
+        """HHI 高且趨勢上升 → chip_score 增加。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.5])
+        hhi_df = pd.DataFrame({"stock_id": ["2330"], "hhi_trend": [0.1], "hhi_short_avg": [0.4]})
+        result = MarketScanner._apply_chip_quality_modifiers(chip, ["2330"], hhi_trend_df=hhi_df)
+        assert result.iloc[0] == pytest.approx(0.53)
+
+    def test_hhi_low_no_effect(self):
+        """HHI 低（< 0.25）時不論趨勢方向，不施加修正。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.5])
+        hhi_df = pd.DataFrame({"stock_id": ["2330"], "hhi_trend": [0.2], "hhi_short_avg": [0.1]})
+        result = MarketScanner._apply_chip_quality_modifiers(chip, ["2330"], hhi_trend_df=hhi_df)
+        assert result.iloc[0] == pytest.approx(0.5)  # 不變
+
+    def test_clip_prevents_overflow(self):
+        """修正後的 chip_score 不超過 1.0。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.98])
+        slope_df = pd.DataFrame({"stock_id": ["2330"], "inst_slope": [0.5]})
+        hhi_df = pd.DataFrame({"stock_id": ["2330"], "hhi_trend": [0.3], "hhi_short_avg": [0.5]})
+        result = MarketScanner._apply_chip_quality_modifiers(
+            chip,
+            ["2330"],
+            slope_df=slope_df,
+            hhi_trend_df=hhi_df,
+        )
+        assert result.iloc[0] == pytest.approx(1.0)  # clip at 1.0
+
+    def test_both_modifiers_combined(self):
+        """斜率正 + HHI 集中化 → 雙重加分。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        chip = pd.Series([0.5])
+        slope_df = pd.DataFrame({"stock_id": ["2330"], "inst_slope": [0.1]})
+        hhi_df = pd.DataFrame({"stock_id": ["2330"], "hhi_trend": [0.1], "hhi_short_avg": [0.4]})
+        result = MarketScanner._apply_chip_quality_modifiers(
+            chip,
+            ["2330"],
+            slope_df=slope_df,
+            hhi_trend_df=hhi_df,
+        )
+        assert result.iloc[0] == pytest.approx(0.56)  # 0.5 + 0.03 + 0.03

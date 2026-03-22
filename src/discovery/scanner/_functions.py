@@ -424,7 +424,7 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame [stock_id, broker_concentration, broker_consecutive_days]
         - broker_concentration:    當日淨買超分點的 HHI（0~1，越高=主力越集中）
-        - broker_consecutive_days: 最強主力分點連續淨買超天數（近 5 日）
+        - broker_consecutive_days: 最強主力分點連續淨買超天數（近 7 日）
     """
     required = {"date", "stock_id", "broker_id", "buy", "sell"}
     if df_broker.empty or not required.issubset(df_broker.columns):
@@ -446,9 +446,9 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
             shares = net_buyers["net_buy"] / total_net
             hhi = float((shares**2).sum())
 
-        # ── 連續天數：找近 5 日最活躍（累計淨買最多）的主力分點 ────────
-        recent_dates = sorted(grp["date"].unique())[-5:]
-        # 各分點在近 5 日的累計淨買
+        # ── 連續天數：找近 7 日最活躍（累計淨買最多）的主力分點 ────────
+        recent_dates = sorted(grp["date"].unique())[-7:]
+        # 各分點在近 7 日的累計淨買
         broker_net = grp[grp["date"].isin(recent_dates)].groupby("broker_id")["net_buy"].sum()
         if broker_net.empty or broker_net.max() <= 0:
             consec = 0
@@ -474,6 +474,198 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
 
     if not results:
         return pd.DataFrame(columns=["stock_id", "broker_concentration", "broker_consecutive_days"])
+
+    return pd.DataFrame(results)
+
+
+def compute_institutional_persistence(
+    df_inst: pd.DataFrame,
+    stock_ids: list[str],
+    window: int = 10,
+) -> pd.DataFrame:
+    """計算法人連續性因子 — 近 N 日中法人淨買超為正的天數比例（純函數）。
+
+    連續性高（如 8/10 天為正）代表法人持續布局，而非一日行情。
+    用於區分「真波段吸籌」與「假主力 / 隔日沖」。
+
+    Args:
+        df_inst: InstitutionalInvestor 資料，欄位需含 [stock_id, date, net]
+        stock_ids: 候選股代號清單
+        window: 觀察窗口天數（預設 10）
+
+    Returns:
+        DataFrame [stock_id, inst_persistence, inst_positive_days]
+        - inst_persistence:   正淨買超天數佔比（0.0~1.0），資料不足時回傳 0.5（中性）
+        - inst_positive_days: 正淨買超天數（整數）
+    """
+    result_cols = ["stock_id", "inst_persistence", "inst_positive_days"]
+
+    if df_inst.empty or not {"stock_id", "date", "net"}.issubset(df_inst.columns):
+        return pd.DataFrame({"stock_id": stock_ids, "inst_persistence": 0.5, "inst_positive_days": 0})
+
+    # 取最近 window 個交易日
+    all_dates = sorted(df_inst["date"].unique())
+    recent_dates = set(all_dates[-window:] if len(all_dates) >= window else all_dates)
+    actual_window = len(recent_dates)
+
+    if actual_window == 0:
+        return pd.DataFrame({"stock_id": stock_ids, "inst_persistence": 0.5, "inst_positive_days": 0})
+
+    # 篩選近 N 日資料，按 stock_id + date 彙總法人淨買超
+    recent = df_inst[df_inst["date"].isin(recent_dates)]
+    daily_net = recent.groupby(["stock_id", "date"])["net"].sum().reset_index()
+
+    # 計算每檔股票的正淨買超天數
+    positive_days = daily_net[daily_net["net"] > 0].groupby("stock_id").size().reset_index(name="inst_positive_days")
+
+    # 組裝結果
+    result = pd.DataFrame({"stock_id": stock_ids})
+    result = result.merge(positive_days, on="stock_id", how="left")
+    result["inst_positive_days"] = result["inst_positive_days"].fillna(0).astype(int)
+
+    # 有出現在 df_inst 的股票：用實際天數計算比例；未出現的：中性 0.5
+    stocks_in_data = set(df_inst["stock_id"].unique())
+    result["inst_persistence"] = result.apply(
+        lambda r: r["inst_positive_days"] / actual_window if r["stock_id"] in stocks_in_data else 0.5,
+        axis=1,
+    )
+
+    return result[result_cols]
+
+
+def compute_inst_net_buy_slope(
+    df_inst: pd.DataFrame,
+    stock_ids: list[str],
+    window: int = 10,
+) -> pd.DataFrame:
+    """計算法人淨買超斜率 — 判斷法人買盤是「加速」還是「退潮」（純函數）。
+
+    使用最小平方法計算近 window 日法人日淨買超的線性斜率，並以
+    日均量歸一化（slope / mean_abs_net_buy）使跨股可比。
+
+    斜率正 = 法人買盤加速（吸籌初期或加碼）；
+    斜率負 = 法人買盤減退（出貨或退場）。
+
+    Args:
+        df_inst: InstitutionalInvestor 資料，欄位需含 [stock_id, date, net]
+        stock_ids: 候選股代號清單
+        window: 觀察窗口天數（預設 10）
+
+    Returns:
+        DataFrame [stock_id, inst_slope]
+        - inst_slope: 歸一化斜率，正值=加速，負值=減退；
+          資料不足（< 3 天）回傳 0.0（中性）
+    """
+    if df_inst.empty or not {"stock_id", "date", "net"}.issubset(df_inst.columns):
+        return pd.DataFrame({"stock_id": stock_ids, "inst_slope": 0.0})
+
+    # 按 stock_id + date 彙總淨買超
+    daily_net = df_inst.groupby(["stock_id", "date"])["net"].sum().reset_index()
+
+    # 取最近 window 個交易日
+    all_dates = sorted(daily_net["date"].unique())
+    recent_dates = set(all_dates[-window:] if len(all_dates) >= window else all_dates)
+    recent = daily_net[daily_net["date"].isin(recent_dates)]
+
+    results = []
+    for sid in stock_ids:
+        stock_data = recent[recent["stock_id"] == sid].sort_values("date")
+        n = len(stock_data)
+        if n < 3:
+            results.append({"stock_id": sid, "inst_slope": 0.0})
+            continue
+
+        # 線性回歸斜率：y = net_buy, x = 0,1,2,...,n-1
+        y = stock_data["net"].values.astype(float)
+        x = np.arange(n, dtype=float)
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = ((x - x_mean) ** 2).sum()
+        if denom == 0:
+            results.append({"stock_id": sid, "inst_slope": 0.0})
+            continue
+        slope = ((x - x_mean) * (y - y_mean)).sum() / denom
+
+        # 歸一化：除以日均絕對淨買超（避免大型股斜率天然大）
+        mean_abs = np.abs(y).mean()
+        norm_slope = slope / mean_abs if mean_abs > 0 else 0.0
+
+        results.append({"stock_id": sid, "inst_slope": float(norm_slope)})
+
+    return pd.DataFrame(results)
+
+
+def compute_hhi_trend(
+    df_broker: pd.DataFrame,
+    stock_ids: list[str],
+    short_window: int = 3,
+    long_window: int = 7,
+) -> pd.DataFrame:
+    """計算分點集中度（HHI）趨勢 — 判斷主力是「吸籌」還是「出貨」（純函數）。
+
+    逐日計算各股 HHI（淨買超分點的赫芬達指數），比較近期均值 vs 較長期均值：
+    - HHI 趨勢上升 = 籌碼越來越集中（主力加碼吸籌） → 加分
+    - HHI 趨勢下降 = 籌碼分散（多分點出貨） → 扣分
+
+    建議搭配 HHI 絕對值使用：高 HHI + 趨勢上升 → 強訊號。
+
+    Args:
+        df_broker: BrokerTrade 資料，欄位需含 [date, stock_id, broker_id, buy, sell]
+        stock_ids: 候選股代號清單
+        short_window: 短期均值天數（預設 3）
+        long_window: 長期均值天數（預設 7）
+
+    Returns:
+        DataFrame [stock_id, hhi_trend, hhi_short_avg]
+        - hhi_trend:     short_avg - long_avg（正=集中化，負=分散化）
+        - hhi_short_avg: 近期 HHI 均值（0~1）
+        資料不足時回傳 0.0（中性）
+    """
+    required = {"date", "stock_id", "broker_id", "buy", "sell"}
+    if df_broker.empty or not required.issubset(df_broker.columns):
+        return pd.DataFrame({"stock_id": stock_ids, "hhi_trend": 0.0, "hhi_short_avg": 0.0})
+
+    df = df_broker.copy()
+    df["net_buy"] = df["buy"].fillna(0).astype("int64") - df["sell"].fillna(0).astype("int64")
+
+    results = []
+    for sid in stock_ids:
+        stock_df = df[df["stock_id"] == sid]
+        if stock_df.empty:
+            results.append({"stock_id": sid, "hhi_trend": 0.0, "hhi_short_avg": 0.0})
+            continue
+
+        # 逐日計算 HHI
+        dates_sorted = sorted(stock_df["date"].unique())
+        daily_hhis: list[float] = []
+        for d in dates_sorted:
+            day_df = stock_df[stock_df["date"] == d]
+            net_buyers = day_df[day_df["net_buy"] > 0]
+            if net_buyers.empty:
+                daily_hhis.append(0.0)
+            else:
+                total_net = net_buyers["net_buy"].sum()
+                shares = net_buyers["net_buy"] / total_net
+                daily_hhis.append(float((shares**2).sum()))
+
+        n = len(daily_hhis)
+        if n < 2:
+            results.append({"stock_id": sid, "hhi_trend": 0.0, "hhi_short_avg": daily_hhis[0] if n == 1 else 0.0})
+            continue
+
+        # 短期與長期均值
+        short_vals = daily_hhis[-short_window:] if n >= short_window else daily_hhis
+        long_vals = daily_hhis[-long_window:] if n >= long_window else daily_hhis
+        hhi_short = sum(short_vals) / len(short_vals)
+        hhi_long = sum(long_vals) / len(long_vals)
+
+        results.append(
+            {
+                "stock_id": sid,
+                "hhi_trend": float(hhi_short - hhi_long),
+                "hhi_short_avg": float(hhi_short),
+            }
+        )
 
     return pd.DataFrame(results)
 
