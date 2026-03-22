@@ -1674,6 +1674,336 @@ DRAWDOWN_FREQUENCY_RULES: dict[str, dict] = {
 }
 
 
+# ── P2-B3: 籌碼面 MACD ──────────────────────────────────────────────
+
+
+def compute_chip_macd(
+    df_inst: pd.DataFrame,
+    stock_ids: list[str],
+    fast_span: int = 5,
+    slow_span: int = 20,
+    signal_span: int = 5,
+) -> pd.DataFrame:
+    """計算法人淨買超的 MACD 指標（短期 vs 長期 EMA 交叉）。
+
+    以每日法人淨買超（三大法人合計）作為信號源，計算：
+    - fast_ema: 短期（5日）EMA
+    - slow_ema: 長期（20日）EMA
+    - chip_macd_line: fast_ema - slow_ema（正值 = 吸籌加速）
+    - chip_macd_signal: chip_macd_line 的 signal_span EMA
+    - chip_macd_hist: chip_macd_line - signal_span（柱狀圖，正值擴大 = 加速吸籌）
+
+    評分規則：
+    - chip_macd_hist > 0 且遞增（最近值 > 前一日）→ 強勢吸籌 = 1.0
+    - chip_macd_hist > 0                        → 溫和吸籌 = 0.7
+    - chip_macd_hist ≤ 0 但 MACD line > 0        → 減速但仍正向 = 0.4
+    - chip_macd_hist ≤ 0 且 MACD line ≤ 0        → 出貨信號 = 0.1
+
+    Args:
+        df_inst: 三大法人 DataFrame（stock_id / date / name / net）
+        stock_ids: 要評估的股票清單
+        fast_span: 短期 EMA 窗口（預設 5）
+        slow_span: 長期 EMA 窗口（預設 20）
+        signal_span: 信號線 EMA 窗口（預設 5）
+
+    Returns:
+        DataFrame(stock_id, chip_macd_score)  值域 [0.0, 1.0]
+    """
+    if df_inst.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "chip_macd_score": [0.5] * len(stock_ids)})
+
+    # 按股票+日期彙總法人淨買超
+    inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
+    if inst_filtered.empty:
+        return pd.DataFrame({"stock_id": stock_ids, "chip_macd_score": [0.5] * len(stock_ids)})
+
+    daily_net = inst_filtered.groupby(["stock_id", "date"])["net"].sum().reset_index()
+    daily_net = daily_net.sort_values(["stock_id", "date"])
+
+    results: list[dict] = []
+    grouped = daily_net.groupby("stock_id", sort=False)
+
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "chip_macd_score": 0.5})
+            continue
+
+        grp = grouped.get_group(sid).sort_values("date")
+        nets = grp["net"].values.astype(float)
+
+        # 至少需 slow_span 天資料才能計算有意義的 EMA
+        if len(nets) < slow_span:
+            results.append({"stock_id": sid, "chip_macd_score": 0.5})
+            continue
+
+        # 計算 EMA
+        fast_ema = pd.Series(nets).ewm(span=fast_span, adjust=False).mean()
+        slow_ema = pd.Series(nets).ewm(span=slow_span, adjust=False).mean()
+        macd_line = fast_ema - slow_ema
+        signal_line = macd_line.ewm(span=signal_span, adjust=False).mean()
+        hist = macd_line - signal_line
+
+        # 取最近值
+        cur_hist = float(hist.iloc[-1])
+        prev_hist = float(hist.iloc[-2]) if len(hist) >= 2 else 0.0
+        cur_macd = float(macd_line.iloc[-1])
+
+        # 避免極小浮點誤差：接近零視為中性
+        _eps = 1e-6
+        macd_pos = cur_macd > _eps
+        macd_neg = cur_macd < -_eps
+        hist_pos = cur_hist > _eps
+        hist_rising = cur_hist > prev_hist + _eps
+
+        if macd_pos and hist_pos and hist_rising:
+            score = 1.0  # 強勢吸籌：MACD 正 + 柱狀圖正且遞增
+        elif macd_pos and hist_pos:
+            score = 0.7  # 溫和吸籌：MACD 正 + 柱狀圖正但遞減
+        elif macd_pos:
+            score = 0.5  # 減速吸籌：MACD 仍正但柱狀圖翻負
+        elif not macd_pos and not macd_neg:
+            score = 0.5  # 中性：MACD 接近零（穩定買入或無趨勢）
+        elif macd_neg and hist_pos:
+            score = 0.3  # 出貨減速：MACD 負但柱狀圖回升（跌勢趨緩）
+        else:
+            score = 0.1  # 出貨信號：MACD 負且柱狀圖負或下降
+
+        results.append({"stock_id": sid, "chip_macd_score": score})
+
+    return pd.DataFrame(results)
+
+
+# ── P2-E1: 勝率回饋循環 ─────────────────────────────────────────────
+
+# 勝率回饋門檻調整：近期勝率低 → 提高 min_composite_score
+WIN_RATE_FEEDBACK_CONFIG: dict[str, float] = {
+    "low_threshold": 0.40,  # 勝率低於此值 → 提高門檻
+    "moderate_threshold": 0.50,  # 勝率低於此值 → 輕微提高
+    "low_penalty": 0.05,  # 勝率 < 40% → 門檻 +0.05
+    "moderate_penalty": 0.02,  # 勝率 40~50% → 門檻 +0.02
+    "holding_days": 5,  # 以 5 天報酬計算勝率
+    "lookback_days": 30,  # 回溯 30 天的推薦記錄
+}
+
+
+def compute_win_rate_threshold_adjustment(
+    df_records: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    mode: str,
+    holding_days: int = 5,
+    lookback_days: int = 30,
+    reference_date: date | None = None,
+) -> float:
+    """根據近期推薦勝率計算門檻調整值。
+
+    讀取指定模式過去 lookback_days 天的 DiscoveryRecord，
+    計算 holding_days 天報酬率的勝率，
+    勝率低則回傳正值（提高門檻），否則回傳 0。
+
+    Args:
+        df_records: 推薦記錄 DataFrame
+            （scan_date / stock_id / close / composite_score / mode）
+        df_prices: 日K線 DataFrame（stock_id / date / close）
+        mode: 掃描模式（momentum / swing / value / dividend / growth）
+        holding_days: 評估報酬天數（預設 5）
+        lookback_days: 回溯推薦記錄天數（預設 30）
+        reference_date: 基準日期（預設 today）
+
+    Returns:
+        門檻調整值（≥ 0.0）
+    """
+    if df_records.empty or df_prices.empty:
+        return 0.0
+
+    ref_date = reference_date or date.today()
+    cutoff = ref_date - timedelta(days=lookback_days)
+
+    # 過濾指定模式 + 時間範圍
+    mask = df_records["scan_date"].apply(lambda d: d >= cutoff if isinstance(d, date) else False)
+    recent = df_records[mask]
+    if recent.empty:
+        return 0.0
+
+    # 計算每筆推薦的 N 天報酬
+    returns = []
+    for _, rec in recent.iterrows():
+        scan_d = rec["scan_date"]
+        sid = rec["stock_id"]
+        entry_close = float(rec["close"])
+        if entry_close <= 0:
+            continue
+
+        future = df_prices[(df_prices["stock_id"] == sid) & (df_prices["date"] > scan_d)].sort_values("date")
+
+        if len(future) >= holding_days:
+            exit_close = float(future.iloc[holding_days - 1]["close"])
+            returns.append((exit_close - entry_close) / entry_close)
+
+    if len(returns) < 5:  # 太少樣本，不做調整
+        return 0.0
+
+    win_rate = sum(1 for r in returns if r > 0) / len(returns)
+
+    cfg = WIN_RATE_FEEDBACK_CONFIG
+    if win_rate < cfg["low_threshold"]:
+        return cfg["low_penalty"]
+    elif win_rate < cfg["moderate_threshold"]:
+        return cfg["moderate_penalty"]
+    else:
+        return 0.0
+
+
+# ── P2-E2: 因子有效性監控 ────────────────────────────────────────────
+
+# 因子名稱映射（DiscoveryRecord 欄位 → 中文標籤）
+FACTOR_COLUMNS: list[str] = [
+    "technical_score",
+    "chip_score",
+    "fundamental_score",
+    "news_score",
+]
+
+
+def compute_factor_ic(
+    df_records: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    holding_days: int = 5,
+    lookback_days: int = 30,
+    reference_date: date | None = None,
+) -> pd.DataFrame:
+    """計算各評分因子與後續報酬率的 IC（Information Coefficient）。
+
+    IC = Spearman Rank Correlation(factor_score, N-day return)
+    高 IC（> 0.05）= 因子有效；低 IC（< -0.05）= 因子反向。
+
+    Args:
+        df_records: 推薦記錄 DataFrame
+            （scan_date / stock_id / close / technical_score /
+              chip_score / fundamental_score / news_score）
+        df_prices: 日K線 DataFrame（stock_id / date / close）
+        holding_days: 報酬天數（預設 5）
+        lookback_days: 回溯天數（預設 30）
+        reference_date: 基準日期（預設 today）
+
+    Returns:
+        DataFrame(factor, ic, evaluable_count, direction)
+        direction: "effective" (IC > 0.05) / "weak" (|IC| ≤ 0.05) / "inverse" (IC < -0.05)
+    """
+    if df_records.empty or df_prices.empty:
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    ref_date = reference_date or date.today()
+    cutoff = ref_date - timedelta(days=lookback_days)
+
+    mask = df_records["scan_date"].apply(lambda d: d >= cutoff if isinstance(d, date) else False)
+    recent = df_records[mask].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    # 計算每筆推薦的 N 天報酬
+    ret_map: dict[tuple, float] = {}
+    for _, rec in recent.iterrows():
+        scan_d = rec["scan_date"]
+        sid = rec["stock_id"]
+        entry_close = float(rec["close"])
+        if entry_close <= 0:
+            continue
+
+        future = df_prices[(df_prices["stock_id"] == sid) & (df_prices["date"] > scan_d)].sort_values("date")
+
+        if len(future) >= holding_days:
+            exit_close = float(future.iloc[holding_days - 1]["close"])
+            ret_map[(scan_d, sid)] = (exit_close - entry_close) / entry_close
+
+    if len(ret_map) < 10:  # 太少樣本，無統計意義
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    # 建立含報酬的 DataFrame
+    recent = recent.copy()
+    recent["forward_return"] = recent.apply(
+        lambda r: ret_map.get((r["scan_date"], r["stock_id"]), None),
+        axis=1,
+    )
+    recent = recent.dropna(subset=["forward_return"])
+
+    results: list[dict] = []
+    for factor in FACTOR_COLUMNS:
+        if factor not in recent.columns:
+            continue
+
+        valid = recent[[factor, "forward_return"]].dropna()
+        if len(valid) < 10:
+            continue
+
+        # Spearman Rank Correlation
+        ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
+        if np.isnan(ic):
+            ic = 0.0
+
+        if ic > 0.05:
+            direction = "effective"
+        elif ic < -0.05:
+            direction = "inverse"
+        else:
+            direction = "weak"
+
+        results.append(
+            {
+                "factor": factor,
+                "ic": round(ic, 4),
+                "evaluable_count": len(valid),
+                "direction": direction,
+            }
+        )
+
+    return pd.DataFrame(results)
+
+
+def compute_ic_weight_adjustments(
+    ic_df: pd.DataFrame,
+    base_weights: dict[str, float],
+    dampen_factor: float = 0.5,
+) -> dict[str, float]:
+    """根據 IC 結果調整因子權重。
+
+    規則：
+    - IC "effective" → 維持原權重
+    - IC "weak" → 權重 × dampen_factor（降半）
+    - IC "inverse" → 權重 × dampen_factor²（大幅降權）
+    - 調整後重新歸一化至原始權重總和
+
+    Args:
+        ic_df: compute_factor_ic 的輸出
+        base_weights: 原始權重字典（如 {"technical_score": 0.45, ...}）
+        dampen_factor: 衰減因子（預設 0.5）
+
+    Returns:
+        調整後權重字典（總和等於原始 base_weights 總和）
+    """
+    if ic_df.empty:
+        return dict(base_weights)
+
+    adjusted = dict(base_weights)
+    ic_map = dict(zip(ic_df["factor"], ic_df["direction"]))
+
+    for factor, weight in adjusted.items():
+        direction = ic_map.get(factor, "effective")
+        if direction == "weak":
+            adjusted[factor] = weight * dampen_factor
+        elif direction == "inverse":
+            adjusted[factor] = weight * (dampen_factor**2)
+        # "effective" → 維持
+
+    # 歸一化：保持原始權重總和不變
+    original_total = sum(base_weights.values())
+    adjusted_total = sum(adjusted.values())
+    if adjusted_total > 0:
+        scale = original_total / adjusted_total
+        adjusted = {k: v * scale for k, v in adjusted.items()}
+
+    return adjusted
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""

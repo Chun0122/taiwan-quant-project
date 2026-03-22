@@ -17,6 +17,7 @@ from src.data.schema import (
     Announcement,
     BrokerTrade,
     DailyPrice,
+    DiscoveryRecord,
     FinancialStatement,
     InstitutionalInvestor,
     MarginTrading,
@@ -32,13 +33,16 @@ from src.discovery.scanner._functions import (
     DiscoveryResult,
     _calc_atr14,
     compute_abnormal_announcement_rate,
+    compute_chip_macd,
     compute_daytrade_penalty,
+    compute_factor_ic,
     compute_institutional_acceleration,
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
     compute_news_decay_weight,
     compute_taiex_relative_strength,
     compute_volume_price_divergence,
+    compute_win_rate_threshold_adjustment,
 )
 from src.discovery.universe import UniverseConfig, UniverseFilter
 from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
@@ -193,11 +197,17 @@ class MarketScanner:
         # Stage 3.5e: 多時框一致性（日線+週線方向一致 → 加分，矛盾 → 降分）
         scored = self._apply_multi_timeframe_alignment(scored)
 
+        # Stage 3.5f: 籌碼面 MACD（法人淨買超短期 vs 長期 EMA 交叉 → 加/減分）
+        scored = self._apply_chip_macd(scored, df_inst)
+
         # Stage 3.6: 量價背離偵測（價漲量縮 → 降分）
         scored = self._apply_volume_price_divergence(scored, df_price)
 
         # Stage 3.7: 動態評分閾值（Regime 越差門檻越高，寧缺勿濫）
+        # E1: 勝率回饋循環 — 近期勝率低 → 提高門檻
         scored = self._apply_score_threshold(scored)
+        # E2: 因子有效性日誌（不影響評分，僅記錄 IC 供參考）
+        self._log_factor_effectiveness()
 
         # Stage 4: 排名 + 產業標籤
         rankings = self._rank_and_enrich(scored)
@@ -1830,6 +1840,44 @@ class MarketScanner:
         return scored
 
     # ------------------------------------------------------------------ #
+    #  Stage 3.5f: 籌碼面 MACD
+    # ------------------------------------------------------------------ #
+
+    def _apply_chip_macd(
+        self,
+        scored: pd.DataFrame,
+        df_inst: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.5f — 法人淨買超 MACD 交叉信號 → composite_score 調整。
+
+        短期(5日) vs 長期(20日) EMA 交叉：
+        - 強勢吸籌（柱狀圖正值遞增）→ +3%
+        - 出貨信號（MACD 和柱狀圖皆負）→ -3%
+        """
+        if scored.empty or df_inst.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        macd_df = compute_chip_macd(df_inst, stock_ids, fast_span=5, slow_span=20, signal_span=5)
+        scored = scored.merge(macd_df, on="stock_id", how="left")
+        scored["chip_macd_score"] = scored["chip_macd_score"].fillna(0.5)
+
+        # 將 chip_macd_score (0~1) 轉換為 composite_score 調整值
+        # 0.5 = 中性（無調整），1.0 = +3%，0.1 = -3%
+        scored["chip_macd_adj"] = (scored["chip_macd_score"] - 0.5) * 0.06
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["chip_macd_adj"])
+
+        n_boost = (scored["chip_macd_adj"] > 0.005).sum()
+        n_penalty = (scored["chip_macd_adj"] < -0.005).sum()
+        if n_boost > 0 or n_penalty > 0:
+            logger.info(
+                "Stage 3.5f: 籌碼面 MACD — %d 支加分（吸籌加速）/ %d 支降分（出貨信號）",
+                n_boost,
+                n_penalty,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
     #  Stage 3.6: 量價背離偵測
     # ------------------------------------------------------------------ #
 
@@ -1871,12 +1919,25 @@ class MarketScanner:
 
         門檻：bull=0.45, sideways=0.50, bear=0.55, crisis=0.60。
         Regime 越差門檻越高，寧缺勿濫，確保推薦品質。
+
+        E1 勝率回饋：若近 30 天勝率 < 40% → 門檻額外 +0.05。
         """
         if scored.empty:
             return scored
 
         regime = getattr(self, "regime", "sideways")
         threshold = MIN_SCORE_THRESHOLDS.get(regime, 0.50)
+
+        # E1: 勝率回饋循環 — 查詢近期推薦勝率，低勝率 → 提高門檻
+        wr_adj = self._compute_win_rate_adjustment()
+        if wr_adj > 0:
+            threshold += wr_adj
+            logger.info(
+                "Stage 3.7 E1: 勝率回饋 — %s 模式近期勝率偏低，門檻 +%.2f → %.2f",
+                self.mode_name,
+                wr_adj,
+                threshold,
+            )
 
         before = len(scored)
         scored = scored[scored["composite_score"] >= threshold].copy()
@@ -1889,6 +1950,124 @@ class MarketScanner:
                 removed,
             )
         return scored
+
+    def _compute_win_rate_adjustment(self) -> float:
+        """E1 — 從 DB 讀取近 30 天推薦記錄，計算勝率門檻調整值。
+
+        若 DB 無足夠資料（<5 筆推薦）則回傳 0（不調整）。
+        """
+        try:
+            from src.discovery.scanner._functions import WIN_RATE_FEEDBACK_CONFIG
+
+            cfg = WIN_RATE_FEEDBACK_CONFIG
+            lookback = cfg["lookback_days"]
+            holding = cfg["holding_days"]
+            cutoff = date.today() - timedelta(days=lookback + holding + 5)
+
+            with get_session() as session:
+                # 載入推薦記錄
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                ).where(
+                    DiscoveryRecord.mode == self.mode_name,
+                    DiscoveryRecord.scan_date >= cutoff,
+                )
+                rows = session.execute(stmt).all()
+                if not rows:
+                    return 0.0
+                df_records = pd.DataFrame(rows, columns=["scan_date", "stock_id", "close"])
+
+                # 載入價格
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                if not price_rows:
+                    return 0.0
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            return compute_win_rate_threshold_adjustment(
+                df_records,
+                df_prices,
+                self.mode_name,
+                holding_days=holding,
+                lookback_days=lookback,
+            )
+        except Exception:
+            logger.debug("E1: 勝率回饋計算失敗，跳過")
+            return 0.0
+
+    # ------------------------------------------------------------------ #
+    #  E2: 因子有效性監控（日誌記錄 IC，供人工調參參考）
+    # ------------------------------------------------------------------ #
+
+    def _log_factor_effectiveness(self) -> None:
+        """E2 — 計算四維度因子 IC（Spearman Rank Correlation）並記錄日誌。
+
+        不影響當前評分流程，僅提供因子有效性資訊供後續人工調參。
+        若 DB 無足夠資料（<10 筆推薦）則靜默跳過。
+        """
+        try:
+            cutoff = date.today() - timedelta(days=35)
+
+            with get_session() as session:
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.technical_score,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.fundamental_score,
+                    DiscoveryRecord.news_score,
+                ).where(
+                    DiscoveryRecord.mode == self.mode_name,
+                    DiscoveryRecord.scan_date >= cutoff,
+                )
+                rows = session.execute(stmt).all()
+                if not rows:
+                    return
+                df_records = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "scan_date",
+                        "stock_id",
+                        "close",
+                        "technical_score",
+                        "chip_score",
+                        "fundamental_score",
+                        "news_score",
+                    ],
+                )
+
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                if not price_rows:
+                    return
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+            if ic_df.empty:
+                return
+
+            for _, row in ic_df.iterrows():
+                logger.info(
+                    "E2 因子IC: %s — %s IC=%.4f (%s, n=%d)",
+                    self.mode_name,
+                    row["factor"],
+                    row["ic"],
+                    row["direction"],
+                    row["evaluable_count"],
+                )
+        except Exception:
+            logger.debug("E2: 因子有效性計算失敗，跳過")
 
     # ------------------------------------------------------------------ #
     #  Stage 4.1: 同產業分散化

@@ -37,9 +37,12 @@ from src.discovery.scanner._functions import (
     _extract_level_lower_bound,
     compute_abnormal_announcement_rate,
     compute_broker_score,
+    compute_chip_macd,
     compute_daytrade_penalty,
     compute_eps_sustainability,
+    compute_factor_ic,
     compute_hhi_trend,
+    compute_ic_weight_adjustments,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
     compute_news_decay_weight,
@@ -49,6 +52,7 @@ from src.discovery.scanner._functions import (
     compute_taiex_relative_strength,
     compute_vcp_score,
     compute_whale_score,
+    compute_win_rate_threshold_adjustment,
     detect_daytrade_brokers,
 )
 from src.discovery.scanner._growth import GrowthScanner
@@ -77,6 +81,10 @@ __all__ = [
     "detect_daytrade_brokers",
     "compute_daytrade_penalty",
     "compute_smart_broker_score",
+    "compute_chip_macd",
+    "compute_win_rate_threshold_adjustment",
+    "compute_factor_ic",
+    "compute_ic_weight_adjustments",
     # 資料容器
     "DiscoveryResult",
     # 類別

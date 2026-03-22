@@ -15,11 +15,15 @@ from src.discovery.scanner import (
     compute_taiex_relative_strength,
 )
 from src.discovery.scanner._functions import (
+    compute_chip_macd,
     compute_earnings_quality,
+    compute_factor_ic,
+    compute_ic_weight_adjustments,
     compute_institutional_acceleration,
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
     compute_value_weighted_inst_flow,
+    compute_win_rate_threshold_adjustment,
 )
 from tests.scanner_helpers import (
     make_entry_exit_price_df,
@@ -6536,3 +6540,322 @@ class TestDrawdownAdjustedTopN:
         df_price = self._make_taiex_price(-20.0)
         result = scanner._compute_drawdown_adjusted_top_n(df_price)
         assert result >= 3
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P2-B3: compute_chip_macd 籌碼面 MACD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestComputeChipMacd:
+    """測試 compute_chip_macd 法人淨買超 MACD 信號。"""
+
+    @staticmethod
+    def _make_inst_series(stock_id: str, net_values: list[float]) -> pd.DataFrame:
+        """建立指定淨買超序列的法人資料。"""
+        rows = []
+        base = date.today() - timedelta(days=len(net_values))
+        for i, net in enumerate(net_values):
+            d = base + timedelta(days=i)
+            rows.append({"stock_id": stock_id, "date": d, "name": "外資", "net": net})
+        return pd.DataFrame(rows)
+
+    def test_empty_returns_default(self):
+        """空資料 → 預設 0.5。"""
+        result = compute_chip_macd(pd.DataFrame(), ["2330"])
+        assert len(result) == 1
+        assert result.iloc[0]["chip_macd_score"] == 0.5
+
+    def test_insufficient_data_returns_default(self):
+        """資料不足 slow_span(20) → 預設 0.5。"""
+        df = self._make_inst_series("2330", [100] * 10)  # 只有 10 天
+        result = compute_chip_macd(df, ["2330"])
+        assert result.iloc[0]["chip_macd_score"] == 0.5
+
+    def test_strong_accumulation(self):
+        """持續增加的淨買超 → 高分（強勢吸籌）。"""
+        # 30 天，淨買超從 100 持續增加到 3000
+        nets = [100 + i * 100 for i in range(30)]
+        df = self._make_inst_series("2330", nets)
+        result = compute_chip_macd(df, ["2330"])
+        assert result.iloc[0]["chip_macd_score"] >= 0.7
+
+    def test_distribution_signal(self):
+        """持續賣出 → 低分（出貨信號，MACD 負且柱狀圖負）。"""
+        # 持續淨賣超，且加速賣出 → MACD 負且柱狀圖負
+        nets = [200] * 15 + [-100 * i for i in range(1, 16)]
+        df = self._make_inst_series("2330", nets)
+        result = compute_chip_macd(df, ["2330"])
+        assert result.iloc[0]["chip_macd_score"] <= 0.3
+
+    def test_multiple_stocks(self):
+        """多支股票各自獨立計算：加速買入 > 加速賣出。"""
+        nets_bull = [100 + i * 100 for i in range(30)]  # 加速買入
+        nets_bear = [200] * 15 + [-100 * i for i in range(1, 16)]  # 轉賣出
+        df1 = self._make_inst_series("2330", nets_bull)
+        df2 = self._make_inst_series("2317", nets_bear)
+        df = pd.concat([df1, df2], ignore_index=True)
+        result = compute_chip_macd(df, ["2330", "2317"])
+        scores = dict(zip(result["stock_id"], result["chip_macd_score"]))
+        assert scores["2330"] > scores["2317"]
+
+    def test_flat_buying(self):
+        """穩定小量買入 → 中性分數。"""
+        nets = [200] * 30
+        df = self._make_inst_series("2330", nets)
+        result = compute_chip_macd(df, ["2330"])
+        # 穩定買入 → fast ≈ slow → MACD ≈ 0 → 中性 0.5
+        assert result.iloc[0]["chip_macd_score"] == 0.5
+
+    def test_missing_stock_gets_default(self):
+        """stock_ids 中有 DB 無資料的股票 → 預設 0.5。"""
+        nets = [100 + i * 100 for i in range(30)]
+        df = self._make_inst_series("2330", nets)
+        result = compute_chip_macd(df, ["2330", "9999"])
+        scores = dict(zip(result["stock_id"], result["chip_macd_score"]))
+        assert scores["9999"] == 0.5
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P2-E1: compute_win_rate_threshold_adjustment 勝率回饋循環
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestWinRateThresholdAdjustment:
+    """測試勝率回饋門檻調整純函數。"""
+
+    @staticmethod
+    def _make_records_and_prices(
+        n_recs: int, win_ratio: float, ref_date: date | None = None
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """建立推薦記錄和對應價格資料。
+
+        win_ratio: 0.0~1.0，獲利推薦的比例。
+        """
+        ref = ref_date or date.today()
+        records = []
+        prices = []
+        n_win = int(n_recs * win_ratio)
+
+        for i in range(n_recs):
+            scan_d = ref - timedelta(days=20 - i % 20)
+            sid = f"S{i:03d}"
+            entry_close = 100.0
+            records.append(
+                {
+                    "scan_date": scan_d,
+                    "stock_id": sid,
+                    "close": entry_close,
+                }
+            )
+            # 5 天後的收盤價
+            exit_close = 105.0 if i < n_win else 95.0
+            for d in range(1, 7):
+                prices.append(
+                    {
+                        "stock_id": sid,
+                        "date": scan_d + timedelta(days=d),
+                        "close": exit_close if d >= 5 else entry_close,
+                    }
+                )
+
+        return pd.DataFrame(records), pd.DataFrame(prices)
+
+    def test_empty_returns_zero(self):
+        """空資料 → 不調整。"""
+        result = compute_win_rate_threshold_adjustment(pd.DataFrame(), pd.DataFrame(), "momentum")
+        assert result == 0.0
+
+    def test_high_win_rate_no_adjustment(self):
+        """勝率 70% → 不調整。"""
+        df_rec, df_price = self._make_records_and_prices(20, 0.7)
+        result = compute_win_rate_threshold_adjustment(df_rec, df_price, "momentum", holding_days=5, lookback_days=30)
+        assert result == 0.0
+
+    def test_moderate_win_rate_small_adjustment(self):
+        """勝率 45% (40~50%) → 輕微調整 +0.02。"""
+        df_rec, df_price = self._make_records_and_prices(20, 0.45)
+        result = compute_win_rate_threshold_adjustment(df_rec, df_price, "momentum", holding_days=5, lookback_days=30)
+        assert result == pytest.approx(0.02)
+
+    def test_low_win_rate_large_adjustment(self):
+        """勝率 30% (<40%) → 大幅調整 +0.05。"""
+        df_rec, df_price = self._make_records_and_prices(20, 0.30)
+        result = compute_win_rate_threshold_adjustment(df_rec, df_price, "momentum", holding_days=5, lookback_days=30)
+        assert result == pytest.approx(0.05)
+
+    def test_too_few_samples_no_adjustment(self):
+        """不足 5 筆 → 不調整。"""
+        df_rec, df_price = self._make_records_and_prices(3, 0.0)
+        result = compute_win_rate_threshold_adjustment(df_rec, df_price, "momentum", holding_days=5, lookback_days=30)
+        assert result == 0.0
+
+    def test_exactly_50pct_no_adjustment(self):
+        """勝率剛好 50% → 不調整（>= moderate_threshold）。"""
+        df_rec, df_price = self._make_records_and_prices(20, 0.50)
+        result = compute_win_rate_threshold_adjustment(df_rec, df_price, "momentum", holding_days=5, lookback_days=30)
+        assert result == 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# P2-E2: compute_factor_ic + compute_ic_weight_adjustments
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestComputeFactorIc:
+    """測試因子有效性 IC 計算。"""
+
+    @staticmethod
+    def _make_records_with_scores(n: int, tech_predictive: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """建立帶四維度分數的推薦記錄。
+
+        tech_predictive=True: technical_score 與後續報酬正相關。
+        """
+        ref = date.today()
+        records = []
+        prices = []
+
+        for i in range(n):
+            scan_d = ref - timedelta(days=25 - i % 20)
+            sid = f"T{i:03d}"
+            entry_close = 100.0
+            tech = 0.3 + (i / n) * 0.5  # 0.3 ~ 0.8
+            records.append(
+                {
+                    "scan_date": scan_d,
+                    "stock_id": sid,
+                    "close": entry_close,
+                    "technical_score": tech,
+                    "chip_score": 0.5,  # 隨機，不預測
+                    "fundamental_score": 0.5,
+                    "news_score": 0.5,
+                }
+            )
+            # tech 分高 → 報酬高（如果 tech_predictive）
+            if tech_predictive:
+                exit_close = 100 + (tech - 0.5) * 20  # tech=0.8→106, tech=0.3→96
+            else:
+                exit_close = 100 - (tech - 0.5) * 20  # 反向
+            for d in range(1, 7):
+                prices.append(
+                    {
+                        "stock_id": sid,
+                        "date": scan_d + timedelta(days=d),
+                        "close": exit_close if d >= 5 else entry_close,
+                    }
+                )
+
+        return pd.DataFrame(records), pd.DataFrame(prices)
+
+    def test_empty_returns_empty(self):
+        """空資料 → 空 DataFrame。"""
+        result = compute_factor_ic(pd.DataFrame(), pd.DataFrame())
+        assert result.empty
+
+    def test_effective_factor_positive_ic(self):
+        """technical_score 正向預測 → IC > 0, direction=effective。"""
+        df_rec, df_price = self._make_records_with_scores(20, tech_predictive=True)
+        result = compute_factor_ic(df_rec, df_price, holding_days=5, lookback_days=30)
+        tech_row = result[result["factor"] == "technical_score"]
+        assert len(tech_row) == 1
+        assert tech_row.iloc[0]["ic"] > 0
+        assert tech_row.iloc[0]["direction"] == "effective"
+
+    def test_inverse_factor_negative_ic(self):
+        """technical_score 反向預測 → IC < 0, direction=inverse。"""
+        df_rec, df_price = self._make_records_with_scores(20, tech_predictive=False)
+        result = compute_factor_ic(df_rec, df_price, holding_days=5, lookback_days=30)
+        tech_row = result[result["factor"] == "technical_score"]
+        assert len(tech_row) == 1
+        assert tech_row.iloc[0]["ic"] < 0
+        assert tech_row.iloc[0]["direction"] == "inverse"
+
+    def test_neutral_factor_weak(self):
+        """chip_score 全部相同 → IC ≈ 0, direction=weak。"""
+        df_rec, df_price = self._make_records_with_scores(20, tech_predictive=True)
+        result = compute_factor_ic(df_rec, df_price, holding_days=5, lookback_days=30)
+        chip_row = result[result["factor"] == "chip_score"]
+        if not chip_row.empty:
+            # 全部 0.5，IC 應近 0
+            assert abs(chip_row.iloc[0]["ic"]) <= 0.1
+
+    def test_too_few_samples(self):
+        """不足 10 筆 → 空 DataFrame。"""
+        df_rec, df_price = self._make_records_with_scores(5, tech_predictive=True)
+        result = compute_factor_ic(df_rec, df_price, holding_days=5, lookback_days=30)
+        assert result.empty
+
+    def test_evaluable_count_reported(self):
+        """evaluable_count 正確反映有效樣本數。"""
+        df_rec, df_price = self._make_records_with_scores(20, tech_predictive=True)
+        result = compute_factor_ic(df_rec, df_price, holding_days=5, lookback_days=30)
+        for _, row in result.iterrows():
+            assert row["evaluable_count"] >= 10
+
+
+class TestComputeIcWeightAdjustments:
+    """測試 IC 驅動的權重調整。"""
+
+    def test_all_effective_no_change(self):
+        """全部 effective → 權重不變。"""
+        ic_df = pd.DataFrame(
+            {
+                "factor": ["technical_score", "chip_score"],
+                "ic": [0.10, 0.08],
+                "direction": ["effective", "effective"],
+            }
+        )
+        base = {"technical_score": 0.45, "chip_score": 0.45}
+        result = compute_ic_weight_adjustments(ic_df, base)
+        assert result["technical_score"] == pytest.approx(0.45)
+        assert result["chip_score"] == pytest.approx(0.45)
+
+    def test_weak_factor_dampened(self):
+        """weak 因子 → 權重降半後歸一化。"""
+        ic_df = pd.DataFrame(
+            {
+                "factor": ["technical_score", "chip_score"],
+                "ic": [0.10, 0.02],
+                "direction": ["effective", "weak"],
+            }
+        )
+        base = {"technical_score": 0.50, "chip_score": 0.50}
+        result = compute_ic_weight_adjustments(ic_df, base, dampen_factor=0.5)
+        # chip 降半 → 0.25，tech 維持 0.5，歸一化後 tech 佔更大
+        assert result["technical_score"] > 0.50
+        assert result["chip_score"] < 0.50
+        # 總和應維持 1.0
+        assert sum(result.values()) == pytest.approx(1.0)
+
+    def test_inverse_factor_heavily_dampened(self):
+        """inverse 因子 → 權重大幅降低。"""
+        ic_df = pd.DataFrame(
+            {
+                "factor": ["technical_score", "chip_score"],
+                "ic": [0.10, -0.10],
+                "direction": ["effective", "inverse"],
+            }
+        )
+        base = {"technical_score": 0.50, "chip_score": 0.50}
+        result = compute_ic_weight_adjustments(ic_df, base, dampen_factor=0.5)
+        # inverse → 0.50 * 0.25 = 0.125，effective 維持 0.50
+        assert result["chip_score"] < result["technical_score"]
+
+    def test_empty_ic_returns_base(self):
+        """空 IC → 維持原始權重。"""
+        base = {"technical_score": 0.45, "chip_score": 0.45}
+        result = compute_ic_weight_adjustments(pd.DataFrame(), base)
+        assert result == base
+
+    def test_preserves_total_weight(self):
+        """權重總和一定保持不變。"""
+        ic_df = pd.DataFrame(
+            {
+                "factor": ["technical_score", "chip_score", "fundamental_score"],
+                "ic": [0.10, -0.10, 0.01],
+                "direction": ["effective", "inverse", "weak"],
+            }
+        )
+        base = {"technical_score": 0.40, "chip_score": 0.30, "fundamental_score": 0.30}
+        result = compute_ic_weight_adjustments(ic_df, base)
+        assert sum(result.values()) == pytest.approx(1.0)
