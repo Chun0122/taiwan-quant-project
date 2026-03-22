@@ -43,7 +43,10 @@ class MomentumScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)  # F3 季線突破需 60 交易日（80 曆日）
-        kwargs.setdefault("universe_config", UniverseConfig(min_available_days=30))
+        kwargs.setdefault(
+            "universe_config",
+            UniverseConfig(min_available_days=30, volume_ratio_min=None),
+        )
         super().__init__(**kwargs)
 
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
