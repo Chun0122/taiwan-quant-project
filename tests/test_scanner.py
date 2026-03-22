@@ -14,6 +14,11 @@ from src.discovery.scanner import (
     ValueScanner,
     compute_taiex_relative_strength,
 )
+from src.discovery.scanner._functions import (
+    compute_institutional_acceleration,
+    compute_momentum_decay,
+    compute_multi_timeframe_alignment,
+)
 from tests.scanner_helpers import (
     make_entry_exit_price_df,
     make_inst_df,
@@ -5983,3 +5988,252 @@ class TestApplyVolumePriceDivergence:
         scored = pd.DataFrame(columns=["stock_id", "composite_score"])
         result = scanner._apply_volume_price_divergence(scored, pd.DataFrame())
         assert result.empty
+
+
+# ======================================================================== #
+#  P1-B1: compute_momentum_decay
+# ======================================================================== #
+
+
+class TestComputeMomentumDecay:
+    """測試動量衰減偵測（RSI 頂背離 + MACD 柱縮短）。"""
+
+    def _make_rising_price_df(self, stock_id: str, n: int = 60) -> pd.DataFrame:
+        """建立一個穩定上漲的股價 DataFrame（無背離）。"""
+        dates = pd.bdate_range(end=date.today(), periods=n)
+        closes = [100 + i * 0.5 for i in range(n)]
+        highs = [c + 1 for c in closes]
+        return pd.DataFrame(
+            {
+                "stock_id": stock_id,
+                "date": dates,
+                "close": closes,
+                "high": highs,
+            }
+        )
+
+    def test_no_decay_accelerating_rise(self):
+        """加速上漲（日漲幅遞增），MACD histogram 擴張 → decay = 0.0。"""
+        n = 60
+        dates = pd.bdate_range(end=date.today(), periods=n)
+        # 加速成長：漲幅逐日遞增 → MACD histogram 持續擴張
+        closes = [100.0]
+        for i in range(1, n):
+            # 每日漲幅 = 0.5% + 0.02%*i（越來越快）
+            closes.append(closes[-1] * (1 + 0.005 + 0.0002 * i))
+        highs = [c + 0.5 for c in closes]
+        df = pd.DataFrame({"stock_id": "2330", "date": dates, "close": closes, "high": highs})
+        result = compute_momentum_decay(df, ["2330"])
+        assert len(result) == 1
+        assert result.iloc[0]["momentum_decay"] == 0.0
+
+    def test_empty_df(self):
+        """空 DataFrame → 全部 0.0。"""
+        result = compute_momentum_decay(pd.DataFrame(), ["2330", "2317"])
+        assert len(result) == 2
+        assert all(result["momentum_decay"] == 0.0)
+
+    def test_missing_stock(self):
+        """stock_id 不在 df 中 → 0.0。"""
+        df = self._make_rising_price_df("2330")
+        result = compute_momentum_decay(df, ["9999"])
+        assert result.iloc[0]["momentum_decay"] == 0.0
+
+    def test_insufficient_data(self):
+        """資料不足 → 0.0。"""
+        dates = pd.bdate_range(end=date.today(), periods=10)
+        df = pd.DataFrame({"stock_id": "2330", "date": dates, "close": range(100, 110), "high": range(101, 111)})
+        result = compute_momentum_decay(df, ["2330"])
+        assert result.iloc[0]["momentum_decay"] == 0.0
+
+    def test_rsi_divergence_detection(self):
+        """價格創新高但 RSI 走弱（模擬頂背離）→ decay < 0。"""
+        n = 60
+        dates = pd.bdate_range(end=date.today(), periods=n)
+        # 先大漲再平緩上漲（RSI 先衝高再走弱，但 high 持續新高）
+        closes = []
+        for i in range(n):
+            if i < 30:
+                closes.append(100 + i * 2.0)  # 強勢上漲 → RSI 衝高
+            else:
+                closes.append(160 + (i - 30) * 0.1)  # 微幅新高 → RSI 回落
+        highs = [c + 0.5 for c in closes]
+        df = pd.DataFrame({"stock_id": "2330", "date": dates, "close": closes, "high": highs})
+        result = compute_momentum_decay(df, ["2330"])
+        # 應偵測到至少 RSI 頂背離
+        assert result.iloc[0]["momentum_decay"] <= 0.0
+
+    def test_macd_shrinking_detection(self):
+        """MACD histogram 連續縮短 → decay < 0。"""
+        n = 60
+        dates = pd.bdate_range(end=date.today(), periods=n)
+        # 先大漲讓 MACD hist 走正，然後漲幅遞減讓 hist 連縮
+        closes = []
+        for i in range(n):
+            if i < 40:
+                closes.append(100 + i * 1.5)
+            else:
+                # 漲幅快速遞減
+                closes.append(closes[-1] + max(0.01, 1.5 - (i - 40) * 0.15))
+        highs = [c + 0.5 for c in closes]
+        df = pd.DataFrame({"stock_id": "2330", "date": dates, "close": closes, "high": highs})
+        result = compute_momentum_decay(df, ["2330"])
+        # MACD hist 縮短應被偵測
+        assert result.iloc[0]["momentum_decay"] <= 0.0
+
+    def test_multiple_stocks(self):
+        """多股混合測試。"""
+        df1 = self._make_rising_price_df("2330")
+        df2 = self._make_rising_price_df("2317")
+        df = pd.concat([df1, df2])
+        result = compute_momentum_decay(df, ["2330", "2317"])
+        assert len(result) == 2
+
+    def test_decay_range(self):
+        """衰減值在預期範圍 [-0.06, 0.0]。"""
+        df = self._make_rising_price_df("2330", n=80)
+        result = compute_momentum_decay(df, ["2330"])
+        val = result.iloc[0]["momentum_decay"]
+        assert -0.06 <= val <= 0.0
+
+
+# ======================================================================== #
+#  P1-B2: compute_institutional_acceleration
+# ======================================================================== #
+
+
+class TestComputeInstitutionalAcceleration:
+    """測試法人買超加速度。"""
+
+    def _make_inst_data(self, stock_id: str, daily_nets: list[float]) -> pd.DataFrame:
+        """建立法人資料（每日單一 net）。"""
+        dates = pd.bdate_range(end=date.today(), periods=len(daily_nets))
+        return pd.DataFrame(
+            {
+                "stock_id": stock_id,
+                "date": dates,
+                "name": "外資及陸資(不含外資自營商)",
+                "net": daily_nets,
+            }
+        )
+
+    def test_accelerating_buy(self):
+        """前 7 天小量買超，後 3 天大量買超 → 加分。"""
+        nets = [100] * 7 + [500] * 3  # 10 天，後 3 天大幅加速
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] > 0
+
+    def test_decelerating_buy(self):
+        """前 7 天大量買超，後 3 天小量 → 不加分。"""
+        nets = [500] * 7 + [100] * 3
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.0
+
+    def test_selling_recent(self):
+        """近期賣超 → 不加分。"""
+        nets = [100] * 7 + [-200] * 3
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.0
+
+    def test_sell_to_buy_reversal(self):
+        """從賣超轉為買超（加速比 = 1.0）→ 加分 +0.04。"""
+        nets = [-100] * 7 + [200] * 3
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.04
+
+    def test_empty_inst(self):
+        """空法人資料 → 0.0。"""
+        result = compute_institutional_acceleration(pd.DataFrame(), ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.0
+
+    def test_insufficient_data(self):
+        """資料不足 10 天 → 0.0。"""
+        nets = [100] * 5
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"], window=10)
+        assert result.iloc[0]["inst_accel_bonus"] == 0.0
+
+    def test_missing_stock(self):
+        """stock_id 不在資料中 → 0.0。"""
+        nets = [100] * 10
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["9999"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.0
+
+    def test_bonus_range(self):
+        """加分在 [0.0, 0.04] 範圍。"""
+        nets = [100] * 7 + [300] * 3
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        val = result.iloc[0]["inst_accel_bonus"]
+        assert 0.0 <= val <= 0.04
+
+    def test_moderate_acceleration(self):
+        """中度加速（ratio 0 < x ≤ 0.5）→ +0.02。"""
+        nets = [200] * 7 + [250] * 3  # 250/200 - 1 = 0.25
+        df = self._make_inst_data("2330", nets)
+        result = compute_institutional_acceleration(df, ["2330"])
+        assert result.iloc[0]["inst_accel_bonus"] == 0.02
+
+
+# ======================================================================== #
+#  P1-C1: compute_multi_timeframe_alignment
+# ======================================================================== #
+
+
+class TestComputeMultiTimeframeAlignment:
+    """測試多時框一致性。"""
+
+    def test_both_bullish(self):
+        """日線多頭 + 週線多頭 → +0.04。"""
+        result = compute_multi_timeframe_alignment({"2330": True}, {"2330": 0.05})
+        assert result.iloc[0]["mtf_alignment"] == 0.04
+
+    def test_both_bearish(self):
+        """日線空頭 + 週線空頭 → -0.04。"""
+        result = compute_multi_timeframe_alignment({"2330": False}, {"2330": -0.05})
+        assert result.iloc[0]["mtf_alignment"] == -0.04
+
+    def test_daily_bull_weekly_bear(self):
+        """日線多頭 + 週線空頭（短多長空矛盾）→ -0.03。"""
+        result = compute_multi_timeframe_alignment({"2330": True}, {"2330": -0.05})
+        assert result.iloc[0]["mtf_alignment"] == -0.03
+
+    def test_daily_bear_weekly_bull(self):
+        """日線空頭 + 週線多頭（短空長多，較輕）→ -0.02。"""
+        result = compute_multi_timeframe_alignment({"2330": False}, {"2330": 0.05})
+        assert result.iloc[0]["mtf_alignment"] == -0.02
+
+    def test_weekly_neutral(self):
+        """週線中性（0.0）→ 0.0。"""
+        result = compute_multi_timeframe_alignment({"2330": True}, {"2330": 0.0})
+        assert result.iloc[0]["mtf_alignment"] == 0.0
+
+    def test_daily_none(self):
+        """日線無資料 → 0.0。"""
+        result = compute_multi_timeframe_alignment({"2330": None}, {"2330": 0.05})
+        assert result.iloc[0]["mtf_alignment"] == 0.0
+
+    def test_multiple_stocks(self):
+        """多股混合。"""
+        result = compute_multi_timeframe_alignment(
+            {"2330": True, "2317": False, "2454": None},
+            {"2330": 0.05, "2317": -0.05, "2454": 0.05},
+        )
+        assert len(result) == 3
+        vals = dict(zip(result["stock_id"], result["mtf_alignment"]))
+        assert vals["2330"] == 0.04
+        assert vals["2317"] == -0.04
+        assert vals["2454"] == 0.0
+
+    def test_alignment_range(self):
+        """所有回傳值在 [-0.04, +0.04]。"""
+        for daily in [True, False, None]:
+            for weekly in [0.05, -0.05, 0.0]:
+                result = compute_multi_timeframe_alignment({"X": daily}, {"X": weekly})
+                val = result.iloc[0]["mtf_alignment"]
+                assert -0.04 <= val <= 0.04

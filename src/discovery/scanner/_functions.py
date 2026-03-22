@@ -1254,6 +1254,262 @@ def compute_volume_price_divergence(
     return pd.DataFrame(results)
 
 
+def compute_momentum_decay(
+    df_price: pd.DataFrame,
+    stock_ids: list[str],
+    rsi_window: int = 14,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+    price_lookback: int = 5,
+) -> pd.DataFrame:
+    """偵測動量衰減訊號（RSI 頂背離 + MACD 柱狀縮短）。
+
+    **RSI 頂背離**：近 price_lookback 日價格創新高，但 RSI14 未創新高 → 動能減弱。
+    **MACD 柱縮短**：MACD histogram 連續 2 天以上縮短 → 趨勢轉弱。
+
+    兩個訊號各產生一個布林值，最終合成連續衰減因子：
+    - 兩訊號同時觸發 → -0.06（嚴重衰減）
+    - 單一訊號觸發 → -0.03（輕度衰減）
+    - 無訊號 → 0.0
+
+    Args:
+        df_price: 含 stock_id / date / close / high 欄位的 DataFrame
+        stock_ids: 要評估的股票清單
+        rsi_window: RSI 計算期間（預設 14）
+        macd_fast: MACD 快線期間（預設 12）
+        macd_slow: MACD 慢線期間（預設 26）
+        macd_signal: MACD 信號線期間（預設 9）
+        price_lookback: 價格/RSI 回溯比較天數（預設 5）
+
+    Returns:
+        DataFrame(stock_id, momentum_decay)  值域 [-0.06, 0.0]
+    """
+    if df_price.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "momentum_decay": [0.0] * len(stock_ids)})
+
+    min_required = macd_slow + macd_signal + 5  # 最少需要的資料筆數
+    sorted_price = df_price.sort_values(["stock_id", "date"])
+    grouped = sorted_price.groupby("stock_id", sort=False)
+
+    results: list[dict] = []
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "momentum_decay": 0.0})
+            continue
+
+        grp = grouped.get_group(sid)
+        if len(grp) < min_required:
+            results.append({"stock_id": sid, "momentum_decay": 0.0})
+            continue
+
+        close = grp["close"].astype(float).values
+        high = grp["high"].astype(float).values if "high" in grp.columns else close
+
+        # ── RSI 頂背離偵測 ─────────────────────────────────────
+        # 計算 RSI14
+        delta = np.diff(close)
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+
+        # EMA-based RSI
+        avg_gain = np.full(len(delta), np.nan)
+        avg_loss = np.full(len(delta), np.nan)
+        if len(delta) >= rsi_window:
+            avg_gain[rsi_window - 1] = np.mean(gain[:rsi_window])
+            avg_loss[rsi_window - 1] = np.mean(loss[:rsi_window])
+            for i in range(rsi_window, len(delta)):
+                avg_gain[i] = (avg_gain[i - 1] * (rsi_window - 1) + gain[i]) / rsi_window
+                avg_loss[i] = (avg_loss[i - 1] * (rsi_window - 1) + loss[i]) / rsi_window
+
+        rsi = np.full(len(delta), np.nan)
+        valid = ~np.isnan(avg_gain) & (avg_loss != 0)
+        rsi[valid] = 100 - 100 / (1 + avg_gain[valid] / avg_loss[valid])
+        # avg_loss == 0 且 avg_gain 不為 NaN → RSI = 100
+        zero_loss = ~np.isnan(avg_gain) & (avg_loss == 0)
+        rsi[zero_loss] = 100.0
+
+        rsi_divergence = False
+        if len(rsi) >= price_lookback + 1 and not np.all(np.isnan(rsi[-price_lookback:])):
+            recent_high = high[-price_lookback:]
+            prev_high = high[-(price_lookback * 2) : -price_lookback] if len(high) >= price_lookback * 2 else None
+            recent_rsi = rsi[-(price_lookback + 1) :]  # RSI 比 close 少一筆
+            prev_rsi = (
+                rsi[-(price_lookback * 2 + 1) : -(price_lookback + 1)] if len(rsi) >= price_lookback * 2 + 1 else None
+            )
+
+            if prev_high is not None and prev_rsi is not None:
+                # 價格新高但 RSI 未新高
+                recent_rsi_clean = recent_rsi[~np.isnan(recent_rsi)]
+                prev_rsi_clean = prev_rsi[~np.isnan(prev_rsi)]
+                if (
+                    len(recent_rsi_clean) > 0
+                    and len(prev_rsi_clean) > 0
+                    and np.max(recent_high) > np.max(prev_high)
+                    and np.max(recent_rsi_clean) < np.max(prev_rsi_clean)
+                ):
+                    rsi_divergence = True
+
+        # ── MACD 柱狀縮短偵測 ──────────────────────────────────
+        # 計算 MACD histogram
+        ema_fast = pd.Series(close).ewm(span=macd_fast, adjust=False).mean().values
+        ema_slow = pd.Series(close).ewm(span=macd_slow, adjust=False).mean().values
+        macd_line = ema_fast - ema_slow
+        signal_line = pd.Series(macd_line).ewm(span=macd_signal, adjust=False).mean().values
+        histogram = macd_line - signal_line
+
+        macd_shrinking = False
+        if len(histogram) >= 4:
+            # MACD 柱狀體 > 0（多頭區間）且連續 2 天縮短
+            recent_hist = histogram[-3:]
+            if recent_hist[-1] > 0 and recent_hist[-2] > 0:
+                if recent_hist[-1] < recent_hist[-2] and recent_hist[-2] < recent_hist[-3]:
+                    macd_shrinking = True
+
+        # ── 合成衰減因子 ───────────────────────────────────────
+        signals = int(rsi_divergence) + int(macd_shrinking)
+        if signals == 2:
+            decay = -0.06
+        elif signals == 1:
+            decay = -0.03
+        else:
+            decay = 0.0
+
+        results.append({"stock_id": sid, "momentum_decay": decay})
+
+    return pd.DataFrame(results)
+
+
+def compute_institutional_acceleration(
+    df_inst: pd.DataFrame,
+    stock_ids: list[str],
+    window: int = 10,
+    recent_days: int = 3,
+) -> pd.DataFrame:
+    """計算法人買超加速度，獎勵連續且加速的籌碼流入。
+
+    比較近 recent_days 日的平均法人淨買超 vs 前 (window - recent_days) 日的平均值。
+    加速比 = recent_avg / older_avg - 1。
+
+    加分規則：
+    - 近 recent_days 日平均淨買超 > 0 **且** 加速比 > 0.5 → +0.04
+    - 近 recent_days 日平均淨買超 > 0 **且** 0 < 加速比 ≤ 0.5 → +0.02
+    - 其餘 → 0.0
+
+    Args:
+        df_inst: 三大法人 DataFrame（stock_id / date / name / net）
+        stock_ids: 要評估的股票清單
+        window: 總回溯天數（預設 10）
+        recent_days: 近期天數（預設 3）
+
+    Returns:
+        DataFrame(stock_id, inst_accel_bonus)  值域 [0.0, +0.04]
+    """
+    if df_inst.empty or not stock_ids:
+        return pd.DataFrame({"stock_id": stock_ids, "inst_accel_bonus": [0.0] * len(stock_ids)})
+
+    # 按股票+日期彙總法人淨買超
+    inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
+    if inst_filtered.empty:
+        return pd.DataFrame({"stock_id": stock_ids, "inst_accel_bonus": [0.0] * len(stock_ids)})
+
+    daily_net = inst_filtered.groupby(["stock_id", "date"])["net"].sum().reset_index()
+    daily_net = daily_net.sort_values(["stock_id", "date"])
+    grouped = daily_net.groupby("stock_id", sort=False)
+
+    results: list[dict] = []
+    for sid in stock_ids:
+        if sid not in grouped.groups:
+            results.append({"stock_id": sid, "inst_accel_bonus": 0.0})
+            continue
+
+        grp = grouped.get_group(sid)
+        if len(grp) < window:
+            results.append({"stock_id": sid, "inst_accel_bonus": 0.0})
+            continue
+
+        recent = grp.tail(window)
+        recent_part = recent.tail(recent_days)["net"]
+        older_part = recent.head(window - recent_days)["net"]
+
+        recent_avg = float(recent_part.mean())
+        older_avg = float(older_part.mean())
+
+        # 近期淨買超必須為正才可能加分
+        if recent_avg <= 0:
+            results.append({"stock_id": sid, "inst_accel_bonus": 0.0})
+            continue
+
+        # 計算加速度
+        if older_avg <= 0:
+            # 從賣超轉為買超 = 明顯加速
+            accel_ratio = 1.0
+        else:
+            accel_ratio = recent_avg / older_avg - 1.0
+
+        if accel_ratio > 0.5:
+            bonus = 0.04
+        elif accel_ratio > 0:
+            bonus = 0.02
+        else:
+            bonus = 0.0
+
+        results.append({"stock_id": sid, "inst_accel_bonus": bonus})
+
+    return pd.DataFrame(results)
+
+
+def compute_multi_timeframe_alignment(
+    daily_trend_bullish: dict[str, bool | None],
+    weekly_bonus: dict[str, float],
+) -> pd.DataFrame:
+    """計算日線/週線多時框一致性分數。
+
+    將日線趨勢（是否站上均線 → bullish/bearish）與週線趨勢（weekly_bonus）結合：
+    - 日線 bullish + 週線 bullish (+0.05) → +0.04（一致多頭）
+    - 日線 bearish + 週線 bearish (-0.05) → -0.04（一致空頭）
+    - 日線 bullish + 週線 bearish → -0.03（時框矛盾，短多長空）
+    - 日線 bearish + 週線 bullish → -0.02（時框矛盾，短空長多，但較輕）
+    - 任一方無資料 → 0.0
+
+    Args:
+        daily_trend_bullish: {stock_id: True/False/None} 日線是否多頭
+        weekly_bonus: {stock_id: float} 週線加成值（+0.05=多頭, -0.05=空頭, 0=中性）
+
+    Returns:
+        DataFrame(stock_id, mtf_alignment)  值域 [-0.04, +0.04]
+    """
+    stock_ids = list(daily_trend_bullish.keys())
+    results: list[dict] = []
+
+    for sid in stock_ids:
+        daily = daily_trend_bullish.get(sid)
+        weekly = weekly_bonus.get(sid, 0.0)
+
+        # 任一方無資料 → 中性
+        if daily is None or weekly == 0.0:
+            results.append({"stock_id": sid, "mtf_alignment": 0.0})
+            continue
+
+        weekly_bullish = weekly > 0
+        weekly_bearish = weekly < 0
+
+        if daily and weekly_bullish:
+            alignment = 0.04  # 日週一致多頭
+        elif not daily and weekly_bearish:
+            alignment = -0.04  # 日週一致空頭
+        elif daily and weekly_bearish:
+            alignment = -0.03  # 短多長空矛盾（較危險）
+        elif not daily and weekly_bullish:
+            alignment = -0.02  # 短空長多矛盾（較輕微）
+        else:
+            alignment = 0.0
+
+        results.append({"stock_id": sid, "mtf_alignment": alignment})
+
+    return pd.DataFrame(results)
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""

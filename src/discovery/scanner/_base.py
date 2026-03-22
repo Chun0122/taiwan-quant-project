@@ -33,6 +33,9 @@ from src.discovery.scanner._functions import (
     _calc_atr14,
     compute_abnormal_announcement_rate,
     compute_daytrade_penalty,
+    compute_institutional_acceleration,
+    compute_momentum_decay,
+    compute_multi_timeframe_alignment,
     compute_news_decay_weight,
     compute_taiex_relative_strength,
     compute_volume_price_divergence,
@@ -180,6 +183,15 @@ class MarketScanner:
 
         # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
         scored = self._apply_crisis_filter(scored, df_price)
+
+        # Stage 3.5c: 動量衰減偵測（RSI 頂背離 + MACD 柱縮短 → 降分）
+        scored = self._apply_momentum_decay(scored, df_price)
+
+        # Stage 3.5d: 籌碼加速度加成（法人連買且加速 → 加分）
+        scored = self._apply_institutional_acceleration(scored, df_inst)
+
+        # Stage 3.5e: 多時框一致性（日線+週線方向一致 → 加分，矛盾 → 降分）
+        scored = self._apply_multi_timeframe_alignment(scored)
 
         # Stage 3.6: 量價背離偵測（價漲量縮 → 降分）
         scored = self._apply_volume_price_divergence(scored, df_price)
@@ -1660,6 +1672,119 @@ class MarketScanner:
         removed = before_count - len(scored)
         if removed > 0:
             logger.info("Stage 3.5: 波動率風險過濾剔除 %d 支高波動股", removed)
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.5c: 動量衰減偵測
+    # ------------------------------------------------------------------ #
+
+    def _apply_momentum_decay(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.5c — RSI 頂背離 + MACD 柱縮短 → composite_score 降分。
+
+        僅對 momentum / growth 模式生效（短線動能型），
+        swing / value / dividend 等中長期模式不受影響。
+        """
+        if scored.empty:
+            return scored
+        if self.mode_name not in ("momentum", "growth"):
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        decay_df = compute_momentum_decay(df_price, stock_ids)
+        scored = scored.merge(decay_df, on="stock_id", how="left")
+        scored["momentum_decay"] = scored["momentum_decay"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["momentum_decay"])
+
+        n_affected = (scored["momentum_decay"] < 0).sum()
+        if n_affected > 0:
+            logger.info(
+                "Stage 3.5c: 動量衰減偵測影響 %d 支（輕度 -3%% / 嚴重 -6%%）",
+                n_affected,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.5d: 籌碼加速度加成
+    # ------------------------------------------------------------------ #
+
+    def _apply_institutional_acceleration(
+        self,
+        scored: pd.DataFrame,
+        df_inst: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.5d — 法人買超加速 → composite_score 加分。
+
+        法人近 3 日平均淨買超 > 0 且高於前 7 日平均 → 加分。
+        適用所有模式（法人加速買超是通用正面訊號）。
+        """
+        if scored.empty or df_inst.empty:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+        accel_df = compute_institutional_acceleration(df_inst, stock_ids)
+        scored = scored.merge(accel_df, on="stock_id", how="left")
+        scored["inst_accel_bonus"] = scored["inst_accel_bonus"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["inst_accel_bonus"])
+
+        n_boosted = (scored["inst_accel_bonus"] > 0).sum()
+        if n_boosted > 0:
+            logger.info(
+                "Stage 3.5d: 籌碼加速度加成 %d 支（+2%%~+4%%）",
+                n_boosted,
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.5e: 多時框一致性
+    # ------------------------------------------------------------------ #
+
+    def _apply_multi_timeframe_alignment(
+        self,
+        scored: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Stage 3.5e — 日線 + 週線方向一致性 → composite_score 加減分。
+
+        需要 weekly_confirm=True 時才有週線資料。
+        日線趨勢取自技術面（close vs SMA20），週線趨勢取自 weekly_bonus。
+        若 weekly_bonus 不存在（未啟用週線確認），此 Stage 跳過。
+        """
+        if scored.empty:
+            return scored
+        if "weekly_bonus" not in scored.columns:
+            return scored
+
+        stock_ids = scored["stock_id"].tolist()
+
+        # 日線趨勢：從 scored 中推斷（close > entry_price 的近似，或直接看 technical_score）
+        # 更精確的方式：如果有 technical_score > 0.5 視為日線多頭
+        daily_trend: dict[str, bool | None] = {}
+        for _, row in scored.iterrows():
+            sid = row["stock_id"]
+            tech = row.get("technical_score")
+            if pd.notna(tech):
+                daily_trend[sid] = float(tech) > 0.55  # 略高於中性門檻
+            else:
+                daily_trend[sid] = None
+
+        weekly_map: dict[str, float] = dict(zip(scored["stock_id"], scored["weekly_bonus"]))
+
+        mtf_df = compute_multi_timeframe_alignment(daily_trend, weekly_map)
+        scored = scored.merge(mtf_df, on="stock_id", how="left")
+        scored["mtf_alignment"] = scored["mtf_alignment"].fillna(0.0)
+        scored["composite_score"] = scored["composite_score"] * (1 + scored["mtf_alignment"])
+
+        n_aligned = (scored["mtf_alignment"] > 0).sum()
+        n_conflict = (scored["mtf_alignment"] < 0).sum()
+        if n_aligned > 0 or n_conflict > 0:
+            logger.info(
+                "Stage 3.5e: 多時框一致性 — %d 支加分（+4%%），%d 支降分（-2%%~-4%%）",
+                n_aligned,
+                n_conflict,
+            )
         return scored
 
     # ------------------------------------------------------------------ #
