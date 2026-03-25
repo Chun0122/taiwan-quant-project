@@ -579,88 +579,6 @@ class FinMindFetcher(DataFetcher):
     #  財報三表（EAV → pivot 寬表）
     # ------------------------------------------------------------------ #
 
-
-# ====================================================================== #
-#  美國 VIX（CBOE ^VIX）— 透過 yfinance 抓取（獨立於 FinMind）
-# ====================================================================== #
-
-
-def fetch_us_vix(start: str, end: str | None = None) -> pd.DataFrame:
-    """抓取美國 CBOE VIX (^VIX) 波動率指數。
-
-    使用 yfinance 套件，回傳對齊 DailyPrice 格式。
-    stock_id 固定為 "US_VIX"。
-
-    Args:
-        start: 起始日期（YYYY-MM-DD）
-        end: 結束日期（YYYY-MM-DD，None 則取今天）
-
-    Returns:
-        pd.DataFrame: 含 date/stock_id/open/high/low/close/volume/turnover/spread
-    """
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.warning("yfinance 未安裝，無法抓取美國 VIX。請執行 pip install yfinance")
-        return pd.DataFrame()
-
-    if end is None:
-        end = date.today().isoformat()
-
-    logger.info("抓取 US VIX (^VIX) | %s ~ %s", start, end)
-
-    try:
-        df = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=True)
-    except Exception as e:
-        logger.warning("yfinance 抓取 ^VIX 失敗: %s", e)
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        logger.info("US VIX 無資料回傳")
-        return pd.DataFrame()
-
-    # yfinance 回傳 MultiIndex columns 時（新版），取第一層
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.reset_index()
-
-    # 欄位對齊 DailyPrice schema
-    col_map = {}
-    for col in df.columns:
-        lower = str(col).lower()
-        if lower == "date":
-            col_map[col] = "date"
-        elif lower == "open":
-            col_map[col] = "open"
-        elif lower == "high":
-            col_map[col] = "high"
-        elif lower == "low":
-            col_map[col] = "low"
-        elif lower == "close":
-            col_map[col] = "close"
-        elif lower == "volume":
-            col_map[col] = "volume"
-    df = df.rename(columns=col_map)
-
-    if "close" not in df.columns:
-        logger.warning("yfinance ^VIX 回傳缺少 close 欄位: %s", list(df.columns))
-        return pd.DataFrame()
-
-    df["stock_id"] = "US_VIX"
-    for col in ("open", "high", "low"):
-        if col not in df.columns:
-            df[col] = df["close"]
-    if "volume" not in df.columns:
-        df["volume"] = 0
-    df["turnover"] = 0
-    df["spread"] = 0.0
-
-    keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
-    df = df[[c for c in keep if c in df.columns]]
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    return df
-
     # FinMind 財報 EAV 中需要的 type 值對應
     _INCOME_TYPES = {
         "Revenue": "revenue",
@@ -829,4 +747,86 @@ def compute_financial_ratios(df: pd.DataFrame) -> pd.DataFrame:
             lambda r: r["total_liabilities"] / r["total_assets"] * 100 if r.get("total_assets") else None, axis=1
         )
 
+    return df
+
+
+# ====================================================================== #
+#  美國 VIX（CBOE ^VIX）— 透過 yfinance 抓取（獨立於 FinMind）
+# ====================================================================== #
+
+
+def fetch_us_vix(start: str, end: str | None = None) -> pd.DataFrame:
+    """抓取美國 CBOE VIX (^VIX) 波動率指數。
+
+    使用 yfinance 套件，回傳對齊 DailyPrice 格式。
+    stock_id 固定為 "US_VIX"。
+
+    Args:
+        start: 起始日期（YYYY-MM-DD）
+        end: 結束日期（YYYY-MM-DD，None 則取今天）
+
+    Returns:
+        pd.DataFrame: 含 date/stock_id/open/high/low/close/volume/turnover/spread
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance 未安裝，無法抓取美國 VIX。請執行 pip install yfinance")
+        return pd.DataFrame()
+
+    if end is None:
+        end = date.today().isoformat()
+
+    logger.info("抓取 US VIX (^VIX) | %s ~ %s", start, end)
+
+    try:
+        df = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=True)
+    except Exception as e:
+        logger.warning("yfinance 抓取 ^VIX 失敗: %s", e)
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        logger.info("US VIX 無資料回傳")
+        return pd.DataFrame()
+
+    # yfinance 回傳 MultiIndex columns 時（新版），取第一層
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.reset_index()
+
+    # 欄位對齊 DailyPrice schema
+    col_map = {}
+    for col in df.columns:
+        lower = str(col).lower()
+        if lower == "date":
+            col_map[col] = "date"
+        elif lower == "open":
+            col_map[col] = "open"
+        elif lower == "high":
+            col_map[col] = "high"
+        elif lower == "low":
+            col_map[col] = "low"
+        elif lower == "close":
+            col_map[col] = "close"
+        elif lower == "volume":
+            col_map[col] = "volume"
+    df = df.rename(columns=col_map)
+
+    if "close" not in df.columns:
+        logger.warning("yfinance ^VIX 回傳缺少 close 欄位: %s", list(df.columns))
+        return pd.DataFrame()
+
+    df["stock_id"] = "US_VIX"
+    for col in ("open", "high", "low"):
+        if col not in df.columns:
+            df[col] = df["close"]
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    df["turnover"] = 0
+    df["spread"] = 0.0
+
+    keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
+    df = df[[c for c in keep if c in df.columns]]
+    df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
