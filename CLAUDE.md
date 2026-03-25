@@ -22,6 +22,7 @@ python main.py sync                          # 從 FinMind 同步觀察清單資
 python main.py compute                       # 計算技術指標
 python main.py backtest --stock 2330 --strategy sma_cross
 python main.py backtest --stock 2330 --strategy sma_cross --attribution  # 含五因子歸因分析
+python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades.csv  # 匯出交易明細
 python main.py discover --top 20             # 全市場掃描（預設 momentum 模式）
 python main.py discover momentum --top 20   # 短線動能掃描
 python main.py discover swing --top 20      # 中期波段掃描
@@ -60,6 +61,7 @@ python main.py sync-info                     # 同步全市場股票基本資料
 python main.py sync-info --force             # 強制重新同步（即使 DB 已有資料）
 python main.py sync-features                 # 計算全市場 DailyFeature（Feature Store，供 UniverseFilter 使用，預設 90 天）
 python main.py sync-features --days 60       # 自訂回溯天數
+python main.py sync-vix                       # 同步 VIX 波動率指數（台灣 TW_VIX via FinMind（已停用，graceful degradation）+ 美國 US_VIX via yfinance ^VIX）
 python main.py sync-sbl                      # 同步全市場借券賣出資料（TWSE TWT96U，預設最近 3 天）
 python main.py sync-sbl --days 5             # 同步最近 5 個交易日
 python main.py alert-check                   # 掃描近期 MOPS 重大事件（法說會/財報/月營收，預設 7 天）
@@ -112,7 +114,7 @@ python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto  # 自動加入
 
 ### 測試
 
-使用 pytest 測試框架，1323 個測試（37 個測試檔）覆蓋核心模組：
+使用 pytest 測試框架，1344 個測試（37 個測試檔）覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -131,11 +133,11 @@ pytest --cov=src --cov-report=term-missing
 | ------------------------------- | ------------------------------------------------ | ---------------------- |
 | `tests/test_factors.py`         | `src/screener/factors.py` 8 個篩選因子           | 純函數                 |
 | `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
-| `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算（含 TestAtrBasedStop ATR-based 止損止利）+ P6 進階指標（Sortino/Calmar/VaR/CVaR） | 純函數 + mock Strategy |
+| `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算（含 TestAtrBasedStop ATR-based 止損止利）+ `src/backtest/metrics.py` 共用績效指標（Sortino/Calmar/VaR/CVaR/爆倉防護）+ 交易統計（`TestComputeTradeStats` 7 個 + `TestTradesToDataframe` 4 個 + `TestExportTrades` 2 個） | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
 | `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value+Dividend+Growth 六類掃描 + 產業加成 + `TestComputeTaixRelativeStrength`（6 個）+ `TestApplyCrisisFilter`（4 個）+ `TestCrisisFilterMA60`（4 個）+ `TestRiskFilterEnhancements`（4 個）+ `TestCrisisEntryTriggerText`（3 個）+ `TestDetectDaytradeBrokers`（6 個）+ `TestComputeDaytradePenalty`（7 個）+ `TestComputeInstitutionalPersistence`（8 個）+ `TestDaytradePersistenceDampening`（4 個）+ `TestComputeInstNetBuySlope`（7 個）+ `TestComputeHhiTrend`（6 個）+ `TestApplyChipQualityModifiers`（6 個）+ `TestComputeVolumePriceDivergence`（6 個）+ `TestApplyScoreThreshold`（7 個）+ `TestApplySectorDiversification`（6 個）+ `TestApplyVolumePriceDivergence`（2 個）+ `TestComputeMomentumDecay`（8 個）+ `TestComputeInstitutionalAcceleration`（9 個）+ `TestComputeMultiTimeframeAlignment`（8 個）+ `TestMultiTimeframeForceExclude`（3 個）+ `TestComputeValueWeightedInstFlow`（6 個）+ `TestComputeEarningsQuality`（7 個）+ `TestDrawdownAdjustedTopN`（7 個）+ `TestComputeChipMacd`（7 個）+ `TestWinRateThresholdAdjustment`（6 個）+ `TestComputeFactorIc`（5 個）+ `TestComputeIcWeightAdjustments`（5 個）+ `TestKeyPlayerCostBasis`（6 個）+ `TestAdaptiveAtrMultiplier`（6 個）+ `TestRevenueAccelerationScore`（6 個）+ `TestPeerFundamentalRanking`（5 個）+ `TestComputeMfeMae`（6 個）| 純函數                 |
 | `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + 月營收解析 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
-| `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 + `TestDetectCrisisSignals`（8 個）+ `TestRegimeWeightsCrisis`（5 個）+ `TestComputeMarketBreadthPct`（5 個）+ `TestBreadthDowngrade`（5 個）+ `TestPanicVolumeSignal`（6 個）+ `TestCheckTransitionCondition`（6 個）+ `TestApplyHysteresis`（13 個）+ `TestRegimeStateMachine`（6 個）| 純函數                 |
+| `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 + `TestDetectCrisisSignals`（23 個，含台灣 VIX spike + 單日急跌 + 美國 VIX spike 7 個）+ `TestRegimeWeightsCrisis`（5 個）+ `TestComputeMarketBreadthPct`（5 個）+ `TestBreadthDowngrade`（5 個）+ `TestPanicVolumeSignal`（6 個）+ `TestCheckTransitionCondition`（6 個）+ `TestApplyHysteresis`（13 個）+ `TestRegimeStateMachine`（6 個）| 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
 | `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
@@ -204,7 +206,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組                                | 角色                                                                                                              |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次 + 財報三表 EAV pivot）                                                              |
+| `src/data/fetcher.py`               | FinMind API 封裝（逐股 + 批次 + 財報三表 EAV pivot + `fetch_taiwan_vix()` 台灣 VIX（FinMind 已移除 `TaiwanOptionMarketVIX` dataset，graceful degradation 回傳空 DataFrame））；`fetch_us_vix()` 模組級純函數（yfinance ^VIX，stock_id="US_VIX"，獨立於 FinMind） |
 | `src/data/twse_fetcher.py`          | TWSE/TPEX 官方資料（全市場、免費）；`fetch_twse_sbl()` 借券賣出彙總（TWT96U）；`fetch_dj_broker_trades()` 分點進出彙整（DJ 端點，替代 FinMind，Big5 HTML 解析，BHID 彙整，date=end，buy/sell 已換算為股）；**`fetch_tdcc_holding_all_market()`** TDCC 集保戶股權分散表（全市場，免費，替代 FinMind TaiwanStockHoldingSharesPer，CSV，tier 1-15 → level 字串） |
 | `src/data/pipeline.py`              | ETL 調度、寫入 DB；`_sync_per_stock()` 通用逐股同步輔助（cache 檢查→fetch→upsert，供估值/營收/財報共用）；`_classify_security_type()` 純函數（stock_id 規則推斷 security_type）；`compute_and_store_daily_features(lookback_days=90)` 計算全市場 DailyFeature（ma20/ma60/volume_ma20/turnover_ma5/momentum_20d/volatility_20d）並以 upsert 寫入 Feature Store |
 | `src/data/mops_fetcher.py`          | MOPS 公開資訊觀測站（重大訊息 + 全市場月營收，免費）；`classify_event_type()` 純函數（governance_change / buyback / earnings_call / investor_day / filing / revenue / general，優先序由高到低）；`classify_sentiment()` 使用 Regex 上下文比對（`_NEGATIVE_CONTEXT_PATTERNS` / `_POSITIVE_CONTEXT_PATTERNS`）優先於單詞比對，正確處理「處分利益/持股」、「澄清衰退/報導」等模糊語境 |
@@ -212,7 +214,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/validator.py`             | 資料品質檢查（6 個純函數檢查 + orchestrator + console 報告）                                                       |
 | `src/data/io.py`                    | 通用資料匯出/匯入（CSV/Parquet，含欄位驗證 + upsert）                                                            |
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
-| `src/constants.py`                  | 全系統共用常數集中管理：交易成本（COMMISSION_RATE/TAX_RATE/SLIPPAGE_RATE）、DB/ETL（UPSERT_BATCH_SIZE/API_SLEEP_*）、籌碼異動門檻（DEFAULT_VOL_MULT/DEFAULT_INST_THRESHOLD/DEFAULT_SBL_SIGMA/DEFAULT_HHI_THRESHOLD/DEFAULT_DT_THRESHOLD） |
+| `src/constants.py`                  | 全系統共用常數集中管理：交易成本（COMMISSION_RATE/TAX_RATE/SLIPPAGE_RATE）、DB/ETL（UPSERT_BATCH_SIZE/API_SLEEP_*）、籌碼異動門檻（DEFAULT_VOL_MULT/DEFAULT_INST_THRESHOLD/DEFAULT_SBL_SIGMA/DEFAULT_HHI_THRESHOLD/DEFAULT_DT_THRESHOLD）、VIX 危機偵測（VIX_STOCK_ID/CRISIS_VIX_LEVEL/CRISIS_VIX_DAILY_CHANGE/CRISIS_SINGLE_DAY_DROP）、美國 VIX（US_VIX_STOCK_ID/CRISIS_US_VIX_LEVEL/CRISIS_US_VIX_DAILY_CHANGE） |
 | `src/entry_exit.py`                 | 進出場建議共用純函數：`REGIME_ATR_PARAMS` 常數（bull/sideways/bear/crisis ATR 倍數）、`compute_atr_stops()` ATR 止損止利、`compute_entry_trigger()` 進場觸發文字、`assess_timing()` 時機評估（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB/ADX(14) → EAV 格式；`compute_indicators_from_df()` 寬表純函數（含 adx_14）；`calc_rsi14_from_series()` 純函數；`aggregate_to_weekly()` 純函數（日K聚合週K + 週線 SMA13/RSI14/MACD） |
@@ -221,6 +223,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
 | `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
 | `src/backtest/attribution.py`       | 五因子歸因分析（`FactorAttribution` 類別）：momentum/reversal/quality/size/liquidity 因子暴露 × Pearson 相關係數；`compute(BacktestResultData, data)` + `compute_from_df(trades_df, data)` 雙接口 |
+| `src/backtest/metrics.py`           | 回測績效指標計算共用純函數：`compute_metrics()`（10 個指標+爆倉防護）、`compute_trade_stats()`（持倉天數/連勝連敗/出場原因分佈/勝敗損益分析）、`trades_to_dataframe()`（含 holding_days 計算欄位）、`export_trades()`（CSV 匯出），供 engine/portfolio/walk_forward 統一呼叫 |
 | `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管、除權息股利入帳                                                                      |
 | `src/backtest/allocator.py`         | 投資組合配置計算（risk_parity / mean_variance），scipy 優化純函數                                                 |
 | `src/backtest/portfolio.py`         | 多股票組合回測，支援 equal_weight / custom / risk_parity / mean_variance 四種配置                                 |
@@ -231,7 +234,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/discovery/scanner/`            | 全市場選股 package（`_base.py` 基類 + `_momentum.py`/`_swing.py`/`_value.py`/`_dividend.py`/`_growth.py` 五模式 + `_functions.py` 共用純函數）。四階段漏斗（含風險過濾），四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成，權重依 Regime 動態調整（含 crisis 模式）。MomentumScanner 籌碼面最高 8-factor（含智慧分點 Smart Broker）；隔日沖偵測+扣分（含法人連續性調節）；籌碼品質修正（斜率+HHI趨勢）；Stage 3.6 量價背離偵測（`compute_volume_price_divergence()` 純函數，價漲量縮 -5%/量價齊揚 +2%）；Stage 3.7 動態評分閾值（`MIN_SCORE_THRESHOLDS` Regime 別最低分，bull=0.45/crisis=0.60）；Stage 3.5c 動量衰減偵測（`compute_momentum_decay()` RSI 頂背離+MACD 柱縮短，momentum/growth -3%~-6%）；Stage 3.5d 籌碼加速度（`compute_institutional_acceleration()` 法人買超加速 +2%~+4%）；Stage 3.5e 多時框強制共振（`compute_multi_timeframe_alignment()` 日週方向一致±4%，momentum/growth 日多週空矛盾直接排除）；Stage 4.1 同產業分散化（`SECTOR_MAX_RATIO=25%`）；Stage 4.2 回撤降頻（TAIEX 20日回撤>-10% 砍半/>-15% 砍1/3，value/dividend 不受影響）；籌碼面法人金額加權（`compute_value_weighted_inst_flow()` 衰減加權替代純天數）；盈餘品質分數（`compute_earnings_quality()` 現金流+收入品質+負債，Value/Dividend 15%權重）；Stage 3.5f 籌碼面 MACD（`compute_chip_macd()` 法人淨買超短期5日 vs 長期20日 EMA 交叉，吸籌加速 +3%/出貨信號 -3%）；E1 勝率回饋循環（`compute_win_rate_threshold_adjustment()` 追蹤模式過去30天勝率，勝率<40% → 門檻+0.05，<50% → +0.02）；E2 因子有效性監控（`compute_factor_ic()` Spearman IC 計算 + `compute_ic_weight_adjustments()` IC 驅動權重調整，日誌記錄因子有效性）；Stage 3.5g 主力成本分析（`compute_key_player_cost_basis()` Top-3 主力加權成本 vs 現價 → `score_key_player_cost()` 護盤/風險評分 ±3%）；D1 動態停損（`compute_adaptive_atr_multiplier()` 個股 MDD 調整 ATR 倍數，穩定股放寬×1.2/高波動收緊×0.7）；C2 營收加速推廣（`compute_revenue_acceleration_score()` 連續 N 月 YoY 加速計數，MomentumScanner 基本面 80% base + 20% 加速度）；C3 同業基本面排名（`compute_peer_fundamental_ranking()` 同產業 ROE/毛利率/營收 percentile，前25% +3%/後25% -3%）；E3 MFE/MAE 分析（`compute_mfe_mae()` 追蹤推薦後最大有利/不利偏移） |
 | `src/discovery/universe.py`         | Universe Filtering 三層漏斗（`UniverseConfig` dataclass + `UniverseFilter`）：Stage 1 SQL 硬過濾（StockInfo security_type/listing_type/可用天數/收盤價）→ Stage 2 流動性（5 日均成交金額，DailyFeature 優先/DailyPrice fallback）→ Stage 3 趨勢動能（close > MA60 + 量比，Value/Dividend Scanner 跳過）→ Candidate Memory（union 前一日推薦降低換股率）；`filter_liquidity()` / `filter_trend()` 可獨立測試的純函數 |
 | `src/discovery/performance.py`      | Discover 推薦績效回測（讀取歷史推薦 vs DailyPrice，計算 N 日報酬率、勝率、三層聚合統計）                           |
-| `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways/**crisis**），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率）+ **市場寬度降級**（`compute_market_breadth_pct()` 純函數，>60% 股票跌破 MA20 → regime 降一級，資料來源 DailyFeature）+ **Crisis 快速訊號覆蓋**（4 訊號 ≥2 觸發：5日跌>5% / 連跌≥3天 / 波動率飆升1.8x / **爆量長黑**（成交量>20日均量×1.5且下跌），crisis 優先於寬度降級）；**Hysteresis 狀態機**（`HYSTERESIS_RULES` 轉換矩陣、`check_transition_condition()` 純函數、`apply_hysteresis()` 純函數、`RegimeStateMachine` 類別 JSON 持久化）：sideways→bull 需 3 天確認 +1%/3d、bull→sideways 快速降級 1 天、crisis 退出需低點遞增+波動率回落；`detect_crisis_signals()` 純函數；輸出五模式四維度權重矩陣（含 crisis 保守模式：news 25~40%，tech 5~10%） |
+| `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways/**crisis**），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率）+ **市場寬度降級**（`compute_market_breadth_pct()` 純函數，>60% 股票跌破 MA20 → regime 降一級，資料來源 DailyFeature）+ **Crisis 快速訊號覆蓋**（7 訊號 ≥2 觸發：5日跌>5% / 連跌≥3天 / 波動率飆升1.8x / **爆量長黑**（成交量>20日均量×1.5且下跌）/ **台灣 VIX 飆升**（VIX>30 或單日漲幅>25%，TW_VIX from DailyPrice）/ **單日急跌**（TAIEX 單日跌>2.5%）/ **美國 VIX 飆升**（CBOE ^VIX>30 或單日漲幅>25%，US_VIX from yfinance），crisis 優先於寬度降級）；**Hysteresis 狀態機**（`HYSTERESIS_RULES` 轉換矩陣、`check_transition_condition()` 純函數、`apply_hysteresis()` 純函數、`RegimeStateMachine` 類別 JSON 持久化）：sideways→bull 需 3 天確認 +1%/3d、bull→sideways 快速降級 1 天、crisis 退出需低點遞增+波動率回落；`detect_crisis_signals()` 純函數；輸出五模式四維度權重矩陣（含 crisis 保守模式：news 25~40%，tech 5~10%） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用；`compute_sector_relative_strength()` 模組級純函數（個股 20 日報酬率 vs 同產業中位數，超越 +20pp → +3%，落後 -20pp → -3%）               |
 | `src/industry/concept_analyzer.py`  | 概念股輪動分析引擎；`compute_concept_momentum()` / `compute_concept_institutional_flow()` / `compute_concept_correlation_candidates()` 純函數；`ConceptRotationAnalyzer` 類別（`rank_concepts()` Percentile Rank + `compute_concept_scores_for_stocks()` ±5% 加成供 scanner Stage 3.3b 使用） |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
@@ -245,7 +248,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
 | `src/visualization/pages/`          | 儀表板 12 分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, concept_rotation, discovery_history, position_monitoring） |
-| `main.py`                           | CLI 調度器（argparse 子命令，34 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` 五個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 7 anomaly-scan）；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數） |
+| `main.py`                           | CLI 調度器（argparse 子命令，35 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` 五個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 0 VIX 同步 + Step 7 anomaly-scan）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數） |
 
 ### 設定
 

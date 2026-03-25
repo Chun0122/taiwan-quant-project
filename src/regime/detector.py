@@ -16,6 +16,9 @@ Crisis 快速訊號（≥2 個觸發即覆蓋為 crisis）：
 2. 連續下跌 ≥ 3 天
 3. 近 20 日波動率 > 過去 120 日平均波動率 × 1.8
 4. 爆量長黑：TAIEX 成交量 > 20 日均量 × 1.5 且當日下跌
+5. 台灣 VIX 飆升（VIX > 30 或單日漲幅 > 25%，FinMind TW_VIX）
+6. TAIEX 單日急跌 > 2.5%
+7. 美國 VIX 飆升（CBOE ^VIX > 30 或單日漲幅 > 25%，yfinance US_VIX）
 
 市場寬度降級（Breadth Downgrade）：
 - 跌破 MA20 股票比例 > 60% → regime 降一級（bull→sideways, sideways→bear）
@@ -57,6 +60,11 @@ _CRISIS_RETURN_5D: float = -0.05  # 5 日報酬率 < -5%
 _CRISIS_CONSEC_DOWN: int = 3  # 連跌 ≥ 3 天
 _CRISIS_VOL_RATIO: float = 1.8  # rolling-20d-vol / avg-vol-120d > 1.8
 _CRISIS_PANIC_VOL_RATIO: float = 1.5  # TAIEX 成交量 > 20 日均量 × 1.5 且下跌
+_CRISIS_VIX_LEVEL: float = 30.0  # 台灣 VIX 絕對值 > 30 觸發
+_CRISIS_VIX_DAILY_CHANGE: float = 0.25  # 台灣 VIX 單日漲幅 > 25% 觸發
+_CRISIS_SINGLE_DAY_DROP: float = -0.025  # TAIEX 單日跌幅 > 2.5% 觸發
+_CRISIS_US_VIX_LEVEL: float = 30.0  # 美國 VIX 絕對值 > 30 觸發
+_CRISIS_US_VIX_DAILY_CHANGE: float = 0.25  # 美國 VIX 單日漲幅 > 25% 觸發
 
 # 市場寬度降級門檻
 _BREADTH_BELOW_MA20_THRESHOLD: float = 0.60  # >60% 股票跌破 MA20 → regime 降一級
@@ -367,6 +375,8 @@ class RegimeStateMachine:
         closes: pd.Series,
         volumes: pd.Series | None = None,
         breadth_below_ma20_pct: float | None = None,
+        vix_series: pd.Series | None = None,
+        us_vix_series: pd.Series | None = None,
     ) -> dict:
         """執行 detect_from_series() → apply_hysteresis()，更新並持久化狀態。
 
@@ -374,6 +384,8 @@ class RegimeStateMachine:
             closes: TAIEX 收盤價序列
             volumes: TAIEX 成交量序列
             breadth_below_ma20_pct: 跌破 MA20 比例
+            vix_series: 台灣 VIX 收盤價序列（None 則跳過 VIX 訊號）
+            us_vix_series: 美國 VIX 收盤價序列（None 則跳過 US VIX 訊號）
 
         Returns:
             dict: 與 detect_from_series() 相同 schema + 額外 hysteresis 欄位
@@ -389,6 +401,8 @@ class RegimeStateMachine:
         raw_result = detect_from_series(
             closes,
             volumes=volumes,
+            vix_series=vix_series,
+            us_vix_series=us_vix_series,
             sma_short=self.sma_short,
             sma_long=self.sma_long,
             return_window=self.return_window,
@@ -501,28 +515,45 @@ def compute_market_breadth_pct(
 def detect_crisis_signals(
     closes: pd.Series,
     volumes: pd.Series | None = None,
+    vix_series: pd.Series | None = None,
+    us_vix_series: pd.Series | None = None,
     return_5d_threshold: float = _CRISIS_RETURN_5D,
     consec_down_days: int = _CRISIS_CONSEC_DOWN,
     vol_ratio_threshold: float = _CRISIS_VOL_RATIO,
     panic_vol_ratio: float = _CRISIS_PANIC_VOL_RATIO,
+    vix_level_threshold: float = _CRISIS_VIX_LEVEL,
+    vix_change_threshold: float = _CRISIS_VIX_DAILY_CHANGE,
+    single_day_drop_threshold: float = _CRISIS_SINGLE_DAY_DROP,
+    us_vix_level_threshold: float = _CRISIS_US_VIX_LEVEL,
+    us_vix_change_threshold: float = _CRISIS_US_VIX_DAILY_CHANGE,
     vol_window: int = 20,
     vol_baseline: int = 120,
 ) -> dict:
     """從收盤價序列偵測快速崩盤訊號（純函數，供測試用）。
 
-    四個快速訊號，任意 ≥2 個觸發 → crisis：
+    七個快速訊號，任意 ≥2 個觸發 → crisis：
     1. fast_return_5d：5 日報酬率 < return_5d_threshold（預設 -5%）
     2. consec_decline：最後 consec_down_days 天連續收跌
     3. vol_spike：rolling-20d-std(daily_returns) / avg-rolling-20d-std(120d) > vol_ratio_threshold
     4. panic_volume：爆量長黑（TAIEX 成交量 > 20 日均量 × panic_vol_ratio 且當日下跌）
+    5. vix_spike：台灣 VIX > vix_level_threshold 或單日漲幅 > vix_change_threshold
+    6. single_day_drop：TAIEX 單日跌幅 > single_day_drop_threshold
+    7. us_vix_spike：美國 VIX (CBOE ^VIX) > us_vix_level_threshold 或單日漲幅 > us_vix_change_threshold
 
     Args:
         closes: TAIEX 收盤價序列（pd.Series，時序由舊至新）
         volumes: TAIEX 成交量序列（pd.Series，與 closes 等長；None 則跳過 panic_volume 訊號）
+        vix_series: 台灣 VIX 收盤價序列（pd.Series；None 則跳過 vix_spike 訊號）
+        us_vix_series: 美國 VIX (CBOE ^VIX) 收盤價序列（pd.Series；None 則跳過 us_vix_spike 訊號）
         return_5d_threshold: 5 日跌幅門檻（預設 -0.05 即 -5%）
         consec_down_days: 連跌天數門檻（預設 3）
         vol_ratio_threshold: 波動率倍數門檻（預設 1.8）
         panic_vol_ratio: 爆量門檻（成交量 / 20 日均量，預設 1.5）
+        vix_level_threshold: 台灣 VIX 絕對值門檻（預設 30.0）
+        vix_change_threshold: 台灣 VIX 單日漲幅門檻（預設 0.25 即 25%）
+        single_day_drop_threshold: TAIEX 單日跌幅門檻（預設 -0.025 即 -2.5%）
+        us_vix_level_threshold: 美國 VIX 絕對值門檻（預設 30.0）
+        us_vix_change_threshold: 美國 VIX 單日漲幅門檻（預設 0.25 即 25%）
         vol_window: 近期波動率計算窗口（預設 20 天）
         vol_baseline: 基準波動率回溯天數（預設 120 天）
 
@@ -534,9 +565,14 @@ def detect_crisis_signals(
                 "consec_decline": bool,
                 "vol_spike": bool,
                 "panic_volume": bool,
+                "vix_spike": bool,
+                "single_day_drop": bool,
+                "us_vix_spike": bool,
             },
             "fast_return_5d_val": float,
             "vol_ratio_val": float,
+            "vix_val": float,
+            "us_vix_val": float,
         }
     """
     _safe = {
@@ -546,9 +582,14 @@ def detect_crisis_signals(
             "consec_decline": False,
             "vol_spike": False,
             "panic_volume": False,
+            "vix_spike": False,
+            "single_day_drop": False,
+            "us_vix_spike": False,
         },
         "fast_return_5d_val": 0.0,
         "vol_ratio_val": 0.0,
+        "vix_val": 0.0,
+        "us_vix_val": 0.0,
     }
 
     if len(closes) < max(consec_down_days + 1, 10):
@@ -609,11 +650,38 @@ def detect_crisis_signals(
         if vol_ma20 > 0 and latest_vol > vol_ma20 * panic_vol_ratio and latest_return < 0:
             sig_panic_vol = True
 
+    # Signal 5: VIX 飆升（絕對水準 > 30 或單日漲幅 > 25%）
+    sig_vix = False
+    vix_val = 0.0
+    if vix_series is not None and len(vix_series) >= 2:
+        vix_val = float(vix_series.iloc[-1])
+        vix_prev = float(vix_series.iloc[-2])
+        vix_change = (vix_val - vix_prev) / vix_prev if vix_prev > 0 else 0.0
+        sig_vix = vix_val > vix_level_threshold or vix_change > vix_change_threshold
+
+    # Signal 6: TAIEX 單日急跌 > 2.5%
+    sig_single_drop = False
+    if len(closes) >= 2:
+        daily_ret = (closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]
+        sig_single_drop = float(daily_ret) < single_day_drop_threshold
+
+    # Signal 7: 美國 VIX (CBOE ^VIX) 飆升（絕對水準 > 30 或單日漲幅 > 25%）
+    sig_us_vix = False
+    us_vix_val = 0.0
+    if us_vix_series is not None and len(us_vix_series) >= 2:
+        us_vix_val = float(us_vix_series.iloc[-1])
+        us_vix_prev = float(us_vix_series.iloc[-2])
+        us_vix_change = (us_vix_val - us_vix_prev) / us_vix_prev if us_vix_prev > 0 else 0.0
+        sig_us_vix = us_vix_val > us_vix_level_threshold or us_vix_change > us_vix_change_threshold
+
     signals = {
         "fast_return_5d": sig_return5d,
         "consec_decline": sig_consec,
         "vol_spike": sig_vol,
         "panic_volume": sig_panic_vol,
+        "vix_spike": sig_vix,
+        "single_day_drop": sig_single_drop,
+        "us_vix_spike": sig_us_vix,
     }
     crisis = sum(signals.values()) >= 2
 
@@ -622,12 +690,16 @@ def detect_crisis_signals(
         "signals": signals,
         "fast_return_5d_val": ret5d_val,
         "vol_ratio_val": vol_ratio_val,
+        "vix_val": vix_val,
+        "us_vix_val": us_vix_val,
     }
 
 
 def detect_from_series(
     closes: pd.Series,
     volumes: pd.Series | None = None,
+    vix_series: pd.Series | None = None,
+    us_vix_series: pd.Series | None = None,
     sma_short: int = 60,
     sma_long: int = 120,
     return_window: int = 20,
@@ -640,6 +712,8 @@ def detect_from_series(
     Args:
         closes: TAIEX 收盤價序列（需至少 sma_long 筆）
         volumes: TAIEX 成交量序列（與 closes 等長；None 則跳過爆量長黑訊號）
+        vix_series: 台灣 VIX 收盤價序列（None 則跳過 VIX 訊號）
+        us_vix_series: 美國 VIX 收盤價序列（None 則跳過 US VIX 訊號）
         sma_short: 短期均線天數（預設 60）
         sma_long: 長期均線天數（預設 120）
         return_window: 報酬率回溯天數（預設 20）
@@ -655,7 +729,7 @@ def detect_from_series(
             "signals": {"vs_sma_short": ..., "vs_sma_long": ..., "return_20d": ...},
             "taiex_close": float,
             "crisis_triggered": bool,       # crisis 是否觸發
-            "crisis_signals": dict,         # 四個快速訊號的 bool 值
+            "crisis_signals": dict,         # 七個快速訊號的 bool 值
             "breadth_downgraded": bool,     # 市場寬度是否觸發降級
             "breadth_below_ma20_pct": float | None,  # 跌破 MA20 比例
         }
@@ -718,7 +792,12 @@ def detect_from_series(
     crisis_info: dict = {}
     crisis_triggered = False
     if include_crisis:
-        crisis_info = detect_crisis_signals(closes, volumes=volumes)
+        crisis_info = detect_crisis_signals(
+            closes,
+            volumes=volumes,
+            vix_series=vix_series,
+            us_vix_series=us_vix_series,
+        )
         if crisis_info["crisis"]:
             regime = "crisis"
             crisis_triggered = True
@@ -735,6 +814,8 @@ def detect_from_series(
         "crisis_signals": crisis_info.get("signals", {}),
         "fast_return_5d_val": crisis_info.get("fast_return_5d_val", 0.0),
         "vol_ratio_val": crisis_info.get("vol_ratio_val", 0.0),
+        "vix_val": crisis_info.get("vix_val", 0.0),
+        "us_vix_val": crisis_info.get("us_vix_val", 0.0),
         "breadth_downgraded": breadth_downgraded,
         "breadth_below_ma20_pct": breadth_below_ma20_pct,
     }
@@ -818,6 +899,26 @@ class MarketRegimeDetector:
         # TAIEX 成交量可能為 0（FinMind 部分資料源），僅在有非零資料時傳入
         volumes = volumes_raw if (volumes_raw > 0).any() else None
 
+        # 載入 VIX 資料（graceful degradation：無資料時為 None）
+        with get_session() as session:
+            vix_rows = session.execute(
+                select(DailyPrice.date, DailyPrice.close)
+                .where(DailyPrice.stock_id == "TW_VIX")
+                .order_by(DailyPrice.date)
+            ).all()
+        vix_series = pd.Series([r[1] for r in vix_rows], index=[r[0] for r in vix_rows]) if vix_rows else None
+
+        # 載入美國 VIX 資料（graceful degradation：無資料時為 None）
+        with get_session() as session:
+            us_vix_rows = session.execute(
+                select(DailyPrice.date, DailyPrice.close)
+                .where(DailyPrice.stock_id == "US_VIX")
+                .order_by(DailyPrice.date)
+            ).all()
+        us_vix_series = (
+            pd.Series([r[1] for r in us_vix_rows], index=[r[0] for r in us_vix_rows]) if us_vix_rows else None
+        )
+
         # 計算市場寬度：跌破 MA20 的股票比例
         breadth_pct = self._compute_breadth()
 
@@ -826,11 +927,15 @@ class MarketRegimeDetector:
                 closes,
                 volumes=volumes,
                 breadth_below_ma20_pct=breadth_pct,
+                vix_series=vix_series,
+                us_vix_series=us_vix_series,
             )
         else:
             result = detect_from_series(
                 closes,
                 volumes=volumes,
+                vix_series=vix_series,
+                us_vix_series=us_vix_series,
                 sma_short=self.sma_short,
                 sma_long=self.sma_long,
                 return_window=self.return_window,
@@ -860,11 +965,15 @@ class MarketRegimeDetector:
         if result.get("crisis_triggered"):
             crisis_sigs = result.get("crisis_signals", {})
             logger.warning(
-                "⚠ Crisis 訊號觸發！regime 覆蓋為 crisis (5日=%+.1f%%, 連跌=%s, 波動率倍數=%.2f, 爆量長黑=%s)",
+                "⚠ Crisis 訊號觸發！regime 覆蓋為 crisis "
+                "(5日=%+.1f%%, 連跌=%s, 波動率倍數=%.2f, 爆量長黑=%s, TW_VIX=%.1f, US_VIX=%.1f, 單日急跌=%s)",
                 result.get("fast_return_5d_val", 0.0) * 100,
                 crisis_sigs.get("consec_decline", False),
                 result.get("vol_ratio_val", 0.0),
                 crisis_sigs.get("panic_volume", False),
+                result.get("vix_val", 0.0),
+                result.get("us_vix_val", 0.0),
+                crisis_sigs.get("single_day_drop", False),
             )
         elif not result.get("hysteresis_applied"):
             logger.info(

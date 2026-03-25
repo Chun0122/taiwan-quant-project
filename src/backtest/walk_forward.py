@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from src.backtest.engine import BacktestConfig, RiskConfig, TradeRecord
+from src.backtest.metrics import compute_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,10 @@ class WalkForwardResult:
     max_drawdown: float
     win_rate: float | None
     total_trades: int
+    sortino_ratio: float | None = None
+    calmar_ratio: float | None = None
+    var_95: float | None = None
+    cvar_95: float | None = None
     profit_factor: float | None = None
 
     # 各 fold 詳細
@@ -233,11 +238,12 @@ class WalkForwardEngine:
             raise ValueError("Walk-Forward 驗證失敗：無有效 fold")
 
         # 計算合併績效
-        metrics = self._compute_combined_metrics(
+        metrics = compute_metrics(
             combined_equity,
             all_trades,
             dates[0],
             dates[-1],
+            self.config.initial_capital,
         )
 
         strategy_name = self.strategy_cls.__name__
@@ -268,6 +274,10 @@ class WalkForwardEngine:
             max_drawdown=metrics["max_drawdown"],
             win_rate=metrics["win_rate"],
             total_trades=len(all_trades),
+            sortino_ratio=metrics["sortino_ratio"],
+            calmar_ratio=metrics["calmar_ratio"],
+            var_95=metrics["var_95"],
+            cvar_95=metrics["cvar_95"],
             profit_factor=metrics["profit_factor"],
             folds=folds,
             all_trades=all_trades,
@@ -378,62 +388,4 @@ class WalkForwardEngine:
             "trades": trades,
             "equity_curve": equity_curve,
             "sharpe_ratio": sharpe,
-        }
-
-    def _compute_combined_metrics(
-        self,
-        equity_curve: list[float],
-        trades: list[TradeRecord],
-        start: date,
-        end: date,
-    ) -> dict:
-        """計算合併所有 fold 的績效指標。"""
-        initial = self.config.initial_capital
-        final = equity_curve[-1] if equity_curve else initial
-
-        total_return = (final / initial - 1) * 100
-
-        days = (end - start).days
-        years = days / 365.25 if days > 0 else 1
-        if final > 0 and initial > 0 and years > 0:
-            annual_return = ((final / initial) ** (1 / years) - 1) * 100
-        else:
-            annual_return = 0.0
-
-        sharpe_ratio = None
-        if len(equity_curve) > 1:
-            eq = np.array(equity_curve)
-            daily_returns = np.diff(eq) / eq[:-1]
-            if np.std(daily_returns) > 0:
-                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
-
-        max_drawdown = 0.0
-        if equity_curve:
-            peak = equity_curve[0]
-            for val in equity_curve:
-                if val > peak:
-                    peak = val
-                dd = (peak - val) / peak * 100
-                if dd > max_drawdown:
-                    max_drawdown = dd
-
-        win_rate = None
-        if trades:
-            wins = sum(1 for t in trades if t.pnl > 0)
-            win_rate = round(wins / len(trades) * 100, 2)
-
-        profit_factor = None
-        if trades:
-            gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
-            gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
-            if gross_loss > 0:
-                profit_factor = round(gross_profit / gross_loss, 4)
-
-        return {
-            "total_return": round(total_return, 2),
-            "annual_return": round(annual_return, 2),
-            "sharpe_ratio": sharpe_ratio,
-            "max_drawdown": round(max_drawdown, 2),
-            "win_rate": win_rate,
-            "profit_factor": profit_factor,
         }

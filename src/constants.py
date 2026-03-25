@@ -18,3 +18,14 @@ DEFAULT_INST_THRESHOLD = 3_000_000  # 外資大買超金額門檻
 DEFAULT_SBL_SIGMA = 2.0  # 借券激增 σ 門檻
 DEFAULT_HHI_THRESHOLD = 0.4  # 主力集中度 HHI 門檻
 DEFAULT_DT_THRESHOLD = 0.3  # 隔日沖風險門檻
+
+# ── VIX 危機偵測 ─────────────────────────────────────────────────────
+VIX_STOCK_ID: str = "TW_VIX"  # DailyPrice 中的 stock_id（台灣 VIX）
+CRISIS_VIX_LEVEL: float = 30.0  # 台灣 VIX 絕對值門檻
+CRISIS_VIX_DAILY_CHANGE: float = 0.25  # 台灣 VIX 單日漲幅門檻 (25%)
+CRISIS_SINGLE_DAY_DROP: float = -0.025  # TAIEX 單日跌幅門檻 (-2.5%)
+
+# ── 美國 VIX (CBOE ^VIX) ────────────────────────────────────────────
+US_VIX_STOCK_ID: str = "US_VIX"  # DailyPrice 中的 stock_id（美國 VIX）
+CRISIS_US_VIX_LEVEL: float = 30.0  # 美國 VIX 絕對值門檻
+CRISIS_US_VIX_DAILY_CHANGE: float = 0.25  # 美國 VIX 單日漲幅門檻 (25%)

@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import date
 
-import numpy as np
 import pandas as pd
 
 from src.backtest.engine import (
     BacktestConfig,
     RiskConfig,
 )
+from src.backtest.metrics import compute_metrics
 from src.strategy.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -322,7 +321,7 @@ class PortfolioBacktestEngine:
             equity_curve[-1] = capital
 
         # 6. 計算組合層級指標
-        metrics = self._compute_metrics(equity_curve, trades, all_dates[0], all_dates[-1])
+        metrics = compute_metrics(equity_curve, trades, all_dates[0], all_dates[-1], self.config.initial_capital)
 
         # 個股報酬分解
         per_stock_returns = {}
@@ -399,84 +398,3 @@ class PortfolioBacktestEngine:
         if len(prices) < 2:
             return None
         return prices.pct_change().dropna()
-
-    def _compute_metrics(
-        self,
-        equity_curve: list[float],
-        trades: list[PortfolioTradeRecord],
-        start: date,
-        end: date,
-    ) -> dict:
-        """計算組合層級績效指標。"""
-        initial = self.config.initial_capital
-        final = equity_curve[-1] if equity_curve else initial
-
-        total_return = (final / initial - 1) * 100
-
-        days = (end - start).days
-        years = days / 365.25 if days > 0 else 1
-        if final > 0 and initial > 0 and years > 0:
-            annual_return = ((final / initial) ** (1 / years) - 1) * 100
-        else:
-            annual_return = 0.0
-
-        sharpe_ratio = None
-        sortino_ratio = None
-        calmar_ratio = None
-        var_95 = None
-        cvar_95 = None
-
-        max_drawdown = 0.0
-        if equity_curve:
-            peak = equity_curve[0]
-            for val in equity_curve:
-                if val > peak:
-                    peak = val
-                dd = (peak - val) / peak * 100
-                if dd > max_drawdown:
-                    max_drawdown = dd
-
-        if len(equity_curve) > 1:
-            eq = np.array(equity_curve)
-            daily_returns = np.diff(eq) / eq[:-1]
-
-            if np.std(daily_returns) > 0:
-                sharpe_ratio = round(np.mean(daily_returns) / np.std(daily_returns) * math.sqrt(252), 4)
-
-            neg_returns = daily_returns[daily_returns < 0]
-            if len(neg_returns) > 0 and np.std(neg_returns) > 0:
-                sortino_ratio = round(np.mean(daily_returns) / np.std(neg_returns) * math.sqrt(252), 4)
-
-            if max_drawdown > 0:
-                calmar_ratio = round(annual_return / max_drawdown, 4)
-
-            var_95 = round(float(np.percentile(daily_returns, 5)) * 100, 4)
-
-            var_threshold = np.percentile(daily_returns, 5)
-            tail_returns = daily_returns[daily_returns <= var_threshold]
-            if len(tail_returns) > 0:
-                cvar_95 = round(float(np.mean(tail_returns)) * 100, 4)
-
-        win_rate = None
-        profit_factor = None
-        if trades:
-            wins = sum(1 for t in trades if t.pnl > 0)
-            win_rate = round(wins / len(trades) * 100, 2)
-
-            gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
-            gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
-            if gross_loss > 0:
-                profit_factor = round(gross_profit / gross_loss, 4)
-
-        return {
-            "total_return": round(total_return, 2),
-            "annual_return": round(annual_return, 2),
-            "sharpe_ratio": sharpe_ratio,
-            "max_drawdown": round(max_drawdown, 2),
-            "win_rate": win_rate,
-            "sortino_ratio": sortino_ratio,
-            "calmar_ratio": calmar_ratio,
-            "var_95": var_95,
-            "cvar_95": cvar_95,
-            "profit_factor": profit_factor,
-        }

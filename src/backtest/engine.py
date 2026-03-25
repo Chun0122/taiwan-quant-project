@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import date
 
 import numpy as np
 import pandas as pd
 
+from src.backtest.metrics import compute_metrics
 from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
 from src.strategy.base import Strategy
 
@@ -309,7 +309,7 @@ class BacktestEngine:
             equity_curve[-1] = capital
 
         final_capital = capital
-        metrics = self._compute_metrics(equity_curve, trades, data.index[0], data.index[-1])
+        metrics = compute_metrics(equity_curve, trades, data.index[0], data.index[-1], self.config.initial_capital)
 
         # 計算同期 buy & hold 基準報酬
         benchmark_return = self._compute_benchmark(data)
@@ -452,7 +452,7 @@ class BacktestEngine:
         return float(np.mean(tr))
 
     # ------------------------------------------------------------------ #
-    #  基準與績效計算
+    #  基準計算
     # ------------------------------------------------------------------ #
 
     def _compute_benchmark(self, data: pd.DataFrame) -> float | None:
@@ -483,111 +483,3 @@ class BacktestEngine:
             return round(total_return * 100, 2)
 
         return round((last_close / first_close - 1) * 100, 2)
-
-    def _compute_metrics(
-        self,
-        equity_curve: list[float],
-        trades: list[TradeRecord],
-        start: date,
-        end: date,
-    ) -> dict:
-        """計算績效指標。"""
-        initial = self.config.initial_capital
-        final = equity_curve[-1] if equity_curve else initial
-
-        # 總報酬率
-        total_return = (final / initial - 1) * 100
-
-        # 年化報酬率
-        days = (end - start).days
-        years = days / 365.25 if days > 0 else 1
-        if final > 0 and initial > 0 and years > 0:
-            annual_return = ((final / initial) ** (1 / years) - 1) * 100
-        else:
-            annual_return = 0.0
-
-        # Sharpe Ratio (以每日報酬率計算，假設無風險利率 = 0)
-        sharpe_ratio = None
-        if len(equity_curve) > 1:
-            eq = np.array(equity_curve, dtype=np.float64)
-            # 防止 equity 為 0 時產生 inf（爆倉情境）
-            prev_eq = eq[:-1]
-            safe_prev = np.where(prev_eq == 0, np.nan, prev_eq)
-            daily_returns = np.diff(eq) / safe_prev
-            daily_returns = daily_returns[np.isfinite(daily_returns)]
-            if len(daily_returns) > 1 and np.std(daily_returns) > 0:
-                sharpe_ratio = round(float(np.mean(daily_returns)) / float(np.std(daily_returns)) * math.sqrt(252), 4)
-
-        # 最大回撤
-        max_drawdown = 0.0
-        if equity_curve:
-            peak = equity_curve[0]
-            for val in equity_curve:
-                if val > peak:
-                    peak = val
-                dd = (peak - val) / peak * 100
-                if dd > max_drawdown:
-                    max_drawdown = dd
-
-        # 勝率
-        win_rate = None
-        if trades:
-            wins = sum(1 for t in trades if t.pnl > 0)
-            win_rate = round(wins / len(trades) * 100, 2)
-
-        # --- 進階指標 ---
-        sortino_ratio = None
-        calmar_ratio = None
-        var_95 = None
-        cvar_95 = None
-        profit_factor = None
-
-        if len(equity_curve) > 1:
-            eq = np.array(equity_curve, dtype=np.float64)
-            # 防止 equity 為 0 時產生 inf（爆倉情境）
-            prev_eq = eq[:-1]
-            safe_prev = np.where(prev_eq == 0, np.nan, prev_eq)
-            raw_daily_returns = np.diff(eq) / safe_prev
-            daily_returns = raw_daily_returns[np.isfinite(raw_daily_returns)]
-
-            # Sortino Ratio: mean / downside_std × √252
-            if len(daily_returns) > 1:
-                neg_returns = daily_returns[daily_returns < 0]
-                if len(neg_returns) > 0 and np.std(neg_returns) > 0:
-                    sortino_ratio = round(
-                        float(np.mean(daily_returns)) / float(np.std(neg_returns)) * math.sqrt(252), 4
-                    )
-
-            # Calmar Ratio: annual_return / max_drawdown
-            if max_drawdown > 0:
-                calmar_ratio = round(annual_return / max_drawdown, 4)
-
-            # VaR (95%): 5th percentile of daily returns
-            if len(daily_returns) > 1:
-                var_95 = round(float(np.percentile(daily_returns, 5)) * 100, 4)
-
-                # CVaR (95%): mean of returns <= VaR
-                var_threshold = np.percentile(daily_returns, 5)
-                tail_returns = daily_returns[daily_returns <= var_threshold]
-                if len(tail_returns) > 0:
-                    cvar_95 = round(float(np.mean(tail_returns)) * 100, 4)
-
-        # Profit Factor: gross_profit / gross_loss
-        if trades:
-            gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
-            gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
-            if gross_loss > 0:
-                profit_factor = round(gross_profit / gross_loss, 4)
-
-        return {
-            "total_return": round(total_return, 2),
-            "annual_return": round(annual_return, 2),
-            "sharpe_ratio": sharpe_ratio,
-            "max_drawdown": round(max_drawdown, 2),
-            "win_rate": win_rate,
-            "sortino_ratio": sortino_ratio,
-            "calmar_ratio": calmar_ratio,
-            "var_95": var_95,
-            "cvar_95": cvar_95,
-            "profit_factor": profit_factor,
-        }

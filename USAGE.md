@@ -254,6 +254,9 @@ python main.py backtest --stock 2330 --strategy sma_cross --start 2023-01-01 --e
 
 # 五因子歸因分析（momentum/reversal/quality/size/liquidity 因子暴露 × 期間報酬相關係數）
 python main.py backtest --stock 2330 --strategy sma_cross --attribution
+
+# 匯出交易明細 CSV（含持倉天數、出場原因、止損/目標價）
+python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades.csv
 ```
 
 可用策略：
@@ -336,6 +339,7 @@ python main.py backtest --stock 2330 --strategy sma_cross --sizing atr
 | `--fraction N` | `fixed_fraction` 模式的資金比例（0.0~1.0） |
 | `--adjust-dividend` | 啟用除權息還原（回溯調整價格 + 股利入帳） |
 | `--attribution` | 回測後輸出五因子歸因分析（momentum/reversal/quality/size/liquidity 因子暴露與報酬 Pearson 相關係數）；Dashboard 回測結果頁亦會顯示因子貢獻長條圖 |
+| `--export-trades PATH` | 匯出交易明細至 CSV（含持倉天數、出場原因、止損/目標價） |
 
 部位計算模式說明：
 | 模式 | 說明 |
@@ -1496,7 +1500,7 @@ python main.py morning-routine --top 30 --notify
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
-| Step 0 | Macro Stress Check | 偵測 TAIEX crisis 訊號（5日跌>5%/連跌/波動率/爆量長黑），觸發時顯示 CRISIS 警示 banner + Discord 預警 |
+| Step 0 | VIX 同步 + Macro Stress Check | 同步台灣 VIX + 美國 VIX → 偵測 TAIEX crisis 訊號（7 訊號：5日跌>5%/連跌/波動率/爆量長黑/台灣VIX飆升/單日急跌/美國VIX飆升），≥2 觸發時顯示 CRISIS 警示 banner + Discord 預警 |
 | Step 1 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
 | Step 2a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
 | Step 2b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
@@ -1578,6 +1582,22 @@ python main.py sync-features --days 60
 - DailyFeature 表為空時，`UniverseFilter` 會自動從 `DailyPrice` fallback 計算（冷啟動相容）
 
 > **冷啟動順序**：`sync-info --force` → `sync-features` → `discover`
+
+### 4.29 同步 VIX 波動率指數（`sync-vix`）
+
+同步兩個 VIX 來源至 `DailyPrice` 表，供 `detect_crisis_signals()` 使用：
+
+1. **台灣 VIX**（`stock_id="TW_VIX"`）— FinMind `TaiwanOptionMarketVIX`（目前 FinMind 已移除此 dataset，graceful degradation 回傳 0 筆）
+2. **美國 VIX**（`stock_id="US_VIX"`）— yfinance `^VIX`（CBOE VIX，穩定可用）
+
+```bash
+python main.py sync-vix
+```
+
+- 台灣 VIX > 30 或單日漲幅 > 25% 觸發 `vix_spike` crisis 訊號（Signal 5）
+- 美國 VIX > 30 或單日漲幅 > 25% 觸發 `us_vix_spike` crisis 訊號（Signal 7）
+- `morning-routine` Step 0 自動同步兩者（失敗不中斷流程）
+- 無 VIX 資料時自動跳過對應訊號（graceful degradation）
 
 ---
 

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from src.backtest.engine import BacktestConfig
+from src.backtest.metrics import compute_metrics
 from src.backtest.portfolio import (
     PortfolioBacktestEngine,
     PortfolioConfig,
@@ -108,117 +109,111 @@ class TestComputeWeights:
 
 
 class TestComputeMetrics:
-    def _make_engine(self):
-        engine = object.__new__(PortfolioBacktestEngine)
-        engine.config = BacktestConfig()
-        return engine
-
     def test_total_return(self):
-        engine = self._make_engine()
         equity = [1_000_000, 1_050_000, 1_100_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["total_return"] == pytest.approx(10.0)
 
     def test_max_drawdown(self):
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_100_000, 900_000, 1_050_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         # peak=1_100_000, trough=900_000 → MDD = 200_000/1_100_000 ≈ 18.18%
         assert metrics["max_drawdown"] == pytest.approx(18.18, abs=0.1)
 
     def test_win_rate(self):
-        engine = self._make_engine()
+
         trades = [
             PortfolioTradeRecord("A", date(2024, 1, 1), 100, pnl=50),
             PortfolioTradeRecord("B", date(2024, 1, 1), 100, pnl=-30),
             PortfolioTradeRecord("A", date(2024, 1, 1), 100, pnl=20),
         ]
-        metrics = engine._compute_metrics([1_000_000], trades, date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics([1_000_000], trades, date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["win_rate"] == pytest.approx(66.67, abs=0.1)
 
     def test_profit_factor(self):
-        engine = self._make_engine()
+
         trades = [
             PortfolioTradeRecord("A", date(2024, 1, 1), 100, pnl=100),
             PortfolioTradeRecord("B", date(2024, 1, 1), 100, pnl=-50),
         ]
-        metrics = engine._compute_metrics([1_000_000], trades, date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics([1_000_000], trades, date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["profit_factor"] == pytest.approx(2.0)
 
     def test_no_trades_no_win_rate(self):
-        engine = self._make_engine()
-        metrics = engine._compute_metrics([1_000_000], [], date(2024, 1, 1), date(2024, 6, 30))
+
+        metrics = compute_metrics([1_000_000], [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["win_rate"] is None
         assert metrics["profit_factor"] is None
 
     def test_sharpe_ratio_calculated(self):
-        engine = self._make_engine()
+
         # 穩定上漲的 equity curve
         equity = [1_000_000 + i * 10_000 for i in range(20)]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["sharpe_ratio"] is not None
         assert metrics["sharpe_ratio"] > 0
 
     def test_sortino_ratio_with_mixed_returns(self):
         """含漲跌天數的 equity curve 應計算出正的 Sortino Ratio。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_010_000, 1_005_000, 1_015_000, 1_008_000, 1_020_000, 1_012_000, 1_025_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["sortino_ratio"] is not None
         assert metrics["sortino_ratio"] > 0
 
     def test_sortino_ratio_none_when_no_down_days(self):
         """單調遞增（無下跌日）的 equity curve → sortino_ratio 為 None。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_010_000, 1_020_000, 1_030_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["sortino_ratio"] is None
 
     def test_calmar_ratio_computed_with_drawdown(self):
         """有最大回撤時應計算 Calmar Ratio > 0。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_200_000, 900_000, 1_100_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
         assert metrics["calmar_ratio"] is not None
         assert metrics["calmar_ratio"] > 0
 
     def test_calmar_ratio_none_when_no_drawdown(self):
         """無最大回撤（單調遞增）時 calmar_ratio 為 None。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_100_000, 1_200_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["calmar_ratio"] is None
 
     def test_var_cvar_computed_with_sufficient_data(self):
         """有多個資料點時 var_95 與 cvar_95 應不為 None。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_010_000, 1_005_000, 1_020_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["var_95"] is not None
         assert metrics["cvar_95"] is not None
 
     def test_cvar_is_worse_than_or_equal_to_var(self):
         """CVaR（尾部期望損失）應 <= VaR（第 5 百分位數）。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 1_010_000, 1_005_000, 1_015_000, 1_008_000, 1_020_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["cvar_95"] is not None
         assert metrics["var_95"] is not None
         assert metrics["cvar_95"] <= metrics["var_95"]
 
     def test_var_negative_for_downtrend(self):
         """持續下跌的 equity curve → var_95 應為負值。"""
-        engine = self._make_engine()
+
         equity = [1_000_000, 990_000, 980_000, 970_000, 960_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["var_95"] is not None
         assert metrics["var_95"] < 0
 
     def test_var_cvar_none_for_single_point(self):
         """只有 1 筆資料點時 var_95 與 cvar_95 應為 None。"""
-        engine = self._make_engine()
+
         equity = [1_000_000]
-        metrics = engine._compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["var_95"] is None
         assert metrics["cvar_95"] is None
 

@@ -854,6 +854,57 @@ def sync_taiex_index(
     return count
 
 
+def sync_taiwan_vix(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    fetcher: FinMindFetcher | None = None,
+) -> int:
+    """同步台灣 VIX 波動率指數至 DailyPrice（stock_id='TW_VIX'）。"""
+    init_db()
+
+    if fetcher is None:
+        fetcher = FinMindFetcher()
+
+    default_start = start_date or settings.fetcher.default_start_date
+    if end_date is None:
+        end_date = date.today().isoformat()
+
+    last = _get_last_date(DailyPrice, "TW_VIX")
+    s = last if last and last > default_start else default_start
+
+    logger.info("[VIX] 同步台灣 VIX: %s ~ %s", s, end_date)
+    df = fetcher.fetch_taiwan_vix(s, end_date)
+    count = _upsert_daily_price(df)
+    logger.info("[VIX] 完成 — %d 筆", count)
+    return count
+
+
+def sync_us_vix(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> int:
+    """同步美國 VIX (CBOE ^VIX) 至 DailyPrice（stock_id='US_VIX'）。
+
+    使用 yfinance 抓取，與 FinMind 無關。
+    """
+    init_db()
+
+    default_start = start_date or settings.fetcher.default_start_date
+    if end_date is None:
+        end_date = date.today().isoformat()
+
+    last = _get_last_date(DailyPrice, "US_VIX")
+    s = last if last and last > default_start else default_start
+
+    logger.info("[US_VIX] 同步美國 VIX: %s ~ %s", s, end_date)
+    from src.data.fetcher import fetch_us_vix
+
+    df = fetch_us_vix(s, end_date)
+    count = _upsert_daily_price(df)
+    logger.info("[US_VIX] 完成 — %d 筆", count)
+    return count
+
+
 def sync_market_data(
     days: int = 10,
     fetcher: FinMindFetcher | None = None,

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from src.backtest.engine import BacktestConfig
+from src.backtest.metrics import compute_metrics
 from src.backtest.walk_forward import WalkForwardEngine, WalkForwardResult
 from src.strategy.base import Strategy
 
@@ -159,21 +160,14 @@ class TestSimulateFold:
 
 
 class TestComputeCombinedMetrics:
-    def _make_engine(self):
-        engine = object.__new__(WalkForwardEngine)
-        engine.config = BacktestConfig()
-        return engine
-
     def test_total_return(self):
-        engine = self._make_engine()
         equity = [1_000_000, 1_050_000, 1_100_000]
-        metrics = engine._compute_combined_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         assert metrics["total_return"] == pytest.approx(10.0)
 
     def test_max_drawdown(self):
-        engine = self._make_engine()
         equity = [1_000_000, 1_200_000, 900_000, 1_000_000]
-        metrics = engine._compute_combined_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 6, 30), 1_000_000)
         # peak=1_200_000, trough=900_000 → MDD = 25%
         assert metrics["max_drawdown"] == pytest.approx(25.0)
 

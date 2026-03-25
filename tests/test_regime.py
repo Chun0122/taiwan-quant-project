@@ -205,6 +205,9 @@ class TestDetectCrisisSignals:
             "consec_decline": False,
             "vol_spike": False,
             "panic_volume": False,
+            "vix_spike": False,
+            "single_day_drop": False,
+            "us_vix_spike": False,
         }
 
     def test_crisis_overrides_bull_vote(self):
@@ -229,6 +232,136 @@ class TestDetectCrisisSignals:
         result = detect_crisis_signals(closes)
         # 緩慢下跌不會有 5 日 -5%（5日約 -1%），連跌訊號可能觸發但 5d 不觸發
         assert result["signals"]["fast_return_5d"] is False
+
+    # ── VIX spike 訊號測試 ──
+
+    def test_vix_spike_absolute_level(self):
+        """VIX > 30 觸發 vix_spike。"""
+        closes = self._make_series([16000.0] * 130)
+        vix = pd.Series([20.0, 35.0])  # 最新 VIX=35 > 30
+        result = detect_crisis_signals(closes, vix_series=vix)
+        assert result["signals"]["vix_spike"] is True
+        assert result["vix_val"] == pytest.approx(35.0)
+
+    def test_vix_spike_daily_change(self):
+        """VIX 單日漲幅 > 25% 觸發 vix_spike。"""
+        closes = self._make_series([16000.0] * 130)
+        vix = pd.Series([20.0, 26.0])  # 漲幅 30% > 25%
+        result = detect_crisis_signals(closes, vix_series=vix)
+        assert result["signals"]["vix_spike"] is True
+
+    def test_vix_none_graceful(self):
+        """vix_series=None → vix_spike=False（向後相容）。"""
+        closes = self._make_series([16000.0] * 130)
+        result = detect_crisis_signals(closes, vix_series=None)
+        assert result["signals"]["vix_spike"] is False
+        assert result["vix_val"] == 0.0
+
+    def test_vix_insufficient_data(self):
+        """VIX 資料 < 2 筆 → vix_spike=False。"""
+        closes = self._make_series([16000.0] * 130)
+        vix = pd.Series([35.0])  # 只有一筆
+        result = detect_crisis_signals(closes, vix_series=vix)
+        assert result["signals"]["vix_spike"] is False
+
+    # ── 單日急跌訊號測試 ──
+
+    def test_single_day_drop_triggers(self):
+        """TAIEX 單日跌 3% 觸發 single_day_drop。"""
+        closes = [16000.0] * 130
+        closes[-1] = 16000.0 * 0.97  # -3%
+        result = detect_crisis_signals(self._make_series(closes))
+        assert result["signals"]["single_day_drop"] is True
+
+    def test_single_day_small_decline_no_trigger(self):
+        """TAIEX 單日跌 1% 不觸發 single_day_drop。"""
+        closes = [16000.0] * 130
+        closes[-1] = 16000.0 * 0.99  # -1%
+        result = detect_crisis_signals(self._make_series(closes))
+        assert result["signals"]["single_day_drop"] is False
+
+    def test_vix_plus_single_drop_crisis(self):
+        """VIX spike + single_day_drop 兩個新訊號同時觸發 → crisis。"""
+        closes = [16000.0] * 130
+        closes[-1] = 16000.0 * 0.97  # -3% → single_day_drop
+        vix = pd.Series([20.0, 35.0])  # VIX=35 > 30 → vix_spike
+        result = detect_crisis_signals(self._make_series(closes), vix_series=vix)
+        assert result["signals"]["vix_spike"] is True
+        assert result["signals"]["single_day_drop"] is True
+        assert result["crisis"] is True
+
+    def test_backward_compat_no_vix(self):
+        """不傳 vix_series 時行為與原 4 訊號完全一致（向後相容回歸測試）。"""
+        closes = [16000.0] * 130
+        # 只觸發 consec_decline（連跌 3 天但幅度極小）
+        closes[-3] = 15998.0
+        closes[-2] = 15996.0
+        closes[-1] = 15994.0
+        result = detect_crisis_signals(self._make_series(closes))
+        # 新訊號預設 False，不影響結果
+        assert result["signals"]["vix_spike"] is False
+        assert result["signals"]["single_day_drop"] is False
+        assert result["signals"]["us_vix_spike"] is False
+        assert result["crisis"] is False  # 仍只有 1 個訊號
+
+    # ── 美國 VIX (US VIX) spike 訊號測試 ──
+
+    def test_us_vix_spike_absolute_level(self):
+        """US VIX > 30 觸發 us_vix_spike。"""
+        closes = self._make_series([16000.0] * 130)
+        us_vix = pd.Series([20.0, 35.0])
+        result = detect_crisis_signals(closes, us_vix_series=us_vix)
+        assert result["signals"]["us_vix_spike"] is True
+        assert result["us_vix_val"] == pytest.approx(35.0)
+
+    def test_us_vix_spike_daily_change(self):
+        """US VIX 單日漲幅 > 25% 觸發 us_vix_spike。"""
+        closes = self._make_series([16000.0] * 130)
+        us_vix = pd.Series([20.0, 26.0])  # 漲幅 30% > 25%
+        result = detect_crisis_signals(closes, us_vix_series=us_vix)
+        assert result["signals"]["us_vix_spike"] is True
+
+    def test_us_vix_none_graceful(self):
+        """us_vix_series=None → us_vix_spike=False（graceful degradation）。"""
+        closes = self._make_series([16000.0] * 130)
+        result = detect_crisis_signals(closes, us_vix_series=None)
+        assert result["signals"]["us_vix_spike"] is False
+        assert result["us_vix_val"] == 0.0
+
+    def test_us_vix_insufficient_data(self):
+        """US VIX 資料 < 2 筆 → us_vix_spike=False。"""
+        closes = self._make_series([16000.0] * 130)
+        us_vix = pd.Series([35.0])  # 只有一筆
+        result = detect_crisis_signals(closes, us_vix_series=us_vix)
+        assert result["signals"]["us_vix_spike"] is False
+
+    def test_us_vix_plus_single_drop_crisis(self):
+        """US VIX spike + single_day_drop → crisis。"""
+        closes = [16000.0] * 130
+        closes[-1] = 16000.0 * 0.97  # -3% → single_day_drop
+        us_vix = pd.Series([20.0, 35.0])  # US VIX=35 > 30 → us_vix_spike
+        result = detect_crisis_signals(self._make_series(closes), us_vix_series=us_vix)
+        assert result["signals"]["us_vix_spike"] is True
+        assert result["signals"]["single_day_drop"] is True
+        assert result["crisis"] is True
+
+    def test_tw_and_us_vix_both_spike_crisis(self):
+        """TW VIX + US VIX 同時飆升 → crisis（兩個 VIX 訊號可同時觸發）。"""
+        closes = self._make_series([16000.0] * 130)
+        tw_vix = pd.Series([20.0, 35.0])
+        us_vix = pd.Series([20.0, 35.0])
+        result = detect_crisis_signals(closes, vix_series=tw_vix, us_vix_series=us_vix)
+        assert result["signals"]["vix_spike"] is True
+        assert result["signals"]["us_vix_spike"] is True
+        assert result["crisis"] is True
+
+    def test_us_vix_normal_no_trigger(self):
+        """US VIX 正常水位（< 30 且漲幅 < 25%）不觸發。"""
+        closes = self._make_series([16000.0] * 130)
+        us_vix = pd.Series([18.0, 20.0])  # 漲幅 11%，值 20 — 都正常
+        result = detect_crisis_signals(closes, us_vix_series=us_vix)
+        assert result["signals"]["us_vix_spike"] is False
+        assert result["us_vix_val"] == pytest.approx(20.0)
 
 
 class TestRegimeWeightsCrisis:

@@ -265,6 +265,52 @@ def _print_attribution(attr: object) -> None:
     print()
 
 
+EXIT_REASON_LABELS: dict[str, str] = {
+    "signal": "策略訊號",
+    "stop_loss": "停損",
+    "take_profit": "停利",
+    "trailing_stop": "移動停損",
+    "force_close": "到期平倉",
+}
+
+
+def _print_trade_stats(trades: list) -> None:
+    """印出交易明細統計。"""
+    from src.backtest.metrics import compute_trade_stats
+
+    stats = compute_trade_stats(trades)
+    if stats["holding_days_avg"] is None and not stats["exit_reason_counts"]:
+        return
+
+    print(f"\n{'─' * 60}")
+    print("交易統計")
+    print(f"{'─' * 60}")
+
+    if stats["holding_days_avg"] is not None:
+        print(f"  平均持倉天數: {stats['holding_days_avg']:>10}")
+        print(f"  中位數持倉:   {stats['holding_days_median']:>10}")
+        print(f"  最短 / 最長:  {stats['holding_days_min']:>4} / {stats['holding_days_max']} 天")
+
+    if stats["avg_win_return"] is not None:
+        print(f"  獲利平均報酬: {stats['avg_win_return']:>+10.2f}%")
+    if stats["avg_loss_return"] is not None:
+        print(f"  虧損平均報酬: {stats['avg_loss_return']:>+10.2f}%")
+    if stats["avg_win_pnl"] is not None:
+        print(f"  獲利平均損益: {stats['avg_win_pnl']:>+14,.2f}")
+    if stats["avg_loss_pnl"] is not None:
+        print(f"  虧損平均損益: {stats['avg_loss_pnl']:>+14,.2f}")
+
+    if stats["max_consecutive_wins"] > 0 or stats["max_consecutive_losses"] > 0:
+        print(f"  最大連勝:     {stats['max_consecutive_wins']:>10}")
+        print(f"  最大連敗:     {stats['max_consecutive_losses']:>10}")
+
+    if stats["exit_reason_counts"]:
+        print("  出場原因:")
+        for reason, count in sorted(stats["exit_reason_counts"].items(), key=lambda x: -x[1]):
+            label = EXIT_REASON_LABELS.get(reason, reason)
+            print(f"    {label:<12} {count:>4} 筆")
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
     """執行回測（單股或投資組合）。"""
     from datetime import date
@@ -333,7 +379,18 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             for sid, ret in result.per_stock_returns.items():
                 print(f"    {sid}: {ret:+.2f}%")
 
-        print(f"  (結果已儲存, portfolio_id={bt_id})")
+        # 交易統計
+        if result.trades:
+            _print_trade_stats(result.trades)
+
+        print(f"\n  (結果已儲存, portfolio_id={bt_id})")
+
+        # 交易明細匯出
+        if getattr(args, "export_trades", None) and result.trades:
+            from src.backtest.metrics import export_trades
+
+            path = export_trades(result.trades, args.export_trades)
+            print(f"  交易明細已匯出至: {path}（{len(result.trades)} 筆）")
         return
 
     # --- 單股回測 ---
@@ -372,7 +429,19 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print(f"  VaR (95%):    {result.var_95 or 'N/A':>13}")
     print(f"  CVaR (95%):   {result.cvar_95 or 'N/A':>13}")
     print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
-    print(f"  (結果已儲存, id={bt_id})")
+
+    # 交易統計
+    if result.trades:
+        _print_trade_stats(result.trades)
+
+    print(f"\n  (結果已儲存, id={bt_id})")
+
+    # --- 交易明細匯出 ---
+    if getattr(args, "export_trades", None) and result.trades:
+        from src.backtest.metrics import export_trades
+
+        path = export_trades(result.trades, args.export_trades, stock_id=result.stock_id)
+        print(f"  交易明細已匯出至: {path}（{len(result.trades)} 筆）")
 
     # --- 因子歸因分析 ---
     if getattr(args, "attribution", False):
@@ -646,7 +715,15 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
     print(f"  最大回撤:     {result.max_drawdown:>13.2f}%")
     print(f"  勝率:         {result.win_rate or 'N/A':>13}%")
     print(f"  交易次數:     {result.total_trades:>13}")
+    print(f"  Sortino Ratio:{result.sortino_ratio or 'N/A':>13}")
+    print(f"  Calmar Ratio: {result.calmar_ratio or 'N/A':>13}")
+    print(f"  VaR (95%):    {result.var_95 or 'N/A':>13}")
+    print(f"  CVaR (95%):   {result.cvar_95 or 'N/A':>13}")
     print(f"  Profit Factor:{result.profit_factor or 'N/A':>13}")
+
+    # 交易統計
+    if result.all_trades:
+        _print_trade_stats(result.all_trades)
 
     # 各 Fold 摘要
     if result.folds:
@@ -658,6 +735,13 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
                 f"  {f.fold_idx:>4}  {f.train_start}~{f.train_end}  "
                 f"{f.test_start}~{f.test_end}  {f.total_return:>6.2f}%  {f.trades:>4}"
             )
+
+    # 交易明細匯出
+    if getattr(args, "export_trades", None) and result.all_trades:
+        from src.backtest.metrics import export_trades
+
+        path = export_trades(result.all_trades, args.export_trades, stock_id=result.stock_id)
+        print(f"\n  交易明細已匯出至: {path}（{len(result.all_trades)} 筆）")
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -1541,6 +1625,29 @@ def cmd_sync_holding(args: argparse.Namespace) -> None:
         print(f"持股分級資料庫: {total:,} 筆（{distinct_stocks:,} 支股票，最新至 {max_date}）")
 
 
+def cmd_sync_vix(args: argparse.Namespace) -> None:
+    """同步 VIX 波動率指數（台灣 + 美國）。"""
+    from src.data.pipeline import sync_taiwan_vix, sync_us_vix
+
+    print("同步台灣 VIX 波動率指數...")
+    try:
+        tw_count = sync_taiwan_vix()
+        print(f"台灣 VIX 同步完成：{tw_count:,} 筆")
+    except Exception as e:
+        print(f"台灣 VIX 同步失敗（不影響流程）: {e}")
+        tw_count = 0
+
+    print("同步美國 VIX (CBOE ^VIX)...")
+    try:
+        us_count = sync_us_vix()
+        print(f"美國 VIX 同步完成：{us_count:,} 筆")
+    except Exception as e:
+        print(f"美國 VIX 同步失敗（不影響流程）: {e}")
+        us_count = 0
+
+    print(f"\nVIX 同步總計：台灣 {tw_count:,} 筆 + 美國 {us_count:,} 筆")
+
+
 def cmd_sync_sbl(args: argparse.Namespace) -> None:
     """同步 TWSE 全市場借券賣出彙總資料（TWT96U）。"""
     from src.data.pipeline import sync_sbl_all_market
@@ -1798,6 +1905,22 @@ def _compute_macro_stress_check() -> dict:
                 .limit(130)
             ).all()
 
+            # 載入 VIX 資料（graceful degradation）
+            vix_rows = session.execute(
+                select(DailyPrice.date, DailyPrice.close)
+                .where(DailyPrice.stock_id == "TW_VIX")
+                .order_by(DailyPrice.date.desc())
+                .limit(30)
+            ).all()
+
+            # 載入美國 VIX 資料（graceful degradation）
+            us_vix_rows = session.execute(
+                select(DailyPrice.date, DailyPrice.close)
+                .where(DailyPrice.stock_id == "US_VIX")
+                .order_by(DailyPrice.date.desc())
+                .limit(30)
+            ).all()
+
         if not rows or len(rows) < 10:
             return {
                 "regime": "sideways",
@@ -1806,6 +1929,7 @@ def _compute_macro_stress_check() -> dict:
                 "fast_return_5d": 0.0,
                 "consec_decline_days": 0,
                 "vol_ratio": 0.0,
+                "vix_val": 0.0,
                 "signals": {},
                 "summary": "TAIEX 資料不足，跳過壓力檢查",
                 "breadth_below_ma20_pct": None,
@@ -1816,7 +1940,24 @@ def _compute_macro_stress_check() -> dict:
         volumes_raw = pd.Series([float(r[2]) for r in rows_sorted])
         volumes = volumes_raw if (volumes_raw > 0).any() else None
 
-        crisis_info = detect_crisis_signals(closes, volumes=volumes)
+        # VIX 序列（由舊至新）
+        vix_series = None
+        if vix_rows:
+            vix_sorted = sorted(vix_rows, key=lambda r: r[0])
+            vix_series = pd.Series([float(r[1]) for r in vix_sorted])
+
+        # 美國 VIX 序列（由舊至新）
+        us_vix_series = None
+        if us_vix_rows:
+            us_vix_sorted = sorted(us_vix_rows, key=lambda r: r[0])
+            us_vix_series = pd.Series([float(r[1]) for r in us_vix_sorted])
+
+        crisis_info = detect_crisis_signals(
+            closes,
+            volumes=volumes,
+            vix_series=vix_series,
+            us_vix_series=us_vix_series,
+        )
         regime_info = MarketRegimeDetector().detect()
         regime = regime_info.get("regime", "sideways")
 
@@ -1833,13 +1974,19 @@ def _compute_macro_stress_check() -> dict:
 
         breadth_pct = regime_info.get("breadth_below_ma20_pct")
         breadth_downgraded = regime_info.get("breadth_downgraded", False)
+        vix_val = crisis_info.get("vix_val", 0.0)
+
+        us_vix_val = crisis_info.get("us_vix_val", 0.0)
 
         if regime == "crisis":
             panic_tag = "，爆量長黑" if crisis_info.get("signals", {}).get("panic_volume") else ""
+            vix_tag = f"，TW_VIX={vix_val:.1f}" if crisis_info.get("signals", {}).get("vix_spike") else ""
+            us_vix_tag = f"，US_VIX={us_vix_val:.1f}" if crisis_info.get("signals", {}).get("us_vix_spike") else ""
+            drop_tag = "，單日急跌" if crisis_info.get("signals", {}).get("single_day_drop") else ""
             summary = (
                 f"⚠ CRISIS 崩盤訊號觸發！"
                 f"5日={ret_5d:+.1%}，連跌{consec}天，波動率={crisis_info.get('vol_ratio_val', 0.0):.1f}x"
-                f"{panic_tag}"
+                f"{panic_tag}{vix_tag}{us_vix_tag}{drop_tag}"
             )
         elif regime == "bear":
             breadth_tag = f"，MA20寬度={breadth_pct:.0%}" if breadth_pct is not None else ""
@@ -1855,6 +2002,8 @@ def _compute_macro_stress_check() -> dict:
             "fast_return_5d": ret_5d,
             "consec_decline_days": consec,
             "vol_ratio": crisis_info.get("vol_ratio_val", 0.0),
+            "vix_val": vix_val,
+            "us_vix_val": us_vix_val,
             "signals": crisis_info.get("signals", {}),
             "summary": summary,
             "breadth_below_ma20_pct": breadth_pct,
@@ -3678,7 +3827,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     def _skip(reason: str) -> None:
         print(f"  >> 跳過（{reason}）")
 
-    # ── Step 0: 宏觀壓力預檢（Macro Stress Check）────────────────
+    # ── Step 0: VIX 同步 + 宏觀壓力預檢（Macro Stress Check）──────
     print(f"\n{'═' * 64}")
     print("  [Step 0] 宏觀壓力預檢（Macro Stress Check）")
     print(f"{'═' * 64}")
@@ -3686,6 +3835,25 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     if dry_run:
         _skip("dry-run")
     else:
+        # 先同步 VIX（失敗不中斷流程）
+        try:
+            from src.data.pipeline import sync_taiwan_vix
+
+            vix_count = sync_taiwan_vix()
+            if vix_count > 0:
+                print(f"  台灣 VIX 同步：{vix_count} 筆")
+        except Exception as e:
+            logging.warning("台灣 VIX 同步失敗（不影響流程）: %s", e)
+
+        try:
+            from src.data.pipeline import sync_us_vix
+
+            us_vix_count = sync_us_vix()
+            if us_vix_count > 0:
+                print(f"  美國 VIX 同步：{us_vix_count} 筆")
+        except Exception as e:
+            logging.warning("美國 VIX 同步失敗（不影響流程）: %s", e)
+
         stress_result = _compute_macro_stress_check()
         regime_now = stress_result.get("regime", "sideways")
         print(f"  市場狀態: {regime_now.upper()}")
@@ -3702,6 +3870,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             sigs = stress_result.get("signals", {})
             if sigs.get("panic_volume"):
                 print("     爆量長黑: ✓（成交量 > 20日均量 × 1.5 且下跌）")
+            if sigs.get("vix_spike"):
+                print(f"     台灣 VIX 飆升: ✓（TW_VIX={stress_result.get('vix_val', 0.0):.1f}）")
+            if sigs.get("us_vix_spike"):
+                print(f"     美國 VIX 飆升: ✓（US_VIX={stress_result.get('us_vix_val', 0.0):.1f}）")
+            if sigs.get("single_day_drop"):
+                print("     單日急跌: ✓（TAIEX 單日跌幅 > 2.5%）")
             print()
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
@@ -3864,6 +4038,7 @@ def main() -> None:
         "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
     )
     sp_bt.add_argument("--attribution", action="store_true", default=False, help="回測結束後計算五因子歸因分析")
+    sp_bt.add_argument("--export-trades", default=None, help="匯出交易明細 CSV 路徑")
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")
@@ -3922,6 +4097,7 @@ def main() -> None:
     sp_wf.add_argument(
         "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
     )
+    sp_wf.add_argument("--export-trades", default=None, help="匯出交易明細 CSV 路徑")
 
     # report 子命令
     sp_report = subparsers.add_parser("report", help="每日選股報告")
@@ -4036,6 +4212,9 @@ def main() -> None:
     sp_hold = subparsers.add_parser("sync-holding", help="同步大戶持股分級資料（週資料）")
     sp_hold.add_argument("--stocks", nargs="+", help="股票代號（預設使用 watchlist）")
     sp_hold.add_argument("--weeks", type=int, default=4, help="同步最近幾週（預設 4）")
+
+    # sync-vix 子命令
+    subparsers.add_parser("sync-vix", help="同步 VIX 波動率指數（台灣 TW_VIX + 美國 US_VIX via yfinance）")
 
     # sync-sbl 子命令
     sp_sbl = subparsers.add_parser("sync-sbl", help="同步全市場借券賣出資料（TWSE TWT96U）")
@@ -4315,6 +4494,8 @@ def main() -> None:
         cmd_sync_features(args)
     elif args.command == "sync-holding":
         cmd_sync_holding(args)
+    elif args.command == "sync-vix":
+        cmd_sync_vix(args)
     elif args.command == "sync-sbl":
         cmd_sync_sbl(args)
     elif args.command == "sync-broker":
