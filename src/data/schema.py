@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-二十三張核心表：
+二十五張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -23,6 +23,8 @@
 - DailyFeature:            每日特徵快取（Feature Store，供 UniverseFilter 使用）
 - ConceptGroup:            概念股分組定義（CoWoS封裝、散熱模組等）
 - ConceptMembership:       概念股成員（多對多，stock_id ↔ concept_name）
+- RotationPortfolio:       輪動組合設定（部位控制系統）
+- RotationPosition:        輪動組合持倉記錄（開/平倉明細）
 """
 
 from datetime import date, datetime
@@ -637,3 +639,69 @@ class ConceptMembership(Base):
 
     def __repr__(self) -> str:
         return f"<ConceptMembership {self.concept_name} {self.stock_id} source={self.source}>"
+
+
+class RotationPortfolio(Base):
+    """輪動組合設定 — 部位控制系統的組合定義。
+
+    每個 portfolio 綁定一種 discover mode（或 'all' 綜合模式），
+    定義最大持股數、固定持有天數、資金規模等參數。
+    透過 CLI `rotation create/update/status/backtest` 管理。
+    """
+
+    __tablename__ = "rotation_portfolio"
+    __table_args__ = (UniqueConstraint("name", name="uq_rotation_portfolio_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)  # momentum/swing/value/dividend/growth/all
+    max_positions: Mapped[int] = mapped_column(Integer, nullable=False)  # 最大持股數 N
+    holding_days: Mapped[int] = mapped_column(Integer, nullable=False)  # 固定持有天數
+    allow_renewal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)  # 到期續持
+    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)  # 初始資金
+    current_capital: Mapped[float] = mapped_column(Float, nullable=False)  # 目前總資產（現金+持倉市值）
+    current_cash: Mapped[float] = mapped_column(Float, nullable=False)  # 目前現金部位
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active/paused
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RotationPortfolio {self.name} mode={self.mode} N={self.max_positions} hold={self.holding_days}d>"
+
+
+class RotationPosition(Base):
+    """輪動組合持倉記錄 — 追蹤每一筆開倉/平倉明細。
+
+    每筆記錄對應一個 portfolio 中的單一持倉，
+    記錄進場/出場資訊、持有天數、損益等。
+    """
+
+    __tablename__ = "rotation_position"
+    __table_args__ = (
+        UniqueConstraint("portfolio_id", "stock_id", "entry_date", name="uq_rotation_position"),
+        Index("ix_rotation_position_portfolio_status", "portfolio_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_id: Mapped[int] = mapped_column(Integer, ForeignKey("rotation_portfolio.id"), nullable=False)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    entry_rank: Mapped[int] = mapped_column(Integer, nullable=False)  # 進場時排名
+    entry_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # composite_score / avg_score
+    holding_days_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 已持有交易日數
+    planned_exit_date: Mapped[date] = mapped_column(Date, nullable=False)  # 預計到期日
+    exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # exit_reason: holding_expired / rank_dropped / stop_loss / renewed / manual
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    allocated_capital: Mapped[float] = mapped_column(Float, nullable=False)  # 配置資金
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)  # 已實現損益
+    return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 報酬率
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open/closed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RotationPosition {self.stock_id} entry={self.entry_date} status={self.status}>"

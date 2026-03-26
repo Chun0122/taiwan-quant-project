@@ -1478,9 +1478,82 @@ python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto
 
 ---
 
+### rotation — 輪動組合部位控制
+
+自動化的部位控制系統，根據 discover 推薦排名管理模擬投資組合。支援等權配置、固定持有天數、排名淘汰、到期續持，以及歷史回測。
+
+**建立組合：**
+
+```bash
+# 單模式：momentum Top-5，持有 3 天，100 萬資金
+python main.py rotation create --name mom5_3d --mode momentum --max-positions 5 --holding-days 3 --capital 1000000
+
+# 綜合模式：discover all 的 avg_score 排名，Top-10，持有 5 天
+python main.py rotation create --name all10_5d --mode all --max-positions 10 --holding-days 5 --capital 2000000
+
+# 停用續持（到期一律賣出再重買）
+python main.py rotation create --name all10_5d --mode all --max-positions 10 --holding-days 5 --capital 2000000 --no-renewal
+```
+
+**每日更新：**
+
+```bash
+python main.py rotation update --name mom5_3d   # 指定組合
+python main.py rotation update --all            # 所有 active 組合
+```
+
+**查看狀態 / 歷史：**
+
+```bash
+python main.py rotation status --name mom5_3d   # 持倉明細 + 未實現損益
+python main.py rotation status --all            # 所有組合概覽
+python main.py rotation history --name mom5_3d --limit 30  # 已平倉交易
+python main.py rotation list                    # 列出所有組合
+```
+
+**歷史回測：**
+
+```bash
+# 從已建立組合讀取參數
+python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12-31
+
+# Ad-hoc 回測（不需先建立組合）
+python main.py rotation backtest --mode momentum --max-positions 5 --holding-days 3 --capital 1000000 --start 2025-01-01 --end 2025-12-31
+```
+
+**管理：**
+
+```bash
+python main.py rotation pause --name mom5_3d    # 暫停每日更新
+python main.py rotation resume --name mom5_3d   # 恢復
+python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
+```
+
+**參數說明（create）：**
+
+| 參數 | 說明 |
+|------|------|
+| `--name` | 組合名稱（唯一，如 mom5_3d） |
+| `--mode` | discover 模式：momentum / swing / value / dividend / growth / all |
+| `--max-positions` | 最大持股數 N（等權配置，每支 1/N 資金） |
+| `--holding-days` | 固定持有天數（到期自動處理） |
+| `--capital` | 初始資金（TWD） |
+| `--no-renewal` | 停用續持（預設啟用：到期時仍在 Top-N 則免賣續持） |
+
+**Rotation 邏輯：**
+
+1. 每日讀取 discover 排名（單模式按 rank，all 模式按 avg_score）
+2. 未到期持倉：不動（不因排名下降提前賣出）
+3. 到期持倉：若仍在 Top-N 且啟用續持 → 延長持有期；否則賣出
+4. 止損：今日收盤 ≤ DiscoveryRecord.stop_loss → 立即賣出（不受持有期限制）
+5. 空位填補：從今日排名由高到低選入（排除已持有 + 今日剛賣出的股票）
+6. 已整合 morning-routine Step 6，每日自動更新
+
+---
+
 ### morning-routine — 每日早晨例行流程
 
-一鍵執行七個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
+一鍵執行八個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
 
 ```bash
 # 完整流程 + Discord 摘要推播
@@ -1507,8 +1580,9 @@ python main.py morning-routine --top 30 --notify
 | Step 3 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
-| Step 6 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
-| Step 7 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
+| Step 6 | `rotation update --all` | 更新所有 active 輪動組合（讀取 discover 排名，執行換股） |
+| Step 7 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
+| Step 8 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
 
 **參數說明：**
 
