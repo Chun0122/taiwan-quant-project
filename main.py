@@ -4070,6 +4070,43 @@ def _print_rotation_backtest(result) -> None:
     print(f"  交易天數:   {metrics.get('trading_days', 0):>8d}")
 
 
+def _check_strategy_decay() -> None:
+    """檢查所有 Discover 模式的策略衰減（供 morning-routine Step 9 呼叫）。"""
+    from src.discovery.performance import check_all_modes_decay
+
+    mode_labels = {
+        "momentum": "Momentum 短線動能",
+        "swing": "Swing 中期波段",
+        "value": "Value 價值修復",
+        "dividend": "Dividend 高息存股",
+        "growth": "Growth 高成長",
+    }
+
+    results = check_all_modes_decay(recent_days=30, holding_days=10)
+    has_decay = False
+
+    for r in results:
+        mode = r.get("mode", "?")
+        label = mode_labels.get(mode, mode)
+        if r["recent_count"] == 0:
+            print(f"  {label}: 近 30 天無足夠推薦績效資料，跳過")
+            continue
+
+        wr = r["recent_win_rate"]
+        avg = r["recent_avg_return"]
+        wr_str = f"{wr:.0%}" if wr is not None else "N/A"
+        avg_str = f"{avg:+.2%}" if avg is not None else "N/A"
+        status = "⚠ 衰減" if r["is_decaying"] else "✓ 正常"
+        print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({r['recent_count']}筆) → {status}")
+
+        if r["is_decaying"]:
+            has_decay = True
+            print(f"    {r['warning']}")
+
+    if not has_decay:
+        print("  所有模式績效正常，無衰減警告。")
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
@@ -4082,6 +4119,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
       Step 6  rotation update     輪動組合每日更新（所有 active portfolio）
       Step 7  revenue-scan        高成長掃描（YoY≥10%，Top 5）
       Step 8  anomaly-scan        籌碼異動掃描
+      Step 9  strategy-decay      策略衰減監控（30天績效趨勢）
       最終     Discord 推播綜合摘要（需加 --notify）
 
     Flags:
@@ -4104,7 +4142,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 8
+    TOTAL = 9
 
     def _step(n: int, title: str) -> None:
         print(f"\n{'═' * 64}")
@@ -4232,6 +4270,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                     notify=False,
                 )
             ),
+        ),
+        (
+            9,
+            "策略衰減監控（30/60/90 天績效趨勢）",
+            {"dry_run"},
+            lambda: _check_strategy_decay(),
         ),
     ]
 

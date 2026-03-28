@@ -6,6 +6,8 @@ from __future__ import annotations
 COMMISSION_RATE = 0.001425  # 手續費 0.1425%
 TAX_RATE = 0.003  # 交易稅 0.3%（賣出時）
 SLIPPAGE_RATE = 0.0005  # 滑價 0.05%
+SLIPPAGE_IMPACT_COEFF = 0.5  # 動態滑價衝擊係數 k（slippage = base + k / sqrt(volume)）
+LIQUIDITY_PARTICIPATION_LIMIT = 0.05  # 流動性約束：單筆交易量 ≤ 當日成交量 × 此比例
 
 # ── DB / ETL ─────────────────────────────────────────────────────────
 UPSERT_BATCH_SIZE = 80  # SQLite 變數上限安全批次大小

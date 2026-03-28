@@ -10,7 +10,12 @@ import numpy as np
 import pandas as pd
 
 from src.backtest.metrics import compute_metrics
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import (
+    COMMISSION_RATE,
+    SLIPPAGE_IMPACT_COEFF,
+    SLIPPAGE_RATE,
+    TAX_RATE,
+)
 from src.strategy.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,9 @@ class BacktestConfig:
     commission_rate: float = COMMISSION_RATE  # 手續費 0.1425%
     tax_rate: float = TAX_RATE  # 交易稅 0.3%（賣出時）
     slippage: float = SLIPPAGE_RATE  # 滑價 0.05%
+    dynamic_slippage: bool = False  # 啟用動態滑價（根據成交量調整）
+    slippage_impact_coeff: float = SLIPPAGE_IMPACT_COEFF  # 動態滑價衝擊係數 k
+    liquidity_limit: float | None = None  # 流動性約束（單筆 ≤ 當日量 × 此比例，None=不限制）
 
 
 @dataclass
@@ -178,7 +186,8 @@ class BacktestEngine:
 
             # --- 執行風險出場 ---
             if risk_exit and position > 0:
-                sell_price = raw_close * (1 - self.config.slippage)
+                daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
+                sell_price = raw_close * (1 - self._get_slippage(daily_volume))
                 revenue = position * sell_price
                 commission = revenue * self.config.commission_rate
                 tax = revenue * self.config.tax_rate
@@ -213,8 +222,11 @@ class BacktestEngine:
             elif not risk_exit:
                 # --- 買入 ---
                 if signal == 1 and position == 0:
-                    buy_price = raw_close * (1 + self.config.slippage)
+                    daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
+                    slip = self._get_slippage(daily_volume)
+                    buy_price = raw_close * (1 + slip)
                     shares = self._calculate_shares(capital, buy_price, data, dt, trades)
+                    shares = self._apply_liquidity_limit(shares, daily_volume)
                     if shares > 0:
                         cost = shares * buy_price + shares * buy_price * self.config.commission_rate
                         capital -= cost
@@ -243,7 +255,8 @@ class BacktestEngine:
 
                 # --- 賣出 ---
                 elif signal == -1 and position > 0:
-                    sell_price = raw_close * (1 - self.config.slippage)
+                    daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
+                    sell_price = raw_close * (1 - self._get_slippage(daily_volume))
                     revenue = position * sell_price
                     commission = revenue * self.config.commission_rate
                     tax = revenue * self.config.tax_rate
@@ -281,7 +294,8 @@ class BacktestEngine:
         # 若回測結束時仍持有部位，以最後收盤價平倉
         if position > 0:
             last_close = data.iloc[-1]["raw_close"] if has_raw else data.iloc[-1]["close"]
-            sell_price = last_close * (1 - self.config.slippage)
+            last_volume = float(data.iloc[-1]["volume"]) if "volume" in data.columns else 0.0
+            sell_price = last_close * (1 - self._get_slippage(last_volume))
             revenue = position * sell_price
             commission = revenue * self.config.commission_rate
             tax = revenue * self.config.tax_rate
@@ -336,6 +350,32 @@ class BacktestEngine:
             trades=trades,
             equity_curve=equity_curve,
         )
+
+    # ------------------------------------------------------------------ #
+    #  動態滑價 & 流動性
+    # ------------------------------------------------------------------ #
+
+    def _get_slippage(self, volume: float) -> float:
+        """計算滑價比率。
+
+        動態模式：slippage = base + k / sqrt(volume)
+        - 大量股（如 2330）：衝擊趨近 base（0.05%）
+        - 小量股（日均萬股級）：衝擊可達 0.3%~0.5%
+        """
+        if not self.config.dynamic_slippage or volume <= 0:
+            return self.config.slippage
+        base = self.config.slippage
+        k = self.config.slippage_impact_coeff
+        return base + k / np.sqrt(volume)
+
+    def _apply_liquidity_limit(self, shares: int, daily_volume: float) -> int:
+        """流動性約束：限制單筆交易量不超過當日成交量的指定比例。"""
+        if self.config.liquidity_limit is None or daily_volume <= 0:
+            return shares
+        max_shares = int(daily_volume * self.config.liquidity_limit)
+        if max_shares < 1:
+            return 0
+        return min(shares, max_shares)
 
     # ------------------------------------------------------------------ #
     #  部位大小計算

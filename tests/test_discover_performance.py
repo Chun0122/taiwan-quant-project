@@ -1,11 +1,11 @@
-"""測試 Discover 推薦績效回測 — DiscoveryPerformance。"""
+"""測試 Discover 推薦績效回測 — DiscoveryPerformance + 策略衰減監控。"""
 
 from datetime import date
 
 import pandas as pd
 
 from src.data.schema import DailyPrice, DiscoveryRecord
-from src.discovery.performance import DiscoveryPerformance
+from src.discovery.performance import DiscoveryPerformance, compute_strategy_decay
 
 
 def _insert_discovery(session, scan_date, mode, rank, stock_id, close, score=0.8, name=None):
@@ -291,3 +291,103 @@ class TestSwingModeHorizons:
             assert 20 in holding_days_in_summary
             assert 40 in holding_days_in_summary
             assert 60 in holding_days_in_summary
+
+
+# ─── 策略衰減監控（純函數測試，不需 DB） ─────────────────────
+
+
+class TestComputeStrategyDecay:
+    """測試 compute_strategy_decay() 純函數。"""
+
+    def _make_detail(self, scan_dates, returns_10d):
+        """建構 detail DataFrame。"""
+        return pd.DataFrame(
+            {
+                "scan_date": scan_dates,
+                "stock_id": [f"S{i:03d}" for i in range(len(scan_dates))],
+                "return_10d": returns_10d,
+            }
+        )
+
+    def test_empty_df_returns_no_decay(self):
+        """空 DataFrame → is_decaying=False, 所有指標 None。"""
+        result = compute_strategy_decay(pd.DataFrame(), holding_days=10)
+        assert result["is_decaying"] is False
+        assert result["recent_count"] == 0
+        assert result["recent_win_rate"] is None
+
+    def test_missing_column_returns_empty(self):
+        """缺少 return_10d 欄位 → 安全回傳。"""
+        df = pd.DataFrame({"scan_date": [date(2025, 3, 1)], "return_5d": [0.05]})
+        result = compute_strategy_decay(df, holding_days=10)
+        assert result["recent_count"] == 0
+
+    def test_all_positive_no_decay(self):
+        """全正報酬 → 不衰減。"""
+        ref = date(2025, 3, 28)
+        # 所有資料都在近 30 天內
+        dates = [date(2025, 3, d) for d in range(1, 11)]
+        returns = [0.05, 0.03, 0.02, 0.04, 0.06, 0.01, 0.03, 0.02, 0.05, 0.04]
+        df = self._make_detail(dates, returns)
+        result = compute_strategy_decay(df, recent_days=30, holding_days=10, reference_date=ref)
+        assert result["is_decaying"] is False
+        assert result["recent_win_rate"] == 1.0
+        assert result["recent_count"] == 10
+
+    def test_low_win_rate_triggers_decay(self):
+        """近期勝率 < 40% → 觸發衰減警告。"""
+        ref = date(2025, 3, 28)
+        dates = [date(2025, 3, d) for d in range(1, 11)]
+        # 3 wins, 7 losses → 30% win rate
+        returns = [0.05, -0.03, -0.02, -0.04, 0.02, -0.01, -0.03, -0.02, 0.01, -0.04]
+        df = self._make_detail(dates, returns)
+        result = compute_strategy_decay(df, recent_days=30, holding_days=10, reference_date=ref)
+        assert result["is_decaying"] is True
+        assert result["warning"] is not None
+        assert "勝率" in result["warning"]
+
+    def test_negative_avg_return_triggers_decay(self):
+        """近期平均報酬 < 0 → 觸發衰減。"""
+        ref = date(2025, 3, 28)
+        dates = [date(2025, 3, d) for d in range(1, 6)]
+        returns = [0.02, -0.10, 0.01, -0.08, 0.03]  # avg < 0
+        df = self._make_detail(dates, returns)
+        result = compute_strategy_decay(df, recent_days=30, holding_days=10, reference_date=ref)
+        assert result["is_decaying"] is True
+        assert "均報酬" in result["warning"]
+
+    def test_recent_vs_historical_split(self):
+        """驗證近期/歷史分割正確。"""
+        ref = date(2025, 3, 28)
+        # 歷史資料（60 天前）
+        hist_dates = [date(2025, 1, d) for d in range(10, 20)]
+        hist_returns = [0.08] * 10  # 歷史很好
+        # 近期資料
+        recent_dates = [date(2025, 3, d) for d in range(1, 11)]
+        recent_returns = [0.01] * 10  # 近期較弱但還正
+
+        df = self._make_detail(hist_dates + recent_dates, hist_returns + recent_returns)
+        result = compute_strategy_decay(df, recent_days=30, holding_days=10, reference_date=ref)
+
+        assert result["recent_count"] == 10
+        assert result["historical_count"] == 10
+        assert result["recent_avg_return"] < result["historical_avg_return"]
+        # 近期雖弱但勝率 100% 且均報酬 > 0 → 不衰減
+        assert result["is_decaying"] is False
+
+    def test_win_rate_decay_calculation(self):
+        """驗證 win_rate_decay 計算（pct points）。"""
+        ref = date(2025, 3, 28)
+        hist_dates = [date(2025, 1, d) for d in range(10, 20)]
+        hist_returns = [0.05, 0.03, -0.01, 0.04, 0.02, 0.06, -0.02, 0.03, 0.01, 0.04]
+        # 歷史勝率 = 8/10 = 80%
+
+        recent_dates = [date(2025, 3, d) for d in range(1, 11)]
+        recent_returns = [0.02, -0.03, -0.01, 0.01, -0.02, 0.03, -0.04, -0.01, 0.02, -0.03]
+        # 近期勝率 = 4/10 = 40%
+
+        df = self._make_detail(hist_dates + recent_dates, hist_returns + recent_returns)
+        result = compute_strategy_decay(df, recent_days=30, holding_days=10, reference_date=ref)
+
+        # win_rate_decay = (40% - 80%) * 100 = -40 pct points
+        assert result["win_rate_decay"] == -40.0

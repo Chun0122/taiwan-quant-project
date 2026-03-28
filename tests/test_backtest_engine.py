@@ -13,7 +13,13 @@ from src.backtest.engine import (
     RiskConfig,
     TradeRecord,
 )
-from src.backtest.metrics import compute_metrics, compute_trade_stats, export_trades, trades_to_dataframe
+from src.backtest.metrics import (
+    compute_metrics,
+    compute_trade_stats,
+    export_trades,
+    monte_carlo_equity,
+    trades_to_dataframe,
+)
 from src.strategy.base import Strategy
 
 
@@ -817,3 +823,185 @@ class TestExportTrades:
         csv_path = str(tmp_path / "empty.csv")
         with pytest.raises(ValueError, match="無交易記錄"):
             export_trades([], csv_path)
+
+
+# ─── A1: 動態滑價模型 ──────────────────────────────────────
+
+
+class TestDynamicSlippage:
+    """測試 BacktestEngine._get_slippage() 動態滑價模型。"""
+
+    def _make_engine_with_dynamic(self, dynamic: bool = True, impact_coeff: float = 0.5):
+        config = BacktestConfig(
+            dynamic_slippage=dynamic,
+            slippage_impact_coeff=impact_coeff,
+        )
+        return _make_engine(pd.DataFrame(), pd.Series(), config=config)
+
+    def test_fixed_slippage_when_disabled(self):
+        """dynamic_slippage=False 時回傳固定滑價。"""
+        engine = self._make_engine_with_dynamic(dynamic=False)
+        assert engine._get_slippage(1_000_000) == BacktestConfig().slippage
+
+    def test_dynamic_higher_for_low_volume(self):
+        """低成交量股票的滑價應高於高成交量。"""
+        engine = self._make_engine_with_dynamic(dynamic=True)
+        slip_low = engine._get_slippage(50_000)  # 小型股
+        slip_high = engine._get_slippage(30_000_000)  # TSMC 級
+        assert slip_low > slip_high
+
+    def test_dynamic_converges_to_base_for_large_volume(self):
+        """超高成交量時滑價應接近 base。"""
+        engine = self._make_engine_with_dynamic(dynamic=True, impact_coeff=0.5)
+        base = BacktestConfig().slippage
+        slip = engine._get_slippage(100_000_000)
+        assert slip == pytest.approx(base, abs=0.0001)
+
+    def test_dynamic_formula_correctness(self):
+        """驗證公式 slippage = base + k / sqrt(volume)。"""
+        import numpy as np
+
+        engine = self._make_engine_with_dynamic(dynamic=True, impact_coeff=0.5)
+        volume = 250_000
+        expected = BacktestConfig().slippage + 0.5 / np.sqrt(volume)
+        assert engine._get_slippage(volume) == pytest.approx(expected, rel=1e-6)
+
+    def test_dynamic_zero_volume_fallback(self):
+        """volume=0 時回傳固定滑價（避免除零）。"""
+        engine = self._make_engine_with_dynamic(dynamic=True)
+        assert engine._get_slippage(0) == BacktestConfig().slippage
+
+    def test_dynamic_slippage_affects_backtest(self):
+        """啟用動態滑價後，低量股的最終資金應低於固定滑價。"""
+        dates = pd.date_range("2024-01-01", periods=10, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 10,
+                "high": [105] * 10,
+                "low": [95] * 10,
+                "close": [100, 102, 104, 106, 108, 110, 108, 106, 104, 102],
+                "volume": [10_000] * 10,  # 低量
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, -1, 0, 0, 0, 0, 0], index=dates)
+
+        # 固定滑價
+        result_fixed = _make_engine(data, signals, config=BacktestConfig(dynamic_slippage=False)).run()
+        # 動態滑價
+        result_dynamic = _make_engine(data, signals, config=BacktestConfig(dynamic_slippage=True)).run()
+
+        # 動態滑價在低量下成本更高 → 最終資金更少
+        assert result_dynamic.final_capital < result_fixed.final_capital
+
+
+# ─── A2: 流動性約束 ──────────────────────────────────────
+
+
+class TestLiquidityLimit:
+    """測試 BacktestEngine._apply_liquidity_limit() 流動性約束。"""
+
+    def _make_engine_with_limit(self, limit: float | None = 0.05):
+        config = BacktestConfig(liquidity_limit=limit)
+        return _make_engine(pd.DataFrame(), pd.Series(), config=config)
+
+    def test_no_limit_returns_original(self):
+        """liquidity_limit=None 時不限制。"""
+        engine = self._make_engine_with_limit(limit=None)
+        assert engine._apply_liquidity_limit(10_000, 100_000) == 10_000
+
+    def test_within_limit_unchanged(self):
+        """交易量在限制內時不調整。"""
+        engine = self._make_engine_with_limit(limit=0.05)
+        # 5% of 1M = 50,000 → 10,000 shares 不超限
+        assert engine._apply_liquidity_limit(10_000, 1_000_000) == 10_000
+
+    def test_exceeds_limit_capped(self):
+        """交易量超出限制時被截斷。"""
+        engine = self._make_engine_with_limit(limit=0.05)
+        # 5% of 100,000 = 5,000 → 10,000 shares 超限
+        assert engine._apply_liquidity_limit(10_000, 100_000) == 5_000
+
+    def test_zero_volume_no_limit(self):
+        """volume=0 時不限制（可能為資料缺失）。"""
+        engine = self._make_engine_with_limit(limit=0.05)
+        assert engine._apply_liquidity_limit(10_000, 0) == 10_000
+
+    def test_liquidity_limit_reduces_position_in_backtest(self):
+        """啟用流動性約束後，低量股的持倉應被限制。"""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 5,
+                "high": [105] * 5,
+                "low": [95] * 5,
+                "close": [100, 105, 110, 105, 100],
+                "volume": [5_000] * 5,  # 極低量
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, -1, 0], index=dates)
+
+        # 無限制
+        result_no_limit = _make_engine(data, signals, config=BacktestConfig(liquidity_limit=None)).run()
+        # 有限制（5% × 5000 = 250 股）
+        result_limited = _make_engine(data, signals, config=BacktestConfig(liquidity_limit=0.05)).run()
+
+        # 有限制時持倉量較小 → 獲利絕對值較小
+        if result_no_limit.trades and result_limited.trades:
+            assert result_limited.trades[0].shares < result_no_limit.trades[0].shares
+
+
+# ─── A3: Monte Carlo 信賴區間 ──────────────────────────────
+
+
+class TestMonteCarlo:
+    """測試 monte_carlo_equity() Bootstrap Resampling。"""
+
+    def test_empty_returns_none(self):
+        """空交易序列 → 所有指標為 None。"""
+        result = monte_carlo_equity([])
+        assert result["total_return_p50"] is None
+        assert result["n_trades"] == 0
+
+    def test_single_trade_returns_none(self):
+        """只有 1 筆交易 → 不足以做 bootstrap。"""
+        result = monte_carlo_equity([5.0])
+        assert result["total_return_p50"] is None
+        assert result["n_trades"] == 1
+
+    def test_positive_trades_positive_median(self):
+        """全正報酬序列 → 中位數報酬應為正。"""
+        returns = [3.0, 5.0, 2.0, 4.0, 6.0, 1.0, 3.5, 2.5]
+        result = monte_carlo_equity(returns, seed=42)
+        assert result["total_return_p50"] is not None
+        assert result["total_return_p50"] > 0
+
+    def test_confidence_interval_ordering(self):
+        """P5 ≤ P50 ≤ P95 對所有指標成立。"""
+        returns = [3.0, -2.0, 5.0, -1.0, 4.0, -3.0, 2.0, 1.0, -0.5, 6.0]
+        result = monte_carlo_equity(returns, seed=42, n_simulations=500)
+        assert result["total_return_p5"] <= result["total_return_p50"] <= result["total_return_p95"]
+        assert result["max_drawdown_p5"] <= result["max_drawdown_p50"] <= result["max_drawdown_p95"]
+        assert result["sharpe_p5"] <= result["sharpe_p50"] <= result["sharpe_p95"]
+
+    def test_deterministic_with_seed(self):
+        """相同 seed → 相同結果（可重現性）。"""
+        returns = [2.0, -1.0, 3.0, -2.0, 4.0]
+        r1 = monte_carlo_equity(returns, seed=123)
+        r2 = monte_carlo_equity(returns, seed=123)
+        assert r1["total_return_p50"] == r2["total_return_p50"]
+        assert r1["max_drawdown_p50"] == r2["max_drawdown_p50"]
+
+    def test_max_drawdown_non_negative(self):
+        """最大回撤應 >= 0。"""
+        returns = [5.0, -3.0, 2.0, -1.0, 4.0]
+        result = monte_carlo_equity(returns, seed=42)
+        assert result["max_drawdown_p5"] >= 0
+        assert result["max_drawdown_p95"] >= 0
+
+    def test_n_simulations_respected(self):
+        """回傳的 n_simulations 應與輸入一致。"""
+        returns = [1.0, 2.0, 3.0]
+        result = monte_carlo_equity(returns, n_simulations=200, seed=42)
+        assert result["n_simulations"] == 200

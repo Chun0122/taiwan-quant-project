@@ -306,8 +306,23 @@ python main.py backtest --stocks 2330 2317 2454 --strategy multi_factor --adjust
 交易成本設定（符合台股實際費率）：
 - 手續費: 0.1425%（買賣各收一次）
 - 交易稅: 0.3%（僅賣出時收取）
-- 滑價: 0.05%
+- 滑價: 0.05%（固定模式）；可啟用動態滑價，根據成交量自動調整（低量股 → 更高滑價）
 - 初始資金: 1,000,000 元
+
+#### 動態滑價 & 流動性約束（Phase A 回測可信度強化）
+
+```python
+# BacktestConfig 新增參數（程式碼層級，非 CLI 旗標）：
+# dynamic_slippage=True  → 滑價 = base + k / √(volume)，低量股滑價更高
+# liquidity_limit=0.05   → 單筆交易量 ≤ 當日成交量 × 5%
+```
+
+| 成交量級 | 固定滑價 | 動態滑價（k=0.5） |
+|----------|----------|-------------------|
+| 3000 萬股（TSMC 級） | 0.05% | ~0.06% |
+| 100 萬股（中型股） | 0.05% | ~0.10% |
+| 5 萬股（小型股） | 0.05% | ~0.27% |
+| 1 萬股（冷門股） | 0.05% | ~0.55% |
 
 #### 風險管理參數
 
@@ -1553,7 +1568,7 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
 
 ### morning-routine — 每日早晨例行流程
 
-一鍵執行八個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
+一鍵執行九個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
 
 ```bash
 # 完整流程 + Discord 摘要推播
@@ -1569,7 +1584,7 @@ python main.py morning-routine --dry-run
 python main.py morning-routine --top 30 --notify
 ```
 
-**八個執行步驟：**
+**九個執行步驟：**
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
@@ -1583,6 +1598,7 @@ python main.py morning-routine --top 30 --notify
 | Step 6 | `rotation update --all` | 更新所有 active 輪動組合（讀取 discover 排名，執行換股） |
 | Step 7 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
 | Step 8 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
+| Step 9 | 策略衰減監控 | 比較五模式近 30 天 vs 歷史勝率/均報酬，衰減時顯示警告（勝率<40% 或均報酬<0） |
 
 **參數說明：**
 

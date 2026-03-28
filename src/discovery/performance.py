@@ -2,11 +2,15 @@
 
 讀取 DiscoveryRecord 歷史推薦，對照 DailyPrice 計算推薦後 N 天的
 實際報酬率，輸出勝率/平均報酬/最大虧損等統計。
+
+包含策略衰減監控（compute_strategy_decay）：比較近期 vs 歷史勝率，
+偵測模式績效衰退。
 """
 
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import date, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -14,6 +18,8 @@ from sqlalchemy import select
 
 from src.data.database import get_session
 from src.data.schema import DailyPrice, DiscoveryRecord
+
+logger = logging.getLogger(__name__)
 
 
 class DiscoveryPerformance:
@@ -311,3 +317,150 @@ def print_performance_report(result: dict, mode: str, start_date=None, end_date=
                 best = f"{row['best_stock']} {row['best_return']:+.1%}"
                 worst = f"{row['worst_stock']} {row['worst_return']:+.1%}"
                 print(f"{row['scan_date']}  {int(row['count']):>5}  {wr:>7}  {avg:>8}  {best:>16}  {worst:>16}")
+
+
+# ------------------------------------------------------------------
+#  策略衰減監控（純函數）
+# ------------------------------------------------------------------
+
+# 衰減警告閾值
+DECAY_WIN_RATE_THRESHOLD = 0.40  # 近期勝率低於 40% 視為衰減
+DECAY_RETURN_THRESHOLD = 0.0  # 近期平均報酬低於 0% 視為衰減
+
+
+def compute_strategy_decay(
+    detail_df: pd.DataFrame,
+    recent_days: int = 30,
+    holding_days: int = 10,
+    reference_date: date | None = None,
+) -> dict:
+    """比較近期 vs 歷史的 Discover 推薦績效，偵測策略衰減。
+
+    純函數：接收 _calc_returns() 的 detail DataFrame，不碰 DB。
+
+    Parameters
+    ----------
+    detail_df : pd.DataFrame
+        含 scan_date, return_{N}d 欄位的推薦績效明細表。
+    recent_days : int
+        「近期」的定義（天數），預設 30。
+    holding_days : int
+        使用哪個持有天數欄位，預設 10。
+    reference_date : date | None
+        基準日期（預設 today），近期 = reference_date - recent_days ~ reference_date。
+
+    Returns
+    -------
+    dict
+        mode, holding_days, recent_days,
+        recent_count, recent_win_rate, recent_avg_return,
+        historical_count, historical_win_rate, historical_avg_return,
+        win_rate_decay (pct points), return_decay (pct points),
+        is_decaying (bool), warning (str | None)
+    """
+    ref = reference_date or date.today()
+    ret_col = f"return_{holding_days}d"
+
+    if ret_col not in detail_df.columns or detail_df.empty:
+        return _empty_decay_result(holding_days, recent_days)
+
+    df = detail_df.copy()
+    df["scan_date"] = pd.to_datetime(df["scan_date"]).dt.date
+
+    cutoff = ref - timedelta(days=recent_days)
+    recent = df[df["scan_date"] >= cutoff][ret_col].dropna()
+    historical = df[df["scan_date"] < cutoff][ret_col].dropna()
+
+    if recent.empty:
+        return _empty_decay_result(holding_days, recent_days)
+
+    recent_wr = float((recent > 0).mean())
+    recent_avg = float(recent.mean())
+
+    # 歷史基線（若無歷史資料，使用全部資料作基線）
+    if historical.empty:
+        hist_wr = recent_wr
+        hist_avg = recent_avg
+        hist_count = 0
+    else:
+        hist_wr = float((historical > 0).mean())
+        hist_avg = float(historical.mean())
+        hist_count = len(historical)
+
+    wr_decay = (recent_wr - hist_wr) * 100  # pct points
+    ret_decay = (recent_avg - hist_avg) * 100  # pct points
+
+    is_decaying = recent_wr < DECAY_WIN_RATE_THRESHOLD or recent_avg < DECAY_RETURN_THRESHOLD
+
+    warning = None
+    if is_decaying:
+        parts = []
+        if recent_wr < DECAY_WIN_RATE_THRESHOLD:
+            parts.append(f"勝率 {recent_wr:.0%} < {DECAY_WIN_RATE_THRESHOLD:.0%}")
+        if recent_avg < DECAY_RETURN_THRESHOLD:
+            parts.append(f"均報酬 {recent_avg:+.2%} < 0")
+        warning = f"近 {recent_days} 天績效衰減：{'、'.join(parts)}"
+
+    return {
+        "holding_days": holding_days,
+        "recent_days": recent_days,
+        "recent_count": len(recent),
+        "recent_win_rate": round(recent_wr, 4),
+        "recent_avg_return": round(recent_avg, 4),
+        "historical_count": hist_count,
+        "historical_win_rate": round(hist_wr, 4),
+        "historical_avg_return": round(hist_avg, 4),
+        "win_rate_decay": round(wr_decay, 2),
+        "return_decay": round(ret_decay, 2),
+        "is_decaying": is_decaying,
+        "warning": warning,
+    }
+
+
+def _empty_decay_result(holding_days: int, recent_days: int) -> dict:
+    return {
+        "holding_days": holding_days,
+        "recent_days": recent_days,
+        "recent_count": 0,
+        "recent_win_rate": None,
+        "recent_avg_return": None,
+        "historical_count": 0,
+        "historical_win_rate": None,
+        "historical_avg_return": None,
+        "win_rate_decay": None,
+        "return_decay": None,
+        "is_decaying": False,
+        "warning": None,
+    }
+
+
+def check_all_modes_decay(
+    modes: list[str] | None = None,
+    recent_days: int = 30,
+    holding_days: int = 10,
+) -> list[dict]:
+    """檢查所有 Discover 模式的策略衰減（DB 版本）。
+
+    Returns
+    -------
+    list[dict]
+        每個模式一個 decay 結果 dict（含 mode 欄位）。
+    """
+    if modes is None:
+        modes = ["momentum", "swing", "value", "dividend", "growth"]
+
+    results = []
+    for mode in modes:
+        perf = DiscoveryPerformance(mode=mode, holding_days=[holding_days])
+        eval_result = perf.evaluate()
+        detail = eval_result.get("detail", pd.DataFrame())
+
+        decay = compute_strategy_decay(
+            detail,
+            recent_days=recent_days,
+            holding_days=holding_days,
+        )
+        decay["mode"] = mode
+        results.append(decay)
+
+    return results

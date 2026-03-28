@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter
 from datetime import date
@@ -15,6 +16,8 @@ from typing import Protocol
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
 #  交易記錄 Protocol（僅要求 pnl 屬性，相容 TradeRecord / PortfolioTradeRecord）
@@ -266,6 +269,100 @@ def compute_trade_stats(trades: list) -> dict:
         "max_consecutive_wins": max_con_win,
         "max_consecutive_losses": max_con_loss,
         "exit_reason_counts": exit_reason_counts,
+    }
+
+
+# ------------------------------------------------------------------
+#  Monte Carlo 模擬（Bootstrap Resampling）
+# ------------------------------------------------------------------
+
+
+def monte_carlo_equity(
+    trade_returns: list[float],
+    initial_capital: float = 1_000_000,
+    n_simulations: int = 1000,
+    seed: int | None = None,
+) -> dict:
+    """對交易報酬序列做 bootstrap resampling，產生績效指標的信賴區間。
+
+    隨機重新排列交易順序 n_simulations 次，每次計算
+    total_return / max_drawdown / sharpe_ratio，
+    回傳各指標的 5th / 50th / 95th percentile。
+
+    Parameters
+    ----------
+    trade_returns : list[float]
+        每筆交易的報酬率（%），例 [5.2, -2.1, 3.0, ...]。
+    initial_capital : float
+        初始資金。
+    n_simulations : int
+        模擬次數（預設 1000）。
+    seed : int | None
+        隨機種子（測試用）。
+
+    Returns
+    -------
+    dict
+        total_return_p5, total_return_p50, total_return_p95,
+        max_drawdown_p5, max_drawdown_p50, max_drawdown_p95,
+        sharpe_p5, sharpe_p50, sharpe_p95,
+        n_simulations, n_trades
+    """
+    if not trade_returns or len(trade_returns) < 2:
+        return {
+            "total_return_p5": None,
+            "total_return_p50": None,
+            "total_return_p95": None,
+            "max_drawdown_p5": None,
+            "max_drawdown_p50": None,
+            "max_drawdown_p95": None,
+            "sharpe_p5": None,
+            "sharpe_p50": None,
+            "sharpe_p95": None,
+            "n_simulations": n_simulations,
+            "n_trades": len(trade_returns),
+        }
+
+    rng = np.random.default_rng(seed)
+    returns_arr = np.array(trade_returns, dtype=np.float64) / 100.0  # % → 比率
+
+    total_returns = np.empty(n_simulations)
+    max_drawdowns = np.empty(n_simulations)
+    sharpe_ratios = np.empty(n_simulations)
+
+    for i in range(n_simulations):
+        # Bootstrap：有放回抽樣，保持交易筆數不變
+        sampled = rng.choice(returns_arr, size=len(returns_arr), replace=True)
+
+        # 建構權益曲線
+        equity = initial_capital * np.cumprod(1 + sampled)
+
+        # Total return
+        total_returns[i] = (equity[-1] / initial_capital - 1) * 100
+
+        # Max drawdown
+        running_max = np.maximum.accumulate(equity)
+        drawdowns = (running_max - equity) / running_max * 100
+        max_drawdowns[i] = float(np.max(drawdowns))
+
+        # Sharpe（以交易報酬的 mean/std 近似，非年化）
+        if np.std(sampled) > 0:
+            sharpe_ratios[i] = float(np.mean(sampled) / np.std(sampled))
+        else:
+            sharpe_ratios[i] = 0.0
+
+    return {
+        "total_return_p5": round(float(np.percentile(total_returns, 5)), 2),
+        "total_return_p50": round(float(np.percentile(total_returns, 50)), 2),
+        "total_return_p95": round(float(np.percentile(total_returns, 95)), 2),
+        "max_drawdown_p5": round(float(np.percentile(max_drawdowns, 5)), 2),
+        "max_drawdown_p50": round(float(np.percentile(max_drawdowns, 50)), 2),
+        "max_drawdown_p95": round(float(np.percentile(max_drawdowns, 95)), 2),
+        "sharpe_p5": round(float(np.percentile(sharpe_ratios, 5)), 4),
+        "sharpe_p50": round(float(np.percentile(sharpe_ratios, 50)), 4),
+        "sharpe_p95": round(float(np.percentile(sharpe_ratios, 95)), 4),
+        "n_simulations": n_simulations,
+        "n_trades": len(trade_returns),
     }
 
 
