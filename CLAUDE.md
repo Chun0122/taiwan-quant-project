@@ -127,7 +127,7 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及持倉
 
 ### 測試
 
-使用 pytest 測試框架，1430 個測試（38 個測試檔）覆蓋核心模組：
+使用 pytest 測試框架，1465 個測試（39 個測試檔）覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -145,7 +145,8 @@ pytest --cov=src --cov-report=term-missing
 | 測試檔                          | 測試對象                                         | 類型                   |
 | ------------------------------- | ------------------------------------------------ | ---------------------- |
 | `tests/test_factors.py`         | `src/screener/factors.py` 8 個篩選因子           | 純函數                 |
-| `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程           | 純函數                 |
+| `tests/test_ml_features.py`     | `src/features/ml_features.py` 特徵工程 + `TestInteractionFeatures`（4 個，C1 交互特徵）+ `TestLagFeatures`（3 個，C1 Lag 特徵）+ `TestSectorRanks`（3 個，C1 跨截面特徵）+ `TestFeatureCount`（1 個）+ `TestSelectFeaturesByImportance`（5 個，C5 特徵篩選）+ `TestComputeShapImportances`（4 個，C5 SHAP 重要性） | 純函數                 |
+| `tests/test_ml_strategy.py`     | `src/strategy/ml_strategy.py` ML 策略純函數：`TestEvaluateTimeSeriesCv`（5 個，C2 時序 CV）+ `TestTuneHyperparameters`（5 個，C3 Optuna 調優）+ `TestComputeShapFeatureImportance`（5 個，C4 SHAP 特徵重要性） | 純函數                 |
 | `tests/test_backtest_engine.py` | `src/backtest/engine.py` 回測計算（含 TestAtrBasedStop ATR-based 止損止利）+ `src/backtest/metrics.py` 共用績效指標（Sortino/Calmar/VaR/CVaR/爆倉防護）+ 交易統計（`TestComputeTradeStats` 7 個 + `TestTradesToDataframe` 4 個 + `TestExportTrades` 2 個）+ `TestDynamicSlippage`（6 個，動態滑價模型）+ `TestLiquidityLimit`（5 個，流動性約束）+ `TestMonteCarlo`（7 個，Bootstrap 信賴區間） | 純函數 + mock Strategy |
 | `tests/test_twse_helpers.py`    | `src/data/twse_fetcher.py` 工具函數              | 純函數                 |
 | `tests/test_scanner.py`         | `src/discovery/scanner.py` 基底+Momentum+Swing+Value+Dividend+Growth 六類掃描 + 產業加成 + `TestComputeTaixRelativeStrength`（6 個）+ `TestApplyCrisisFilter`（4 個）+ `TestCrisisFilterMA60`（4 個）+ `TestRiskFilterEnhancements`（4 個）+ `TestCrisisEntryTriggerText`（3 個）+ `TestDetectDaytradeBrokers`（6 個）+ `TestComputeDaytradePenalty`（7 個）+ `TestComputeInstitutionalPersistence`（8 個）+ `TestDaytradePersistenceDampening`（4 個）+ `TestComputeInstNetBuySlope`（7 個）+ `TestComputeHhiTrend`（6 個）+ `TestApplyChipQualityModifiers`（6 個）+ `TestComputeVolumePriceDivergence`（6 個）+ `TestApplyScoreThreshold`（7 個）+ `TestApplySectorDiversification`（6 個）+ `TestApplyVolumePriceDivergence`（2 個）+ `TestComputeMomentumDecay`（8 個）+ `TestComputeInstitutionalAcceleration`（9 個）+ `TestComputeMultiTimeframeAlignment`（8 個）+ `TestMultiTimeframeForceExclude`（3 個）+ `TestComputeValueWeightedInstFlow`（6 個）+ `TestComputeEarningsQuality`（7 個）+ `TestDrawdownAdjustedTopN`（7 個）+ `TestComputeChipMacd`（7 個）+ `TestWinRateThresholdAdjustment`（6 個）+ `TestComputeFactorIc`（5 個）+ `TestComputeIcWeightAdjustments`（5 個）+ `TestKeyPlayerCostBasis`（6 個）+ `TestAdaptiveAtrMultiplier`（6 個）+ `TestRevenueAccelerationScore`（6 個）+ `TestPeerFundamentalRanking`（5 個）+ `TestComputeMfeMae`（6 個）| 純函數                 |
@@ -232,10 +233,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/entry_exit.py`                 | 進出場建議共用純函數：`REGIME_ATR_PARAMS` 常數（bull/sideways/bear/crisis ATR 倍數）、`compute_atr_stops()` ATR 止損止利、`compute_entry_trigger()` 進場觸發文字、`assess_timing()` 時機評估（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
 | `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB/ADX(14) → EAV 格式；`compute_indicators_from_df()` 寬表純函數（含 adx_14）；`calc_rsi14_from_series()` 純函數；`aggregate_to_weekly()` 純函數（日K聚合週K + 週線 SMA13/RSI14/MACD） |
-| `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）                                                                                 |
+| `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）+ **C1 擴充**：交互特徵（量價共振/RSI×波動率/ADX×動量）、Lag 特徵（5/10/20 日）、跨截面特徵（sector_ranks）+ **C5**：`select_features_by_importance()` SHAP-based 特徵篩選、`compute_shap_importances()` SHAP 重要性計算 |
 | `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()` + 除權息調整（`_apply_dividend_adjustment`）                |
 | `src/strategy/__init__.py`          | `STRATEGY_REGISTRY`（9 個策略）                                                                                   |
-| `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）                                                                     |
+| `src/strategy/ml_strategy.py`       | ML 策略（Random Forest / XGBoost / Logistic）+ **C2** `evaluate_time_series_cv()` TimeSeriesSplit 5-fold CV + **C3** `tune_hyperparameters()` Optuna 超參數調優 + **C4** `compute_shap_feature_importance()` SHAP TreeExplainer/LinearExplainer；MLStrategy 新增 `use_optuna`/`use_shap`/`feature_selection` 參數 |
 | `src/backtest/attribution.py`       | 五因子歸因分析（`FactorAttribution` 類別）：momentum/reversal/quality/size/liquidity 因子暴露 × Pearson 相關係數；`compute(BacktestResultData, data)` + `compute_from_df(trades_df, data)` 雙接口 |
 | `src/backtest/metrics.py`           | 回測績效指標計算共用純函數：`compute_metrics()`（10 個指標+爆倉防護）、`compute_trade_stats()`（持倉天數/連勝連敗/出場原因分佈/勝敗損益分析）、`trades_to_dataframe()`（含 holding_days 計算欄位）、`export_trades()`（CSV 匯出）、**`monte_carlo_equity()`（Bootstrap Resampling 1000 次，產生 total_return/max_drawdown/sharpe 的 P5/P50/P95 信賴區間）**，供 engine/portfolio/walk_forward 統一呼叫 |
 | `src/backtest/engine.py`            | 交易模擬、風險管理、部位控管、除權息股利入帳；**動態滑價**（`_get_slippage()` 根據成交量調整 slippage = base + k/√volume）；**流動性約束**（`_apply_liquidity_limit()` 單筆 ≤ 當日量 × 比例） |

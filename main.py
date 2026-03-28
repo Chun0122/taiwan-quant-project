@@ -399,7 +399,19 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     adj_div = getattr(args, "adjust_dividend", False)
-    strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end, adjust_dividend=adj_div)
+
+    # ML 策略額外參數（Phase C）
+    ml_kwargs: dict = {}
+    if args.strategy.startswith("ml_"):
+        if getattr(args, "shap", False):
+            ml_kwargs["use_shap"] = True
+        if getattr(args, "optuna", False):
+            ml_kwargs["use_optuna"] = True
+        if getattr(args, "feature_selection", False):
+            ml_kwargs["use_shap"] = True
+            ml_kwargs["feature_selection"] = True
+
+    strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end, adjust_dividend=adj_div, **ml_kwargs)
 
     engine = BacktestEngine(strategy, risk_config=risk_config)
     result = engine.run()
@@ -453,6 +465,34 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             _print_attribution(attr)
         else:
             print("  因子歸因：無法取得策略資料")
+
+    # --- SHAP 特徵重要性輸出（Phase C4） ---
+    if getattr(args, "shap", False) and hasattr(strategy, "last_shap_importances"):
+        shap_imp = strategy.last_shap_importances
+        if shap_imp:
+            print("\n  🔍 SHAP 特徵重要性 Top-10:")
+            print(f"  {'排名':<4} {'特徵名稱':<28} {'重要性':>10}")
+            print("  " + "-" * 44)
+            for rank, (feat, imp) in enumerate(list(shap_imp.items())[:10], 1):
+                print(f"  {rank:<4} {feat:<28} {imp:>10.4f}")
+        else:
+            print("\n  🔍 SHAP：無法計算特徵重要性（可能 shap 未安裝或模型不支援）")
+
+    # --- Optuna 調優結果輸出（Phase C3） ---
+    if getattr(args, "optuna", False) and hasattr(strategy, "last_tune_result"):
+        tune = strategy.last_tune_result
+        if tune and tune.get("best_params"):
+            print(f"\n  ⚡ Optuna 調優（{tune['n_trials']} trials）:")
+            print(f"     最佳 CV 分數: {tune['best_score']:.2%}")
+            for k, v in tune["best_params"].items():
+                print(f"     {k}: {v}")
+
+    # --- CV 結果輸出（Phase C2） ---
+    if hasattr(strategy, "last_cv_result") and strategy.last_cv_result:
+        cv = strategy.last_cv_result
+        if cv["n_splits"] > 0:
+            print(f"\n  📊 TimeSeriesSplit CV ({cv['n_splits']}-fold):")
+            print(f"     平均準確率: {cv['mean_accuracy']:.2%} ± {cv['std_accuracy']:.2%}")
 
 
 def cmd_dashboard() -> None:
@@ -4371,6 +4411,11 @@ def main() -> None:
     )
     sp_bt.add_argument("--attribution", action="store_true", default=False, help="回測結束後計算五因子歸因分析")
     sp_bt.add_argument("--export-trades", default=None, help="匯出交易明細 CSV 路徑")
+    sp_bt.add_argument("--shap", action="store_true", default=False, help="ML 策略回測時輸出 SHAP 特徵重要性 Top-10")
+    sp_bt.add_argument("--optuna", action="store_true", default=False, help="ML 策略啟用 Optuna 超參數調優")
+    sp_bt.add_argument(
+        "--feature-selection", action="store_true", default=False, help="ML 策略啟用 SHAP 特徵篩選（需搭配 --shap）"
+    )
 
     # dashboard 子命令
     subparsers.add_parser("dashboard", help="啟動視覺化儀表板")

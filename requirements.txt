@@ -33,6 +33,8 @@ schedule>=1.2.0
 # Machine Learning (P7)
 scikit-learn>=1.3.0
 xgboost>=2.0.0  # 可選，未安裝時 fallback 到 Random Forest
+optuna>=3.5.0  # 超參數調優（Phase C3）
+shap>=0.44.0  # 特徵重要性解釋（Phase C4/C5）
 
 # Claude AI (P30)
 anthropic>=0.40.0

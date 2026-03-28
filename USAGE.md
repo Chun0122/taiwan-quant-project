@@ -274,14 +274,30 @@ python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades
 
 多因子策略綜合 RSI、MACD、法人動向、營收成長四大因子，加權計算後產生訊號。
 
-ML 策略使用機器學習模型預測未來 N 天漲跌，自動建構 15+ 技術特徵（動量、均線比率、波動率、成交量比率、布林位置等），依訓練比例分割歷史資料進行訓練與測試。XGBoost 未安裝時自動 fallback 到 Random Forest。
+ML 策略使用機器學習模型預測未來 N 天漲跌，自動建構 25+ 技術特徵（動量、均線比率、波動率、成交量比率、布林位置、交互特徵、Lag 特徵等），依訓練比例分割歷史資料進行訓練與測試。XGBoost 未安裝時自動 fallback 到 Random Forest。
 
 ```bash
 # ML 策略回測
 python main.py backtest --stock 2330 --strategy ml_random_forest
 python main.py backtest --stock 2330 --strategy ml_xgboost
 python main.py backtest --stock 2330 --strategy ml_logistic
+
+# Phase C 增強功能
+python main.py backtest --stock 2330 --strategy ml_random_forest --shap              # SHAP 特徵重要性 Top-10
+python main.py backtest --stock 2330 --strategy ml_random_forest --optuna            # Optuna 超參數調優
+python main.py backtest --stock 2330 --strategy ml_random_forest --shap --feature-selection  # SHAP 篩選 + 重新訓練
+python main.py backtest --stock 2330 --strategy ml_random_forest --shap --optuna     # 組合使用
 ```
+
+**Phase C ML 增強參數：**
+
+| 參數 | 說明 |
+|------|------|
+| `--shap` | 使用 SHAP TreeExplainer 輸出特徵重要性排名 Top-10 |
+| `--optuna` | 使用 Optuna 進行超參數調優（30 trials，TimeSeriesSplit 3-fold） |
+| `--feature-selection` | 基於 SHAP 篩選特徵（移除 bottom 20%），需搭配 `--shap` |
+
+所有 ML 策略均自動執行 TimeSeriesSplit 5-fold 交叉驗證，並輸出平均準確率 ± 標準差。
 
 #### 除權息還原回測
 
