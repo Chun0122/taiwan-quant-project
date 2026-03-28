@@ -17,9 +17,11 @@ from src.portfolio.rotation import (
     compute_correlation_matrix,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
+    compute_portfolio_heat,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
+    compute_single_trade_risk,
     compute_vol_inverse_weights,
     count_trading_days_held,
     find_high_correlation_pairs,
@@ -902,3 +904,353 @@ class TestPortfolioDrawdown:
 
     def test_single_point(self):
         assert compute_portfolio_drawdown([100]) == 0.0
+
+
+# ===========================================================================
+# Portfolio Heat（組合風險預算）
+# ===========================================================================
+
+
+class TestPortfolioHeat:
+    """測試 compute_portfolio_heat() 純函數。"""
+
+    def test_no_positions_zero_heat(self):
+        """無持倉 → heat = 0。"""
+        assert compute_portfolio_heat([], {}, {}, 1_000_000) == 0.0
+
+    def test_with_stop_loss(self):
+        """有停損 → heat = (price - sl) × shares / capital。"""
+        positions = [_make_position("A", date(2025, 1, 6), entry_price=100, shares=1000)]
+        heat = compute_portfolio_heat(
+            positions,
+            stop_losses={"A": 95.0},
+            today_prices={"A": 100.0},
+            total_capital=1_000_000,
+        )
+        # risk = (100 - 95) × 1000 = 5000；heat = 5000 / 1_000_000 = 0.005
+        assert abs(heat - 0.005) < 0.001
+
+    def test_without_stop_loss_uses_cap(self):
+        """無停損 → 以 allocated_capital × risk_cap 估算。"""
+        positions = [_make_position("A", date(2025, 1, 6), entry_price=100, shares=1000, allocated_capital=100_000)]
+        heat = compute_portfolio_heat(
+            positions,
+            stop_losses={},
+            today_prices={"A": 100.0},
+            total_capital=1_000_000,
+            per_position_risk_cap=0.03,
+        )
+        # risk = 100_000 × 0.03 = 3000；heat = 3000 / 1_000_000 = 0.003
+        assert abs(heat - 0.003) < 0.001
+
+    def test_multiple_positions(self):
+        """多筆持倉累加風險。"""
+        positions = [
+            _make_position("A", date(2025, 1, 6), entry_price=100, shares=1000),
+            _make_position("B", date(2025, 1, 6), entry_price=200, shares=500),
+        ]
+        heat = compute_portfolio_heat(
+            positions,
+            stop_losses={"A": 95.0, "B": 190.0},
+            today_prices={"A": 100.0, "B": 200.0},
+            total_capital=1_000_000,
+        )
+        # A: (100-95)×1000=5000, B: (200-190)×500=5000 → total 10000 / 1M = 0.01
+        assert abs(heat - 0.01) < 0.001
+
+    def test_zero_capital(self):
+        """total_capital=0 → heat=0 防護。"""
+        positions = [_make_position("A", date(2025, 1, 6))]
+        assert compute_portfolio_heat(positions, {"A": 90.0}, {"A": 100.0}, 0) == 0.0
+
+    def test_price_below_stop_no_negative_risk(self):
+        """現價已低於停損 → 風險為 0（max(0, ...)）。"""
+        positions = [_make_position("A", date(2025, 1, 6), entry_price=100, shares=1000)]
+        heat = compute_portfolio_heat(
+            positions,
+            stop_losses={"A": 95.0},
+            today_prices={"A": 90.0},  # 已跌破停損
+            total_capital=1_000_000,
+        )
+        assert heat == 0.0
+
+
+class TestSingleTradeRisk:
+    """測試 compute_single_trade_risk() 純函數。"""
+
+    def test_with_stop_loss(self):
+        risk = compute_single_trade_risk(100.0, 95.0, 1000, 1_000_000)
+        assert abs(risk - 0.005) < 0.001
+
+    def test_without_stop_loss(self):
+        risk = compute_single_trade_risk(100.0, None, 1000, 1_000_000, allocated_capital=100_000)
+        assert abs(risk - 0.003) < 0.001  # 100_000 × 0.03 / 1_000_000
+
+    def test_zero_capital(self):
+        assert compute_single_trade_risk(100.0, 95.0, 1000, 0) == 0.0
+
+
+class TestPortfolioHeatIntegration:
+    """測試 Portfolio Heat 整合進 compute_rotation_actions()。"""
+
+    def test_heat_blocks_when_exceeded(self):
+        """heat 已超過上限 → 拒絕新開倉。"""
+        # 已持有一筆高風險持倉，heat 接近上限
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100, shares=10000, allocated_capital=1_000_000)
+        rankings = _make_rankings([("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            stop_losses={"A": 85.0},  # (100-85)×10000=150000, heat=150000/1M=0.15 > 0.12
+            today_prices={"A": 100.0, "B": 100.0},
+            total_capital=1_000_000,
+            max_heat=0.12,
+        )
+        # heat 已 0.15 > 0.12，新倉應被拒
+        assert len(actions.to_buy) == 0
+
+    def test_heat_allows_when_budget_remaining(self):
+        """heat 低於上限 → 正常開倉。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100, shares=1000, allocated_capital=100_000)
+        rankings = _make_rankings([("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            stop_losses={"A": 95.0},  # (100-95)×1000=5000, heat=0.005 << 0.12
+            today_prices={"A": 100.0, "B": 100.0},
+            total_capital=1_000_000,
+            max_heat=0.12,
+        )
+        assert len(actions.to_buy) == 1
+
+    def test_heat_disabled_when_no_total_capital(self):
+        """total_capital=None → heat 檢查停用，正常開倉。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            total_capital=None,  # 停用
+        )
+        assert len(actions.to_buy) == 1
+
+
+# ===========================================================================
+# Correlation Budget（相關性決策化）
+# ===========================================================================
+
+
+class TestCorrelationBudget:
+    """測試 Correlation Budget 整合進 compute_rotation_actions()。"""
+
+    def test_no_corr_matrix_no_effect(self):
+        """未提供 corr_matrix → 不影響開倉。"""
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=None,
+        )
+        assert len(actions.to_buy) == 2
+
+    def test_low_correlation_no_penalty(self):
+        """候選與持倉低相關 → 正常開倉金額。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100)
+        rankings = _make_rankings([("B", 100)])
+        # 低相關矩陣
+        corr = pd.DataFrame({"A": {"A": 1.0, "B": 0.3}, "B": {"A": 0.3, "B": 1.0}})
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=corr,
+            corr_threshold=0.7,
+        )
+        assert len(actions.to_buy) == 1
+        # 低相關不 penalty → 正常金額
+        assert actions.to_buy[0]["allocated_capital"] > 50_000
+
+    def test_high_correlation_reduces_position(self):
+        """候選與持倉高相關 → 部位減半。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100)
+        rankings = _make_rankings([("B", 100)])
+        # 高相關矩陣
+        corr = pd.DataFrame({"A": {"A": 1.0, "B": 0.9}, "B": {"A": 0.9, "B": 1.0}})
+        actions_no_corr = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=None,
+        )
+        actions_with_corr = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=corr,
+            corr_threshold=0.7,
+            corr_penalty=0.5,
+        )
+        assert len(actions_with_corr.to_buy) == 1
+        # 高相關 penalty → 部位應更小
+        if actions_no_corr.to_buy:
+            assert actions_with_corr.to_buy[0]["shares"] < actions_no_corr.to_buy[0]["shares"]
+
+    def test_only_one_penalty_applied(self):
+        """候選與多檔持倉都高相關 → 只觸發一次 penalty（break）。"""
+        positions = [
+            _make_position("A", date(2025, 1, 6), entry_price=100),
+            _make_position("B", date(2025, 1, 6), entry_price=100),
+        ]
+        rankings = _make_rankings([("C", 100)])
+        # C 與 A、B 都高相關
+        corr = pd.DataFrame(
+            {
+                "A": {"A": 1.0, "B": 0.5, "C": 0.9},
+                "B": {"A": 0.5, "B": 1.0, "C": 0.85},
+                "C": {"A": 0.9, "B": 0.85, "C": 1.0},
+            }
+        )
+        actions = compute_rotation_actions(
+            current_positions=positions,
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=corr,
+            corr_threshold=0.7,
+            corr_penalty=0.5,
+        )
+        assert len(actions.to_buy) == 1
+        # penalty 只 ×0.5 一次，不是 ×0.5×0.5
+
+    def test_empty_corr_matrix_no_effect(self):
+        """空矩陣 → 不影響。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=pd.DataFrame(),
+        )
+        assert len(actions.to_buy) == 1
+
+
+# ===========================================================================
+# Crisis 硬阻擋
+# ===========================================================================
+
+
+class TestCrisisBlock:
+    """測試 regime='crisis' 硬阻擋新開倉。"""
+
+    def test_regime_none_no_block(self):
+        """regime=None → 不影響。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime=None,
+        )
+        assert len(actions.to_buy) == 1
+
+    def test_regime_bull_no_block(self):
+        """regime='bull' → 不影響。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime="bull",
+        )
+        assert len(actions.to_buy) == 1
+
+    def test_crisis_blocks_new_buys(self):
+        """regime='crisis' + crisis_block_new=True → to_buy 為空。"""
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime="crisis",
+            crisis_block_new=True,
+        )
+        assert len(actions.to_buy) == 0
+
+    def test_crisis_block_disabled(self):
+        """regime='crisis' + crisis_block_new=False → 正常開倉。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime="crisis",
+            crisis_block_new=False,
+        )
+        assert len(actions.to_buy) == 1

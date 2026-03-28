@@ -23,6 +23,7 @@ from src.data.schema import (
 )
 from src.portfolio.rotation import (
     RotationActions,
+    compute_correlation_matrix,
     compute_planned_exit_date,
     compute_position_pnl,
     compute_rotation_actions,
@@ -236,8 +237,17 @@ class RotationManager:
 
     # ── 每日更新 ──
 
-    def update(self, today: date | None = None) -> RotationActions | None:
-        """每日更新：讀取 discover 排名 → 計算 rotation → 寫入 DB。"""
+    def update(self, today: date | None = None, regime: str | None = None) -> RotationActions | None:
+        """每日更新：讀取 discover 排名 → 計算 rotation → 寫入 DB。
+
+        Parameters
+        ----------
+        today : date | None
+            今日日期，預設 date.today()。
+        regime : str | None
+            目前市場狀態（bull/sideways/bear/crisis），用於 Crisis 硬阻擋。
+            None 時嘗試從 RegimeStateMachine JSON 持久化讀取。
+        """
         if today is None:
             today = date.today()
 
@@ -273,6 +283,47 @@ class RotationManager:
             # 止損價
             stop_losses = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
 
+            # ── Regime fallback：嘗試從 JSON 持久化讀取 ──
+            if regime is None:
+                try:
+                    from src.regime.detector import RegimeStateMachine
+
+                    rsm = RegimeStateMachine()
+                    if rsm._state.get("current_regime"):
+                        regime = rsm._state["current_regime"]
+                        logger.info("從 RegimeStateMachine 讀取 regime=%s", regime)
+                except Exception:
+                    pass  # 無持久化資料時 regime 維持 None
+
+            # ── Correlation Budget：計算持倉+候選相關性矩陣 ──
+            corr_matrix = None
+            held_sids = [p["stock_id"] for p in open_positions]
+            candidate_sids = [r["stock_id"] for r in rankings[: portfolio.max_positions]]
+            corr_sids = list(set(held_sids + candidate_sids))
+            if len(corr_sids) >= 2:
+                from datetime import timedelta
+
+                price_start = today - timedelta(days=90)
+                stmt_prices = (
+                    select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+                    .where(
+                        DailyPrice.stock_id.in_(corr_sids),
+                        DailyPrice.date >= price_start,
+                        DailyPrice.date <= today,
+                    )
+                    .order_by(DailyPrice.date)
+                )
+                price_rows = session.execute(stmt_prices).all()
+                if price_rows:
+                    price_data: dict[str, pd.Series] = {}
+                    for sid in corr_sids:
+                        sid_rows = [(r[1], r[2]) for r in price_rows if r[0] == sid]
+                        if sid_rows:
+                            dates_list, prices_list = zip(*sid_rows)
+                            price_data[sid] = pd.Series(prices_list, index=pd.DatetimeIndex(dates_list))
+                    if len(price_data) >= 2:
+                        corr_matrix = compute_correlation_matrix(price_data, window=60)
+
             # 計算 rotation
             actions = compute_rotation_actions(
                 current_positions=open_positions,
@@ -285,6 +336,9 @@ class RotationManager:
                 current_cash=portfolio.current_cash,
                 stop_losses=stop_losses,
                 today_prices=today_prices,
+                total_capital=portfolio.current_capital,
+                corr_matrix=corr_matrix,
+                regime=regime,
             )
 
             # 執行賣出

@@ -70,12 +70,22 @@ class ScoreThresholdConfig(BaseModel):
     crisis: float = 0.60
 
 
+class RiskBudgetConfig(BaseModel):
+    """組合風險預算參數（Portfolio Heat + Correlation Budget）。"""
+
+    max_heat: float = 0.12  # 組合最大風險上限（0.12 = 12%）
+    per_position_risk_cap: float = 0.03  # 單筆最大風險估算（無停損時）
+    correlation_threshold: float = 0.7  # 高相關判定門檻
+    correlation_penalty: float = 0.5  # 高相關時部位縮減比例
+
+
 class QuantConfig(BaseModel):
     """量化參數外部化（D2）— 可在 settings.yaml 的 quant 區塊覆蓋預設值。"""
 
     trading_cost: TradingCostConfig = TradingCostConfig()
     atr_multiplier: AtrMultiplierConfig = AtrMultiplierConfig()
     score_threshold: ScoreThresholdConfig = ScoreThresholdConfig()
+    risk_budget: RiskBudgetConfig = RiskBudgetConfig()
 
 
 class Settings(BaseModel):

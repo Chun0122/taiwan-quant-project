@@ -141,6 +141,12 @@ class BacktestEngine:
             raw_close = data.loc[dt, "raw_close"] if has_raw else close
             raw_high = data.loc[dt, "raw_high"] if has_raw else high
             raw_low = data.loc[dt, "raw_low"] if has_raw else low
+            # 開盤價用於跳空停損/停利的成交價修正
+            raw_open = (
+                data.loc[dt, "raw_open"]
+                if "raw_open" in data.columns
+                else (data.loc[dt, "open"] if "open" in data.columns else raw_close)
+            )
             signal = signals.get(dt, 0)
 
             # --- 除權息處理（持倉中才處理） ---
@@ -168,13 +174,15 @@ class BacktestEngine:
                 if current_stop_price is not None and raw_low <= current_stop_price:
                     risk_exit = True
                     exit_reason = "stop_loss"
-                    raw_close = min(raw_close, current_stop_price)
+                    # 跳空開低 → 用開盤價（更真實）；正常觸停損 → 用停損價
+                    raw_close = min(raw_open, current_stop_price)
 
                 # 2. 停利檢查（使用進場時已計算並固定的目標價）
                 if not risk_exit and current_target_price is not None and raw_high >= current_target_price:
                     risk_exit = True
                     exit_reason = "take_profit"
-                    raw_close = max(raw_close, current_target_price)
+                    # 跳空開高 → 用開盤價（更真實）；正常觸停利 → 用目標價
+                    raw_close = max(raw_open, current_target_price)
 
                 # 3. 移動停損檢查
                 if not risk_exit and self.risk_config.trailing_stop_pct is not None:
@@ -182,7 +190,8 @@ class BacktestEngine:
                     if raw_low <= trail_price:
                         risk_exit = True
                         exit_reason = "trailing_stop"
-                        raw_close = min(raw_close, trail_price)
+                        # 跳空開低 → 用開盤價
+                        raw_close = min(raw_open, trail_price)
 
             # --- 執行風險出場 ---
             if risk_exit and position > 0:

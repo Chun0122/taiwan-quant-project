@@ -31,3 +31,11 @@ CRISIS_SINGLE_DAY_DROP: float = -0.025  # TAIEX 單日跌幅門檻 (-2.5%)
 US_VIX_STOCK_ID: str = "US_VIX"  # DailyPrice 中的 stock_id（美國 VIX）
 CRISIS_US_VIX_LEVEL: float = 30.0  # 美國 VIX 絕對值門檻
 CRISIS_US_VIX_DAILY_CHANGE: float = 0.25  # 美國 VIX 單日漲幅門檻 (25%)
+
+# ── 組合風險預算（Portfolio Heat）─────────────────────────────────────
+MAX_PORTFOLIO_HEAT: float = 0.12  # 組合最大風險上限 12%
+PER_POSITION_RISK_CAP: float = 0.03  # 單筆最大風險估算上限 3%（無停損時使用）
+
+# ── 相關性預算（Correlation Budget）──────────────────────────────────
+CORRELATION_THRESHOLD: float = 0.7  # 高相關判定門檻
+CORRELATION_PENALTY: float = 0.5  # 高相關時部位縮減比例

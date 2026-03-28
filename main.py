@@ -2996,8 +2996,14 @@ def _watch_update_status() -> None:
     print(f"\n更新完成：{len(active_entries)} 筆持倉，{trailing_msg}觸發狀態變更 {updated} 筆。\n")
 
 
-def _rotation_update_all() -> None:
-    """更新所有 active 的輪動組合（供 morning-routine 呼叫）。"""
+def _rotation_update_all(regime: str | None = None) -> None:
+    """更新所有 active 的輪動組合（供 morning-routine 呼叫）。
+
+    Parameters
+    ----------
+    regime : str | None
+        目前市場狀態，傳遞給 RotationManager.update() 用於 Crisis 硬阻擋。
+    """
     from src.portfolio.manager import RotationManager
 
     portfolios = RotationManager.list_portfolios()
@@ -3008,7 +3014,7 @@ def _rotation_update_all() -> None:
     for p in active:
         print(f"\n  ── 更新 [{p['name']}] ({p['mode']}, N={p['max_positions']}, {p['holding_days']}d) ──")
         mgr = RotationManager(p["name"])
-        actions = mgr.update()
+        actions = mgr.update(regime=regime)
         if actions:
             sold = len(actions.to_sell)
             bought = len(actions.to_buy)
@@ -4002,6 +4008,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     print("  [Step 0] 宏觀壓力預檢（Macro Stress Check）")
     print(f"{'═' * 64}")
     stress_result: dict = {}
+    regime_now: str = "sideways"  # 預設值（dry-run 或 Step 0 異常時使用）
     if dry_run:
         _skip("dry-run")
     else:
@@ -4129,7 +4136,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             lambda: cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False)),
         ),
         (11, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
-        (12, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all()),
+        (12, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all(regime=regime_now)),
         (
             13,
             "高成長掃描（revenue-scan --min-yoy 10 --top 5）",

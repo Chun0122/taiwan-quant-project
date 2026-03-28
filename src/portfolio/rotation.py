@@ -13,7 +13,15 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import (
+    COMMISSION_RATE,
+    CORRELATION_PENALTY,
+    CORRELATION_THRESHOLD,
+    MAX_PORTFOLIO_HEAT,
+    PER_POSITION_RISK_CAP,
+    SLIPPAGE_RATE,
+    TAX_RATE,
+)
 
 # ---------------------------------------------------------------------------
 # 資料結構
@@ -141,6 +149,88 @@ def compute_shares(capital: float, price: float) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 組合風險預算（Portfolio Heat）
+# ---------------------------------------------------------------------------
+
+
+def compute_portfolio_heat(
+    current_positions: list[dict],
+    stop_losses: dict[str, float] | None,
+    today_prices: dict[str, float] | None,
+    total_capital: float,
+    per_position_risk_cap: float = PER_POSITION_RISK_CAP,
+) -> float:
+    """計算當前組合風險百分比（Portfolio Heat）。
+
+    heat = Σ max(0, (current_price - stop_loss) × shares) / total_capital
+
+    若某筆持倉無 stop_loss，以 allocated_capital × per_position_risk_cap 估算。
+
+    Parameters
+    ----------
+    current_positions : list[dict]
+        目前 open 持倉，每筆含 stock_id, shares, allocated_capital, entry_price。
+    stop_losses : dict[str, float] | None
+        各股票的止損價 {stock_id: stop_loss_price}。
+    today_prices : dict[str, float] | None
+        今日各股收盤價 {stock_id: close}。
+    total_capital : float
+        組合總資本（current_capital）。
+    per_position_risk_cap : float
+        無停損時的單筆風險估算比例（預設 3%）。
+
+    Returns
+    -------
+    float
+        組合風險百分比（0.0~1.0），如 0.08 表示 8%。
+    """
+    if total_capital <= 0 or not current_positions:
+        return 0.0
+
+    stop_losses = stop_losses or {}
+    today_prices = today_prices or {}
+    total_risk = 0.0
+
+    for pos in current_positions:
+        sid = pos["stock_id"]
+        shares = pos.get("shares", 0)
+        price = today_prices.get(sid, pos.get("entry_price", 0))
+        sl = stop_losses.get(sid)
+
+        if sl is not None and price > 0 and shares > 0:
+            # 有停損價：風險 = (現價 - 停損價) × 股數
+            risk = max(0.0, (price - sl) * shares)
+        else:
+            # 無停損價：以 allocated_capital × risk_cap 估算
+            alloc = pos.get("allocated_capital", 0)
+            risk = alloc * per_position_risk_cap
+
+        total_risk += risk
+
+    return total_risk / total_capital
+
+
+def compute_single_trade_risk(
+    entry_price: float,
+    stop_loss: float | None,
+    shares: int,
+    total_capital: float,
+    per_position_risk_cap: float = PER_POSITION_RISK_CAP,
+    allocated_capital: float = 0.0,
+) -> float:
+    """計算單筆新交易的風險百分比。"""
+    if total_capital <= 0 or shares <= 0:
+        return 0.0
+
+    if stop_loss is not None and entry_price > 0:
+        risk = max(0.0, (entry_price - stop_loss) * shares)
+    else:
+        risk = allocated_capital * per_position_risk_cap
+
+    return risk / total_capital
+
+
+# ---------------------------------------------------------------------------
 # 核心 Rotation 演算法
 # ---------------------------------------------------------------------------
 
@@ -161,6 +251,17 @@ def compute_rotation_actions(
     drawdown_pct: float | None = None,
     drawdown_half_threshold: float = 10.0,
     drawdown_stop_threshold: float = 15.0,
+    # Portfolio Heat 風險預算
+    max_heat: float = MAX_PORTFOLIO_HEAT,
+    per_position_risk_cap: float = PER_POSITION_RISK_CAP,
+    total_capital: float | None = None,
+    # Correlation Budget 相關性預算
+    corr_matrix: pd.DataFrame | None = None,
+    corr_threshold: float = CORRELATION_THRESHOLD,
+    corr_penalty: float = CORRELATION_PENALTY,
+    # Regime 硬阻擋
+    regime: str | None = None,
+    crisis_block_new: bool = True,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -198,6 +299,22 @@ def compute_rotation_actions(
         回撤達此閾值（%）時新開倉減半（預設 10.0）。
     drawdown_stop_threshold : float
         回撤達此閾值（%）時停止新開倉（預設 15.0）。
+    max_heat : float
+        組合最大風險上限（預設 0.12 = 12%），超過時拒絕新開倉。
+    per_position_risk_cap : float
+        單筆風險估算上限（預設 0.03 = 3%），無停損時使用。
+    total_capital : float | None
+        組合總資本，用於 Portfolio Heat 計算。None 時停用 Heat 檢查。
+    corr_matrix : pd.DataFrame | None
+        持倉相關性矩陣，用於 Correlation Budget。None 時停用。
+    corr_threshold : float
+        高相關判定門檻（預設 0.7）。
+    corr_penalty : float
+        高相關時部位縮減比例（預設 0.5 = 減半）。
+    regime : str | None
+        目前市場狀態（bull/sideways/bear/crisis），用於 Crisis 硬阻擋。
+    crisis_block_new : bool
+        crisis 時是否阻擋所有新開倉（預設 True）。
 
     Returns
     -------
@@ -277,13 +394,17 @@ def compute_rotation_actions(
             )
             remaining_open.append(pos)
 
-    # ── Drawdown Guard：回撤嚴重時限制新開倉 ──
-    drawdown_scale = 1.0  # 新開倉資金倍數
-    if drawdown_pct is not None:
-        if drawdown_pct >= drawdown_stop_threshold:
-            drawdown_scale = 0.0  # 停止新開倉
-        elif drawdown_pct >= drawdown_half_threshold:
-            drawdown_scale = 0.5  # 新開倉減半
+    # ── Crisis 硬阻擋：crisis 時直接停止新開倉 ──
+    if regime == "crisis" and crisis_block_new:
+        drawdown_scale = 0.0
+    else:
+        # ── Drawdown Guard：回撤嚴重時限制新開倉 ──
+        drawdown_scale = 1.0  # 新開倉資金倍數
+        if drawdown_pct is not None:
+            if drawdown_pct >= drawdown_stop_threshold:
+                drawdown_scale = 0.0  # 停止新開倉
+            elif drawdown_pct >= drawdown_half_threshold:
+                drawdown_scale = 0.5  # 新開倉減半
 
     # ── 計算空位並填補 ──
     free_slots = max_positions - len(remaining_open)
@@ -298,6 +419,14 @@ def compute_rotation_actions(
 
         per_position_capital = available_cash / max_positions if max_positions > 0 else 0
         per_position_capital *= drawdown_scale  # Drawdown Guard 縮減
+
+        # ── Portfolio Heat：計算當前組合風險 ──
+        current_heat = 0.0
+        heat_enabled = total_capital is not None and total_capital > 0
+        if heat_enabled:
+            current_heat = compute_portfolio_heat(
+                remaining_open, stop_losses, today_prices, total_capital, per_position_risk_cap
+            )
 
         # 建構已持有的產業分佈（用於集中度檢查）
         sector_counts: dict[str, int] = {}
@@ -325,9 +454,69 @@ def compute_rotation_actions(
                 if candidate_sector and sector_counts.get(candidate_sector, 0) >= max_sector_count:
                     continue  # 同產業已達上限，跳過
 
-            shares = compute_shares(per_position_capital, price)
+            # ── Correlation Budget：高相關持倉縮減部位 ──
+            adj_capital = per_position_capital
+            if corr_matrix is not None and not corr_matrix.empty:
+                for existing_pos in remaining_open:
+                    esid = existing_pos["stock_id"]
+                    if esid in corr_matrix.columns and sid in corr_matrix.columns and esid != sid:
+                        corr_val = corr_matrix.loc[esid, sid]
+                        if not np.isnan(corr_val) and abs(corr_val) >= corr_threshold:
+                            adj_capital *= corr_penalty
+                            break  # 一次 penalty 即可
+
+            # ── Portfolio Heat：檢查新交易是否超過風險上限 ──
+            candidate_sl = stop_losses.get(sid)
+            tentative_shares = compute_shares(adj_capital, price)
+            if heat_enabled and tentative_shares > 0:
+                new_risk = compute_single_trade_risk(
+                    price,
+                    candidate_sl,
+                    tentative_shares,
+                    total_capital,
+                    per_position_risk_cap,
+                    adj_capital,
+                )
+                if current_heat + new_risk > max_heat:
+                    # 嘗試縮小部位使 heat 剛好到上限
+                    remaining_budget = max_heat - current_heat
+                    if remaining_budget <= 0:
+                        continue  # 風險預算已用完
+                    if candidate_sl is not None and price > candidate_sl:
+                        max_affordable_shares = int(remaining_budget * total_capital / (price - candidate_sl))
+                    else:
+                        max_affordable_shares = (
+                            int(remaining_budget / per_position_risk_cap * adj_capital / price) if price > 0 else 0
+                        )
+                    tentative_shares = min(tentative_shares, max_affordable_shares)
+                    if tentative_shares <= 0:
+                        continue
+                    # 重算 adj_capital
+                    adj_capital = tentative_shares * price * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+                    new_risk = compute_single_trade_risk(
+                        price,
+                        candidate_sl,
+                        tentative_shares,
+                        total_capital,
+                        per_position_risk_cap,
+                        adj_capital,
+                    )
+
+            shares = tentative_shares if heat_enabled else compute_shares(adj_capital, price)
             if shares <= 0:
                 continue
+
+            # 更新累積 heat
+            if heat_enabled:
+                current_heat += compute_single_trade_risk(
+                    price,
+                    candidate_sl,
+                    shares,
+                    total_capital,
+                    per_position_risk_cap,
+                    adj_capital,
+                )
+
             actions.to_buy.append(
                 {
                     "stock_id": sid,
@@ -336,7 +525,7 @@ def compute_rotation_actions(
                     "score": r.get("score"),
                     "entry_price": price,
                     "shares": shares,
-                    "allocated_capital": per_position_capital,
+                    "allocated_capital": adj_capital,
                 }
             )
             held_ids.add(sid)
@@ -380,7 +569,7 @@ def compute_correlation_matrix(
 
     # 建構收盤價 DataFrame，取各股最近 window 天的交集
     prices_df = pd.DataFrame(price_data)
-    returns_df = prices_df.pct_change().dropna()
+    returns_df = prices_df.pct_change(fill_method=None).dropna()
 
     if len(returns_df) < window:
         # 資料不足，用可用資料計算

@@ -444,6 +444,124 @@ class TestAtrBasedStop:
         assert trade.target_price is None
 
 
+# ─── 跳空停損/停利成交價修正 ──────────────────────────────────────────────────
+
+
+class TestGapDownStopLoss:
+    """驗證跳空開低時停損/停利使用開盤價而非停損價。"""
+
+    def _make_data_with_open(
+        self, n: int, high: float = 12.0, low: float = 10.0, close: float = 11.0, open_price: float = 11.0
+    ) -> pd.DataFrame:
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        return pd.DataFrame(
+            {
+                "open": [open_price] * n,
+                "high": [high] * n,
+                "low": [low] * n,
+                "close": [close] * n,
+                "volume": [10_000] * n,
+            },
+            index=[d.date() for d in dates],
+        )
+
+    def test_normal_stop_uses_stop_price(self):
+        """正常停損（open > stop > low）→ 以 stop_price 附近成交。"""
+        n = 30
+        data = self._make_data_with_open(n)
+        # Day 20: open 正常(11)，low 跌破停損
+        data.iloc[20, data.columns.get_loc("low")] = 6.0
+        data.iloc[20, data.columns.get_loc("open")] = 11.0  # open > stop
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(atr_multiplier_stop=1.5, atr_multiplier_profit=3.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "stop_loss"
+        # open(11) > stop(≈8)，所以用 stop_price
+        assert trade.stop_price is not None
+        # 成交價應接近 stop_price（含滑價）
+        assert trade.exit_price < trade.stop_price * 1.01  # 扣滑價後略低
+
+    def test_gap_down_uses_open_price(self):
+        """跳空開低（open < stop）→ 以 open 成交。"""
+        n = 30
+        data = self._make_data_with_open(n)
+        # Day 20: open 跳空開低到 5.0（低於 stop ≈ 8.0）
+        data.iloc[20, data.columns.get_loc("open")] = 5.0
+        data.iloc[20, data.columns.get_loc("low")] = 4.5
+        data.iloc[20, data.columns.get_loc("close")] = 5.5
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(atr_multiplier_stop=1.5, atr_multiplier_profit=3.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "stop_loss"
+        # open(5.0) < stop(≈8.0)，成交價應基於 open(5.0) 而非 stop(8.0)
+        assert trade.exit_price < 5.5  # 應該接近 5.0（含滑價）
+
+    def test_gap_up_take_profit_uses_open(self):
+        """跳空開高停利（open > target）→ 以 open 成交。"""
+        n = 30
+        data = self._make_data_with_open(n)
+        # Day 20: open 跳空開高到 20.0（高於 target ≈ 13.0）
+        data.iloc[20, data.columns.get_loc("open")] = 20.0
+        data.iloc[20, data.columns.get_loc("high")] = 21.0
+        data.iloc[20, data.columns.get_loc("close")] = 19.0
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(atr_multiplier_stop=2.0, atr_multiplier_profit=1.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_reason == "take_profit"
+        # open(20) > target(≈13)，成交價應基於 open(20) 而非 target(13)
+        assert trade.exit_price > 15.0  # 遠高於 target
+
+    def test_no_open_column_fallback(self):
+        """無 open 欄位 → fallback 到 raw_close 邏輯（不崩潰）。"""
+        n = 30
+        dates = pd.bdate_range("2024-01-01", periods=n)
+        data = pd.DataFrame(
+            {
+                "high": [12.0] * n,
+                "low": [10.0] * n,
+                "close": [11.0] * n,
+                "volume": [10_000] * n,
+            },
+            index=[d.date() for d in dates],
+        )
+        data.iloc[20, data.columns.get_loc("low")] = 6.0
+
+        signals = pd.Series([0] * n, index=data.index)
+        signals.iloc[15] = 1
+        signals.iloc[29] = -1
+
+        risk_config = RiskConfig(atr_multiplier_stop=1.5, atr_multiplier_profit=3.0)
+        engine = _make_engine(data, signals, risk_config=risk_config)
+        result = engine.run()
+
+        assert len(result.trades) == 1
+        assert result.trades[0].exit_reason == "stop_loss"
+
+
 # ─── ATR 尺度一致性（除權息模式）───────────────────────────────────────────────
 
 
