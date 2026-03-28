@@ -137,9 +137,9 @@ class TestComputeMetrics:
         assert metrics["calmar_ratio"] is None
 
     def test_var_cvar_computed_with_sufficient_data(self):
-        """有多個資料點時 var_95 與 cvar_95 應不為 None。"""
+        """有足夠資料點（≥20 筆日報酬）時 var_95 與 cvar_95 應不為 None。"""
 
-        equity = [1_000_000, 1_010_000, 1_005_000, 1_020_000]
+        equity = [1_000_000 + i * 2000 * ((-1) ** i) for i in range(25)]
         metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
         assert metrics["var_95"] is not None
         assert metrics["cvar_95"] is not None
@@ -147,16 +147,16 @@ class TestComputeMetrics:
     def test_cvar_is_worse_than_or_equal_to_var(self):
         """CVaR（尾部期望損失）應 <= VaR（第 5 百分位數）。"""
 
-        equity = [1_000_000, 1_010_000, 1_005_000, 1_015_000, 1_008_000, 1_020_000]
+        equity = [1_000_000 + i * 3000 * ((-1) ** i) for i in range(25)]
         metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
         assert metrics["cvar_95"] is not None
         assert metrics["var_95"] is not None
         assert metrics["cvar_95"] <= metrics["var_95"]
 
     def test_var_negative_for_downtrend(self):
-        """持續下跌的 equity curve → var_95 應為負值。"""
+        """持續下跌的 equity curve（≥20 筆日報酬）→ var_95 應為負值。"""
 
-        equity = [1_000_000, 990_000, 980_000, 970_000, 960_000]
+        equity = [1_000_000 - i * 10_000 for i in range(25)]
         metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
         assert metrics["var_95"] is not None
         assert metrics["var_95"] < 0
@@ -570,6 +570,53 @@ class TestPhase1SharpeInfGuard:
         equity = [1_000_000 + i * 1000 for i in range(100)]
         metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
         assert metrics["sharpe_ratio"] is not None
+        assert metrics["sharpe_ratio"] > 0
+
+
+class TestMetricsNumericalStability:
+    """驗證 Sharpe/Sortino/VaR/CVaR 在邊界條件下的數值穩定性。"""
+
+    def test_sharpe_near_zero_std_returns_none(self):
+        """日報酬率幾乎恆定（std ~1e-16）時，Sharpe 應為 None 而非極端值。"""
+        # 1000 天微幅波動：equity 每天增加 0.001 元 → std ≈ 0
+        equity = [1_000_000 + i * 0.001 for i in range(100)]
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
+        # std 極低時應回傳 None
+        assert metrics["sharpe_ratio"] is None
+
+    def test_sortino_near_zero_std_returns_none(self):
+        """負向報酬率 std 接近零時，Sortino 應為 None 而非極端值。"""
+        # 構造極小負向波動：每天交替 -1e-12 和 -2e-12
+        base = 1_000_000
+        equity = [base]
+        for i in range(50):
+            equity.append(equity[-1] - 1e-12 * (1 + (i % 2)))
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), base)
+        assert metrics["sortino_ratio"] is None
+
+    def test_cvar_insufficient_samples_returns_none(self):
+        """日報酬率不足 20 筆時，VaR/CVaR 應為 None。"""
+        # 10 天 equity → 9 筆日報酬率，低於 _MIN_SAMPLES_FOR_VAR=20
+        equity = [1_000_000 + i * 5000 for i in range(10)]
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 1, 10), 1_000_000)
+        assert metrics["var_95"] is None
+        assert metrics["cvar_95"] is None
+
+    def test_cvar_sufficient_samples_computes(self):
+        """日報酬率 ≥ 20 筆時，VaR/CVaR 應正常計算。"""
+        equity = [1_000_000 + i * 5000 for i in range(30)]
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 1, 30), 1_000_000)
+        assert metrics["var_95"] is not None
+        assert metrics["cvar_95"] is not None
+
+    def test_sharpe_normal_case_still_works(self):
+        """標準波動度下 Sharpe 仍正常計算（迴歸驗證）。"""
+        import math
+
+        equity = [1_000_000 + i * 1000 for i in range(100)]
+        metrics = compute_metrics(equity, [], date(2024, 1, 1), date(2024, 12, 31), 1_000_000)
+        assert metrics["sharpe_ratio"] is not None
+        assert math.isfinite(metrics["sharpe_ratio"])
         assert metrics["sharpe_ratio"] > 0
 
 

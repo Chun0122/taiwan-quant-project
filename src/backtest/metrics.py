@@ -19,6 +19,12 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# 數值穩定性常數 — 標準差低於此值視為無波動，避免除以接近零的數值產生極端 ratio
+_MIN_STD_EPSILON = 1e-8
+
+# VaR / CVaR 最低樣本數 — 少於此值時百分位數估計不具統計意義
+_MIN_SAMPLES_FOR_VAR = 20
+
 # ------------------------------------------------------------------
 #  交易記錄 Protocol（僅要求 pnl 屬性，相容 TradeRecord / PortfolioTradeRecord）
 # ------------------------------------------------------------------
@@ -82,7 +88,7 @@ def compute_metrics(
 
     # --- Sharpe Ratio (rf=0, annualized) ---
     sharpe_ratio = None
-    if daily_returns is not None and len(daily_returns) > 1 and np.std(daily_returns) > 0:
+    if daily_returns is not None and len(daily_returns) > 1 and np.std(daily_returns) > _MIN_STD_EPSILON:
         sharpe_ratio = round(
             float(np.mean(daily_returns)) / float(np.std(daily_returns)) * math.sqrt(252),
             4,
@@ -109,7 +115,7 @@ def compute_metrics(
     sortino_ratio = None
     if daily_returns is not None and len(daily_returns) > 1:
         neg_returns = daily_returns[daily_returns < 0]
-        if len(neg_returns) > 0 and np.std(neg_returns) > 0:
+        if len(neg_returns) > 0 and np.std(neg_returns) > _MIN_STD_EPSILON:
             sortino_ratio = round(
                 float(np.mean(daily_returns)) / float(np.std(neg_returns)) * math.sqrt(252),
                 4,
@@ -122,12 +128,12 @@ def compute_metrics(
 
     # --- VaR (95%) ---
     var_95 = None
-    if daily_returns is not None and len(daily_returns) > 1:
+    if daily_returns is not None and len(daily_returns) >= _MIN_SAMPLES_FOR_VAR:
         var_95 = round(float(np.percentile(daily_returns, 5)) * 100, 4)
 
     # --- CVaR (95%) ---
     cvar_95 = None
-    if daily_returns is not None and len(daily_returns) > 1:
+    if daily_returns is not None and len(daily_returns) >= _MIN_SAMPLES_FOR_VAR:
         var_threshold = np.percentile(daily_returns, 5)
         tail_returns = daily_returns[daily_returns <= var_threshold]
         if len(tail_returns) > 0:
@@ -346,7 +352,7 @@ def monte_carlo_equity(
         max_drawdowns[i] = float(np.max(drawdowns))
 
         # Sharpe（以交易報酬的 mean/std 近似，非年化）
-        if np.std(sampled) > 0:
+        if np.std(sampled) > _MIN_STD_EPSILON:
             sharpe_ratios[i] = float(np.mean(sampled) / np.std(sampled))
         else:
             sharpe_ratios[i] = 0.0

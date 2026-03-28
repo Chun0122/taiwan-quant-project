@@ -274,14 +274,22 @@ def compute_vcp_score(stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFr
     df_3d = df_price[df_price["date"].isin(dates_3d)]
 
     # 條件一：10 日 close 波動幅度（max - min）/ mean
+    # 零均價股票 → NaN → inf，確保被過濾掉（不符合 < 0.08）
     price_stats = df_10d.groupby("stock_id")["close"].agg(["max", "min", "mean"])
     price_range = (price_stats["max"] - price_stats["min"]) / price_stats["mean"].replace(0, float("nan"))
+    price_range = price_range.fillna(float("inf"))
     price_ok = price_range < 0.08
 
     # 條件二：3 日均量 / 20 日均量
+    # 缺少成交量資料時 → inf，確保不通過收縮檢查（< 0.8）
     vol_3d = df_3d.groupby("stock_id")["volume"].mean()
-    vol_20d = df_price.groupby("stock_id")["volume"].apply(lambda s: s.tail(20).mean())
-    vol_ratio = (vol_3d / vol_20d.replace(0, float("nan"))).fillna(1.0)
+    # 向量化計算 20 日均量：rolling(20) 後取各股最後一筆
+    _sorted = df_price.sort_values(["stock_id", "date"])
+    _sorted["_vol_ma20"] = _sorted.groupby("stock_id")["volume"].transform(
+        lambda x: x.rolling(20, min_periods=1).mean()
+    )
+    vol_20d = _sorted.groupby("stock_id")["_vol_ma20"].last()
+    vol_ratio = (vol_3d / vol_20d.replace(0, float("nan"))).fillna(float("inf"))
     vol_ok = vol_ratio < 0.8
 
     vcp_ok = price_ok & vol_ok
@@ -443,8 +451,11 @@ def compute_broker_score(df_broker: pd.DataFrame) -> pd.DataFrame:
             hhi = 0.0
         else:
             total_net = net_buyers["net_buy"].sum()
-            shares = net_buyers["net_buy"] / total_net
-            hhi = float((shares**2).sum())
+            if total_net < 1e-6:
+                hhi = 0.0
+            else:
+                shares = net_buyers["net_buy"] / total_net
+                hhi = float((shares**2).sum())
 
         # ── 連續天數：找近 7 日最活躍（累計淨買最多）的主力分點 ────────
         recent_dates = sorted(grp["date"].unique())[-7:]

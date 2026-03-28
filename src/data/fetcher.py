@@ -28,6 +28,12 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _standardize_date_column(df: pd.DataFrame, col: str = "date") -> None:
+    """將 DataFrame 的日期欄位從字串/Timestamp 統一轉為 datetime.date（in-place）。"""
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col]).dt.date
+
+
 class DataFetcher(ABC):
     """資料抓取抽象基類 — 日後可擴充 Fugle、TWSE 等來源。"""
 
@@ -154,7 +160,7 @@ class FinMindFetcher(DataFetcher):
         # 只保留需要的欄位
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_institutional(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
@@ -176,7 +182,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "name", "buy", "sell", "net"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_margin_trading(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
@@ -213,7 +219,7 @@ class FinMindFetcher(DataFetcher):
             "short_balance",
         ]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_monthly_revenue(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
@@ -231,7 +237,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "revenue", "revenue_month", "revenue_year"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
 
         # 計算月增率 (MoM) 和年增率 (YoY)
         df = df.sort_values("date").reset_index(drop=True)
@@ -266,7 +272,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_dividend(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
@@ -301,7 +307,7 @@ class FinMindFetcher(DataFetcher):
         ]
         df = df[[c for c in keep if c in df.columns]]
 
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         for col in ("cash_payment_date", "announcement_date"):
             if col in df.columns:
                 # 先轉換為 datetime，將 NaT 處理為 None，再轉 .date
@@ -340,7 +346,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "level", "count", "percent"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0).astype(int)
         df["percent"] = pd.to_numeric(df["percent"], errors="coerce").fillna(0.0)
         return df
@@ -406,7 +412,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "broker_id", "broker_name", "buy", "sell", "buy_price", "sell_price"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_all_daily_price(self, start: str, end: str | None = None) -> pd.DataFrame:
@@ -431,7 +437,7 @@ class FinMindFetcher(DataFetcher):
         )
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_all_institutional(self, start: str, end: str | None = None) -> pd.DataFrame:
@@ -452,7 +458,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "name", "buy", "sell", "net"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_stock_info(self) -> pd.DataFrame:
@@ -523,7 +529,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     def fetch_taiwan_vix(self, start: str, end: str | None = None) -> pd.DataFrame:
@@ -572,7 +578,7 @@ class FinMindFetcher(DataFetcher):
 
         keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
         df = df[[c for c in keep if c in df.columns]]
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        _standardize_date_column(df)
         return df
 
     # ------------------------------------------------------------------ #
@@ -828,5 +834,5 @@ def fetch_us_vix(start: str, end: str | None = None) -> pd.DataFrame:
 
     keep = ["date", "stock_id", "open", "high", "low", "close", "volume", "turnover", "spread"]
     df = df[[c for c in keep if c in df.columns]]
-    df["date"] = pd.to_datetime(df["date"]).dt.date
+    _standardize_date_column(df)
     return df

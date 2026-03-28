@@ -177,7 +177,7 @@ def _sync_per_stock(
             df = fetch_fn(fetcher, sid, last or start, end)
             total += upsert_fn(df)
         except Exception:
-            logger.warning("[%s] %s失敗，跳過", sid, label)
+            logger.warning("[%s] %s失敗，跳過", sid, label, exc_info=True)
 
     if skipped:
         logger.info("[%s] 跳過 %d 支（DB 已有近期資料）", label, skipped)
@@ -599,7 +599,7 @@ def sync_broker_bootstrap(
             )
         trading_dates = list(rows)
     except Exception:
-        pass
+        logger.warning("[Bootstrap] 查詢交易日失敗，將使用工作日曆法", exc_info=True)
 
     # Fallback：若 DailyPrice 無資料，或資料天數不足時，用平日曆法補足
     if len(trading_dates) < days:
@@ -625,22 +625,44 @@ def sync_broker_bootstrap(
             ).all()
         )
 
+    # 建立待抓取清單（排除已存在的 pair）
+    tasks: list[tuple[str, date]] = [
+        (sid, td) for sid in stock_ids for td in trading_dates if (sid, td) not in existing_pairs
+    ]
+
+    if not tasks:
+        logger.info("[Bootstrap] 全部已同步，無需補齊")
+        return 0
+
+    logger.info("[Bootstrap] 共 %d 筆待抓取（已排除 %d 筆既有資料）", len(tasks), len(existing_pairs))
+
+    # 並行抓取（max_workers=3 尊重 TWSE 速率限制）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     total = 0
-    for sid in stock_ids:
-        sid_total = 0
-        for trading_day in trading_dates:  # 從新到舊
-            # 已存在此日資料則跳過
-            if (sid, trading_day) in existing_pairs:
-                continue
+    sid_counts: dict[str, int] = {}
 
-            df = fetch_dj_broker_trades(sid, trading_day, trading_day)
-            if not df.empty:
-                n = _upsert_broker_trade(df)
-                sid_total += n
+    def _fetch_one(sid: str, td: date) -> tuple[str, int]:
+        df = fetch_dj_broker_trades(sid, td, td)
+        if not df.empty:
+            n = _upsert_broker_trade(df)
+            return (sid, n)
+        return (sid, 0)
 
-        if sid_total > 0:
-            logger.info("[Bootstrap] %s 補齊 %d 筆", sid, sid_total)
-        total += sid_total
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_fetch_one, sid, td): (sid, td) for sid, td in tasks}
+        for future in as_completed(futures):
+            sid, td = futures[future]
+            try:
+                _, n = future.result()
+                if n > 0:
+                    sid_counts[sid] = sid_counts.get(sid, 0) + n
+                    total += n
+            except Exception:
+                logger.warning("[Bootstrap] %s %s 抓取失敗", sid, td, exc_info=True)
+
+    for sid, cnt in sid_counts.items():
+        logger.info("[Bootstrap] %s 補齊 %d 筆", sid, cnt)
 
     logger.info("[Bootstrap] 完成，總計新增 %d 筆", total)
     return total
@@ -651,10 +673,19 @@ def sync_stock(
     start_date: str | None = None,
     end_date: str | None = None,
     fetcher: FinMindFetcher | None = None,
+    *,
+    last_dates: dict[str, str | None] | None = None,
 ) -> dict[str, int]:
     """同步單一股票的所有資料（日K + 三大法人 + 融資融券）。
 
     支援增量更新：若 DB 已有資料，自動從最後一筆日期開始抓取。
+
+    Parameters
+    ----------
+    last_dates : dict[str, str | None] | None
+        各表預先批次查詢的最後日期，key 為表名（daily_price / institutional /
+        margin / revenue / dividend / financial），由 sync_watchlist() 傳入以
+        減少 DB 查詢次數。若為 None 則退回逐表查詢。
 
     Returns:
         dict: 各資料表新增筆數，例如 {"daily_price": 100, "institutional": 300, "margin": 100}
@@ -666,55 +697,72 @@ def sync_stock(
     if end_date is None:
         end_date = date.today().isoformat()
 
+    def _resolve_last(table_key: str, model) -> str | None:
+        """從預查結果取得 last_date，若無則退回單次查詢。"""
+        if last_dates is not None:
+            return last_dates.get(table_key)
+        return _get_last_date(model, stock_id)
+
     result = {}
 
     # --- 日K線 ---
-    last = _get_last_date(DailyPrice, stock_id)
+    last = _resolve_last("daily_price", DailyPrice)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步日K線: %s ~ %s", stock_id, s, end_date)
     df_price = fetcher.fetch_daily_price(stock_id, s, end_date)
     result["daily_price"] = _upsert_daily_price(df_price)
 
     # --- 三大法人 ---
-    last = _get_last_date(InstitutionalInvestor, stock_id)
+    last = _resolve_last("institutional", InstitutionalInvestor)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步三大法人: %s ~ %s", stock_id, s, end_date)
     df_inst = fetcher.fetch_institutional(stock_id, s, end_date)
     result["institutional"] = _upsert_institutional(df_inst)
 
     # --- 融資融券 ---
-    last = _get_last_date(MarginTrading, stock_id)
+    last = _resolve_last("margin", MarginTrading)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步融資融券: %s ~ %s", stock_id, s, end_date)
     df_margin = fetcher.fetch_margin_trading(stock_id, s, end_date)
     result["margin"] = _upsert_margin(df_margin)
 
     # --- 月營收 ---
-    last = _get_last_date(MonthlyRevenue, stock_id)
+    last = _resolve_last("revenue", MonthlyRevenue)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步月營收: %s ~ %s", stock_id, s, end_date)
     df_rev = fetcher.fetch_monthly_revenue(stock_id, s, end_date)
     result["revenue"] = _upsert_monthly_revenue(df_rev)
 
     # --- 股利 ---
-    last = _get_last_date(Dividend, stock_id)
+    last = _resolve_last("dividend", Dividend)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步股利: %s ~ %s", stock_id, s, end_date)
     df_div = fetcher.fetch_dividend(stock_id, s, end_date)
     result["dividend"] = _upsert_dividend(df_div)
 
     # --- 財報 ---
-    last = _get_last_date(FinancialStatement, stock_id)
+    last = _resolve_last("financial", FinancialStatement)
     s = last if last and last > default_start else default_start
     logger.info("[%s] 同步財報: %s ~ %s", stock_id, s, end_date)
     try:
         df_fin = fetcher.fetch_financial_summary(stock_id, s, end_date)
         result["financial"] = _upsert_financial(df_fin)
     except Exception:
-        logger.warning("[%s] 財報同步失敗，跳過", stock_id)
+        logger.warning("[%s] 財報同步失敗，跳過", stock_id, exc_info=True)
         result["financial"] = 0
 
     return result
+
+
+# 批次查詢用的 (表名, ORM Model) 映射
+_SYNC_TABLE_MODELS: list[tuple[str, type]] = [
+    ("daily_price", DailyPrice),
+    ("institutional", InstitutionalInvestor),
+    ("margin", MarginTrading),
+    ("revenue", MonthlyRevenue),
+    ("dividend", Dividend),
+    ("financial", FinancialStatement),
+]
 
 
 def sync_watchlist(
@@ -729,12 +777,20 @@ def sync_watchlist(
     init_db()
     fetcher = FinMindFetcher()
 
+    # 批次預查各表的 last_date（6 次 DB 查詢，而非 N×6 次）
+    batch_last: dict[str, dict[str, str | None]] = {}
+    for table_key, model in _SYNC_TABLE_MODELS:
+        batch_last[table_key] = _batch_get_last_dates(model, watchlist)
+    logger.info("已批次查詢 %d 張表的 last_date（%d 支股票）", len(_SYNC_TABLE_MODELS), len(watchlist))
+
     all_results = {}
     for stock_id in watchlist:
         logger.info("=" * 50)
         logger.info("開始同步: %s", stock_id)
+        # 為每支股票組裝預查結果
+        per_stock_last = {tbl: batch_last[tbl].get(stock_id) for tbl in batch_last}
         try:
-            all_results[stock_id] = sync_stock(stock_id, start_date, end_date, fetcher)
+            all_results[stock_id] = sync_stock(stock_id, start_date, end_date, fetcher, last_dates=per_stock_last)
             logger.info("[%s] 完成 — %s", stock_id, all_results[stock_id])
         except Exception:
             logger.exception("[%s] 同步失敗", stock_id)
@@ -810,8 +866,8 @@ def sync_stock_info(force_refresh: bool = False) -> int:
 
     records = df.to_dict("records")
     with get_session() as session:
-        for i in range(0, len(records), 80):
-            batch = records[i : i + 80]
+        for i in range(0, len(records), UPSERT_BATCH_SIZE):
+            batch = records[i : i + UPSERT_BATCH_SIZE]
             stmt = sqlite_upsert(StockInfo).values(batch)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["stock_id"],
@@ -954,7 +1010,7 @@ def sync_market_data(
                 )
                 days = max(1, days_gap)
     except Exception:
-        pass  # 查詢失敗不影響同步，使用原始 days
+        logger.warning("[SBL] 查詢 DB 最新日期失敗，使用預設 days=%d", days, exc_info=True)
 
     # 從今天往前找，跳過週末，直到抓到 days 個有資料的交易日
     # （假日時 API 回傳空資料，自動往前找）
@@ -1001,7 +1057,7 @@ def sync_market_data(
             result["announcements"] = _upsert_announcement(df_ann)
             logger.info("[全市場] MOPS 重訊: %d 筆", result["announcements"])
     except Exception:
-        logger.warning("[全市場] MOPS 重訊同步失敗，不影響其他資料")
+        logger.warning("[全市場] MOPS 重訊同步失敗，不影響其他資料", exc_info=True)
 
     if success_count > 0:
         logger.info(
@@ -1071,7 +1127,7 @@ def sync_market_data(
             df_i = fetcher.fetch_institutional(sid, start_str, end_str)
             result["institutional"] += _upsert_institutional(df_i)
         except Exception:
-            logger.warning("[%s] 抓取失敗，跳過", sid)
+            logger.warning("[%s] 抓取失敗，跳過", sid, exc_info=True)
 
     logger.info(
         "[全市場] 逐股抓取完成 — 日K %d 筆, 法人 %d 筆",
