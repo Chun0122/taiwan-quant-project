@@ -892,7 +892,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 > **資料前提（自適應累積設計）**：8F 採用「自然累積」策略，`_load_broker_data_extended()` 查詢最近 365 天 DB 歷史，並要求每股 **≥ 20 個交易日**的資料才啟用 Smart Broker（不足自動降回 7F）。
 >
 > - **首次部署（一次性）**：執行 `python main.py sync-broker --watchlist-bootstrap` 補齊 watchlist 所有股票的最近 120 個交易日分點歷史（半年），Bootstrap 後即可觸發 8F。若有額外股票清單，可搭配 `--from-file stocks.txt` 一次性補齊任意股票（支援純文字或 CSV 格式，`--days` 可自訂天數）。
-> - **日常運作**：`morning-routine` Step 2 每日同步 watchlist（5 日），歷史資料自然累積，120 天後準確度最高。
+> - **日常運作**：`morning-routine` Step 8 每日同步 watchlist（5 日），歷史資料自然累積，120 天後準確度最高。
 > - **新股加入 watchlist**：累積約 1 個月後自動升級至 8F，無需手動操作。
 
 **Swing 模式：**
@@ -1409,7 +1409,7 @@ python main.py anomaly-scan --notify
 | `--dt-threshold F` | 0.2 | 隔日沖風險 penalty 門檻（0~1）|
 | `--notify` | False | 掃描完成後推播 Discord |
 
-> **資料準備**：需先執行 `python main.py sync`（DailyPrice/InstitutionalInvestor）、`python main.py sync-sbl`（借券）、`python main.py sync-broker`（分點）。`morning-routine` 已自動包含 Step 7 anomaly-scan。
+> **資料準備**：需先執行 `python main.py sync`（DailyPrice/InstitutionalInvestor）、`python main.py sync-sbl`（借券）、`python main.py sync-broker`（分點）。`morning-routine` 已自動包含所有資料同步（Step 1~8）及 anomaly-scan（Step 14）。
 
 ---
 
@@ -1591,7 +1591,7 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
 3. 到期持倉：若仍在 Top-N 且啟用續持 → 延長持有期；否則賣出
 4. 止損：今日收盤 ≤ DiscoveryRecord.stop_loss → 立即賣出（不受持有期限制）
 5. 空位填補：從今日排名由高到低選入（排除已持有 + 今日剛賣出的股票）
-6. 已整合 morning-routine Step 6，每日自動更新
+6. 已整合 morning-routine Step 12，每日自動更新
 
 **Phase B 組合層級風控：**
 
@@ -1607,13 +1607,13 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
 
 ### morning-routine — 每日早晨例行流程
 
-一鍵執行九個步驟，適合搭配 Windows 工作排程器在每日盤前自動執行。
+一鍵執行十六個步驟（Step 0~15），適合搭配 Windows 工作排程器在每日盤前自動執行。涵蓋完整資料同步 → 選股掃描 → 監控警報流程。
 
 ```bash
 # 完整流程 + Discord 摘要推播
 python main.py morning-routine --notify
 
-# 跳過借券/分點同步（資料已是最新時使用，加快執行）
+# 跳過所有資料同步 Step 1~8（資料已是最新時使用，加快執行）
 python main.py morning-routine --skip-sync --notify
 
 # 預覽各步驟與 Discord 摘要內容（不實際執行）
@@ -1623,28 +1623,34 @@ python main.py morning-routine --dry-run
 python main.py morning-routine --top 30 --notify
 ```
 
-**九個執行步驟：**
+**十六個執行步驟：**
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
 | Step 0 | VIX 同步 + Macro Stress Check | 同步台灣 VIX + 美國 VIX → 偵測 TAIEX crisis 訊號（7 訊號：5日跌>5%/連跌/波動率/爆量長黑/台灣VIX飆升/單日急跌/美國VIX飆升），≥2 觸發時顯示 CRISIS 警示 banner + Discord 預警 |
-| Step 1 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
-| Step 2a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
-| Step 2b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
-| Step 3 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
-| Step 4 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
-| Step 5 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
-| Step 6 | `rotation update --all` | 更新所有 active 輪動組合（讀取 discover 排名，執行換股） |
-| Step 7 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
-| Step 8 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
-| Step 9 | 策略衰減監控 | 比較五模式近 30 天 vs 歷史勝率/均報酬，衰減時顯示警告（勝率<40% 或均報酬<0） |
+| Step 1 | `sync-info` | 同步全市場股票基本資料（產業分類 + 上市/上櫃別，DB 已有則跳過） |
+| Step 2 | `sync`（OHLCV） | 同步 watchlist + TAIEX 日K線資料 |
+| Step 3 | `compute` | 計算 watchlist 技術指標 |
+| Step 4 | `sync-mops` | 同步 MOPS 重大訊息公告 |
+| Step 5 | `sync-revenue --months 1` | 同步全市場月營收（最近 1 個月） |
+| Step 6 | `sync-features --days 90` | 計算全市場 DailyFeature（Feature Store，供 Universe Filtering 使用） |
+| Step 7 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
+| Step 8a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
+| Step 8b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
+| Step 9 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
+| Step 10 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
+| Step 11 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
+| Step 12 | `rotation update --all` | 更新所有 active 輪動組合（讀取 discover 排名，執行換股） |
+| Step 13 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
+| Step 14 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
+| Step 15 | 策略衰減監控 | 比較五模式近 30 天 vs 歷史勝率/均報酬，衰減時顯示警告（勝率<40% 或均報酬<0） |
 
 **參數說明：**
 
 | 參數 | 說明 |
 |------|------|
 | `--dry-run` | 只顯示步驟與 Discord 摘要預覽，不實際執行任何操作 |
-| `--skip-sync` | 跳過 Step 1–2（借券/分點同步），適合資料已新鮮時加速執行 |
+| `--skip-sync` | 跳過 Step 1–8（所有資料同步），適合資料已新鮮時加速執行 |
 | `--top N` | discover all 的 Top N（預設 20） |
 | `--notify` | 執行完畢後推播 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態） |
 
@@ -1707,7 +1713,7 @@ python main.py sync-features --days 60
 
 **使用時機：**
 - 初次部署後，執行 `sync-info --force && sync-features` 建立完整基礎資料
-- 可加入 `morning-routine` 前執行（或獨立夜間排程），確保當日 `discover` 使用最新特徵
+- 已整合至 `morning-routine` Step 6（每日自動執行），也可獨立夜間排程確保特徵最新
 - DailyFeature 表為空時，`UniverseFilter` 會自動從 `DailyPrice` fallback 計算（冷啟動相容）
 
 > **冷啟動順序**：`sync-info --force` → `sync-features` → `discover`

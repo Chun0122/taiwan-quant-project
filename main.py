@@ -3950,24 +3950,30 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
     依序執行：
-      Step 1  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
-      Step 2  sync-broker         同步 watchlist 分點資料（5日）+ 補抓 discover 推薦（累積歷史）
-      Step 3  discover all        五模式全市場掃描（--skip-sync，不重複同步）
-      Step 4  alert-check         MOPS 重大事件警報（近3日）
-      Step 5  watch update-status 批次更新持倉止損/止利/過期狀態
-      Step 6  rotation update     輪動組合每日更新（所有 active portfolio）
-      Step 7  revenue-scan        高成長掃描（YoY≥10%，Top 5）
-      Step 8  anomaly-scan        籌碼異動掃描
-      Step 9  strategy-decay      策略衰減監控（30天績效趨勢）
+      Step 1  sync-info           同步全市場股票基本資料（產業分類 + 上市/上櫃別）
+      Step 2  sync                同步日K線資料（OHLCV，watchlist + TAIEX）
+      Step 3  compute             計算技術指標（watchlist）
+      Step 4  sync-mops           同步 MOPS 重大訊息公告
+      Step 5  sync-revenue        同步全市場月營收（最近 1 個月）
+      Step 6  sync-features       計算全市場 DailyFeature（Feature Store）
+      Step 7  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
+      Step 8  sync-broker         同步 watchlist 分點資料（5日）+ 補抓 discover 推薦（累積歷史）
+      Step 9  discover all        五模式全市場掃描（--skip-sync，不重複同步）
+      Step 10 alert-check         MOPS 重大事件警報（近3日）
+      Step 11 watch update-status 批次更新持倉止損/止利/過期狀態
+      Step 12 rotation update     輪動組合每日更新（所有 active portfolio）
+      Step 13 revenue-scan        高成長掃描（YoY≥10%，Top 5）
+      Step 14 anomaly-scan        籌碼異動掃描
+      Step 15 strategy-decay      策略衰減監控（30天績效趨勢）
       最終     Discord 推播綜合摘要（需加 --notify）
 
     Flags:
       --dry-run     只顯示步驟與摘要，不執行任何操作
-      --skip-sync   跳過 Step 1–2（借券/分點同步），適合資料已新鮮時使用
+      --skip-sync   跳過 Step 1–8（所有資料同步），適合資料已新鮮時使用
       --top N       discover 的 Top N（預設 20）
       --notify      執行完畢後推播 Discord 摘要
 
-    Step 2 說明：
+    Step 8 說明：
       每日同步 watchlist 分點資料，使 Smart Broker（8F）所需的歷史勝率資料自然累積。
       約 20 個交易日後，watchlist 股票即可觸發 Smart Broker 計算；60~120 天後準確度最高。
     """
@@ -3981,7 +3987,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 9
+    TOTAL = 15
 
     def _step(n: int, title: str) -> None:
         print(f"\n{'═' * 64}")
@@ -4044,14 +4050,52 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
     _steps = [
+        # ── 新增：基礎資料同步（Step 1~6）──────────────────────────
         (
             1,
+            "同步全市場基本資料（sync-info）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_info(argparse.Namespace(force=False)),
+        ),
+        (
+            2,
+            "同步日K線資料（sync watchlist + TAIEX）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync(argparse.Namespace(stocks=None, start=None, end=None, taiex=False)),
+        ),
+        (
+            3,
+            "計算技術指標（compute）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_compute(argparse.Namespace(stocks=None)),
+        ),
+        (
+            4,
+            "同步 MOPS 重大訊息（sync-mops）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_mops(argparse.Namespace()),
+        ),
+        (
+            5,
+            "同步全市場月營收（sync-revenue --months 1）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_revenue(argparse.Namespace(months=1)),
+        ),
+        (
+            6,
+            "計算 DailyFeature（sync-features --days 90）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_features(argparse.Namespace(days=90)),
+        ),
+        # ── 原有步驟（重新編號 7~15）──────────────────────────────
+        (
+            7,
             "同步借券賣出資料（sync-sbl --days 3）",
             {"dry_run", "skip_sync"},
             lambda: cmd_sync_sbl(argparse.Namespace(days=3)),
         ),
         (
-            2,
+            8,
             "同步分點交易資料（watchlist 歷史累積 + discover 補抓）",
             {"dry_run", "skip_sync"},
             lambda: (
@@ -4060,7 +4104,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ),
         ),
         (
-            3,
+            9,
             f"五模式全市場掃描（discover all --skip-sync --top {top_n}）",
             {"dry_run"},
             lambda: _cmd_discover_all(
@@ -4079,15 +4123,15 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ),
         ),
         (
-            4,
+            10,
             "掃描近期重大事件（alert-check --days 3）",
             {"dry_run"},
             lambda: cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False)),
         ),
-        (5, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
-        (6, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all()),
+        (11, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
+        (12, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all()),
         (
-            7,
+            13,
             "高成長掃描（revenue-scan --min-yoy 10 --top 5）",
             {"dry_run"},
             lambda: cmd_revenue_scan(
@@ -4095,7 +4139,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ),
         ),
         (
-            8,
+            14,
             "籌碼異動掃描（anomaly-scan）",
             {"dry_run"},
             lambda: cmd_anomaly_scan(
@@ -4111,7 +4155,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ),
         ),
         (
-            9,
+            15,
             "策略衰減監控（30/60/90 天績效趨勢）",
             {"dry_run"},
             lambda: _check_strategy_decay(),

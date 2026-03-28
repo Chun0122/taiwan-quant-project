@@ -92,8 +92,8 @@ python main.py anomaly-scan --stocks 2330 2317  # 指定股票
 python main.py anomaly-scan --vol-mult 3.0 --inst-threshold 5000000  # 自訂門檻
 python main.py anomaly-scan --dt-threshold 0.3 # 隔日沖風險門檻（預設 0.2）
 python main.py anomaly-scan --notify         # 掃描並推播 Discord
-python main.py morning-routine --notify      # 每日早晨例行流程（sync-sbl → sync-broker watchlist + discover → discover all → alert-check → watch update-status → revenue-scan → anomaly-scan → Discord 摘要）
-python main.py morning-routine --skip-sync --notify  # 跳過借券/分點同步（資料已新鮮時使用）
+python main.py morning-routine --notify      # 每日早晨例行流程（sync-info → sync → compute → sync-mops → sync-revenue → sync-features → sync-sbl → sync-broker → discover all → alert-check → watch update-status → rotation update → revenue-scan → anomaly-scan → strategy-decay → Discord 摘要）
+python main.py morning-routine --skip-sync --notify  # 跳過所有資料同步 Step 1~8（資料已新鮮時使用）
 python main.py morning-routine --dry-run     # 預覽步驟與摘要（不實際執行）
 python main.py watchlist list                # 列出 DB watchlist 清單（DB 空時顯示 YAML fallback）
 python main.py watchlist add 2330            # 新增股票至 DB watchlist
@@ -261,13 +261,13 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/report/ai_report.py`           | AI 選股摘要（`generate_ai_summary()`，呼叫 Claude API `claude-sonnet-4-6`，生成約 300 字繁中摘要；`discover --ai-summary` 旗標觸發） |
 | `src/strategy_rank/engine.py`       | 策略排名引擎（批次回測 watchlist × strategies）                                                                   |
 | `src/notification/line_notify.py`   | Discord Webhook 通知（檔名為歷史遺留）+ `format_suggest_discord()` 純函數（從 main.py 遷移）                       |
-| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫），`daily_sync_job()` delegate 給 `cmd_morning_routine()`（Step 0~9 + Discord），`weekly_holding_job()` 每週四同步 TDCC |
+| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫），`daily_sync_job()` delegate 給 `cmd_morning_routine()`（Step 0~15 + Discord），`weekly_holding_job()` 每週四同步 TDCC |
 | `src/scheduler/windows_task.py`     | Windows 工作排程器 .bat + XML 產生器，每日 .bat 執行 `morning-routine --notify`，每週四 .bat 執行 `sync-holding`    |
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
 | `src/visualization/charts.py`       | Plotly 圖表元件 + **D4** 抽出的純計算函數：`simulate_equity_curve()`（權益曲線模擬）、`compute_drawdown_series()`（回撤序列）、`transform_calendar_heatmap_data()`（日曆熱圖矩陣轉換） |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
 | `src/visualization/pages/`          | 儀表板 12 分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, concept_rotation, discovery_history, position_monitoring） |
-| `main.py`                           | CLI 調度器（argparse 子命令，36 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；籌碼異動偵測已移至 `src/cli/detection.py`（D1）；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 0 VIX 同步 + Step 6 rotation update + Step 8 anomaly-scan + Step 9 策略衰減監控）；`cmd_rotation()` 輪動組合管理（create/update/status/history/backtest/list/pause/resume/delete）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數）；ML 策略 CLI 新增 `--shap`/`--optuna`/`--feature-selection` 旗標 |
+| `main.py`                           | CLI 調度器（argparse 子命令，36 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；籌碼異動偵測已移至 `src/cli/detection.py`（D1）；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（Step 0 VIX 預檢 + Step 1~6 基礎資料同步 + Step 7~8 籌碼同步 + Step 9 discover + Step 10~15 警報/監控）；`cmd_rotation()` 輪動組合管理（create/update/status/history/backtest/list/pause/resume/delete）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數）；ML 策略 CLI 新增 `--shap`/`--optuna`/`--feature-selection` 旗標 |
 
 ### 設定
 
@@ -307,6 +307,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Universe + 品質** | 42~49 | Universe Filtering 三層漏斗 + Feature Store、粗篩訊號/效能優化、相對估值（同業 PE）、EPS 連續性、消息面四項優化（異常率/事件加乘/Regex/衰減）、Swing 六項強化（財報/SBL/Smart Broker/ADX/突破/回測期間） |
 | **概念 + Crisis** | 50~53 | 概念股系統（ORM/YAML/CLI/Dashboard/Scanner Stage 3.3b）、Crisis Regime 第四狀態（偵測/權重/過濾/morning-routine 警示）、隔日沖偵測+扣分、風險過濾強化（波動率 cap/MA60 濾網） |
 | **統一重構 + 強化** | 54~58 | 進出場共用模組（entry_exit.py）、市場寬度降級+爆量長黑、Hysteresis 狀態機（JSON 持久化）、法人連續性因子+隔日沖交互、籌碼斜率+HHI 趨勢 |
+
+## Pending Tasks (未完成)
 
 ## 已確認事項（規劃時勿重複提出）
 
