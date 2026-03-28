@@ -250,7 +250,7 @@ class TestComputeRevenueScan:
         from unittest.mock import patch
 
         import src.data.database as db_mod
-        from main import _compute_revenue_scan
+        from src.cli.anomaly_cmd import _compute_revenue_scan
 
         # db_session 已被 conftest monkeypatched；但 _compute_revenue_scan 使用
         # with get_session() as session: 形式。我們讓 get_session() 回傳一個

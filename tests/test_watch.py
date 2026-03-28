@@ -16,7 +16,7 @@ from src.data.schema import WatchEntry
 
 def _compute(entry_price, stop_loss, take_profit, valid_until, latest_price, today):
     """代理呼叫 main._compute_watch_status（避免匯入整個 main 模組）。"""
-    from main import _compute_watch_status
+    from src.cli.watch_cmd import _compute_watch_status
 
     return _compute_watch_status(
         entry_price=entry_price,
@@ -188,7 +188,7 @@ def test_watch_entry_default_status(db_session):
 
 def _trailing_stop(highest_price, atr14, multiplier):
     """代理呼叫 main._compute_trailing_stop。"""
-    from main import _compute_trailing_stop
+    from src.cli.watch_cmd import _compute_trailing_stop
 
     return _compute_trailing_stop(highest_price, atr14, multiplier)
 

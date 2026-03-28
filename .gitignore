@@ -17,6 +17,7 @@ env/
 
 # Database
 data/stock.db
+data/regime_state.json
 
 # Data directories (raw/processed files)
 data/raw/*
