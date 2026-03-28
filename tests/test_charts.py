@@ -6,9 +6,13 @@ D4: 從 charts.py 抽出的純函數測試（不依賴 Streamlit / Plotly 渲染
 from datetime import date
 
 import pandas as pd
+import plotly.graph_objects as go
 
 from src.visualization.charts import (
     compute_drawdown_series,
+    plot_correlation_heatmap,
+    plot_drawdown_area,
+    plot_heat_gauge,
     simulate_equity_curve,
     transform_calendar_heatmap_data,
 )
@@ -179,3 +183,66 @@ class TestTransformCalendarHeatmapData:
         # 兩個日期都在 1 月第 1 週，平均為 15
         assert len(z) == 1
         assert any(v is not None and abs(v - 15.0) < 0.01 for row in z for v in row)
+
+
+# ---------------------------------------------------------------------------
+# plot_heat_gauge
+# ---------------------------------------------------------------------------
+
+
+class TestPlotHeatGauge:
+    def test_returns_figure(self):
+        fig = plot_heat_gauge(0.05, max_heat=0.12)
+        assert isinstance(fig, go.Figure)
+
+    def test_zero_heat(self):
+        fig = plot_heat_gauge(0.0, max_heat=0.12)
+        assert isinstance(fig, go.Figure)
+        assert fig.data[0].value == 0.0
+
+    def test_high_heat(self):
+        fig = plot_heat_gauge(0.11, max_heat=0.12)
+        assert isinstance(fig, go.Figure)
+        assert abs(fig.data[0].value - 11.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# plot_correlation_heatmap
+# ---------------------------------------------------------------------------
+
+
+class TestPlotCorrelationHeatmap:
+    def test_returns_figure(self):
+        corr = pd.DataFrame(
+            [[1.0, 0.5], [0.5, 1.0]],
+            index=["2330", "2317"],
+            columns=["2330", "2317"],
+        )
+        fig = plot_correlation_heatmap(corr, threshold=0.7)
+        assert isinstance(fig, go.Figure)
+
+    def test_empty_matrix(self):
+        fig = plot_correlation_heatmap(pd.DataFrame(), threshold=0.7)
+        assert isinstance(fig, go.Figure)
+
+    def test_single_stock(self):
+        corr = pd.DataFrame([[1.0]], index=["2330"], columns=["2330"])
+        fig = plot_correlation_heatmap(corr, threshold=0.7)
+        assert isinstance(fig, go.Figure)
+        assert len(fig.layout.annotations) == 1
+
+
+# ---------------------------------------------------------------------------
+# plot_drawdown_area
+# ---------------------------------------------------------------------------
+
+
+class TestPlotDrawdownArea:
+    def test_returns_figure(self):
+        dd = [0.0, 2.0, 5.0, 3.0]
+        fig = plot_drawdown_area(dd)
+        assert isinstance(fig, go.Figure)
+
+    def test_empty_series(self):
+        fig = plot_drawdown_area([])
+        assert isinstance(fig, go.Figure)

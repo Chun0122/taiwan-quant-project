@@ -1377,3 +1377,134 @@ def plot_sector_treemap(sector_df: pd.DataFrame) -> go.Figure:
         margin=dict(l=10, r=10, t=40, b=10),
     )
     return fig
+
+
+# ------------------------------------------------------------------ #
+#  部位控制總覽 — 風險監控圖表
+# ------------------------------------------------------------------ #
+
+
+def plot_heat_gauge(current_heat: float, max_heat: float = 0.12) -> go.Figure:
+    """Portfolio Heat 儀表板（gauge chart）。
+
+    三色帶：綠（≤50% of max）、黃（≤85%）、紅（>85%）。
+    """
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=current_heat * 100,
+            number={"suffix": "%", "valueformat": ".1f"},
+            gauge={
+                "axis": {"range": [0, max_heat * 120], "ticksuffix": "%"},
+                "bar": {"color": "darkblue"},
+                "steps": [
+                    {"range": [0, max_heat * 50], "color": "#d4edda"},
+                    {"range": [max_heat * 50, max_heat * 85], "color": "#fff3cd"},
+                    {"range": [max_heat * 85, max_heat * 120], "color": "#f8d7da"},
+                ],
+                "threshold": {
+                    "line": {"color": "red", "width": 3},
+                    "thickness": 0.8,
+                    "value": max_heat * 100,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        height=250,
+        margin=dict(l=20, r=20, t=30, b=10),
+    )
+    return fig
+
+
+def plot_correlation_heatmap(corr_matrix: pd.DataFrame, threshold: float = 0.7) -> go.Figure:
+    """持倉相關性熱力圖。
+
+    使用 RdBu_r 色階，標註數值，高相關配對紅框標示。
+    """
+    if corr_matrix.empty:
+        return go.Figure().update_layout(title="相關性矩陣（無資料）")
+
+    labels = list(corr_matrix.columns)
+    z = corr_matrix.values
+
+    # 建立標註文字
+    annotations = []
+    for i, row_label in enumerate(labels):
+        for j, col_label in enumerate(labels):
+            val = z[i][j]
+            color = "red" if abs(val) >= threshold and i != j else "black"
+            annotations.append(
+                dict(
+                    x=col_label,
+                    y=row_label,
+                    text=f"{val:.2f}",
+                    font=dict(color=color, size=11),
+                    showarrow=False,
+                )
+            )
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=z,
+            x=labels,
+            y=labels,
+            colorscale="RdBu_r",
+            zmin=-1,
+            zmax=1,
+            colorbar=dict(title="相關係數"),
+        )
+    )
+    fig.update_layout(
+        annotations=annotations,
+        height=400,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(side="bottom"),
+    )
+    return fig
+
+
+def plot_drawdown_area(drawdown_pcts: list[float]) -> go.Figure:
+    """回撤走勢填充面積圖。
+
+    Parameters
+    ----------
+    drawdown_pcts : list[float]
+        回撤百分比序列（正值，0~100），由 compute_drawdown_series() 產生。
+    """
+    if not drawdown_pcts:
+        return go.Figure().update_layout(title="回撤走勢（無資料）")
+
+    x = list(range(len(drawdown_pcts)))
+    neg_dd = [-v for v in drawdown_pcts]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=neg_dd,
+            fill="tozeroy",
+            fillcolor="rgba(255, 0, 0, 0.15)",
+            line=dict(color="red", width=1),
+            name="回撤 %",
+        )
+    )
+
+    # 閾值水平線
+    for pct, color in [(5, "orange"), (10, "red"), (15, "darkred")]:
+        fig.add_hline(
+            y=-pct,
+            line_dash="dash",
+            line_color=color,
+            annotation_text=f"-{pct}%",
+            annotation_position="right",
+        )
+
+    fig.update_layout(
+        height=250,
+        margin=dict(l=10, r=50, t=30, b=10),
+        yaxis_title="回撤 %",
+        xaxis_title="交易日",
+        showlegend=False,
+    )
+    return fig

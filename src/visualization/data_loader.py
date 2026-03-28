@@ -15,6 +15,8 @@ from src.data.schema import (
     MarginTrading,
     PortfolioBacktestResult,
     PortfolioTrade,
+    RotationPortfolio,
+    RotationPosition,
     StockInfo,
     TechnicalIndicator,
     Trade,
@@ -854,3 +856,163 @@ def load_watch_entry_price_history(stock_id: str, entry_date: str, days: int = 6
             for r in rows
         ]
     )
+
+
+# ──────────────────────────────────────────────────────────────────── #
+#  輪動組合 — 部位控制總覽
+# ──────────────────────────────────────────────────────────────────── #
+
+
+def load_rotation_portfolio_names() -> list[str]:
+    """取得所有輪動組合名稱（按建立時間排序）。"""
+    with get_session() as session:
+        rows = session.execute(select(RotationPortfolio.name).order_by(RotationPortfolio.created_at)).scalars().all()
+    return list(rows)
+
+
+def load_rotation_portfolio_info(name: str) -> dict | None:
+    """載入輪動組合基本資訊。"""
+    with get_session() as session:
+        r = session.execute(select(RotationPortfolio).where(RotationPortfolio.name == name)).scalar_one_or_none()
+
+    if not r:
+        return None
+
+    return {
+        "name": r.name,
+        "mode": r.mode,
+        "max_positions": r.max_positions,
+        "holding_days": r.holding_days,
+        "initial_capital": r.initial_capital,
+        "current_capital": r.current_capital,
+        "current_cash": r.current_cash,
+        "status": r.status,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+    }
+
+
+def load_rotation_positions(name: str) -> list[dict]:
+    """載入指定組合的開倉持倉（status='open'）。"""
+    with get_session() as session:
+        portfolio = session.execute(
+            select(RotationPortfolio).where(RotationPortfolio.name == name)
+        ).scalar_one_or_none()
+        if not portfolio:
+            return []
+
+        rows = (
+            session.execute(
+                select(RotationPosition)
+                .where(RotationPosition.portfolio_id == portfolio.id)
+                .where(RotationPosition.status == "open")
+                .order_by(RotationPosition.entry_date)
+            )
+            .scalars()
+            .all()
+        )
+
+    # 查最新收盤價
+    stock_ids = list({r.stock_id for r in rows})
+    latest_prices: dict[str, float] = {}
+    if stock_ids:
+        with get_session() as session:
+            for sid in stock_ids:
+                price = session.execute(
+                    select(DailyPrice.close).where(DailyPrice.stock_id == sid).order_by(DailyPrice.date.desc()).limit(1)
+                ).scalar()
+                if price is not None:
+                    latest_prices[sid] = float(price)
+
+    # 查 stop_loss（從最近的 DiscoveryRecord）
+    stop_losses: dict[str, float] = {}
+    if stock_ids:
+        with get_session() as session:
+            for sid in stock_ids:
+                sl = session.execute(
+                    select(DiscoveryRecord.stop_loss)
+                    .where(DiscoveryRecord.stock_id == sid)
+                    .where(DiscoveryRecord.stop_loss.is_not(None))
+                    .order_by(DiscoveryRecord.scan_date.desc())
+                    .limit(1)
+                ).scalar()
+                if sl is not None:
+                    stop_losses[sid] = float(sl)
+
+    positions = []
+    for r in rows:
+        cur_price = latest_prices.get(r.stock_id)
+        unrealized_pnl = None
+        unrealized_pct = None
+        if cur_price is not None:
+            unrealized_pnl = (cur_price - r.entry_price) * r.shares
+            unrealized_pct = (cur_price - r.entry_price) / r.entry_price if r.entry_price else None
+
+        positions.append(
+            {
+                "stock_id": r.stock_id,
+                "stock_name": r.stock_name or r.stock_id,
+                "entry_date": r.entry_date,
+                "entry_price": r.entry_price,
+                "shares": r.shares,
+                "allocated_capital": r.allocated_capital,
+                "planned_exit_date": r.planned_exit_date,
+                "holding_days_count": r.holding_days_count,
+                "current_price": cur_price,
+                "stop_loss": stop_losses.get(r.stock_id),
+                "unrealized_pnl": unrealized_pnl,
+                "unrealized_pct": unrealized_pct,
+            }
+        )
+    return positions
+
+
+def load_multi_stock_closes(stock_ids: list[str], days: int = 90) -> pd.DataFrame:
+    """載入多股最近 N 日收盤價（columns=stock_id, index=date）。"""
+    if not stock_ids:
+        return pd.DataFrame()
+
+    import datetime
+
+    end_date = datetime.date.today().isoformat()
+    start_date = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+    with get_session() as session:
+        rows = session.execute(
+            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+            .where(DailyPrice.stock_id.in_(stock_ids))
+            .where(DailyPrice.date >= start_date)
+            .where(DailyPrice.date <= end_date)
+            .order_by(DailyPrice.date)
+        ).all()
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["stock_id", "date", "close"])
+    df["date"] = pd.to_datetime(df["date"])
+    pivot = df.pivot_table(index="date", columns="stock_id", values="close")
+    return pivot
+
+
+def load_regime_state() -> dict | None:
+    """從 JSON 檔讀取最新 Regime 狀態。"""
+    import json
+    from pathlib import Path
+
+    state_file = Path("data/regime_state.json")
+    if not state_file.exists():
+        return None
+
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "regime": data.get("regime", "unknown"),
+            "regime_since": data.get("regime_since"),
+            "last_updated": data.get("last_updated"),
+            "confirmation_count": data.get("confirmation_count", 0),
+            "pending_transition": data.get("pending_transition"),
+        }
+    except (json.JSONDecodeError, OSError):
+        return None
