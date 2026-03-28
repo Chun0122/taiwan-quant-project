@@ -173,9 +173,9 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_io.py`             | `src/data/io.py` 匯出/匯入 + 驗證 + round-trip     | 純函數 + in-memory SQLite |
 | `tests/test_entry_exit.py`     | `src/entry_exit.py` `compute_atr_stops`（7 個）+ `compute_entry_trigger`（7 個）+ `assess_timing` crisis（3 個）+ `REGIME_ATR_PARAMS` 一致性（2 個） | 純函數 |
 | `tests/test_suggest.py`        | `src/features/indicators.py` `calc_rsi14_from_series` + `src/entry_exit.py` `assess_timing`（含 crisis 測試）+ `src/notification/line_notify.py` `format_suggest_discord` | 純函數 |
-| `tests/test_watch.py`          | `main.py` `_compute_watch_status` / `_compute_trailing_stop` 純函數 + `WatchEntry` ORM CRUD（含 trailing stop 欄位） | 純函數 + in-memory SQLite |
+| `tests/test_watch.py`          | `src/cli/watch_cmd.py` `_compute_watch_status` / `_compute_trailing_stop` 純函數 + `WatchEntry` ORM CRUD（含 trailing stop 欄位） | 純函數 + in-memory SQLite |
 | `tests/test_holding.py`        | `_extract_level_lower_bound` + `compute_whale_score` + `HoldingDistribution` ORM + `fetch_holding_distribution`（FinMind mock，舊接口相容） | 純函數 + in-memory SQLite + mock HTTP |
-| `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
+| `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `src/cli/anomaly_cmd.py` `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_broker.py`         | `fetch_dj_broker_trades` HTML 解析（Big5/BHID/多分點彙整/單位換算）+ `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 + `TestLoadBrokerDataExtendedCloseProxy` 收盤價代理均價（NULL 填補/不覆蓋/無資料降回 7F）+ `TestSyncBrokerBootstrap` 逐日查詢簽名/獨立性/預設值/單日 vs 期間 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_anomaly.py`        | `src/cli/detection.py` 五個籌碼異動偵測純函數（量能暴增/外資大買超/借券激增/主力集中/隔日沖風險）| 純函數 |
@@ -267,7 +267,20 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/charts.py`       | Plotly 圖表元件 + **D4** 抽出的純計算函數：`simulate_equity_curve()`（權益曲線模擬）、`compute_drawdown_series()`（回撤序列）、`transform_calendar_heatmap_data()`（日曆熱圖矩陣轉換）+ `plot_heat_gauge()`（Portfolio Heat 儀表）、`plot_correlation_heatmap()`（持倉相關性熱力圖）、`plot_drawdown_area()`（回撤面積圖） |
 | `src/visualization/data_loader.py`  | 儀表板資料載入 + 輪動組合查詢（`load_rotation_portfolio_names()`/`load_rotation_portfolio_info()`/`load_rotation_positions()`/`load_multi_stock_closes()`/`load_regime_state()`） |
 | `src/visualization/pages/`          | 儀表板 12 分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, concept_rotation, discovery_history, position_monitoring, risk_control） |
-| `main.py`                           | CLI 調度器（argparse 子命令，36 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；籌碼異動偵測已移至 `src/cli/detection.py`（D1）；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（Step 0 VIX 預檢 + Step 1~6 基礎資料同步 + Step 7~8 籌碼同步 + Step 9 discover + Step 10~15 警報/監控）；`cmd_rotation()` 輪動組合管理（create/update/status/history/backtest/list/pause/resume/delete）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數）；ML 策略 CLI 新增 `--shap`/`--optuna`/`--feature-selection` 旗標 |
+| `main.py`                           | CLI 調度器（argparse 定義 36 個子命令 + dispatch table，~763 行）；所有命令實作已模組化至 `src/cli/` |
+| `src/cli/__init__.py`               | CLI 子命令模組 package |
+| `src/cli/helpers.py`                | 共用工具函數：`safe_print()`（Windows cp950）、`setup_logging()`、`init_db()`、`ensure_sync_market_data()`、`read_stocks_from_file()` |
+| `src/cli/sync.py`                   | 資料同步系列：`cmd_sync`/`cmd_compute`/`cmd_sync_mops`/`cmd_sync_revenue`/`cmd_sync_financial`/`cmd_sync_info`/`cmd_sync_features`/`cmd_sync_holding`/`cmd_sync_vix`/`cmd_sync_sbl`/`cmd_sync_broker`/`cmd_alert_check` |
+| `src/cli/discover_cmd.py`           | 全市場掃描：`cmd_discover`/`_cmd_discover_all`/`_build_cross_comparison`/`_save_discovery_records`/`_show_discovery_comparison`/`cmd_discover_backtest` |
+| `src/cli/backtest_cmd.py`           | 回測：`cmd_backtest`/`cmd_walk_forward`/`_build_risk_config`/`_print_attribution`/`_print_trade_stats` |
+| `src/cli/watch_cmd.py`              | 持倉監控：`cmd_watch`/`_watch_add`/`_watch_list`/`_watch_close`/`_watch_update_status` + 純函數 `_compute_watch_status`/`_compute_trailing_stop` |
+| `src/cli/anomaly_cmd.py`            | 籌碼異動+營收掃描：`cmd_anomaly_scan`/`cmd_revenue_scan`/`_compute_anomaly_scan`/`_compute_revenue_scan`/`_compute_macro_stress_check` |
+| `src/cli/rotation_cmd.py`           | 輪動組合管理：`cmd_rotation`（create/update/status/history/backtest/list/pause/resume/delete）/`_rotation_update_all` |
+| `src/cli/morning_cmd.py`            | 每日早晨例行：`cmd_morning_routine`（Step 0~15 + Discord 摘要）/`_build_morning_discord_summary`/`_check_strategy_decay` |
+| `src/cli/watchlist_cmd.py`          | Watchlist+概念股：`cmd_watchlist`/`cmd_sync_concepts`/`cmd_concepts`/`cmd_concept_expand` |
+| `src/cli/suggest_cmd.py`            | 單股進出場建議：`cmd_suggest` |
+| `src/cli/misc_cmd.py`              | 雜項命令：`cmd_dashboard`/`cmd_optimize`/`cmd_schedule`/`cmd_status`/`cmd_scan`/`cmd_notify`/`cmd_report`/`cmd_strategy_rank`/`cmd_industry`/`cmd_migrate`/`cmd_validate`/`cmd_export`/`cmd_import_data` |
+| `src/cli/detection.py`              | **D1** 籌碼異動偵測純函數：`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` |
 
 ### 設定
 
