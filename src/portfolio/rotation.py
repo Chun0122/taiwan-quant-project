@@ -10,6 +10,9 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+import numpy as np
+import pandas as pd
+
 from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
 
 # ---------------------------------------------------------------------------
@@ -153,6 +156,11 @@ def compute_rotation_actions(
     current_cash: float,
     stop_losses: dict[str, float] | None = None,
     today_prices: dict[str, float] | None = None,
+    sector_map: dict[str, str] | None = None,
+    max_sector_pct: float = 0.30,
+    drawdown_pct: float | None = None,
+    drawdown_half_threshold: float = 10.0,
+    drawdown_stop_threshold: float = 15.0,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -180,6 +188,16 @@ def compute_rotation_actions(
         各股票的止損價 {stock_id: stop_loss_price}。
     today_prices : dict[str, float] | None
         今日各股收盤價 {stock_id: close}。
+    sector_map : dict[str, str] | None
+        股票→產業映射 {stock_id: sector}，用於產業集中度限制。
+    max_sector_pct : float
+        同產業持股比例上限（預設 0.30 = 30%）。
+    drawdown_pct : float | None
+        目前組合回撤百分比（正值，如 12.0 = -12%），用於 Drawdown Guard。
+    drawdown_half_threshold : float
+        回撤達此閾值（%）時新開倉減半（預設 10.0）。
+    drawdown_stop_threshold : float
+        回撤達此閾值（%）時停止新開倉（預設 15.0）。
 
     Returns
     -------
@@ -259,9 +277,17 @@ def compute_rotation_actions(
             )
             remaining_open.append(pos)
 
+    # ── Drawdown Guard：回撤嚴重時限制新開倉 ──
+    drawdown_scale = 1.0  # 新開倉資金倍數
+    if drawdown_pct is not None:
+        if drawdown_pct >= drawdown_stop_threshold:
+            drawdown_scale = 0.0  # 停止新開倉
+        elif drawdown_pct >= drawdown_half_threshold:
+            drawdown_scale = 0.5  # 新開倉減半
+
     # ── 計算空位並填補 ──
     free_slots = max_positions - len(remaining_open)
-    if free_slots > 0 and new_rankings:
+    if free_slots > 0 and new_rankings and drawdown_scale > 0:
         held_ids = {p["stock_id"] for p in remaining_open}
         available_cash = current_cash
         # 加回賣出持倉的回收資金（粗略估算，manager 會精確計算）
@@ -271,6 +297,17 @@ def compute_rotation_actions(
             available_cash += exit_p * shares * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
 
         per_position_capital = available_cash / max_positions if max_positions > 0 else 0
+        per_position_capital *= drawdown_scale  # Drawdown Guard 縮減
+
+        # 建構已持有的產業分佈（用於集中度檢查）
+        sector_counts: dict[str, int] = {}
+        if sector_map:
+            for p in remaining_open:
+                sec = sector_map.get(p["stock_id"], "")
+                if sec:
+                    sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+        max_sector_count = max(1, int(max_positions * max_sector_pct))
 
         for r in new_rankings:
             if free_slots <= 0:
@@ -281,6 +318,13 @@ def compute_rotation_actions(
             price = r.get("close", 0)
             if price <= 0:
                 continue
+
+            # 產業集中度檢查
+            if sector_map:
+                candidate_sector = sector_map.get(sid, "")
+                if candidate_sector and sector_counts.get(candidate_sector, 0) >= max_sector_count:
+                    continue  # 同產業已達上限，跳過
+
             shares = compute_shares(per_position_capital, price)
             if shares <= 0:
                 continue
@@ -296,6 +340,141 @@ def compute_rotation_actions(
                 }
             )
             held_ids.add(sid)
+            if sector_map:
+                sec = sector_map.get(sid, "")
+                if sec:
+                    sector_counts[sec] = sector_counts.get(sec, 0) + 1
             free_slots -= 1
+    elif drawdown_scale == 0.0:
+        # Drawdown Guard: 停止新開倉，但仍保持其餘邏輯
+        pass
 
     return actions
+
+
+# ---------------------------------------------------------------------------
+# B2: 持倉相關性監控
+# ---------------------------------------------------------------------------
+
+
+def compute_correlation_matrix(
+    price_data: dict[str, pd.Series],
+    window: int = 60,
+) -> pd.DataFrame:
+    """計算持倉間的 rolling correlation matrix。
+
+    Parameters
+    ----------
+    price_data : dict[str, pd.Series]
+        {stock_id: 收盤價 Series（日期索引）}。
+    window : int
+        滾動窗口天數（預設 60）。
+
+    Returns
+    -------
+    pd.DataFrame
+        correlation matrix（stock_id × stock_id）。
+    """
+    if len(price_data) < 2:
+        return pd.DataFrame()
+
+    # 建構收盤價 DataFrame，取各股最近 window 天的交集
+    prices_df = pd.DataFrame(price_data)
+    returns_df = prices_df.pct_change().dropna()
+
+    if len(returns_df) < window:
+        # 資料不足，用可用資料計算
+        return returns_df.corr()
+
+    # 取最近 window 天
+    recent = returns_df.tail(window)
+    return recent.corr()
+
+
+def find_high_correlation_pairs(
+    corr_matrix: pd.DataFrame,
+    threshold: float = 0.7,
+) -> list[tuple[str, str, float]]:
+    """從 correlation matrix 中找出高相關配對。
+
+    Returns
+    -------
+    list[tuple[str, str, float]]
+        [(stock_a, stock_b, correlation), ...] 按相關性降序排列。
+    """
+    if corr_matrix.empty:
+        return []
+
+    pairs = []
+    cols = corr_matrix.columns.tolist()
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            val = corr_matrix.iloc[i, j]
+            if not np.isnan(val) and abs(val) >= threshold:
+                pairs.append((cols[i], cols[j], round(float(val), 4)))
+
+    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# B3: 波動率反比部位大小
+# ---------------------------------------------------------------------------
+
+
+def compute_vol_inverse_weights(
+    volatilities: dict[str, float],
+) -> dict[str, float]:
+    """根據 realized volatility 計算反比權重。
+
+    波動率大的股票分配較少資金，波動率小的分配較多。
+
+    Parameters
+    ----------
+    volatilities : dict[str, float]
+        {stock_id: 20日 realized volatility（年化 std）}。
+        值為 0 或負數的會被排除。
+
+    Returns
+    -------
+    dict[str, float]
+        {stock_id: weight}，權重合為 1.0。
+    """
+    valid = {sid: vol for sid, vol in volatilities.items() if vol > 0}
+    if not valid:
+        return {}
+
+    # 反比：weight_i ∝ 1 / vol_i
+    inv = {sid: 1.0 / vol for sid, vol in valid.items()}
+    total = sum(inv.values())
+    return {sid: round(w / total, 6) for sid, w in inv.items()}
+
+
+# ---------------------------------------------------------------------------
+# B4 support: 計算組合回撤
+# ---------------------------------------------------------------------------
+
+
+def compute_portfolio_drawdown(
+    equity_history: list[float],
+) -> float:
+    """計算當前回撤百分比（正值）。
+
+    Parameters
+    ----------
+    equity_history : list[float]
+        淨值序列（最新值在最後）。
+
+    Returns
+    -------
+    float
+        當前回撤百分比（0.0~100.0），0.0 = 在高點。
+    """
+    if not equity_history or len(equity_history) < 2:
+        return 0.0
+    peak = max(equity_history)
+    current = equity_history[-1]
+    if peak <= 0:
+        return 0.0
+    dd = (peak - current) / peak * 100
+    return round(max(dd, 0.0), 2)

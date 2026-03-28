@@ -127,7 +127,7 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及持倉
 
 ### 測試
 
-使用 pytest 測試框架，1409 個測試（38 個測試檔）覆蓋核心模組：
+使用 pytest 測試框架，1430 個測試（38 個測試檔）覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -180,7 +180,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_attribution.py`    | `FactorAttribution.compute()` / `compute_from_df()` 五因子歸因（momentum/reversal/quality/size/liquidity）純函數測試 | 純函數 |
 | `tests/test_universe.py`       | `filter_liquidity`/`filter_trend` 純函數 + `UniverseFilter._stage1_sql_filter()`（ETF 排除/天數不足/低價/掛牌類型/NULL fallback）+ Stage 2 DailyPrice fallback + Candidate Memory 模式隔離 + `compute_and_store_daily_features()` ETL（ma20/turnover_ma5/upsert 冪等） | 純函數 + in-memory SQLite |
 | `tests/test_concepts.py`       | `classify_concepts()` 關鍵字比對（10 個）+ `compute_concept_momentum()` 純函數（5 個）+ `compute_concept_institutional_flow()` 純函數（4 個）+ `compute_concept_correlation_candidates()` 純函數（5 個）+ `TestConceptBonusCap` cap 機制（4 個）+ `ConceptGroup/ConceptMembership` ORM CRUD（6 個） | 純函數 + in-memory SQLite |
-| `tests/test_rotation.py`      | `compute_rotation_actions()` 核心輪動邏輯（冷啟動/持有期/到期續持/止損/換股/資金配置，共 19 個）+ `compute_position_pnl()`/`compute_shares()` 損益計算（6 個）+ 交易日工具函數（6 個）+ `resolve_rankings()` 排名解析（2 個）+ `RotationPortfolio`/`RotationPosition` ORM CRUD（2 個） | 純函數 + in-memory SQLite |
+| `tests/test_rotation.py`      | `compute_rotation_actions()` 核心輪動邏輯（冷啟動/持有期/到期續持/止損/換股/資金配置，共 19 個）+ `compute_position_pnl()`/`compute_shares()` 損益計算（6 個）+ 交易日工具函數（6 個）+ `resolve_rankings()` 排名解析（2 個）+ `RotationPortfolio`/`RotationPosition` ORM CRUD（2 個）+ `TestSectorConcentration`（4 個，產業集中度限制）+ `TestCorrelationMonitor`（4 個，持倉相關性監控）+ `TestVolInverseWeights`（5 個，波動率反比權重）+ `TestDrawdownGuard`（4 個，組合回撤防護）+ `TestPortfolioDrawdown`（4 個，回撤計算） | 純函數 + in-memory SQLite |
 
 共用 fixtures 在 `tests/conftest.py`：`in_memory_engine`（session scope）、`db_session`（function scope，transaction rollback 隔離）、`sample_ohlcv`。測試用資料建構函數（`make_price_df` 等 5 個）集中於 `tests/scanner_helpers.py`（因 `tests/` 有 `__init__.py`，conftest 不可直接 import）。
 
@@ -251,7 +251,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/regime/detector.py`            | 市場狀態偵測（bull/bear/sideways/**crisis**），三訊號多數決（TAIEX vs SMA60/SMA120 + 20日報酬率）+ **市場寬度降級**（`compute_market_breadth_pct()` 純函數，>60% 股票跌破 MA20 → regime 降一級，資料來源 DailyFeature）+ **Crisis 快速訊號覆蓋**（7 訊號 ≥2 觸發：5日跌>5% / 連跌≥3天 / 波動率飆升1.8x / **爆量長黑**（成交量>20日均量×1.5且下跌）/ **台灣 VIX 飆升**（VIX>30 或單日漲幅>25%，TW_VIX from DailyPrice）/ **單日急跌**（TAIEX 單日跌>2.5%）/ **美國 VIX 飆升**（CBOE ^VIX>30 或單日漲幅>25%，US_VIX from yfinance），crisis 優先於寬度降級）；**Hysteresis 狀態機**（`HYSTERESIS_RULES` 轉換矩陣、`check_transition_condition()` 純函數、`apply_hysteresis()` 純函數、`RegimeStateMachine` 類別 JSON 持久化）：sideways→bull 需 3 天確認 +1%/3d、bull→sideways 快速降級 1 天、crisis 退出需低點遞增+波動率回落；`detect_crisis_signals()` 純函數；輸出五模式四維度權重矩陣（含 crisis 保守模式：news 25~40%，tech 5~10%） |
 | `src/industry/analyzer.py`          | 產業輪動分析（法人動能 + 價格動能），提供 `compute_sector_scores_for_stocks()` 供 scanner 產業加成用；`compute_sector_relative_strength()` 模組級純函數（個股 20 日報酬率 vs 同產業中位數，超越 +20pp → +3%，落後 -20pp → -3%）               |
 | `src/industry/concept_analyzer.py`  | 概念股輪動分析引擎；`compute_concept_momentum()` / `compute_concept_institutional_flow()` / `compute_concept_correlation_candidates()` 純函數；`ConceptRotationAnalyzer` 類別（`rank_concepts()` Percentile Rank + `compute_concept_scores_for_stocks()` ±5% 加成供 scanner Stage 3.3b 使用） |
-| `src/portfolio/rotation.py`         | 輪動組合核心純函數：`compute_rotation_actions()`（到期/續持/止損/換股邏輯）、`compute_position_pnl()`（含交易成本）、`compute_shares()`、交易日工具函數 |
+| `src/portfolio/rotation.py`         | 輪動組合核心純函數：`compute_rotation_actions()`（到期/續持/止損/換股邏輯 + **產業集中度限制** `sector_map`/`max_sector_pct` + **Drawdown Guard** `drawdown_pct`/閾值）、`compute_position_pnl()`（含交易成本）、`compute_shares()`、交易日工具函數、**`compute_correlation_matrix()`**（60 日 rolling 相關性矩陣）、**`find_high_correlation_pairs()`**（高相關配對偵測）、**`compute_vol_inverse_weights()`**（波動率反比權重）、**`compute_portfolio_drawdown()`**（回撤百分比計算） |
 | `src/portfolio/manager.py`          | `RotationManager` 類別：每日更新（讀 DiscoveryRecord → rotation → DB）、歷史回測（逐日模擬 + 績效指標）、狀態查詢、交易歷史；`resolve_rankings()` 排名解析（單模式 / all 綜合 avg_score） |
 | `src/report/engine.py`              | 每日選股報告（四維度綜合評分）                                                                                    |
 | `src/report/formatter.py`           | Discord 訊息格式化（2000 字元限制）                                                                               |

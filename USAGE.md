@@ -1564,6 +1564,16 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
 5. 空位填補：從今日排名由高到低選入（排除已持有 + 今日剛賣出的股票）
 6. 已整合 morning-routine Step 6，每日自動更新
 
+**Phase B 組合層級風控：**
+
+| 功能 | 說明 | 參數 |
+|------|------|------|
+| **產業集中度限制** | 同產業持股不超過上限比例，超限時跳過排名較後的候選 | `sector_map` + `max_sector_pct`（預設 30%） |
+| **Drawdown Guard** | 回撤 >10% 新開倉減半，>15% 暫停新開倉，回撤恢復自動解除 | `drawdown_pct` + 閾值 |
+| **持倉相關性監控** | 60 日 rolling correlation matrix，偵測高相關配對（>0.7） | `compute_correlation_matrix()` + `find_high_correlation_pairs()` |
+| **波動率反比權重** | 波動率大的股票分配較少資金，波動率小的分配較多 | `compute_vol_inverse_weights()` |
+| **組合回撤計算** | 從淨值序列計算當前回撤百分比（0~100%） | `compute_portfolio_drawdown()` |
+
 ---
 
 ### morning-routine — 每日早晨例行流程

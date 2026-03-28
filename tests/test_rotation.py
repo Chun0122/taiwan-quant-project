@@ -9,14 +9,20 @@ from __future__ import annotations
 
 from datetime import date
 
+import pandas as pd
+
 from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
 from src.data.schema import RotationPortfolio, RotationPosition  # noqa: F401 — 確保 ORM 註冊
 from src.portfolio.rotation import (
+    compute_correlation_matrix,
     compute_planned_exit_date,
+    compute_portfolio_drawdown,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
+    compute_vol_inverse_weights,
     count_trading_days_held,
+    find_high_correlation_pairs,
     get_trading_dates_from_prices,
 )
 
@@ -600,3 +606,299 @@ class TestRotationPortfolioCRUD:
         assert loaded.portfolio_id == p.id
         assert loaded.entry_price == 600.0
         assert loaded.status == "open"
+
+
+# ===========================================================================
+# B1: 產業集中度限制
+# ===========================================================================
+
+
+class TestSectorConcentration:
+    """測試 compute_rotation_actions() 的 sector_map + max_sector_pct 產業集中度限制。"""
+
+    def test_no_sector_map_no_limit(self):
+        """未提供 sector_map 時不限制。"""
+        rankings = _make_rankings([("A", 100), ("B", 100), ("C", 100), ("D", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=4,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=400_000,
+        )
+        assert len(actions.to_buy) == 4
+
+    def test_sector_limit_blocks_excess(self):
+        """同產業 4 支候選，max_positions=4，max_sector_pct=0.30 → 同產業最多 1 支。"""
+        # 4 支全為半導體
+        rankings = _make_rankings([("A", 100), ("B", 100), ("C", 100), ("D", 100)])
+        sector_map = {"A": "半導體", "B": "半導體", "C": "半導體", "D": "半導體"}
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=4,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=400_000,
+            sector_map=sector_map,
+            max_sector_pct=0.30,
+        )
+        # max_sector_count = int(4 * 0.30) = 1，所以同產業只能買 1 支
+        semi_bought = [b for b in actions.to_buy if sector_map.get(b["stock_id"]) == "半導體"]
+        assert len(semi_bought) == 1
+
+    def test_mixed_sectors_respects_limit(self):
+        """混合產業，每個產業 2 支，max 5 positions，30% → 每產業最多 1 支。"""
+        rankings = _make_rankings(
+            [
+                ("A1", 100),
+                ("A2", 100),
+                ("B1", 100),
+                ("B2", 100),
+                ("C1", 100),
+            ]
+        )
+        sector_map = {"A1": "半導體", "A2": "半導體", "B1": "金融", "B2": "金融", "C1": "電子"}
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            sector_map=sector_map,
+            max_sector_pct=0.30,
+        )
+        # 統計每個產業的買入數
+        sector_buys: dict[str, int] = {}
+        for b in actions.to_buy:
+            sec = sector_map.get(b["stock_id"], "")
+            sector_buys[sec] = sector_buys.get(sec, 0) + 1
+        for sec, count in sector_buys.items():
+            assert count <= 1  # max(1, int(5 * 0.30)) = 1
+
+    def test_existing_positions_counted(self):
+        """已持有 1 支半導體，新買入時同產業計數從 1 開始。"""
+        pos = _make_position("A1", date(2025, 1, 6))
+        rankings = _make_rankings([("A1", 100), ("A2", 100), ("B1", 100)])
+        sector_map = {"A1": "半導體", "A2": "半導體", "B1": "金融"}
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=5,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            sector_map=sector_map,
+            max_sector_pct=0.50,  # max(1, int(3*0.5))=1
+        )
+        # A1 已持有（to_hold），A2 同產業被跳過，B1 可買
+        semi_bought = [b for b in actions.to_buy if sector_map.get(b["stock_id"]) == "半導體"]
+        assert len(semi_bought) == 0
+        fin_bought = [b for b in actions.to_buy if sector_map.get(b["stock_id"]) == "金融"]
+        assert len(fin_bought) == 1
+
+
+# ===========================================================================
+# B2: 持倉相關性監控
+# ===========================================================================
+
+
+class TestCorrelationMonitor:
+    """測試 compute_correlation_matrix() 和 find_high_correlation_pairs()。"""
+
+    def test_empty_returns_empty(self):
+        """不到 2 支股票 → 空 DataFrame。"""
+        result = compute_correlation_matrix({"A": pd.Series([1, 2, 3])})
+        assert result.empty
+
+    def test_perfect_correlation(self):
+        """完全正相關的兩支股票 → correlation ≈ 1.0。"""
+        import numpy as np
+
+        prices_a = pd.Series(np.arange(100, 200, dtype=float))
+        prices_b = pd.Series(np.arange(50, 150, dtype=float))
+        corr = compute_correlation_matrix({"A": prices_a, "B": prices_b}, window=60)
+        assert not corr.empty
+        assert corr.loc["A", "B"] > 0.99
+
+    def test_find_high_pairs(self):
+        """高相關配對偵測。"""
+        import numpy as np
+
+        np.random.seed(42)
+        base = np.cumsum(np.random.randn(100))
+        prices = {
+            "A": pd.Series(100 + base),
+            "B": pd.Series(50 + base * 1.1),  # 高度相關
+            "C": pd.Series(80 + np.cumsum(np.random.randn(100))),  # 獨立
+        }
+        corr = compute_correlation_matrix(prices, window=60)
+        pairs = find_high_correlation_pairs(corr, threshold=0.7)
+        # A-B 應該高度相關
+        ab_pairs = [(a, b) for a, b, _ in pairs if {a, b} == {"A", "B"}]
+        assert len(ab_pairs) == 1
+
+    def test_threshold_filters_correctly(self):
+        """低門檻能抓到更多配對，高門檻過濾嚴格。"""
+        import numpy as np
+
+        np.random.seed(42)
+        base = np.cumsum(np.random.randn(100))
+        prices = {
+            "A": pd.Series(100 + base),
+            "B": pd.Series(50 + base + np.random.randn(100) * 2),
+            "C": pd.Series(80 + np.cumsum(np.random.randn(100))),
+        }
+        corr = compute_correlation_matrix(prices, window=60)
+        pairs_low = find_high_correlation_pairs(corr, threshold=0.3)
+        pairs_high = find_high_correlation_pairs(corr, threshold=0.9)
+        assert len(pairs_low) >= len(pairs_high)
+
+
+# ===========================================================================
+# B3: 波動率反比部位大小
+# ===========================================================================
+
+
+class TestVolInverseWeights:
+    """測試 compute_vol_inverse_weights()。"""
+
+    def test_equal_vol_equal_weight(self):
+        """相同波動率 → 等權重。"""
+        weights = compute_vol_inverse_weights({"A": 0.2, "B": 0.2, "C": 0.2})
+        assert len(weights) == 3
+        for w in weights.values():
+            assert abs(w - 1 / 3) < 0.001
+
+    def test_higher_vol_lower_weight(self):
+        """波動率高的分配較少。"""
+        weights = compute_vol_inverse_weights({"LOW": 0.1, "HIGH": 0.5})
+        assert weights["LOW"] > weights["HIGH"]
+
+    def test_weights_sum_to_one(self):
+        """權重合為 1.0。"""
+        weights = compute_vol_inverse_weights({"A": 0.15, "B": 0.25, "C": 0.35})
+        assert abs(sum(weights.values()) - 1.0) < 0.001
+
+    def test_zero_vol_excluded(self):
+        """波動率為 0 的被排除。"""
+        weights = compute_vol_inverse_weights({"A": 0.2, "B": 0.0, "C": 0.3})
+        assert "B" not in weights
+        assert len(weights) == 2
+
+    def test_empty_input(self):
+        """空輸入 → 空結果。"""
+        assert compute_vol_inverse_weights({}) == {}
+
+
+# ===========================================================================
+# B4: Drawdown Guard
+# ===========================================================================
+
+
+class TestDrawdownGuard:
+    """測試 compute_rotation_actions() 的 drawdown_pct 參數。"""
+
+    def test_no_drawdown_normal_buying(self):
+        """drawdown_pct=None → 正常買入。"""
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+        )
+        assert len(actions.to_buy) == 2
+
+    def test_moderate_drawdown_halves_capital(self):
+        """drawdown 12% → 新開倉資金減半，持倉量更小。"""
+        rankings = _make_rankings([("A", 100)])
+        actions_normal = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=None,
+        )
+        actions_dd = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=12.0,
+        )
+        if actions_normal.to_buy and actions_dd.to_buy:
+            assert actions_dd.to_buy[0]["shares"] < actions_normal.to_buy[0]["shares"]
+
+    def test_severe_drawdown_stops_buying(self):
+        """drawdown 16% → 停止新開倉。"""
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=16.0,
+        )
+        assert len(actions.to_buy) == 0
+
+    def test_drawdown_below_threshold_normal(self):
+        """drawdown 5% < 10% → 正常買入。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=5.0,
+        )
+        assert len(actions.to_buy) == 1
+
+
+class TestPortfolioDrawdown:
+    """測試 compute_portfolio_drawdown()。"""
+
+    def test_at_peak(self):
+        """淨值在高點 → 回撤 0。"""
+        assert compute_portfolio_drawdown([100, 110, 120]) == 0.0
+
+    def test_simple_drawdown(self):
+        """peak=120, current=100 → 16.67%。"""
+        dd = compute_portfolio_drawdown([100, 120, 100])
+        assert abs(dd - 16.67) < 0.01
+
+    def test_empty_history(self):
+        assert compute_portfolio_drawdown([]) == 0.0
+
+    def test_single_point(self):
+        assert compute_portfolio_drawdown([100]) == 0.0
