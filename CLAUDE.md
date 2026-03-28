@@ -127,7 +127,7 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及持倉
 
 ### 測試
 
-使用 pytest 測試框架，1465 個測試（39 個測試檔）覆蓋核心模組：
+使用 pytest 測試框架，1486 個測試（41 個測試檔）覆蓋核心模組：
 
 ```bash
 # 執行全部測試
@@ -153,7 +153,8 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_mops.py`            | `mops_fetcher.py` 情緒分類 + 月營收解析 + `scanner.py` 消息面評分 + Announcement ORM + 權重矩陣 | 純函數 + in-memory SQLite |
 | `tests/test_regime.py`          | `src/regime/detector.py` 市場狀態偵測 + 權重矩陣 + `TestDetectCrisisSignals`（23 個，含台灣 VIX spike + 單日急跌 + 美國 VIX spike 7 個）+ `TestRegimeWeightsCrisis`（5 個）+ `TestComputeMarketBreadthPct`（5 個）+ `TestBreadthDowngrade`（5 個）+ `TestPanicVolumeSignal`（6 個）+ `TestCheckTransitionCondition`（6 個）+ `TestApplyHysteresis`（13 個）+ `TestRegimeStateMachine`（6 個）| 純函數                 |
 | `tests/test_fetcher.py`         | `src/data/fetcher.py` API 封裝                   | mock HTTP              |
-| `tests/test_config.py`          | `src/config.py` 設定載入                         | tmp_path               |
+| `tests/test_config.py`          | `src/config.py` 設定載入 + `TestQuantConfig`（4 個，D2 量化參數外部化） | tmp_path               |
+| `tests/test_charts.py`          | `src/visualization/charts.py` D4 Dashboard 純計算函數：`TestSimulateEquityCurve`（6 個）+ `TestComputeDrawdownSeries`（6 個）+ `TestTransformCalendarHeatmapData`（5 個） | 純函數 |
 | `tests/test_dividend_adjustment.py` | 除權息還原（價格調整 + 指標重算 + 回測股利入帳） | 純函數 + mock Strategy |
 | `tests/test_discover_performance.py` | `src/discovery/performance.py` 推薦績效回測 + `TestComputeStrategyDecay`（7 個，策略衰減監控純函數）| in-memory SQLite + 純函數 |
 | `tests/test_db_integration.py`  | ORM + upsert + pipeline + DiscoveryRecord + Watchlist ORM CRUD + `get_effective_watchlist()` DB優先/YAML fallback | in-memory SQLite       |
@@ -177,7 +178,7 @@ pytest --cov=src --cov-report=term-missing
 | `tests/test_alert.py`          | `classify_event_type` 事件分類 + `Announcement` event_type ORM + `_compute_revenue_scan` 純函數（YoY + 毛利率掃描） | 純函數 + in-memory SQLite |
 | `tests/test_sbl.py`            | `fetch_twse_sbl` 欄位映射 + `SecuritiesLending` ORM + `compute_sbl_score` 純函數 + `MomentumScanner` 6-factor 啟用/降級/逆向排名 | 純函數 + in-memory SQLite + mock HTTP |
 | `tests/test_broker.py`         | `fetch_dj_broker_trades` HTML 解析（Big5/BHID/多分點彙整/單位換算）+ `BrokerTrade` ORM + `compute_broker_score` HHI/連續天 + `MomentumScanner` 7-factor 啟用/降級/集中度影響 + `TestLoadBrokerDataExtendedCloseProxy` 收盤價代理均價（NULL 填補/不覆蓋/無資料降回 7F）+ `TestSyncBrokerBootstrap` 逐日查詢簽名/獨立性/預設值/單日 vs 期間 | 純函數 + in-memory SQLite + mock HTTP |
-| `tests/test_anomaly.py`        | `detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` 五個純函數（量能暴增/外資大買超/借券激增/主力集中/隔日沖風險）| 純函數 |
+| `tests/test_anomaly.py`        | `src/cli/detection.py` 五個籌碼異動偵測純函數（量能暴增/外資大買超/借券激增/主力集中/隔日沖風險）| 純函數 |
 | `tests/test_attribution.py`    | `FactorAttribution.compute()` / `compute_from_df()` 五因子歸因（momentum/reversal/quality/size/liquidity）純函數測試 | 純函數 |
 | `tests/test_universe.py`       | `filter_liquidity`/`filter_trend` 純函數 + `UniverseFilter._stage1_sql_filter()`（ETF 排除/天數不足/低價/掛牌類型/NULL fallback）+ Stage 2 DailyPrice fallback + Candidate Memory 模式隔離 + `compute_and_store_daily_features()` ETL（ma20/turnover_ma5/upsert 冪等） | 純函數 + in-memory SQLite |
 | `tests/test_concepts.py`       | `classify_concepts()` 關鍵字比對（10 個）+ `compute_concept_momentum()` 純函數（5 個）+ `compute_concept_institutional_flow()` 純函數（4 個）+ `compute_concept_correlation_candidates()` 純函數（5 個）+ `TestConceptBonusCap` cap 機制（4 個）+ `ConceptGroup/ConceptMembership` ORM CRUD（6 個） | 純函數 + in-memory SQLite |
@@ -231,7 +232,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/migrate.py`               | DB schema 遷移工具                                                                                                |
 | `src/constants.py`                  | 全系統共用常數集中管理：交易成本（COMMISSION_RATE/TAX_RATE/SLIPPAGE_RATE/**SLIPPAGE_IMPACT_COEFF**/**LIQUIDITY_PARTICIPATION_LIMIT**）、DB/ETL（UPSERT_BATCH_SIZE/API_SLEEP_*）、籌碼異動門檻（DEFAULT_VOL_MULT/DEFAULT_INST_THRESHOLD/DEFAULT_SBL_SIGMA/DEFAULT_HHI_THRESHOLD/DEFAULT_DT_THRESHOLD）、VIX 危機偵測（VIX_STOCK_ID/CRISIS_VIX_LEVEL/CRISIS_VIX_DAILY_CHANGE/CRISIS_SINGLE_DAY_DROP）、美國 VIX（US_VIX_STOCK_ID/CRISIS_US_VIX_LEVEL/CRISIS_US_VIX_DAILY_CHANGE） |
 | `src/entry_exit.py`                 | 進出場建議共用純函數：`REGIME_ATR_PARAMS` 常數（bull/sideways/bear/crisis ATR 倍數）、`compute_atr_stops()` ATR 止損止利、`compute_entry_trigger()` 進場觸發文字、`assess_timing()` 時機評估（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
-| `src/config.py`                     | Pydantic 設定模型 + `load_settings()`                                                                             |
+| `src/config.py`                     | Pydantic 設定模型 + `load_settings()` + **D2** `QuantConfig`（`TradingCostConfig`/`AtrMultiplierConfig`/`ScoreThresholdConfig` 三子模型，settings.yaml `quant` 區塊覆蓋預設值） |
+| `src/cli/detection.py`              | **D1** 從 main.py 抽出的 5 個籌碼異動偵測純函數：`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` |
 | `src/features/indicators.py`        | SMA/RSI/MACD/BB/ADX(14) → EAV 格式；`compute_indicators_from_df()` 寬表純函數（含 adx_14）；`calc_rsi14_from_series()` 純函數；`aggregate_to_weekly()` 純函數（日K聚合週K + 週線 SMA13/RSI14/MACD） |
 | `src/features/ml_features.py`       | ML 特徵矩陣（動能、波動度、量比）+ **C1 擴充**：交互特徵（量價共振/RSI×波動率/ADX×動量）、Lag 特徵（5/10/20 日）、跨截面特徵（sector_ranks）+ **C5**：`select_features_by_importance()` SHAP-based 特徵篩選、`compute_shap_importances()` SHAP 重要性計算 |
 | `src/strategy/base.py`              | 抽象 `Strategy`：`load_data()` + `generate_signals()` + 除權息調整（`_apply_dividend_adjustment`）                |
@@ -262,10 +264,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫），`daily_sync_job()` delegate 給 `cmd_morning_routine()`（Step 0~9 + Discord），`weekly_holding_job()` 每週四同步 TDCC |
 | `src/scheduler/windows_task.py`     | Windows 工作排程器 .bat + XML 產生器，每日 .bat 執行 `morning-routine --notify`，每週四 .bat 執行 `sync-holding`    |
 | `src/visualization/app.py`          | Streamlit 儀表板入口                                                                                              |
-| `src/visualization/charts.py`       | Plotly 圖表元件                                                                                                   |
+| `src/visualization/charts.py`       | Plotly 圖表元件 + **D4** 抽出的純計算函數：`simulate_equity_curve()`（權益曲線模擬）、`compute_drawdown_series()`（回撤序列）、`transform_calendar_heatmap_data()`（日曆熱圖矩陣轉換） |
 | `src/visualization/data_loader.py`  | 儀表板資料載入                                                                                                    |
 | `src/visualization/pages/`          | 儀表板 12 分頁（market_overview, stock_analysis, backtest_review, portfolio_review, strategy_comparison, screener_results, ml_analysis, industry_rotation, concept_rotation, discovery_history, position_monitoring） |
-| `main.py`                           | CLI 調度器（argparse 子命令，36 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；`detect_volume_spike`/`detect_institutional_buy`/`detect_sbl_spike`/`detect_broker_concentration`/`detect_daytrade_risk` 五個籌碼異動純函數；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 0 VIX 同步 + Step 6 rotation update + Step 8 anomaly-scan + Step 9 策略衰減監控）；`cmd_rotation()` 輪動組合管理（create/update/status/history/backtest/list/pause/resume/delete）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數） |
+| `main.py`                           | CLI 調度器（argparse 子命令，36 個頂層子命令）；`_compute_revenue_scan()` 純函數；`_compute_trailing_stop()` 純函數；籌碼異動偵測已移至 `src/cli/detection.py`（D1）；`_compute_anomaly_scan()` 聚合函數（含隔日沖偵測）；`cmd_anomaly_scan()` 籌碼異動警報；`cmd_morning_routine()` 早晨例行流程（含 Step 0 VIX 同步 + Step 6 rotation update + Step 8 anomaly-scan + Step 9 策略衰減監控）；`cmd_rotation()` 輪動組合管理（create/update/status/history/backtest/list/pause/resume/delete）；`cmd_sync_vix()` VIX 同步；`cmd_watchlist()` DB-based watchlist 管理（add/remove/list/import）；`cmd_sync_info()` 全市場股票基本資料同步（StockInfo，`--force` 強制更新）；`cmd_sync_features()` 計算全市場 DailyFeature（`--days` 回溯天數）；ML 策略 CLI 新增 `--shap`/`--optuna`/`--feature-selection` 旗標 |
 
 ### 設定
 

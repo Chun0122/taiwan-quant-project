@@ -34,3 +34,26 @@ discord:
   webhook_url: ""              # 填入你的 Discord Webhook URL
   username: "台股量化系統"       # Webhook 顯示名稱
   enabled: true                # 設為 false 可暫時停用通知
+
+# 量化參數（可選 — 未設定則使用程式內建預設值）
+# quant:
+#   trading_cost:
+#     commission_rate: 0.001425   # 手續費 0.1425%
+#     tax_rate: 0.003             # 交易稅 0.3%（賣出時）
+#     slippage_rate: 0.0005       # 滑價 0.05%
+#     slippage_impact_coeff: 0.5  # 動態滑價衝擊係數
+#     liquidity_participation_limit: 0.05  # 流動性約束（單筆 ≤ 當日量 × 此比例）
+#   atr_multiplier:
+#     bull_stop: 1.5              # 多頭止損 ATR 倍數
+#     bull_target: 3.0            # 多頭目標 ATR 倍數
+#     sideways_stop: 2.0          # 盤整止損
+#     sideways_target: 2.5        # 盤整目標
+#     bear_stop: 2.5              # 空頭止損
+#     bear_target: 2.0            # 空頭目標
+#     crisis_stop: 3.0            # 危機止損
+#     crisis_target: 1.5          # 危機目標
+#   score_threshold:
+#     bull: 0.45                  # 多頭最低評分門檻
+#     sideways: 0.50
+#     bear: 0.55
+#     crisis: 0.60

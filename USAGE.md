@@ -151,6 +151,19 @@ logging:
 # Anthropic API（AI 選股摘要功能，可選）
 anthropic:
   api_key: "你的 anthropic api key"    # 需要 discover --ai-summary 功能時填入
+
+# 量化參數（可選，未設定則使用程式預設值）
+# quant:
+#   trading_cost:
+#     commission_rate: 0.001425      # 手續費
+#     tax_rate: 0.003                # 交易稅
+#     slippage_rate: 0.0005          # 滑價
+#   atr_multiplier:
+#     bull_stop: 1.5                 # 多頭止損 ATR 倍數
+#     crisis_stop: 3.0               # 危機止損 ATR 倍數
+#   score_threshold:
+#     bull: 0.45                     # 各 Regime 最低評分門檻
+#     crisis: 0.60
 ```
 
 若要新增關注股票，在 `watchlist` 下加入股票代號，或使用 DB-based watchlist 管理（推薦）：

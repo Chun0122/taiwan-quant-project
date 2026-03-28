@@ -9,6 +9,132 @@ from plotly.subplots import make_subplots
 
 from src.constants import COMMISSION_RATE, TAX_RATE
 
+# ---------------------------------------------------------------------------
+# D4: 可測試的純計算函數（從圖表邏輯中抽出）
+# ---------------------------------------------------------------------------
+
+
+def simulate_equity_curve(
+    dates: list,
+    closes: list[float],
+    buy_dates: dict,
+    sell_dates: dict,
+    initial_capital: float = 1_000_000,
+    commission_rate: float = COMMISSION_RATE,
+    tax_rate: float = TAX_RATE,
+) -> list[float]:
+    """從日期序列與交易事件模擬權益曲線（純函數）。
+
+    Parameters
+    ----------
+    dates : list
+        日期序列。
+    closes : list[float]
+        收盤價序列（與 dates 等長）。
+    buy_dates : dict
+        {date: entry_price} 買入事件。
+    sell_dates : dict
+        {date: exit_price} 賣出事件。
+    initial_capital : float
+        初始資金。
+    commission_rate, tax_rate : float
+        交易成本費率。
+
+    Returns
+    -------
+    list[float]
+        每日權益值。
+    """
+    capital = initial_capital
+    position = 0
+    equity = []
+
+    for i, dt in enumerate(dates):
+        dt_date = pd.Timestamp(dt).date() if not isinstance(dt, pd.Timestamp) else dt.date()
+        close = closes[i]
+
+        if dt_date in buy_dates and position == 0:
+            ep = buy_dates[dt_date]
+            shares = int(capital * 0.998 // ep)
+            if shares > 0:
+                capital -= shares * ep * (1 + commission_rate)
+                position = shares
+
+        elif dt_date in sell_dates and position > 0:
+            sp = sell_dates[dt_date]
+            revenue = position * sp * (1 - commission_rate - tax_rate)
+            capital += revenue
+            position = 0
+
+        equity.append(capital + position * close)
+
+    return equity
+
+
+def compute_drawdown_series(equity: list[float]) -> list[float]:
+    """從權益曲線計算回撤百分比序列（純函數）。
+
+    Parameters
+    ----------
+    equity : list[float]
+        權益值序列。
+
+    Returns
+    -------
+    list[float]
+        回撤百分比（正值，0~100），與 equity 等長。
+    """
+    if not equity:
+        return []
+    eq_arr = np.array(equity)
+    peak = np.maximum.accumulate(eq_arr)
+    # 避免除以零
+    dd = np.where(peak > 0, (peak - eq_arr) / peak * 100, 0.0)
+    return dd.tolist()
+
+
+def transform_calendar_heatmap_data(
+    df: pd.DataFrame,
+    value_col: str,
+) -> tuple[list[str], list[str], list[list[float | None]]]:
+    """將含 scan_date 的 DataFrame 轉為日曆熱圖矩陣（純函數）。
+
+    Parameters
+    ----------
+    df : DataFrame
+        需含 scan_date 欄（date/str）和 value_col 欄位。
+    value_col : str
+        數值欄位名稱。
+
+    Returns
+    -------
+    (y_labels, x_labels, z_matrix) : tuple
+        y = 年月標籤，x = 週標籤，z = 數值矩陣（含 None）。
+    """
+    if df.empty:
+        return [], [], []
+
+    dfc = df.copy()
+    dfc["scan_date"] = pd.to_datetime(dfc["scan_date"])
+    dfc["year_month"] = dfc["scan_date"].dt.to_period("M").astype(str)
+    dfc["day"] = dfc["scan_date"].dt.day
+    dfc["week_of_month"] = (dfc["day"] - 1) // 7 + 1
+
+    pivot = dfc.pivot_table(
+        index="year_month",
+        columns="week_of_month",
+        values=value_col,
+        aggfunc="mean",
+    )
+    pivot = pivot.sort_index()
+
+    y_labels = pivot.index.tolist()
+    x_labels = [f"第{w}週" for w in pivot.columns]
+    z_matrix = pivot.where(pd.notna(pivot), None).values.tolist()
+
+    return y_labels, x_labels, z_matrix
+
+
 # ------------------------------------------------------------------ #
 #  個股分析圖表
 # ------------------------------------------------------------------ #
@@ -385,11 +511,6 @@ def plot_equity_curve(
     dates = prices["date"].tolist()
     closes = prices["close"].tolist()
 
-    capital = initial_capital
-    position = 0
-    entry_price = 0.0
-    equity = []
-
     # 建立交易事件 lookup
     buy_dates = {}
     sell_dates = {}
@@ -399,30 +520,9 @@ def plot_equity_curve(
             if pd.notna(t["exit_date"]):
                 sell_dates[pd.Timestamp(t["exit_date"]).date()] = t["exit_price"]
 
-    for i, dt in enumerate(dates):
-        dt_date = pd.Timestamp(dt).date() if not isinstance(dt, pd.Timestamp) else dt.date()
-        close = closes[i]
-
-        if dt_date in buy_dates and position == 0:
-            ep = buy_dates[dt_date]
-            shares = int(capital * 0.998 // ep)
-            if shares > 0:
-                capital -= shares * ep * 1.001425
-                position = shares
-                entry_price = ep
-
-        elif dt_date in sell_dates and position > 0:
-            sp = sell_dates[dt_date]
-            revenue = position * sp * (1 - COMMISSION_RATE - TAX_RATE)
-            capital += revenue
-            position = 0
-
-        equity.append(capital + position * close)
-
-    # 計算回撤
-    eq_arr = np.array(equity)
-    peak = np.maximum.accumulate(eq_arr)
-    drawdown = (peak - eq_arr) / peak * 100
+    # 使用抽出的純函數
+    equity = simulate_equity_curve(dates, closes, buy_dates, sell_dates, initial_capital)
+    drawdown = compute_drawdown_series(equity)
 
     fig = make_subplots(
         rows=2,

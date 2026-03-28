@@ -12,7 +12,7 @@ import datetime
 import pandas as pd
 import pytest
 
-from main import (
+from src.cli.detection import (
     detect_broker_concentration,
     detect_institutional_buy,
     detect_sbl_spike,
@@ -206,7 +206,7 @@ class TestDetectDaytradeRisk:
 
     def test_risk_triggered(self):
         """penalty > threshold → 觸發。"""
-        from main import detect_daytrade_risk
+        from src.cli.detection import detect_daytrade_risk
 
         df = self._make_dt_broker_df(
             "2330",
@@ -221,7 +221,7 @@ class TestDetectDaytradeRisk:
 
     def test_below_threshold(self):
         """penalty < threshold → 不觸發。"""
-        from main import detect_daytrade_risk
+        from src.cli.detection import detect_daytrade_risk
 
         df = self._make_dt_broker_df(
             "2330",
@@ -235,7 +235,7 @@ class TestDetectDaytradeRisk:
 
     def test_top_dt_brokers_returned(self):
         """正確回傳隔日沖分點名稱。"""
-        from main import detect_daytrade_risk
+        from src.cli.detection import detect_daytrade_risk
 
         df = self._make_dt_broker_df(
             "2330",
@@ -252,7 +252,7 @@ class TestDetectDaytradeRisk:
 
     def test_empty_data(self):
         """空資料 → 不觸發。"""
-        from main import detect_daytrade_risk
+        from src.cli.detection import detect_daytrade_risk
 
         df = pd.DataFrame()
         result = detect_daytrade_risk(df, penalty_threshold=0.3)

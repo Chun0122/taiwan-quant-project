@@ -38,6 +38,46 @@ class AnthropicConfig(BaseModel):
     model: str = "claude-sonnet-4-6"
 
 
+class TradingCostConfig(BaseModel):
+    """交易成本參數（預設值與 src/constants.py 一致）。"""
+
+    commission_rate: float = 0.001425
+    tax_rate: float = 0.003
+    slippage_rate: float = 0.0005
+    slippage_impact_coeff: float = 0.5
+    liquidity_participation_limit: float = 0.05
+
+
+class AtrMultiplierConfig(BaseModel):
+    """ATR 倍數參數（預設值與 src/entry_exit.py REGIME_ATR_PARAMS 一致）。"""
+
+    bull_stop: float = 1.5
+    bull_target: float = 3.0
+    sideways_stop: float = 2.0
+    sideways_target: float = 2.5
+    bear_stop: float = 2.5
+    bear_target: float = 2.0
+    crisis_stop: float = 3.0
+    crisis_target: float = 1.5
+
+
+class ScoreThresholdConfig(BaseModel):
+    """各 Regime 的最低評分門檻（預設值與 scanner MIN_SCORE_THRESHOLDS 一致）。"""
+
+    bull: float = 0.45
+    sideways: float = 0.50
+    bear: float = 0.55
+    crisis: float = 0.60
+
+
+class QuantConfig(BaseModel):
+    """量化參數外部化（D2）— 可在 settings.yaml 的 quant 區塊覆蓋預設值。"""
+
+    trading_cost: TradingCostConfig = TradingCostConfig()
+    atr_multiplier: AtrMultiplierConfig = AtrMultiplierConfig()
+    score_threshold: ScoreThresholdConfig = ScoreThresholdConfig()
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
@@ -45,6 +85,7 @@ class Settings(BaseModel):
     logging: LoggingConfig = LoggingConfig()
     discord: DiscordWebhookConfig = DiscordWebhookConfig()
     anthropic: AnthropicConfig = AnthropicConfig()
+    quant: QuantConfig = QuantConfig()
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:

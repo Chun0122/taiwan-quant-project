@@ -1673,7 +1673,7 @@ def cmd_sync_vix(args: argparse.Namespace) -> None:
     try:
         tw_count = sync_taiwan_vix()
         print(f"台灣 VIX 同步完成：{tw_count:,} 筆")
-    except Exception as e:
+    except (ConnectionError, OSError, ValueError, KeyError) as e:
         print(f"台灣 VIX 同步失敗（不影響流程）: {e}")
         tw_count = 0
 
@@ -1681,7 +1681,7 @@ def cmd_sync_vix(args: argparse.Namespace) -> None:
     try:
         us_count = sync_us_vix()
         print(f"美國 VIX 同步完成：{us_count:,} 筆")
-    except Exception as e:
+    except (ConnectionError, OSError, ValueError, KeyError) as e:
         print(f"美國 VIX 同步失敗（不影響流程）: {e}")
         us_count = 0
 
@@ -2050,7 +2050,7 @@ def _compute_macro_stress_check() -> dict:
             "breadth_downgraded": breadth_downgraded,
         }
 
-    except Exception as exc:
+    except (KeyError, ValueError, TypeError, ZeroDivisionError) as exc:
         logging.warning("宏觀壓力預檢失敗: %s", exc)
         return {
             "regime": "sideways",
@@ -2166,218 +2166,14 @@ def _compute_revenue_scan(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def detect_volume_spike(
-    df_price: "pd.DataFrame",
-    lookback: int = 10,
-    threshold: float = 2.0,
-) -> "pd.DataFrame":
-    """量能暴增偵測：今日量 > 近 lookback 天均量 × threshold（純函數）。
-
-    輸入欄位: stock_id, date, volume（股）
-    輸出欄位: stock_id, today_vol, avg_vol, vol_ratio
-    需至少 2 天資料（1 天歷史 + 1 天今日）；不足回傳空 DataFrame。
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame(columns=["stock_id", "today_vol", "avg_vol", "vol_ratio"])
-    if df_price.empty:
-        return empty
-
-    results = []
-    # 預先排序一次，避免每個 group 內重複排序
-    sorted_price = df_price.sort_values(["stock_id", "date"])
-    for stock_id, grp in sorted_price.groupby("stock_id", sort=False):
-        latest_date = grp["date"].iloc[-1]  # 已排序，最後一筆即最新
-        today_row = grp[grp["date"] == latest_date]
-        hist = grp[grp["date"] < latest_date].tail(lookback)
-        if hist.empty or today_row.empty:
-            continue
-        today_vol = int(today_row["volume"].iloc[0])
-        avg_vol = float(hist["volume"].mean())
-        if avg_vol <= 0:
-            continue
-        ratio = today_vol / avg_vol
-        if ratio >= threshold:
-            results.append(
-                {
-                    "stock_id": stock_id,
-                    "today_vol": today_vol,
-                    "avg_vol": round(avg_vol),
-                    "vol_ratio": round(ratio, 2),
-                }
-            )
-
-    if not results:
-        return empty
-    return pd.DataFrame(results).sort_values("vol_ratio", ascending=False).reset_index(drop=True)
-
-
-def detect_institutional_buy(
-    df_inst: "pd.DataFrame",
-    threshold: float = 3_000_000,
-) -> "pd.DataFrame":
-    """外資大買超偵測：最新日外資 net > threshold（股）（純函數）。
-
-    輸入欄位: stock_id, date, name, net
-    name 用 str.contains("外資") 篩選（容納多種命名格式）。
-    輸出欄位: stock_id, inst_net（股）
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame(columns=["stock_id", "inst_net"])
-    if df_inst.empty:
-        return empty
-
-    foreign = df_inst[df_inst["name"].str.contains("外資", na=False)].copy()
-    if foreign.empty:
-        return empty
-
-    latest_date = foreign["date"].max()
-    today_foreign = foreign[foreign["date"] == latest_date]
-
-    # 同一股票可能有多筆外資記錄（外資 + 外資自營商），合計
-    summed = today_foreign.groupby("stock_id")["net"].sum().reset_index()
-    summed.columns = ["stock_id", "inst_net"]
-
-    result = summed[summed["inst_net"] > threshold]
-    return result.sort_values("inst_net", ascending=False).reset_index(drop=True)
-
-
-def detect_sbl_spike(
-    df_sbl: "pd.DataFrame",
-    lookback: int = 10,
-    sigma: float = 2.0,
-) -> "pd.DataFrame":
-    """借券賣出激增偵測：最新日 sbl_change > mean + sigma × std（純函數）。
-
-    需至少 3 筆歷史資料才計算（含今日），不足回傳空 DataFrame。
-    只偵測 sbl_change > 0（借券增加）的情況。
-    輸入欄位: stock_id, date, sbl_change
-    輸出欄位: stock_id, sbl_change, sbl_mean, sbl_std
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame(columns=["stock_id", "sbl_change", "sbl_mean", "sbl_std"])
-    if df_sbl.empty:
-        return empty
-
-    results = []
-    for stock_id, grp in df_sbl.groupby("stock_id"):
-        grp = grp.sort_values("date")
-        if len(grp) < 3:
-            continue
-        latest_date = grp["date"].max()
-        today_row = grp[grp["date"] == latest_date]
-        if today_row.empty:
-            continue
-        today_change = today_row["sbl_change"].iloc[0]
-        if pd.isna(today_change):
-            continue
-        today_change = float(today_change)
-
-        hist_changes = grp[grp["date"] < latest_date]["sbl_change"].dropna()
-        if len(hist_changes) < 2:
-            continue
-        mean_c = float(hist_changes.tail(lookback).mean())
-        std_c = float(hist_changes.tail(lookback).std())
-        if std_c <= 0:
-            continue
-        z = (today_change - mean_c) / std_c
-        if today_change > 0 and z >= sigma:
-            results.append(
-                {
-                    "stock_id": stock_id,
-                    "sbl_change": int(today_change),
-                    "sbl_mean": round(mean_c, 1),
-                    "sbl_std": round(std_c, 1),
-                }
-            )
-
-    if not results:
-        return empty
-    return pd.DataFrame(results).sort_values("sbl_change", ascending=False).reset_index(drop=True)
-
-
-def detect_broker_concentration(
-    df_broker: "pd.DataFrame",
-    hhi_threshold: float = 0.4,
-) -> "pd.DataFrame":
-    """主力分點集中買進：最新日 HHI(淨買超分點) > hhi_threshold AND 總淨買 > 0（純函數）。
-
-    輸入欄位: stock_id, date, broker_id, buy, sell
-    輸出欄位: stock_id, broker_hhi, net_buy_total（股）
-    """
-    import pandas as pd
-
-    empty = pd.DataFrame(columns=["stock_id", "broker_hhi", "net_buy_total"])
-    if df_broker.empty:
-        return empty
-
-    latest_date = df_broker["date"].max()
-    today = df_broker[df_broker["date"] == latest_date].copy()
-    today["net"] = (today["buy"].fillna(0) - today["sell"].fillna(0)).astype(int)
-
-    results = []
-    for stock_id, grp in today.groupby("stock_id"):
-        net_buy_total = int(grp["net"].sum())
-        if net_buy_total <= 0:
-            continue
-        buyers = grp[grp["net"] > 0]
-        if buyers.empty:
-            continue
-        total = buyers["net"].sum()
-        shares = buyers["net"] / total
-        hhi = float((shares**2).sum())
-        if hhi >= hhi_threshold:
-            results.append(
-                {
-                    "stock_id": stock_id,
-                    "broker_hhi": round(hhi, 3),
-                    "net_buy_total": net_buy_total,
-                }
-            )
-
-    if not results:
-        return empty
-    return pd.DataFrame(results).sort_values("broker_hhi", ascending=False).reset_index(drop=True)
-
-
-def detect_daytrade_risk(
-    df_broker: "pd.DataFrame",
-    df_volume: "pd.DataFrame | None" = None,
-    penalty_threshold: float = 0.3,
-) -> "pd.DataFrame":
-    """偵測隔日沖風險超過門檻的股票（純函數）。
-
-    Args:
-        df_broker: BrokerTrade DataFrame [stock_id, date, broker_id, broker_name, buy, sell]
-        df_volume: 各股 20 日均量 DataFrame [stock_id, avg_volume_20d]（可選）
-        penalty_threshold: 觸發門檻（預設 0.3）
-
-    Returns:
-        DataFrame [stock_id, daytrade_penalty, top_dt_brokers]（僅含超過門檻的股票）
-    """
-    import pandas as pd
-
-    from src.discovery.scanner import compute_daytrade_penalty
-
-    empty = pd.DataFrame(columns=["stock_id", "daytrade_penalty", "top_dt_brokers"])
-    if df_broker.empty:
-        return empty
-
-    result = compute_daytrade_penalty(df_broker, df_volume=df_volume)
-    if result.empty:
-        return empty
-
-    triggered = result[result["daytrade_penalty"] >= penalty_threshold].copy()
-    if triggered.empty:
-        return empty
-
-    return (
-        triggered[["stock_id", "daytrade_penalty", "top_dt_brokers"]]
-        .sort_values("daytrade_penalty", ascending=False)
-        .reset_index(drop=True)
-    )
+# 籌碼異動偵測純函數 — 已移至 src/cli/detection.py（D1 CLI 模組化）
+from src.cli.detection import (  # noqa: E402
+    detect_broker_concentration,
+    detect_daytrade_risk,
+    detect_institutional_buy,
+    detect_sbl_spike,
+    detect_volume_spike,
+)
 
 
 def _compute_anomaly_scan(
@@ -2398,6 +2194,7 @@ def _compute_anomaly_scan(
 
     import pandas as pd
     from sqlalchemy import select
+    from sqlalchemy.exc import OperationalError, ProgrammingError
 
     from src.data.database import get_session
     from src.data.schema import BrokerTrade, DailyPrice, InstitutionalInvestor, SecuritiesLending
@@ -2470,8 +2267,8 @@ def _compute_anomaly_scan(
                 df_broker = pd.DataFrame(
                     broker_rows, columns=["stock_id", "date", "broker_id", "broker_name", "buy", "sell"]
                 )
-    except Exception:
-        logging.exception("anomaly_scan DB 查詢失敗")
+    except (OperationalError, ProgrammingError) as exc:
+        logging.warning("anomaly_scan DB 查詢失敗: %s", exc)
 
     # 計算 20 日均量供隔日沖流動性閾值使用
     df_vol_for_dt = None
@@ -2784,7 +2581,8 @@ def cmd_suggest(args: argparse.Namespace) -> None:
         regime_info = MarketRegimeDetector().detect()
         regime: str = regime_info["regime"]
         taiex_close: float = float(regime_info["taiex_close"])
-    except Exception:
+    except (KeyError, ValueError, TypeError) as exc:
+        logging.debug("Regime 偵測失敗，使用 sideways: %s", exc)
         regime = "sideways"
         taiex_close = 0.0
 
@@ -2957,7 +2755,8 @@ def _watch_add(args: argparse.Namespace) -> None:
             from src.regime.detector import MarketRegimeDetector
 
             _regime: str = MarketRegimeDetector().detect()["regime"]
-        except Exception:
+        except (KeyError, ValueError, TypeError) as exc:
+            logging.debug("Regime 偵測失敗，使用 sideways: %s", exc)
             _regime = "sideways"
 
         entry_price_val = round(float(args.price), 2) if args.price else round(close, 2)
@@ -3621,7 +3420,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
             lines.append(f"⚠️ **空頭市場** {stress.get('summary', '')}")
             lines.append("")
     except Exception:
-        pass
+        logging.debug("Discord 摘要：宏觀壓力區塊失敗", exc_info=True)
 
     # ── 1. 多模式選股（今日 DiscoveryRecord，出現 2+ 模式）──────────────
     with get_session() as session:
@@ -3681,7 +3480,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
             ).all()
     except Exception:
         # event_type 欄位可能尚未 migrate，跳過重大事件區塊
-        pass
+        logging.debug("Discord 摘要：重大事件區塊失敗", exc_info=True)
 
     _EVENT_SHORT = {
         "earnings_call": "📣法說",
@@ -3747,7 +3546,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
             lines.append(f"🚨 **籌碼異動** ({_total_anomaly}筆)  " + "  ".join(parts_a))
             lines.append("")
     except Exception:
-        pass
+        logging.debug("Discord 摘要：籌碼異動區塊失敗", exc_info=True)
 
     # ── 5. 輪動組合摘要 ──────────────────────────────────────────────
     try:
@@ -3769,7 +3568,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
                     )
             lines.append("")
     except Exception:
-        pass
+        logging.debug("Discord 摘要：輪動組合區塊失敗", exc_info=True)
 
     msg = "\n".join(lines)
     # Discord 單訊息上限 2000 字元，保留緩衝
@@ -3905,7 +3704,7 @@ def cmd_rotation(args: argparse.Namespace) -> None:
             print(f"已建立輪動組合: {portfolio.name}")
             print(f"  模式: {mode} | 持股上限: {max_pos} | 持有天數: {hold_days}")
             print(f"  初始資金: {capital:,.0f} | 續持: {'是' if allow_renewal else '否'}")
-        except Exception as e:
+        except (ValueError, KeyError) as e:
             print(f"建立失敗: {e}")
 
     elif action == "update":
@@ -4207,7 +4006,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             vix_count = sync_taiwan_vix()
             if vix_count > 0:
                 print(f"  台灣 VIX 同步：{vix_count} 筆")
-        except Exception as e:
+        except (ConnectionError, OSError, ValueError, KeyError) as e:
             logging.warning("台灣 VIX 同步失敗（不影響流程）: %s", e)
 
         try:
@@ -4216,7 +4015,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             us_vix_count = sync_us_vix()
             if us_vix_count > 0:
                 print(f"  美國 VIX 同步：{us_vix_count} 筆")
-        except Exception as e:
+        except (ConnectionError, OSError, ValueError, KeyError) as e:
             logging.warning("美國 VIX 同步失敗（不影響流程）: %s", e)
 
         stress_result = _compute_macro_stress_check()
