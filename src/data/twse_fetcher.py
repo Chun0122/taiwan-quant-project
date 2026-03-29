@@ -87,7 +87,18 @@ def fetch_twse_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     logger.info("抓取 TWSE 上市日行情: %s", target_date.isoformat())
 
     try:
-        resp = requests.get(url, params=params, headers=_HEADERS, timeout=8, verify=False)
+        from src.data.retry import request_with_retry
+
+        resp = request_with_retry(
+            "GET",
+            url,
+            params=params,
+            headers=_HEADERS,
+            timeout=8,
+            verify=False,
+            max_retries=2,
+            base_delay=3.0,
+        )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:

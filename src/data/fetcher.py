@@ -69,7 +69,9 @@ class FinMindFetcher(DataFetcher):
     # ------------------------------------------------------------------ #
 
     def _request(self, dataset: str, stock_id: str, start: str, end: str) -> pd.DataFrame:
-        """統一 API 請求邏輯，含錯誤處理與速率控制。"""
+        """統一 API 請求邏輯，含錯誤處理、重試與速率控制。"""
+        from src.data.retry import request_with_retry
+
         params = {
             "dataset": dataset,
             "data_id": stock_id,
@@ -81,7 +83,15 @@ class FinMindFetcher(DataFetcher):
 
         logger.info("抓取 %s | %s | %s ~ %s", dataset, stock_id, start, end)
 
-        resp = self._session.get(self.api_url, params=params, timeout=30)
+        resp = request_with_retry(
+            "GET",
+            self.api_url,
+            params=params,
+            timeout=30,
+            max_retries=3,
+            base_delay=2.0,
+            session=self._session,
+        )
         resp.raise_for_status()
         payload = resp.json()
 

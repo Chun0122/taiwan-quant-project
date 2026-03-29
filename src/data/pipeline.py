@@ -86,8 +86,43 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
     return len(records)
 
 
+def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """驗證 OHLCV 資料值域，過濾無效列並記錄。
+
+    檢查項目：close > 0、high >= low、volume >= 0。
+    """
+    if df.empty:
+        return df
+
+    n_before = len(df)
+    mask = pd.Series(True, index=df.index)
+
+    # close 必須為正
+    if "close" in df.columns:
+        invalid_close = df["close"].isna() | (df["close"] <= 0)
+        mask &= ~invalid_close
+
+    # high >= low
+    if "high" in df.columns and "low" in df.columns:
+        invalid_hl = df["high"].notna() & df["low"].notna() & (df["high"] < df["low"])
+        mask &= ~invalid_hl
+
+    # volume >= 0
+    if "volume" in df.columns:
+        invalid_vol = df["volume"].notna() & (df["volume"] < 0)
+        mask &= ~invalid_vol
+
+    filtered = df[mask]
+    n_dropped = n_before - len(filtered)
+    if n_dropped > 0:
+        logger.warning("OHLCV 值域驗證：過濾 %d 筆無效資料（共 %d 筆）", n_dropped, n_before)
+
+    return filtered
+
+
 def _upsert_daily_price(df: pd.DataFrame) -> int:
-    """將日K線 DataFrame 寫入 daily_price 表（衝突時略過）。"""
+    """將日K線 DataFrame 寫入 daily_price 表（含值域驗證，衝突時略過）。"""
+    df = _validate_ohlcv(df)
     return _upsert_batch(DailyPrice, df, ["stock_id", "date"])
 
 

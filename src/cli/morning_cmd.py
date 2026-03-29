@@ -351,6 +351,39 @@ def _check_strategy_decay() -> None:
         print("  所有模式績效正常，無衰減警告。")
 
 
+def _verify_data_freshness(today_str: str) -> None:
+    """驗證關鍵資料表的新鮮度（sync 完成後、discover 前執行）。
+
+    檢查 DailyPrice (TAIEX) 最新日期是否為今日或昨日（考慮假日）。
+    資料過舊時發出警告但不中斷流程。
+    """
+    import datetime
+
+    from sqlalchemy import func, select
+
+    from src.data.database import get_session
+    from src.data.schema import DailyPrice
+
+    today = datetime.date.fromisoformat(today_str)
+    max_stale_days = 3  # 允許最大落後天數（考慮假日/長週末）
+
+    try:
+        with get_session() as session:
+            latest = session.execute(select(func.max(DailyPrice.date)).where(DailyPrice.stock_id == "TAIEX")).scalar()
+
+        if latest is None:
+            print("  ⚠️ 資料新鮮度警告：DailyPrice 無 TAIEX 資料，Discover 結果可能不準確")
+            return
+
+        gap = (today - latest).days
+        if gap > max_stale_days:
+            print(f"  ⚠️ 資料新鮮度警告：TAIEX 最新資料為 {latest}（落後 {gap} 天），Discover 可能使用過期數據")
+        else:
+            print(f"  ✓ 資料新鮮度正常：TAIEX 最新 {latest}（{gap} 天前）")
+    except Exception as e:
+        logging.warning("資料新鮮度檢查失敗: %s", e)
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
@@ -580,6 +613,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             _skip("dry-run" if dry_run else "--skip-sync")
         else:
             action()
+
+        # ── 資料新鮮度檢查：在 sync 完成後、discover 前驗證 ──
+        if num == 8 and not dry_run:
+            _verify_data_freshness(today_str)
 
     # ── 完成提示 ─────────────────────────────────────────────────
     suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""

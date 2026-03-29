@@ -119,7 +119,62 @@ class Strategy(ABC):
 
         self._data = df
         logger.info("[%s] 載入 %d 筆交易日資料 (adjust_dividend=%s)", self.stock_id, len(df), self.adjust_dividend)
+
+        # 存活者偏差警告：資料覆蓋率不足時提醒
+        self._check_survivorship_bias(df)
+
         return df
+
+    def _check_survivorship_bias(self, df: pd.DataFrame) -> None:
+        """偵測潛在存活者偏差並記錄警告。
+
+        檢查項目：
+        1. 資料起始日遠晚於請求起始日（可能為近期上市股）
+        2. 交易日覆蓋率偏低（可能有長期停牌或資料缺失）
+        """
+        if df.empty:
+            return
+
+        from datetime import datetime
+
+        req_start = (
+            datetime.strptime(self.start_date, "%Y-%m-%d").date()
+            if isinstance(self.start_date, str)
+            else self.start_date
+        )
+        req_end = (
+            datetime.strptime(self.end_date, "%Y-%m-%d").date() if isinstance(self.end_date, str) else self.end_date
+        )
+        actual_start = (
+            df.index[0] if not isinstance(df.index[0], str) else datetime.strptime(df.index[0], "%Y-%m-%d").date()
+        )
+
+        # 請求區間天數
+        req_days = (req_end - req_start).days
+        if req_days <= 0:
+            return
+
+        # 檢查 1: 資料起始日比請求日晚 20% 以上 → 可能是近期 IPO
+        late_start_days = (actual_start - req_start).days
+        if late_start_days > req_days * 0.2:
+            logger.warning(
+                "[%s] 存活者偏差警告：請求起始 %s 但資料從 %s 開始（晚 %d 天）— 近期上市股的回測結果可能偏樂觀",
+                self.stock_id,
+                self.start_date,
+                actual_start,
+                late_start_days,
+            )
+
+        # 檢查 2: 交易日覆蓋率 — 預期每年約 245 個交易日
+        expected_trading_days = req_days * 245 / 365
+        if expected_trading_days > 30 and len(df) < expected_trading_days * 0.7:
+            logger.warning(
+                "[%s] 存活者偏差警告：預期 ~%d 個交易日但僅有 %d 筆（覆蓋率 %.0f%%）— 可能有長期停牌或資料缺失",
+                self.stock_id,
+                int(expected_trading_days),
+                len(df),
+                len(df) / expected_trading_days * 100,
+            )
 
     # ------------------------------------------------------------------ #
     #  除權息調整

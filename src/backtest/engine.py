@@ -13,7 +13,9 @@ from src.backtest.metrics import compute_metrics
 from src.constants import (
     COMMISSION_RATE,
     SLIPPAGE_IMPACT_COEFF,
+    SLIPPAGE_MAX_PCT,
     SLIPPAGE_RATE,
+    SLIPPAGE_SPREAD_WEIGHT,
     TAX_RATE,
 )
 from src.strategy.base import Strategy
@@ -31,7 +33,10 @@ class BacktestConfig:
     slippage: float = SLIPPAGE_RATE  # 滑價 0.05%
     dynamic_slippage: bool = False  # 啟用動態滑價（根據成交量調整）
     slippage_impact_coeff: float = SLIPPAGE_IMPACT_COEFF  # 動態滑價衝擊係數 k
+    slippage_max: float = SLIPPAGE_MAX_PCT  # 滑價上限（防止低流動性股票滑價爆炸）
+    slippage_spread_weight: float = SLIPPAGE_SPREAD_WEIGHT  # OHLC spread 估算權重
     liquidity_limit: float | None = None  # 流動性約束（單筆 ≤ 當日量 × 此比例，None=不限制）
+    signal_delay: int = 1  # 訊號延遲（1=T+1 執行，消除 look-ahead bias；0=同日執行，僅供向後相容）
 
 
 @dataclass
@@ -89,6 +94,7 @@ class BacktestResultData:
     var_95: float | None = None  # Value at Risk (95%)
     cvar_95: float | None = None  # Conditional VaR (95%)
     profit_factor: float | None = None
+    survivorship_bias_warning: bool = False  # 存活者偏差警告旗標
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
 
@@ -117,6 +123,14 @@ class BacktestEngine:
             raise ValueError(f"[{self.strategy.stock_id}] 無交易資料")
 
         signals = self.strategy.generate_signals(data)
+
+        # T+1 訊號延遲：消除 look-ahead bias
+        # signal_delay=1 表示今日訊號於次日執行（預設），signal_delay=0 為向後相容
+        if self.config.signal_delay > 0:
+            signals = signals.shift(self.config.signal_delay).fillna(0).astype(int)
+
+        # 偵測存活者偏差
+        survivorship_warning = self._detect_survivorship_bias(data)
 
         capital = self.config.initial_capital
         position = 0  # 持有股數
@@ -196,7 +210,7 @@ class BacktestEngine:
             # --- 執行風險出場 ---
             if risk_exit and position > 0:
                 daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                sell_price = raw_close * (1 - self._get_slippage(daily_volume))
+                sell_price = raw_close * (1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close))
                 revenue = position * sell_price
                 commission = revenue * self.config.commission_rate
                 tax = revenue * self.config.tax_rate
@@ -232,7 +246,7 @@ class BacktestEngine:
                 # --- 買入 ---
                 if signal == 1 and position == 0:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                    slip = self._get_slippage(daily_volume)
+                    slip = self._get_slippage(daily_volume, raw_high, raw_low, raw_close)
                     buy_price = raw_close * (1 + slip)
                     shares = self._calculate_shares(capital, buy_price, data, dt, trades)
                     shares = self._apply_liquidity_limit(shares, daily_volume)
@@ -265,7 +279,7 @@ class BacktestEngine:
                 # --- 賣出 ---
                 elif signal == -1 and position > 0:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                    sell_price = raw_close * (1 - self._get_slippage(daily_volume))
+                    sell_price = raw_close * (1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close))
                     revenue = position * sell_price
                     commission = revenue * self.config.commission_rate
                     tax = revenue * self.config.tax_rate
@@ -303,8 +317,10 @@ class BacktestEngine:
         # 若回測結束時仍持有部位，以最後收盤價平倉
         if position > 0:
             last_close = data.iloc[-1]["raw_close"] if has_raw else data.iloc[-1]["close"]
+            last_high = data.iloc[-1]["raw_high"] if has_raw else data.iloc[-1]["high"]
+            last_low = data.iloc[-1]["raw_low"] if has_raw else data.iloc[-1]["low"]
             last_volume = float(data.iloc[-1]["volume"]) if "volume" in data.columns else 0.0
-            sell_price = last_close * (1 - self._get_slippage(last_volume))
+            sell_price = last_close * (1 - self._get_slippage(last_volume, last_high, last_low, last_close))
             revenue = position * sell_price
             commission = revenue * self.config.commission_rate
             tax = revenue * self.config.tax_rate
@@ -356,26 +372,70 @@ class BacktestEngine:
             var_95=metrics["var_95"],
             cvar_95=metrics["cvar_95"],
             profit_factor=metrics["profit_factor"],
+            survivorship_bias_warning=survivorship_warning,
             trades=trades,
             equity_curve=equity_curve,
         )
 
     # ------------------------------------------------------------------ #
+    #  存活者偏差偵測
+    # ------------------------------------------------------------------ #
+
+    def _detect_survivorship_bias(self, data: pd.DataFrame) -> bool:
+        """偵測回測資料是否有存活者偏差風險。
+
+        當資料覆蓋率低於預期的 70% 時回傳 True（可能為近期上市、長期停牌、或已下市股）。
+        """
+        start_date = getattr(self.strategy, "start_date", None)
+        end_date = getattr(self.strategy, "end_date", None)
+        if not start_date or not end_date:
+            return False
+
+        try:
+            req_start = pd.Timestamp(start_date)
+            req_end = pd.Timestamp(end_date)
+        except (ValueError, TypeError):
+            return False
+
+        req_days = (req_end - req_start).days
+        if req_days <= 0:
+            return False
+
+        expected_trading_days = req_days * 245 / 365
+        if expected_trading_days > 30 and len(data) < expected_trading_days * 0.7:
+            logger.warning(
+                "[%s] 存活者偏差：預期 ~%d 個交易日但僅 %d 筆（%.0f%%），回測結果可能偏樂觀",
+                self.strategy.stock_id,
+                int(expected_trading_days),
+                len(data),
+                len(data) / expected_trading_days * 100,
+            )
+            return True
+        return False
+
+    # ------------------------------------------------------------------ #
     #  動態滑價 & 流動性
     # ------------------------------------------------------------------ #
 
-    def _get_slippage(self, volume: float) -> float:
+    def _get_slippage(self, volume: float, high: float = 0.0, low: float = 0.0, close: float = 0.0) -> float:
         """計算滑價比率。
 
-        動態模式：slippage = base + k / sqrt(volume)
-        - 大量股（如 2330）：衝擊趨近 base（0.05%）
-        - 小量股（日均萬股級）：衝擊可達 0.3%~0.5%
+        動態模式（三因子）：
+          1. 基底滑價 base（0.05%）
+          2. 成交量衝擊 k / sqrt(volume) — 低量股懲罰
+          3. OHLC spread 估算 (high-low)/close × weight — 隱含 bid-ask spread
+        最終取 min(計算值, slippage_max) 防止極端值。
         """
         if not self.config.dynamic_slippage or volume <= 0:
             return self.config.slippage
         base = self.config.slippage
         k = self.config.slippage_impact_coeff
-        return base + k / np.sqrt(volume)
+        impact = base + k / np.sqrt(volume)
+        # OHLC spread proxy：日內高低價差越大，隱含滑價越高
+        if close > 0 and high > low:
+            spread_proxy = (high - low) / close * self.config.slippage_spread_weight
+            impact = max(impact, spread_proxy)
+        return min(impact, self.config.slippage_max)
 
     def _apply_liquidity_limit(self, shares: int, daily_volume: float) -> int:
         """流動性約束：限制單筆交易量不超過當日成交量的指定比例。"""
@@ -505,7 +565,7 @@ class BacktestEngine:
     # ------------------------------------------------------------------ #
 
     def _compute_benchmark(self, data: pd.DataFrame) -> float | None:
-        """計算同期 buy & hold 報酬率（含股利，不含交易成本）。"""
+        """計算同期 buy & hold 報酬率（含股利與交易成本）。"""
         if data.empty or len(data) < 2:
             return None
 
@@ -515,9 +575,13 @@ class BacktestEngine:
         if first_close <= 0:
             return None
 
+        # 買入成本（含手續費）
+        buy_cost = first_close * (1 + self.config.commission_rate)
+        # 賣出淨收入（扣手續費 + 交易稅）
+        sell_net = last_close * (1 - self.config.commission_rate - self.config.tax_rate)
+
         dividends = getattr(self.strategy, "_dividends", None)
         if dividends is not None and not dividends.empty:
-            # 模擬持有 1 股，累計現金股利 + 股票股利增股
             shares = 1.0
             total_cash_div = 0.0
             for ex_date in dividends.index:
@@ -528,7 +592,7 @@ class BacktestEngine:
                 total_cash_div += cash_div * shares
                 shares *= 1 + stock_div / 10
 
-            total_return = (last_close * shares + total_cash_div) / first_close - 1
+            total_return = (sell_net * shares + total_cash_div) / buy_cost - 1
             return round(total_return * 100, 2)
 
-        return round((last_close / first_close - 1) * 100, 2)
+        return round((sell_net / buy_cost - 1) * 100, 2)

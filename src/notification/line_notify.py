@@ -45,15 +45,23 @@ def send_message(text: str) -> bool:
         payload["username"] = settings.discord.username
 
     try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        # Discord Webhook 成功回傳 204 No Content
+        from src.data.retry import request_with_retry
+
+        resp = request_with_retry(
+            "POST",
+            webhook_url,
+            json=payload,
+            timeout=10,
+            max_retries=2,
+            base_delay=1.0,
+        )
         if resp.status_code in (200, 204):
             logger.info("Discord 通知發送成功")
             return True
         logger.error("Discord 通知發送失敗: HTTP %d — %s", resp.status_code, resp.text)
         return False
     except requests.RequestException:
-        logger.exception("Discord 通知發送失敗")
+        logger.exception("Discord 通知發送失敗（重試後仍失敗）")
         return False
 
 

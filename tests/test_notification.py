@@ -101,30 +101,32 @@ class TestFormatScanResults:
 
 
 class TestSendMessage:
-    @patch("src.notification.line_notify.requests.post")
+    @patch("src.data.retry.requests")
     @patch("src.notification.line_notify.settings")
-    def test_success_204(self, mock_settings, mock_post):
+    def test_success_204(self, mock_settings, mock_requests):
         mock_settings.discord.webhook_url = "https://discord.com/api/webhooks/test"
         mock_settings.discord.enabled = True
         mock_settings.discord.username = None
         mock_resp = MagicMock()
         mock_resp.status_code = 204
-        mock_post.return_value = mock_resp
+        mock_requests.post.return_value = mock_resp
+        mock_requests.RequestException = Exception
 
         result = send_message("test message")
         assert result is True
-        mock_post.assert_called_once()
+        mock_requests.post.assert_called_once()
 
-    @patch("src.notification.line_notify.requests.post")
+    @patch("src.data.retry.requests")
     @patch("src.notification.line_notify.settings")
-    def test_failure_400(self, mock_settings, mock_post):
+    def test_failure_400(self, mock_settings, mock_requests):
         mock_settings.discord.webhook_url = "https://discord.com/api/webhooks/test"
         mock_settings.discord.enabled = True
         mock_settings.discord.username = None
         mock_resp = MagicMock()
         mock_resp.status_code = 400
         mock_resp.text = "Bad Request"
-        mock_post.return_value = mock_resp
+        mock_requests.post.return_value = mock_resp
+        mock_requests.RequestException = Exception
 
         result = send_message("test message")
         assert result is False

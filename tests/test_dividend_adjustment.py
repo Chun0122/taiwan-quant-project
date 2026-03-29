@@ -397,6 +397,7 @@ class TestBacktestDividendIntegration:
             commission_rate=0.0,
             tax_rate=0.0,
             slippage=0.0,
+            signal_delay=0,  # 同日執行，測試原始價格邏輯
         )
         engine = _make_engine(data, signals, config=config)
         result = engine.run()

@@ -16,6 +16,15 @@ REGIME_ATR_PARAMS: dict[str, tuple[float, float]] = {
 }
 
 
+# ATR=0 時的百分比 fallback 參數（stop_pct, target_pct）
+_FALLBACK_PCT_PARAMS: dict[str, tuple[float, float]] = {
+    "bull": (0.05, 0.10),
+    "sideways": (0.04, 0.08),
+    "bear": (0.03, 0.06),
+    "crisis": (0.02, 0.04),
+}
+
+
 def compute_atr_stops(
     close: float,
     atr14: float,
@@ -29,10 +38,18 @@ def compute_atr_stops(
         regime: 市場狀態 "bull" | "sideways" | "bear" | "crisis"
 
     Returns:
-        (stop_loss, take_profit)，atr14 ≤ 0 時回傳 (None, None)
+        (stop_loss, take_profit)。
+        atr14 ≤ 0 時 fallback 至百分比止損（不再回傳 None）。
     """
-    if atr14 <= 0:
+    if close <= 0:
         return (None, None)
+
+    if atr14 <= 0:
+        # Fallback：ATR 不可用（如停牌復牌），使用百分比止損
+        stop_pct, target_pct = _FALLBACK_PCT_PARAMS.get(regime, _FALLBACK_PCT_PARAMS["sideways"])
+        stop_loss = round(close * (1 - stop_pct), 2)
+        take_profit = round(close * (1 + target_pct), 2)
+        return (stop_loss, take_profit)
 
     stop_mult, target_mult = REGIME_ATR_PARAMS.get(regime, REGIME_ATR_PARAMS["sideways"])
     stop_loss = round(close - stop_mult * atr14, 2)

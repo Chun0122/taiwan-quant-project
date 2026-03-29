@@ -17,6 +17,7 @@ from src.constants import (
     COMMISSION_RATE,
     CORRELATION_PENALTY,
     CORRELATION_THRESHOLD,
+    MAX_DRAWDOWN_LIQUIDATE_PCT,
     MAX_PORTFOLIO_HEAT,
     PER_POSITION_RISK_CAP,
     SLIPPAGE_RATE,
@@ -652,7 +653,7 @@ def compute_portfolio_drawdown(
     Parameters
     ----------
     equity_history : list[float]
-        淨值序列（最新值在最後）。
+        淨值序��（最新值在最後）。
 
     Returns
     -------
@@ -667,3 +668,18 @@ def compute_portfolio_drawdown(
         return 0.0
     dd = (peak - current) / peak * 100
     return round(max(dd, 0.0), 2)
+
+
+def check_drawdown_kill_switch(
+    equity_history: list[float],
+    threshold_pct: float = MAX_DRAWDOWN_LIQUIDATE_PCT,
+) -> bool:
+    """檢查是否應觸發最大回撤熔斷（強制平倉所有部位）。
+
+    Returns
+    -------
+    bool
+        True = 回撤超過閾值，應立即平倉所有持倉。
+    """
+    dd = compute_portfolio_drawdown(equity_history)
+    return dd >= threshold_pct

@@ -23,8 +23,10 @@ from src.data.schema import (
 )
 from src.portfolio.rotation import (
     RotationActions,
+    check_drawdown_kill_switch,
     compute_correlation_matrix,
     compute_planned_exit_date,
+    compute_portfolio_drawdown,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
@@ -323,6 +325,33 @@ class RotationManager:
                             price_data[sid] = pd.Series(prices_list, index=pd.DatetimeIndex(dates_list))
                     if len(price_data) >= 2:
                         corr_matrix = compute_correlation_matrix(price_data, window=60)
+
+            # ── Max Drawdown Kill Switch：回撤超過閾值強制平倉 ──
+            equity_history = self._compute_equity_history(session, portfolio)
+            if check_drawdown_kill_switch(equity_history):
+                dd_pct = compute_portfolio_drawdown(equity_history)
+                logger.error(
+                    "⚠️ [%s] 回撤熔斷觸發 (%.1f%%)！強制平倉所有持倉",
+                    self.portfolio_name,
+                    dd_pct,
+                )
+                cash = portfolio.current_cash
+                for pos in open_positions:
+                    sell_action = {
+                        "stock_id": pos["stock_id"],
+                        "reason": "max_drawdown_liquidation",
+                        "exit_price": today_prices.get(pos["stock_id"], pos["entry_price"]),
+                        "days_held": 0,
+                        **pos,
+                    }
+                    cash = self._execute_sell(session, portfolio.id, sell_action, today, cash)
+                portfolio.current_cash = cash
+                portfolio.current_capital = cash
+                portfolio.status = "liquidated"
+                portfolio.updated_at = datetime.utcnow()
+                session.commit()
+                logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
+                return RotationActions(to_sell=[{**p, "reason": "max_drawdown_liquidation"} for p in open_positions])
 
             # 計算 rotation
             actions = compute_rotation_actions(
@@ -743,6 +772,27 @@ class RotationManager:
     def _load_portfolio(self, session) -> RotationPortfolio | None:
         stmt = select(RotationPortfolio).where(RotationPortfolio.name == self.portfolio_name)
         return session.execute(stmt).scalar_one_or_none()
+
+    def _compute_equity_history(self, session, portfolio: RotationPortfolio) -> list[float]:
+        """從已平倉記錄重建淨值序列（用於回撤計算）。"""
+        equity = [portfolio.initial_capital]
+        stmt = (
+            select(RotationPosition)
+            .where(
+                RotationPosition.portfolio_id == portfolio.id,
+                RotationPosition.status != "open",
+                RotationPosition.exit_date.isnot(None),
+            )
+            .order_by(RotationPosition.exit_date)
+        )
+        closed = session.execute(stmt).scalars().all()
+        running = portfolio.initial_capital
+        for pos in closed:
+            running += pos.pnl or 0.0
+            equity.append(running)
+        # 最後加上當前資本
+        equity.append(portfolio.current_capital)
+        return equity
 
     def _load_open_positions(self, session, portfolio_id: int) -> list[dict]:
         stmt = select(RotationPosition).where(

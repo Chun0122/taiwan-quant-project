@@ -38,15 +38,17 @@ class TestComputeAtrStops:
         assert sl == sl_sw
         assert tp == tp_sw
 
-    def test_atr_zero_returns_none(self) -> None:
+    def test_atr_zero_fallback_to_pct(self) -> None:
+        """ATR=0 時 fallback 至百分比止損（bull: stop=5%, target=10%）。"""
         sl, tp = compute_atr_stops(close=100.0, atr14=0.0, regime="bull")
-        assert sl is None
-        assert tp is None
+        assert sl == pytest.approx(95.0)  # 100 * (1 - 0.05)
+        assert tp == pytest.approx(110.0)  # 100 * (1 + 0.10)
 
-    def test_atr_negative_returns_none(self) -> None:
+    def test_atr_negative_fallback_to_pct(self) -> None:
+        """ATR<0 時同樣 fallback 至百分比止損。"""
         sl, tp = compute_atr_stops(close=100.0, atr14=-1.0, regime="bull")
-        assert sl is None
-        assert tp is None
+        assert sl == pytest.approx(95.0)
+        assert tp == pytest.approx(110.0)
 
 
 # ── TestComputeEntryTrigger ──────────────────────────────────────

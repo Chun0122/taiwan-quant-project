@@ -1,9 +1,12 @@
 """設定管理模組 — 載入 config/settings.yaml 並提供統一存取介面。"""
 
+import logging
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
@@ -16,6 +19,12 @@ class FinMindConfig(BaseModel):
 
 class DatabaseConfig(BaseModel):
     url: str = "sqlite:///data/stock.db"
+
+    @model_validator(mode="after")
+    def _validate_url(self) -> "DatabaseConfig":
+        if not self.url:
+            raise ValueError("database.url 不可為空")
+        return self
 
 
 class FetcherConfig(BaseModel):
@@ -96,6 +105,15 @@ class Settings(BaseModel):
     discord: DiscordWebhookConfig = DiscordWebhookConfig()
     anthropic: AnthropicConfig = AnthropicConfig()
     quant: QuantConfig = QuantConfig()
+
+    @model_validator(mode="after")
+    def _validate_critical_settings(self) -> "Settings":
+        """啟動時驗證關鍵設定 — 在 Settings 層級執行，避免子模型預設值觸發誤警告。"""
+        if not self.finmind.api_token:
+            logger.warning("finmind.api_token 未設定 — 僅 TWSE/TPEX 免費端點可用，FinMind 逐股查詢將失敗")
+        if self.discord.enabled and not self.discord.webhook_url:
+            logger.warning("discord.webhook_url 未設定但 enabled=True — 通知將靜默失敗")
+        return self
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:
