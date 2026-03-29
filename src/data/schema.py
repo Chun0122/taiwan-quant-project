@@ -1,6 +1,6 @@
 """SQLAlchemy ORM 資料表定義。
 
-二十五張核心表：
+二十七張核心表：
 - DailyPrice:              日K線（OHLCV + 還原收盤價）
 - InstitutionalInvestor:   三大法人買賣超
 - MarginTrading:           融資融券
@@ -25,6 +25,8 @@
 - ConceptMembership:       概念股成員（多對多，stock_id ↔ concept_name）
 - RotationPortfolio:       輪動組合設定（部位控制系統）
 - RotationPosition:        輪動組合持倉記錄（開/平倉明細）
+- RotationBacktestSummary: 輪動回測績效摘要
+- RotationBacktestTrade:   輪動回測逐筆交易明細
 """
 
 from datetime import date, datetime
@@ -705,3 +707,59 @@ class RotationPosition(Base):
 
     def __repr__(self) -> str:
         return f"<RotationPosition {self.stock_id} entry={self.entry_date} status={self.status}>"
+
+
+class RotationBacktestSummary(Base):
+    """輪動回測績效摘要。"""
+
+    __tablename__ = "rotation_backtest_summary"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    max_positions: Mapped[int] = mapped_column(Integer, nullable=False)
+    holding_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    allow_renewal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    final_capital: Mapped[float] = mapped_column(Float, nullable=False)
+    total_return: Mapped[float] = mapped_column(Float, nullable=False)
+    annual_return: Mapped[float] = mapped_column(Float, nullable=False)
+    sharpe_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[float] = mapped_column(Float, nullable=False)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_trades: Mapped[int] = mapped_column(Integer, nullable=False)
+    avg_return_per_trade: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_win: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trading_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RotationBacktest {self.portfolio_name} {self.mode} return={self.total_return:.2f}%>"
+
+
+class RotationBacktestTrade(Base):
+    """輪動回測逐筆交易明細。"""
+
+    __tablename__ = "rotation_backtest_trade"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backtest_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("rotation_backtest_summary.id"), nullable=False, index=True
+    )
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    entry_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    entry_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<RotationBacktestTrade {self.stock_id} {self.entry_date}~{self.exit_date} pnl={self.pnl}>"

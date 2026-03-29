@@ -3,6 +3,7 @@
 涵蓋：
 - rotation.py 純函數測試（Rotation 邏輯 + PnL + 交易日）
 - manager.py DB 整合測試（RotationManager CRUD + 回測）
+- save_rotation_backtest() DB 寫入測試
 """
 
 from __future__ import annotations
@@ -12,7 +13,12 @@ from datetime import date
 import pandas as pd
 
 from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
-from src.data.schema import RotationPortfolio, RotationPosition  # noqa: F401 — 確保 ORM 註冊
+from src.data.schema import (  # noqa: F401 — 確保 ORM 註冊
+    RotationBacktestSummary,
+    RotationBacktestTrade,
+    RotationPortfolio,
+    RotationPosition,
+)
 from src.portfolio.rotation import (
     compute_correlation_matrix,
     compute_planned_exit_date,
@@ -1254,3 +1260,131 @@ class TestCrisisBlock:
             crisis_block_new=False,
         )
         assert len(actions.to_buy) == 1
+
+
+# ===========================================================================
+# save_rotation_backtest — DB 寫入
+# ===========================================================================
+
+
+def _make_backtest_result(trades=None):
+    """建立模擬 RotationBacktestResult。"""
+    from src.portfolio.manager import RotationBacktestResult
+
+    if trades is None:
+        trades = [
+            {
+                "stock_id": "2330",
+                "entry_date": date(2025, 1, 6),
+                "entry_price": 600.0,
+                "exit_date": date(2025, 1, 10),
+                "exit_price": 620.0,
+                "shares": 1000,
+                "pnl": 18000.0,
+                "return_pct": 3.0,
+                "exit_reason": "holding_expired",
+                "entry_rank": 1,
+                "entry_score": 0.85,
+            },
+            {
+                "stock_id": "2317",
+                "entry_date": date(2025, 1, 7),
+                "entry_price": 100.0,
+                "exit_date": date(2025, 1, 10),
+                "exit_price": 95.0,
+                "shares": 5000,
+                "pnl": -26500.0,
+                "return_pct": -5.3,
+                "exit_reason": "stop_loss",
+                "entry_rank": 2,
+                "entry_score": 0.78,
+            },
+        ]
+    return RotationBacktestResult(
+        equity_curve=[{"date": date(2025, 1, 6), "equity": 1_000_000}],
+        trades=trades,
+        metrics={
+            "total_return": 0.05,
+            "annual_return": 0.12,
+            "sharpe_ratio": 1.2,
+            "max_drawdown": 0.08,
+            "win_rate": 0.5,
+            "total_trades": 2,
+            "avg_return_per_trade": -0.015,
+            "avg_win": 0.03,
+            "avg_loss": -0.053,
+            "final_capital": 1_050_000,
+            "trading_days": 5,
+        },
+        config={
+            "portfolio_name": "test_bt",
+            "mode": "momentum",
+            "max_positions": 5,
+            "holding_days": 3,
+            "capital": 1_000_000,
+            "allow_renewal": True,
+            "start_date": date(2025, 1, 6),
+            "end_date": date(2025, 1, 10),
+        },
+    )
+
+
+class TestSaveRotationBacktest:
+    """save_rotation_backtest() DB 寫入測試。
+
+    合併為單一測試避免 SingletonThreadPool session 跨測試干擾
+    （save 內部的 ``with get_session()`` 會關閉 fixture session）。
+    """
+
+    def test_save_summary_trades_and_empty(self, db_session):
+        """寫入摘要 + 交易明細 + 空交易，驗證欄位正確。"""
+        from sqlalchemy import select
+
+        from src.data.pipeline import save_rotation_backtest
+
+        # ── Case 1: 含 2 筆交易 ──
+        result = _make_backtest_result()
+        bt_id = save_rotation_backtest(result)
+        assert isinstance(bt_id, int)
+        assert bt_id > 0
+
+        # 驗證摘要
+        saved = db_session.execute(
+            select(RotationBacktestSummary).where(RotationBacktestSummary.id == bt_id)
+        ).scalar_one()
+        assert saved.portfolio_name == "test_bt"
+        assert saved.mode == "momentum"
+        assert saved.max_positions == 5
+        assert saved.total_trades == 2
+        assert saved.total_return == 0.05
+
+        # 驗證交易明細
+        trades = (
+            db_session.execute(
+                select(RotationBacktestTrade)
+                .where(RotationBacktestTrade.backtest_id == bt_id)
+                .order_by(RotationBacktestTrade.entry_date)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(trades) == 2
+        assert trades[0].stock_id == "2330"
+        assert trades[0].entry_rank == 1
+        assert trades[0].entry_score == 0.85
+        assert trades[0].exit_reason == "holding_expired"
+        assert trades[1].stock_id == "2317"
+        assert trades[1].entry_rank == 2
+        assert trades[1].pnl == -26500.0
+
+        # ── Case 2: 空交易 ──
+        result_empty = _make_backtest_result(trades=[])
+        bt_id2 = save_rotation_backtest(result_empty)
+        assert bt_id2 > bt_id
+
+        empty_trades = (
+            db_session.execute(select(RotationBacktestTrade).where(RotationBacktestTrade.backtest_id == bt_id2))
+            .scalars()
+            .all()
+        )
+        assert len(empty_trades) == 0

@@ -522,6 +522,8 @@ class RotationManager:
                             "pnl": pnl,
                             "return_pct": return_pct,
                             "exit_reason": sell["reason"],
+                            "entry_rank": sell.get("entry_rank"),
+                            "entry_score": sell.get("entry_score"),
                         }
                     )
                     sold_ids.add(sid)
@@ -558,6 +560,7 @@ class RotationManager:
                             "entry_date": day,
                             "entry_price": price,
                             "entry_rank": buy["rank"],
+                            "entry_score": buy.get("score"),
                             "shares": shares,
                             "allocated_capital": alloc,
                             "planned_exit_date": planned_exit,
@@ -589,26 +592,36 @@ class RotationManager:
                             "pnl": pnl,
                             "return_pct": return_pct,
                             "exit_reason": "backtest_end",
+                            "entry_rank": pos.get("entry_rank"),
+                            "entry_score": pos.get("entry_score"),
                         }
                     )
 
             # 計算績效指標
             metrics = self._compute_backtest_metrics(equity_curve, all_trades, capital)
 
-            return RotationBacktestResult(
+            result = RotationBacktestResult(
                 equity_curve=equity_curve,
                 trades=all_trades,
                 metrics=metrics,
                 config={
+                    "portfolio_name": self.portfolio_name,
                     "mode": mode,
                     "max_positions": max_positions,
                     "holding_days": holding_days,
                     "capital": capital,
                     "allow_renewal": allow_renewal,
-                    "start_date": str(start_date),
-                    "end_date": str(end_date),
+                    "start_date": start_date,
+                    "end_date": end_date,
                 },
             )
+
+            # 寫入 DB
+            from src.data.pipeline import save_rotation_backtest
+
+            save_rotation_backtest(result)
+
+            return result
 
     # ── 查詢 ──
 

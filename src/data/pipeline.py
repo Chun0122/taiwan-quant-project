@@ -30,6 +30,8 @@ from src.data.schema import (
     MonthlyRevenue,
     PortfolioBacktestResult,
     PortfolioTrade,
+    RotationBacktestSummary,
+    RotationBacktestTrade,
     SecuritiesLending,
     StockInfo,
     StockValuation,
@@ -1313,6 +1315,62 @@ def save_portfolio_result(result_data) -> int:
         logger.info("投資組合回測結果已儲存 (id=%d, %d 筆交易)", pbt_id, len(result_data.trades))
 
     return pbt_id
+
+
+def save_rotation_backtest(result) -> int:
+    """將輪動回測結果與交易明細寫入 DB，回傳 rotation_backtest_summary.id。"""
+    init_db()
+
+    config = result.config
+    metrics = result.metrics
+
+    with get_session() as session:
+        summary = RotationBacktestSummary(
+            portfolio_name=config.get("portfolio_name", "__adhoc__"),
+            mode=config.get("mode", ""),
+            max_positions=config.get("max_positions", 0),
+            holding_days=config.get("holding_days", 0),
+            allow_renewal=config.get("allow_renewal", True),
+            start_date=config.get("start_date"),
+            end_date=config.get("end_date"),
+            initial_capital=config.get("capital", 0),
+            final_capital=metrics.get("final_capital", 0),
+            total_return=metrics.get("total_return", 0),
+            annual_return=metrics.get("annual_return", 0),
+            sharpe_ratio=metrics.get("sharpe_ratio"),
+            max_drawdown=metrics.get("max_drawdown", 0),
+            win_rate=metrics.get("win_rate"),
+            total_trades=metrics.get("total_trades", 0),
+            avg_return_per_trade=metrics.get("avg_return_per_trade"),
+            avg_win=metrics.get("avg_win"),
+            avg_loss=metrics.get("avg_loss"),
+            trading_days=metrics.get("trading_days"),
+        )
+        session.add(summary)
+        session.flush()
+        summary_id = summary.id
+
+        for t in result.trades:
+            trade = RotationBacktestTrade(
+                backtest_id=summary_id,
+                stock_id=t["stock_id"],
+                entry_date=t["entry_date"],
+                entry_price=t["entry_price"],
+                exit_date=t.get("exit_date"),
+                exit_price=t.get("exit_price"),
+                shares=t.get("shares", 0),
+                pnl=t.get("pnl"),
+                return_pct=t.get("return_pct"),
+                exit_reason=t.get("exit_reason"),
+                entry_rank=t.get("entry_rank"),
+                entry_score=t.get("entry_score"),
+            )
+            session.add(trade)
+
+        session.commit()
+        logger.info("輪動回測結果已儲存 (id=%d, %d 筆交易)", summary_id, len(result.trades))
+
+    return summary_id
 
 
 # ────────────────────────────────────────────────────────────────

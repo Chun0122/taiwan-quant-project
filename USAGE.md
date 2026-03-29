@@ -1570,6 +1570,8 @@ python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12
 python main.py rotation backtest --mode momentum --max-positions 5 --holding-days 3 --capital 1000000 --start 2025-01-01 --end 2025-12-31
 ```
 
+回測結果（績效摘要 + 逐筆交易含 entry_rank/entry_score）會自動寫入 DB（`rotation_backtest_summary` + `rotation_backtest_trade`），供後續比較與分析。
+
 **管理：**
 
 ```bash
