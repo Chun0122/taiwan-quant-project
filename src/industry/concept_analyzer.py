@@ -296,7 +296,7 @@ class ConceptRotationAnalyzer:
                 session.query(
                     InstitutionalInvestor.stock_id,
                     InstitutionalInvestor.name,
-                    InstitutionalInvestor.net_buy,
+                    InstitutionalInvestor.net,
                 )
                 .filter(
                     InstitutionalInvestor.stock_id.in_(stock_ids),
@@ -307,7 +307,8 @@ class ConceptRotationAnalyzer:
 
         if not rows:
             return pd.DataFrame(columns=["stock_id", "name", "net_buy"])
-        return pd.DataFrame(rows, columns=["stock_id", "name", "net_buy"])
+        df = pd.DataFrame(rows, columns=["stock_id", "name", "net_buy"])
+        return df
 
     def rank_concepts(
         self,

@@ -522,7 +522,7 @@ def plot_equity_curve(
 
     # 使用抽出的純函數
     equity = simulate_equity_curve(dates, closes, buy_dates, sell_dates, initial_capital)
-    drawdown = compute_drawdown_series(equity)
+    drawdown = np.array(compute_drawdown_series(equity))
 
     fig = make_subplots(
         rows=2,
