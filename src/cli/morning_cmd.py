@@ -351,6 +351,16 @@ def _check_strategy_decay() -> None:
         print("  所有模式績效正常，無衰減警告。")
 
 
+def _sync_full_market() -> None:
+    """同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉等非 watchlist 股票有最新價格）。"""
+    from src.data.pipeline import sync_market_data
+
+    result = sync_market_data(days=1)
+    print(
+        f"  全市場日K: {result.get('daily_price', 0)} 筆, 法人: {result.get('institutional', 0)} 筆, 融資融券: {result.get('margin', 0)} 筆"
+    )
+
+
 def _verify_data_freshness(today_str: str) -> None:
     """驗證關鍵資料表的新鮮度（sync 完成後、discover 前執行）。
 
@@ -396,6 +406,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
       Step 6  sync-features       計算全市場 DailyFeature（Feature Store）
       Step 7  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
       Step 8  sync-broker         同步 watchlist 分點資料（5日）+ 補抓 discover 推薦（累積歷史）
+      Step 8b sync-market         同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉有最新價格）
       Step 9  discover all        五模式全市場掃描（--skip-sync，不重複同步）
       Step 10 alert-check         MOPS 重大事件警報（近3日）
       Step 11 watch update-status 批次更新持倉止損/止利/過期狀態
@@ -407,13 +418,18 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     Flags:
       --dry-run     只顯示步驟與摘要，不執行任何操作
-      --skip-sync   跳過 Step 1–8（所有資料同步），適合資料已新鮮時使用
+      --skip-sync   跳過 Step 1–8b（所有資料同步），適合資料已新鮮時使用
       --top N       discover 的 Top N（預設 20）
       --notify      執行完畢後推播 Discord 摘要
 
     Step 8 說明：
       每日同步 watchlist 分點資料，使 Smart Broker（8F）所需的歷史勝率資料自然累積。
       約 20 個交易日後，watchlist 股票即可觸發 Smart Broker 計算；60~120 天後準確度最高。
+
+    Step 8b 說明：
+      TWSE/TPEX 官方資料（6 次 API）同步全市場日K線，確保 rotation 持倉中非 watchlist
+      股票也有最新收盤價。此步驟在 discover 之前執行，使 discover 與 rotation 都能
+      使用當日資料。
     """
     import datetime
 
@@ -425,9 +441,9 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 15
+    TOTAL = 16
 
-    def _step(n: int, title: str) -> None:
+    def _step(n: int | str, title: str) -> None:
         print(f"\n{'═' * 64}")
         print(f"  [Step {n}/{TOTAL}] {title}")
         print(f"{'═' * 64}")
@@ -543,6 +559,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ),
         ),
         (
+            "8b",
+            "同步全市場 TWSE/TPEX 日K線（rotation 持倉 + discover 候選）",
+            {"dry_run", "skip_sync"},
+            _sync_full_market,
+        ),
+        (
             9,
             f"五模式全市場掃描（discover all --skip-sync --top {top_n}）",
             {"dry_run"},
@@ -552,8 +574,8 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                     sync_days=30,
                     top=top_n,
                     min_price=10.0,
-                    max_price=None,
-                    min_volume=1000,
+                    max_price=2000.0,
+                    min_volume=500_000,
                     max_stocks=None,
                     min_appearances=1,
                     export=None,

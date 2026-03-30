@@ -92,8 +92,8 @@ python main.py anomaly-scan --stocks 2330 2317  # 指定股票
 python main.py anomaly-scan --vol-mult 3.0 --inst-threshold 5000000  # 自訂門檻
 python main.py anomaly-scan --dt-threshold 0.3 # 隔日沖風險門檻（預設 0.2）
 python main.py anomaly-scan --notify         # 掃描並推播 Discord
-python main.py morning-routine --notify      # 每日早晨例行流程（sync-info → sync → compute → sync-mops → sync-revenue → sync-features → sync-sbl → sync-broker → discover all → alert-check → watch update-status → rotation update → revenue-scan → anomaly-scan → strategy-decay → Discord 摘要）
-python main.py morning-routine --skip-sync --notify  # 跳過所有資料同步 Step 1~8（資料已新鮮時使用）
+python main.py morning-routine --notify      # 每日早晨例行流程（sync-info → sync → compute → sync-mops → sync-revenue → sync-features → sync-sbl → sync-broker → sync-market(TWSE/TPEX全市場) → discover all → alert-check → watch update-status → rotation update → revenue-scan → anomaly-scan → strategy-decay → Discord 摘要）
+python main.py morning-routine --skip-sync --notify  # 跳過所有資料同步 Step 1~8b（資料已新鮮時使用）
 python main.py morning-routine --dry-run     # 預覽步驟與摘要（不實際執行）
 python main.py watchlist list                # 列出 DB watchlist 清單（DB 空時顯示 YAML fallback）
 python main.py watchlist add 2330            # 新增股票至 DB watchlist
@@ -262,7 +262,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/report/ai_report.py`           | AI 選股摘要（`generate_ai_summary()`，呼叫 Claude API `claude-sonnet-4-6`，生成約 300 字繁中摘要；`discover --ai-summary` 旗標觸發） |
 | `src/strategy_rank/engine.py`       | 策略排名引擎（批次回測 watchlist × strategies）                                                                   |
 | `src/notification/line_notify.py`   | Discord Webhook 通知（檔名為歷史遺留）+ `format_suggest_discord()` 純函數（從 main.py 遷移）                       |
-| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫），`daily_sync_job()` delegate 給 `cmd_morning_routine()`（Step 0~15 + Discord），`weekly_holding_job()` 每週四同步 TDCC |
+| `src/scheduler/simple_scheduler.py` | 前景排程（schedule 函式庫），`daily_sync_job()` delegate 給 `cmd_morning_routine()`（Step 0~15+8b + Discord），`weekly_holding_job()` 每週四同步 TDCC |
 | `src/scheduler/windows_task.py`     | Windows 工作排程器 .bat + XML 產生器，每日 .bat 執行 `morning-routine --notify`，每週四 .bat 執行 `sync-holding`    |
 | `src/visualization/app.py`          | Streamlit 儀表板入口（12 分頁 sidebar radio 導航）                                                                 |
 | `src/visualization/charts.py`       | Plotly 圖表元件 + **D4** 抽出的純計算函數：`simulate_equity_curve()`（權益曲線模擬）、`compute_drawdown_series()`（回撤序列）、`transform_calendar_heatmap_data()`（日曆熱圖矩陣轉換）+ `plot_heat_gauge()`（Portfolio Heat 儀表）、`plot_correlation_heatmap()`（持倉相關性熱力圖）、`plot_drawdown_area()`（回撤面積圖） |
@@ -277,7 +277,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/cli/watch_cmd.py`              | 持倉監控：`cmd_watch`/`_watch_add`/`_watch_list`/`_watch_close`/`_watch_update_status` + 純函數 `_compute_watch_status`/`_compute_trailing_stop` |
 | `src/cli/anomaly_cmd.py`            | 籌碼異動+營收掃描：`cmd_anomaly_scan`/`cmd_revenue_scan`/`_compute_anomaly_scan`/`_compute_revenue_scan`/`_compute_macro_stress_check` |
 | `src/cli/rotation_cmd.py`           | 輪動組合管理：`cmd_rotation`（create/update/status/history/backtest/list/pause/resume/delete）/`_rotation_update_all` |
-| `src/cli/morning_cmd.py`            | 每日早晨例行：`cmd_morning_routine`（Step 0~15 + Discord 摘要）/`_build_morning_discord_summary`/`_check_strategy_decay`/`_verify_data_freshness()`（Step 8 後驗證 TAIEX 資料日期） |
+| `src/cli/morning_cmd.py`            | 每日早晨例行：`cmd_morning_routine`（Step 0~15+8b + Discord 摘要）/`_build_morning_discord_summary`/`_check_strategy_decay`/`_sync_full_market()`（Step 8b TWSE/TPEX 全市場同步）/`_verify_data_freshness()`（Step 8b 後驗證 TAIEX 資料日期） |
 | `src/cli/watchlist_cmd.py`          | Watchlist+概念股：`cmd_watchlist`/`cmd_sync_concepts`/`cmd_concepts`/`cmd_concept_expand` |
 | `src/cli/suggest_cmd.py`            | 單股進出場建議：`cmd_suggest` |
 | `src/cli/misc_cmd.py`              | 雜項命令：`cmd_dashboard`/`cmd_optimize`/`cmd_schedule`/`cmd_status`/`cmd_scan`/`cmd_notify`/`cmd_report`/`cmd_strategy_rank`/`cmd_industry`/`cmd_migrate`/`cmd_validate`/`cmd_export`/`cmd_import_data` |

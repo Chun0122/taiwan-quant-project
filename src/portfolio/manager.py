@@ -186,14 +186,50 @@ def _get_trading_calendar(session, start: date, end: date) -> list[date]:
 
 
 def _get_prices_on_date(session, stock_ids: list[str], target_date: date) -> dict[str, float]:
-    """取得指定日期的收盤價。"""
+    """取得指定日期（或最近交易日）的收盤價。
+
+    先嘗試精確比對 target_date，若某些股票找不到資料，
+    則 fallback 取最近 5 個交易日內的最新收盤價。
+    """
     if not stock_ids:
         return {}
+
+    # 精確比對
     stmt = select(DailyPrice.stock_id, DailyPrice.close).where(
         DailyPrice.stock_id.in_(stock_ids),
         DailyPrice.date == target_date,
     )
-    return {row[0]: row[1] for row in session.execute(stmt).all()}
+    result = {row[0]: row[1] for row in session.execute(stmt).all()}
+
+    # Fallback：找不到精確日期的股票，取最近 5 天內最新收盤價
+    missing = [sid for sid in stock_ids if sid not in result]
+    if missing:
+        from datetime import timedelta
+
+        fallback_start = target_date - timedelta(days=5)
+        from sqlalchemy import func
+
+        sub = (
+            select(
+                DailyPrice.stock_id,
+                func.max(DailyPrice.date).label("max_date"),
+            )
+            .where(
+                DailyPrice.stock_id.in_(missing),
+                DailyPrice.date >= fallback_start,
+                DailyPrice.date <= target_date,
+            )
+            .group_by(DailyPrice.stock_id)
+            .subquery()
+        )
+        stmt2 = select(DailyPrice.stock_id, DailyPrice.close).join(
+            sub,
+            (DailyPrice.stock_id == sub.c.stock_id) & (DailyPrice.date == sub.c.max_date),
+        )
+        for row in session.execute(stmt2).all():
+            result[row[0]] = row[1]
+
+    return result
 
 
 # ---------------------------------------------------------------------------

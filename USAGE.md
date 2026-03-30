@@ -1614,13 +1614,13 @@ python main.py rotation delete --name mom5_3d   # 刪除組合及所有持倉
 
 ### morning-routine — 每日早晨例行流程
 
-一鍵執行十六個步驟（Step 0~15），適合搭配 Windows 工作排程器在每日盤前自動執行。涵蓋完整資料同步 → 選股掃描 → 監控警報流程。
+一鍵執行十七個步驟（Step 0~15+8b），適合搭配 Windows 工作排程器在每日收盤後自動執行。涵蓋完整資料同步 → 選股掃描 → 監控警報流程。
 
 ```bash
 # 完整流程 + Discord 摘要推播
 python main.py morning-routine --notify
 
-# 跳過所有資料同步 Step 1~8（資料已是最新時使用，加快執行）
+# 跳過所有資料同步 Step 1~8b（資料已是最新時使用，加快執行）
 python main.py morning-routine --skip-sync --notify
 
 # 預覽各步驟與 Discord 摘要內容（不實際執行）
@@ -1630,20 +1630,20 @@ python main.py morning-routine --dry-run
 python main.py morning-routine --top 30 --notify
 ```
 
-**十六個執行步驟：**
+**十七個執行步驟：**
 
 | 步驟 | 動作 | 說明 |
 |------|------|------|
 | Step 0 | VIX 同步 + Macro Stress Check | 同步台灣 VIX + 美國 VIX → 偵測 TAIEX crisis 訊號（7 訊號：5日跌>5%/連跌/波動率/爆量長黑/台灣VIX飆升/單日急跌/美國VIX飆升），≥2 觸發時顯示 CRISIS 警示 banner + Discord 預警 |
 | Step 1 | `sync-info` | 同步全市場股票基本資料（產業分類 + 上市/上櫃別，DB 已有則跳過） |
-| Step 2 | `sync`（OHLCV） | 同步 watchlist + TAIEX 日K線資料 |
+| Step 2 | `sync`（OHLCV） | 同步 watchlist + TAIEX 日K線資料（FinMind 逐股） |
 | Step 3 | `compute` | 計算 watchlist 技術指標 |
 | Step 4 | `sync-mops` | 同步 MOPS 重大訊息公告 |
 | Step 5 | `sync-revenue --months 1` | 同步全市場月營收（最近 1 個月） |
 | Step 6 | `sync-features --days 90` | 計算全市場 DailyFeature（Feature Store，供 Universe Filtering 使用） |
 | Step 7 | `sync-sbl --days 3` | 同步全市場借券賣出資料（TWSE TWT96U） |
-| Step 8a | `sync-broker --days 5` | 同步 watchlist 全部股票分點資料（每日累積，使 Smart Broker 自然成熟） |
-| Step 8b | `sync-broker --from-discover --days 5` | 補抓最近 discover 推薦的非 watchlist 股票分點資料（已在 watchlist 者跳過） |
+| Step 8 | `sync-broker`（watchlist + discover） | 同步 watchlist 分點資料（5日）+ 補抓 discover 推薦的非 watchlist 股票 |
+| Step 8b | `sync_market_data`（TWSE/TPEX 全市場） | 同步全市場日K線+法人+融資融券（6 次 API），確保 rotation 持倉等非 watchlist 股票有最新價格 |
 | Step 9 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 10 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 11 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
@@ -1657,7 +1657,7 @@ python main.py morning-routine --top 30 --notify
 | 參數 | 說明 |
 |------|------|
 | `--dry-run` | 只顯示步驟與 Discord 摘要預覽，不實際執行任何操作 |
-| `--skip-sync` | 跳過 Step 1–8（所有資料同步），適合資料已新鮮時加速執行 |
+| `--skip-sync` | 跳過 Step 1–8b（所有資料同步），適合資料已新鮮時加速執行 |
 | `--top N` | discover all 的 Top N（預設 20） |
 | `--notify` | 執行完畢後推播 Discord 摘要（多模式選股 + 重大事件 + 持倉狀態） |
 
