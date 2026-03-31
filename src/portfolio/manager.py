@@ -331,8 +331,8 @@ class RotationManager:
                     from src.regime.detector import RegimeStateMachine
 
                     rsm = RegimeStateMachine()
-                    if rsm._state.get("current_regime"):
-                        regime = rsm._state["current_regime"]
+                    regime = rsm.current_regime
+                    if regime:
                         logger.info("從 RegimeStateMachine 讀取 regime=%s", regime)
                 except Exception:
                     pass  # 無持久化資料時 regime 維持 None
