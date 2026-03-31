@@ -467,7 +467,8 @@ def compute_rotation_actions(
                             break  # 一次 penalty 即可
 
             # ── Portfolio Heat：檢查新交易是否超過風險上限 ──
-            candidate_sl = stop_losses.get(sid)
+            # 止損價優先從 ranking dict 取（discover 原始值），fallback 到 stop_losses 參數
+            candidate_sl = r.get("stop_loss") or stop_losses.get(sid)
             tentative_shares = compute_shares(adj_capital, price)
             if heat_enabled and tentative_shares > 0:
                 new_risk = compute_single_trade_risk(
@@ -527,6 +528,7 @@ def compute_rotation_actions(
                     "entry_price": price,
                     "shares": shares,
                     "allocated_capital": adj_capital,
+                    "stop_loss": candidate_sl,
                 }
             )
             held_ids.add(sid)

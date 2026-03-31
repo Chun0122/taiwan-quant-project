@@ -700,6 +700,7 @@ class RotationPosition(Base):
     # exit_reason: holding_expired / rank_dropped / stop_loss / renewed / manual
     shares: Mapped[int] = mapped_column(Integer, nullable=False)
     allocated_capital: Mapped[float] = mapped_column(Float, nullable=False)  # 配置資金
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場時鎖定的止損價
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)  # 已實現損益
     return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 報酬率
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open/closed

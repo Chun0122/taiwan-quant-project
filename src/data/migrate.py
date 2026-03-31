@@ -45,6 +45,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # 隔日沖大戶偵測欄位
     ("discovery_record", "daytrade_penalty", "REAL"),
     ("discovery_record", "daytrade_tags", "VARCHAR(200)"),
+    # 輪動持倉止損價持久化（進場時鎖定，不隨 discover 每日更新）
+    ("rotation_position", "stop_loss", "REAL"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

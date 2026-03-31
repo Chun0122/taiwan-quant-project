@@ -318,8 +318,12 @@ class RotationManager:
             all_sids = list({p["stock_id"] for p in open_positions} | {r["stock_id"] for r in rankings})
             today_prices = _get_prices_on_date(session, all_sids, today)
 
-            # 止損價
-            stop_losses = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
+            # 止損價：從持倉記錄取進場時鎖定的止損價（不隨 discover 每日浮動）
+            stop_losses = {p["stock_id"]: p["stop_loss"] for p in open_positions if p.get("stop_loss") is not None}
+            # 新買入候選的止損價從 rankings 取（進場後會寫入 position）
+            for r in rankings:
+                if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
+                    stop_losses[r["stock_id"]] = r["stop_loss"]
 
             # ── Regime fallback：嘗試從 JSON 持久化讀取 ──
             if regime is None:
@@ -411,9 +415,11 @@ class RotationManager:
             for sell in actions.to_sell:
                 cash = self._execute_sell(session, portfolio.id, sell, today, cash)
 
-            # 執行續持
+            # 執行續持（從 rankings 取最新止損價，只上移不下移）
+            ranking_sl = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
             for renew in actions.renewed:
-                self._execute_renewal(session, portfolio.id, renew)
+                new_sl = ranking_sl.get(renew["stock_id"])
+                self._execute_renewal(session, portfolio.id, renew, new_stop_loss=new_sl)
 
             # 執行買入
             for buy in actions.to_buy:
@@ -521,8 +527,12 @@ class RotationManager:
                 all_sids = list({p["stock_id"] for p in positions} | {r["stock_id"] for r in last_rankings})
                 today_prices = _get_prices_on_date(session, all_sids, day)
 
-                # 止損價
-                stop_losses = {r["stock_id"]: r["stop_loss"] for r in last_rankings if r.get("stop_loss") is not None}
+                # 止損價：從持倉記錄取進場時鎖定的止損價
+                stop_losses = {p["stock_id"]: p["stop_loss"] for p in positions if p.get("stop_loss") is not None}
+                # 新買入候選的止損價從 rankings 取
+                for r in last_rankings:
+                    if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
+                        stop_losses[r["stock_id"]] = r["stop_loss"]
 
                 # 計算 rotation
                 actions = compute_rotation_actions(
@@ -571,12 +581,18 @@ class RotationManager:
                         new_positions.append(pos)
                 positions = new_positions
 
-                # 處理續持
+                # 處理續持（止損價只上移不下移）
                 renewed_ids = {r["stock_id"] for r in actions.renewed}
+                ranking_sl = {r["stock_id"]: r["stop_loss"] for r in last_rankings if r.get("stop_loss") is not None}
                 for pos in positions:
                     if pos["stock_id"] in renewed_ids:
                         renew_info = next(r for r in actions.renewed if r["stock_id"] == pos["stock_id"])
                         pos["planned_exit_date"] = renew_info["new_planned_exit_date"]
+                        new_sl = ranking_sl.get(pos["stock_id"])
+                        if new_sl is not None:
+                            old_sl = pos.get("stop_loss")
+                            if old_sl is None or new_sl > old_sl:
+                                pos["stop_loss"] = new_sl
 
                 # 執行買入
                 for buy in actions.to_buy:
@@ -600,6 +616,7 @@ class RotationManager:
                             "shares": shares,
                             "allocated_capital": alloc,
                             "planned_exit_date": planned_exit,
+                            "stop_loss": buy.get("stop_loss"),
                         }
                     )
 
@@ -859,6 +876,7 @@ class RotationManager:
                 "shares": p.shares,
                 "allocated_capital": p.allocated_capital,
                 "planned_exit_date": p.planned_exit_date,
+                "stop_loss": p.stop_loss,
             }
             for p in positions
         ]
@@ -909,8 +927,8 @@ class RotationManager:
 
         return cash + sell_proceeds
 
-    def _execute_renewal(self, session, portfolio_id: int, renew: dict) -> None:
-        """執行續持：更新 planned_exit_date。"""
+    def _execute_renewal(self, session, portfolio_id: int, renew: dict, new_stop_loss: float | None = None) -> None:
+        """執行續持：更新 planned_exit_date，止損價只能上移（trailing stop）。"""
         stmt = select(RotationPosition).where(
             RotationPosition.portfolio_id == portfolio_id,
             RotationPosition.stock_id == renew["stock_id"],
@@ -920,6 +938,10 @@ class RotationManager:
         if pos is not None:
             pos.planned_exit_date = renew["new_planned_exit_date"]
             pos.holding_days_count = renew.get("days_held", pos.holding_days_count)
+            # 續持時止損價只能上移（trailing stop），不能下移
+            if new_stop_loss is not None:
+                if pos.stop_loss is None or new_stop_loss > pos.stop_loss:
+                    pos.stop_loss = new_stop_loss
 
     def _execute_buy(
         self, session, portfolio_id: int, buy: dict, today: date, trading_cal: list[date], cash: float
@@ -956,6 +978,7 @@ class RotationManager:
             planned_exit_date=planned_exit,
             shares=shares,
             allocated_capital=buy.get("allocated_capital", buy_cost),
+            stop_loss=buy.get("stop_loss"),
             status="open",
         )
         session.add(pos)

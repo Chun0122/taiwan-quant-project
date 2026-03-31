@@ -1388,3 +1388,108 @@ class TestSaveRotationBacktest:
             .all()
         )
         assert len(empty_trades) == 0
+
+
+# ===========================================================================
+# 止損價持久化 — to_buy 攜帶 stop_loss + 持倉止損不隨 rankings 浮動
+# ===========================================================================
+
+
+class TestStopLossPersistence:
+    """止損價應從持倉記錄取，不隨 discover rankings 每日浮動。"""
+
+    def test_buy_action_includes_stop_loss(self):
+        """新開倉的 to_buy dict 攜帶 rankings 中的 stop_loss。"""
+        rankings = _make_rankings([("2330", 100)])  # stop_loss = 100 * 0.9 = 90
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=5,
+            allow_renewal=True,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+        )
+        assert len(actions.to_buy) == 1
+        assert actions.to_buy[0]["stop_loss"] == 90.0
+
+    def test_position_stop_loss_used_over_rankings(self):
+        """持倉有自己的 stop_loss 時，不受 rankings 的新止損價影響。
+
+        模擬：進場價 100，進場止損 90。股價跌到 92，
+        新 rankings 重算止損為 92*0.9=82.8 → 不應採用。
+        用持倉的 stop_loss=90 判斷，92 > 90 → 不觸發。
+        """
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100)
+        pos["stop_loss"] = 90.0  # 進場時鎖定
+
+        # Rankings 重算後的 stop_loss 為 82.8（不應被使用）
+        rankings = _make_rankings([("2330", 92)])  # stop_loss = 92*0.9 = 82.8
+
+        # 以持倉的 stop_loss=90 檢查
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            stop_losses={"2330": 90.0},  # 來自持倉記錄
+            today_prices={"2330": 92.0},
+        )
+        assert len(actions.to_sell) == 0
+        assert len(actions.to_hold) == 1
+
+    def test_position_dropped_from_rankings_still_has_stop_loss(self):
+        """掉出推薦的持倉仍保有止損保護。
+
+        持倉 stop_loss=90，股價跌到 85 → 應觸發止損。
+        即使 rankings 裡已無此股票。
+        """
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100)
+        pos["stop_loss"] = 90.0
+
+        # Rankings 不含 2330（已掉出推薦）
+        rankings = _make_rankings([("2454", 80)])
+
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            stop_losses={"2330": 90.0},  # 來自持倉記錄
+            today_prices={"2330": 85.0},  # 跌破止損
+        )
+        assert len(actions.to_sell) == 1
+        assert actions.to_sell[0]["reason"] == "stop_loss"
+        assert actions.to_sell[0]["exit_price"] == 85.0
+
+    def test_position_dropped_from_rankings_no_stop_loss_no_crash(self):
+        """掉出推薦且無止損記錄的持倉（舊資料相容）不會 crash。"""
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100)
+        # 不設 stop_loss（模擬舊版資料）
+
+        rankings = _make_rankings([("2454", 80)])
+
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            stop_losses={},  # 無止損資訊
+            today_prices={"2330": 85.0},
+        )
+        # 無止損 → 不觸發，繼續持有
+        assert len(actions.to_sell) == 0
+        assert len(actions.to_hold) == 1
