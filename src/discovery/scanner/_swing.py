@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from datetime import date, timedelta
 
 import numpy as np
@@ -229,15 +230,17 @@ class SwingScanner(MarketScanner):
             #    +DI ≤ -DI（空頭趨勢）：此因子給 0 分，避免把主跌段評為高分
             if len(closes) >= 28:
                 window = min(len(closes), 60)
-                adx_indicator = _ADXIndicator(
-                    high=pd.Series(highs[-window:]),
-                    low=pd.Series(lows[-window:]),
-                    close=pd.Series(closes[-window:]),
-                    n=14,
-                )
-                adx_s = adx_indicator.adx().dropna()
-                di_pos_s = adx_indicator.adx_pos().dropna()
-                di_neg_s = adx_indicator.adx_neg().dropna()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    adx_indicator = _ADXIndicator(
+                        high=pd.Series(highs[-window:]),
+                        low=pd.Series(lows[-window:]),
+                        close=pd.Series(closes[-window:]),
+                        n=14,
+                    )
+                    adx_s = adx_indicator.adx().dropna()
+                    di_pos_s = adx_indicator.adx_pos().dropna()
+                    di_neg_s = adx_indicator.adx_neg().dropna()
                 if not adx_s.empty and not di_pos_s.empty and not di_neg_s.empty:
                     adx_val = float(adx_s.iloc[-1])
                     di_pos = float(di_pos_s.iloc[-1])

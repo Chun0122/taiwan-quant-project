@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 
 import pandas as pd
 from sqlalchemy import select
@@ -102,7 +103,9 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
                 records.append({"stock_id": stock_id, "date": dates[i], "name": name, "value": round(val, 4)})
 
     # --- ADX(14) ---
-    adx = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        adx = ADXIndicator(high=high, low=low, close=close, n=14).adx()
     for i, val in enumerate(adx):
         if pd.notna(val):
             records.append({"stock_id": stock_id, "date": dates[i], "name": "adx_14", "value": round(val, 4)})
@@ -151,7 +154,9 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # ADX(14)：資料不足 14 根時跳過（避免 ValueError）
     if len(close) >= 14:
-        result["adx_14"] = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result["adx_14"] = ADXIndicator(high=high, low=low, close=close, n=14).adx()
     else:
         result["adx_14"] = float("nan")
 
