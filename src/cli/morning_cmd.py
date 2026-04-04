@@ -32,6 +32,8 @@ from src.constants import (
     DEFAULT_VOL_MULT,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
     """建立早晨例行報告的 Discord 訊息摘要。
@@ -451,6 +453,20 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     def _skip(reason: str) -> None:
         print(f"  >> 跳過（{reason}）")
 
+    # ── 交易日檢查：非交易日跳過全部流程 ──
+    import datetime as _dt
+
+    from src.data.calendar import has_calendar_data, is_trading_day
+
+    _today_dt = _dt.date.today()
+    if not dry_run and not is_trading_day(_today_dt):
+        print(f"\n{'═' * 64}")
+        print(f"  今日 {today_str} 非交易日（休市），跳過早晨例行流程。")
+        if not has_calendar_data(_today_dt.year):
+            print(f"  （注意：{_today_dt.year} 年假日資料尚未建立，僅依週末判斷）")
+        print(f"{'═' * 64}\n")
+        return
+
     # ── Step 0: VIX 同步 + 宏觀壓力預檢（Macro Stress Check）──────
     print(f"\n{'═' * 64}")
     print("  [Step 0] 宏觀壓力預檢（Macro Stress Check）")
@@ -629,26 +645,48 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     if skip_sync:
         active_flags.add("skip_sync")
 
+    # 步驟執行結果追蹤（原子性：單步失敗不影響後續）
+    step_results: list[tuple[int | str, str, str]] = []  # (num, title, status)
+
     for num, title, skip_on, action in _steps:
         _step(num, title)
         if skip_on & active_flags:
             _skip("dry-run" if dry_run else "--skip-sync")
+            step_results.append((num, title, "skipped"))
         else:
-            action()
+            try:
+                action()
+                step_results.append((num, title, "success"))
+            except Exception:
+                logger.exception("Step %s 執行失敗", num)
+                print(f"  !! Step {num} 失敗，繼續執行後續步驟")
+                step_results.append((num, title, "failed"))
 
         # ── 資料新鮮度檢查：在 sync 完成後、discover 前驗證 ──
         if num == 8 and not dry_run:
             _verify_data_freshness(today_str)
 
-    # ── 完成提示 ─────────────────────────────────────────────────
+    # ── 完成提示（含失敗步驟摘要）──────────────────────────────
+    failed_steps = [(n, t) for n, t, s in step_results if s == "failed"]
     suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""
     print(f"\n{'═' * 64}")
-    print(f"  [完成] 早晨例行流程完成！{suffix}")
+    if failed_steps:
+        print(f"  [完成] 早晨例行流程完成（{len(failed_steps)} 個步驟失敗）{suffix}")
+        for n, t in failed_steps:
+            print(f"    ✗ Step {n}: {t}")
+    else:
+        print(f"  [完成] 早晨例行流程完成！{suffix}")
     print(f"{'═' * 64}\n")
 
     # ── Discord 摘要推播（或 dry-run 預覽）────────────────────────
     if notify or dry_run:
         msg = _build_morning_discord_summary(today_str, top_n)
+        # 失敗步驟附加至 Discord 摘要
+        if failed_steps:
+            fail_lines = [f"\n⚠ **{len(failed_steps)} 個步驟失敗：**"]
+            for n, t in failed_steps:
+                fail_lines.append(f"  ✗ Step {n}: {t}")
+            msg += "\n".join(fail_lines) + "\n"
         discover_msgs = _build_discover_discord_detail(today_str, top_n_per_mode=min(top_n, 10))
         if dry_run:
             # 使用 UTF-8 輸出，繞過 Windows cp950 對 emoji 的限制

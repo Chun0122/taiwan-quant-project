@@ -30,10 +30,12 @@ _EVENT_TYPE_WEIGHTS: dict[str, float] = {
 def compute_news_decay_weight(days_ago: int, event_type: str) -> float:
     """計算單則公告的時間衰減加權值。
 
-    公式：exp(-0.2 × days_ago) × type_weight
+    公式：exp(-decay_constant × days_ago) × type_weight
 
-    衰減常數 0.2：7 天後仍保留 ~25% 權重（exp(-1.4) ≈ 0.247），
-    適合「董監改選」等後續發酵型事件。
+    衰減常數依事件類型分化：
+      - 結構性事件（governance_change/buyback）：0.07（半衰期 ~10 天）
+      - 一般性事件（revenue/general）：0.15（半衰期 ~4.6 天）
+      - 其他事件：0.12（半衰期 ~5.8 天）
 
     Args:
         days_ago: 公告距今天數（≥0）
@@ -43,8 +45,24 @@ def compute_news_decay_weight(days_ago: int, event_type: str) -> float:
     Returns:
         加權值（≥0）
     """
+    from src.constants import (
+        NEWS_DECAY_DEFAULT,
+        NEWS_DECAY_STRUCTURAL,
+        NEWS_DECAY_TRANSIENT,
+        NEWS_STRUCTURAL_TYPES,
+        NEWS_TRANSIENT_TYPES,
+    )
+
     type_weight = _EVENT_TYPE_WEIGHTS.get(event_type, 1.0)
-    return float(np.exp(-0.2 * max(0, days_ago)) * type_weight)
+
+    if event_type in NEWS_STRUCTURAL_TYPES:
+        decay = NEWS_DECAY_STRUCTURAL
+    elif event_type in NEWS_TRANSIENT_TYPES:
+        decay = NEWS_DECAY_TRANSIENT
+    else:
+        decay = NEWS_DECAY_DEFAULT
+
+    return float(np.exp(-decay * max(0, days_ago)) * type_weight)
 
 
 def compute_abnormal_announcement_rate(
@@ -2507,6 +2525,56 @@ def compute_mfe_mae(
         )
 
     return pd.DataFrame(results)
+
+
+# ── 籌碼層級序數（數字越大 = 越高層級）──────────────────
+_CHIP_TIER_ORDER: dict[str, int] = {
+    "N/A": 0,
+    "3F": 1,
+    "4F": 2,
+    "5F": 3,
+    "6F": 4,
+    "7F": 5,
+    "8F": 6,
+}
+
+
+def detect_chip_tier_changes(
+    current: pd.DataFrame,
+    previous: pd.DataFrame,
+) -> pd.DataFrame:
+    """比對當前與前次掃描的 chip_tier，回傳有變化的股票。
+
+    Args:
+        current: 含 stock_id, chip_tier 的 DataFrame（本次掃描結果）
+        previous: 含 stock_id, chip_tier 的 DataFrame（前次 DiscoveryRecord）
+
+    Returns:
+        DataFrame[stock_id, prev_tier, curr_tier, direction]
+        direction: "upgrade" / "downgrade"
+    """
+    if current.empty or previous.empty:
+        return pd.DataFrame(columns=["stock_id", "prev_tier", "curr_tier", "direction"])
+
+    merged = current[["stock_id", "chip_tier"]].merge(
+        previous[["stock_id", "chip_tier"]],
+        on="stock_id",
+        suffixes=("_curr", "_prev"),
+    )
+    if merged.empty:
+        return pd.DataFrame(columns=["stock_id", "prev_tier", "curr_tier", "direction"])
+
+    merged["curr_ord"] = merged["chip_tier_curr"].map(_CHIP_TIER_ORDER).fillna(0).astype(int)
+    merged["prev_ord"] = merged["chip_tier_prev"].map(_CHIP_TIER_ORDER).fillna(0).astype(int)
+
+    changed = merged[merged["curr_ord"] != merged["prev_ord"]].copy()
+    if changed.empty:
+        return pd.DataFrame(columns=["stock_id", "prev_tier", "curr_tier", "direction"])
+
+    changed["direction"] = np.where(changed["curr_ord"] < changed["prev_ord"], "downgrade", "upgrade")
+    return changed.rename(columns={"chip_tier_prev": "prev_tier", "chip_tier_curr": "curr_tier"})[
+        ["stock_id", "prev_tier", "curr_tier", "direction"]
+    ].reset_index(drop=True)
 
 
 @dataclass

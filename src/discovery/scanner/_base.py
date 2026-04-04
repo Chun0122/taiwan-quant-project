@@ -37,6 +37,7 @@ from src.discovery.scanner._functions import (
     compute_chip_macd,
     compute_daytrade_penalty,
     compute_factor_ic,
+    compute_ic_weight_adjustments,
     compute_institutional_acceleration,
     compute_key_player_cost_basis,
     compute_momentum_decay,
@@ -46,6 +47,7 @@ from src.discovery.scanner._functions import (
     compute_taiex_relative_strength,
     compute_volume_price_divergence,
     compute_win_rate_threshold_adjustment,
+    detect_chip_tier_changes,
     score_key_player_cost,
 )
 from src.discovery.universe import UniverseConfig, UniverseFilter
@@ -82,6 +84,7 @@ class MarketScanner:
         top_n_results: int = 30,
         lookback_days: int = 5,
         weekly_confirm: bool = False,
+        use_ic_adjustment: bool = False,
         universe_config: UniverseConfig | None = None,
     ) -> None:
         self.min_price = min_price
@@ -91,6 +94,7 @@ class MarketScanner:
         self.top_n_results = top_n_results
         self.lookback_days = lookback_days
         self.weekly_confirm = weekly_confirm
+        self.use_ic_adjustment = use_ic_adjustment
         # Universe Filter：各子類可在 __init__ 中傳入模式專屬 config
         self._universe_config = universe_config or UniverseConfig()
         self._universe_filter = UniverseFilter(self._universe_config)
@@ -229,6 +233,9 @@ class MarketScanner:
         effective_top_n = self._compute_drawdown_adjusted_top_n(df_price)
         sector_summary = self._compute_sector_summary(rankings)
         logger.info("Stage 4: 輸出 Top %d（原始 Top %d）", min(effective_top_n, len(rankings)), self.top_n_results)
+
+        # Stage 4.3: 籌碼層級降級稽核（比對前次掃描 chip_tier，記錄升降級）
+        rankings = self._audit_chip_tier_changes(rankings)
 
         return DiscoveryResult(
             rankings=rankings.head(effective_top_n),
@@ -468,7 +475,7 @@ class MarketScanner:
     def _load_announcement_data(
         self,
         stock_ids: list[str] | None = None,
-        days: int = 10,
+        days: int | None = None,
         baseline_days: int = 180,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """從 DB 查詢 MOPS 重大訊息公告（近期 + 基準期歷史）。
@@ -483,6 +490,10 @@ class MarketScanner:
             - recent_df: 最近 days 天，含 stock_id/date/seq/subject/sentiment/event_type
             - history_df: 最近 baseline_days 天，含 stock_id/date（供異常率計算）
         """
+        from src.constants import NEWS_LOAD_WINDOW_DAYS
+
+        if days is None:
+            days = NEWS_LOAD_WINDOW_DAYS
         today = date.today()
         recent_cutoff = today - timedelta(days=days)
         baseline_cutoff = today - timedelta(days=baseline_days)
@@ -911,6 +922,12 @@ class MarketScanner:
         peer_df = compute_peer_fundamental_ranking(df_fin, stock_ids, industry_map, bonus=0.03)
         scored = scored.merge(peer_df, on="stock_id", how="left")
         scored["peer_rank_bonus"] = scored["peer_rank_bonus"].fillna(0.0)
+        # peer_rank_bonus 受統一加成上限約束（與 sector/concept 合計 ≤ ±8%）
+        sector = scored.get("sector_bonus", pd.Series(0.0, index=scored.index)).fillna(0.0)
+        concept = scored.get("concept_bonus", pd.Series(0.0, index=scored.index)).fillna(0.0)
+        used = sector + concept  # 已使用的加成空間
+        remaining = (0.08 - used.abs()).clip(lower=0.0)
+        scored["peer_rank_bonus"] = scored["peer_rank_bonus"].clip(lower=-remaining, upper=remaining)
         scored["composite_score"] = scored["composite_score"] * (1 + scored["peer_rank_bonus"])
 
         n_leader = (scored["peer_rank_bonus"] > 0).sum()
@@ -1112,6 +1129,10 @@ class MarketScanner:
 
         regime = getattr(self, "regime", "sideways")
         w = MarketRegimeDetector.get_weights(self.mode_name, regime)
+
+        # E2b: Factor IC 動態權重調整（需 >= 20 筆歷史推薦）
+        if self.use_ic_adjustment:
+            w = self._apply_ic_weight_adjustment(w)
 
         composite = pd.Series(0.0, index=candidates.index)
         for key, weight in w.items():
@@ -2193,6 +2214,151 @@ class MarketScanner:
                 )
         except Exception:
             logger.debug("E2: 因子有效性計算失敗，跳過")
+
+    # ------------------------------------------------------------------ #
+    #  E2b: Factor IC 動態權重調整
+    # ------------------------------------------------------------------ #
+
+    def _apply_ic_weight_adjustment(self, base_weights: dict[str, float]) -> dict[str, float]:
+        """E2b — 根據歷史 IC 自動微調四維度權重。
+
+        需 >= 20 筆可評估推薦紀錄（~4 天 × top 5）才啟動調整。
+        調整後權重歸一化至原始總和，確保不改變評分量級。
+        """
+        try:
+            cutoff = date.today() - timedelta(days=35)
+
+            with get_session() as session:
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.technical_score,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.fundamental_score,
+                    DiscoveryRecord.news_score,
+                ).where(
+                    DiscoveryRecord.mode == self.mode_name,
+                    DiscoveryRecord.scan_date >= cutoff,
+                )
+                rows = session.execute(stmt).all()
+                if len(rows) < 20:
+                    logger.info("E2b: 歷史推薦不足 20 筆（%d），跳過 IC 權重調整", len(rows))
+                    return dict(base_weights)
+
+                df_records = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "scan_date",
+                        "stock_id",
+                        "close",
+                        "technical_score",
+                        "chip_score",
+                        "fundamental_score",
+                        "news_score",
+                    ],
+                )
+
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                if not price_rows:
+                    return dict(base_weights)
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+            if ic_df.empty:
+                return dict(base_weights)
+
+            # 將 base_weights key (如 "technical") 轉為 score 欄位名 (如 "technical_score")
+            score_weights = {f"{k}_score": v for k, v in base_weights.items()}
+            adjusted_score = compute_ic_weight_adjustments(ic_df, score_weights)
+            # 轉回原始 key
+            adjusted = {k.replace("_score", ""): v for k, v in adjusted_score.items()}
+
+            for key in base_weights:
+                if base_weights[key] != adjusted.get(key, base_weights[key]):
+                    logger.info(
+                        "E2b IC 權重調整: %s — %s %.2f → %.2f",
+                        self.mode_name,
+                        key,
+                        base_weights[key],
+                        adjusted[key],
+                    )
+            return adjusted
+
+        except Exception:
+            logger.debug("E2b: IC 權重調整失敗，使用原始權重")
+            return dict(base_weights)
+
+    # ------------------------------------------------------------------ #
+    #  Stage 4.3: 籌碼層級降級稽核
+    # ------------------------------------------------------------------ #
+
+    def _audit_chip_tier_changes(self, rankings: pd.DataFrame) -> pd.DataFrame:
+        """Stage 4.3 — 比對前次掃描 chip_tier，記錄升降級至日誌與 DataFrame。
+
+        從 DB 讀取前一次同模式 DiscoveryRecord 的 chip_tier，
+        呼叫 detect_chip_tier_changes() 純函數比對。
+        結果寫入 rankings["chip_tier_change"] 欄位（如 "8F→7F"），供儲存至 DB。
+        """
+        if "chip_tier" not in rankings.columns or rankings.empty:
+            rankings["chip_tier_change"] = None
+            return rankings
+
+        try:
+            from sqlalchemy import func
+
+            with get_session() as session:
+                # 找前一次掃描日期
+                prev_date_row = session.execute(
+                    select(func.max(DiscoveryRecord.scan_date)).where(
+                        DiscoveryRecord.mode == self.mode_name,
+                        DiscoveryRecord.scan_date < self.scan_date,
+                    )
+                ).scalar()
+                if prev_date_row is None:
+                    rankings["chip_tier_change"] = None
+                    return rankings
+
+                # 載入前次記錄的 chip_tier
+                prev_rows = session.execute(
+                    select(DiscoveryRecord.stock_id, DiscoveryRecord.chip_tier).where(
+                        DiscoveryRecord.mode == self.mode_name,
+                        DiscoveryRecord.scan_date == prev_date_row,
+                    )
+                ).all()
+                if not prev_rows:
+                    rankings["chip_tier_change"] = None
+                    return rankings
+
+            df_prev = pd.DataFrame(prev_rows, columns=["stock_id", "chip_tier"])
+            changes = detect_chip_tier_changes(rankings, df_prev)
+
+            # 寫入 chip_tier_change 欄位
+            if changes.empty:
+                rankings["chip_tier_change"] = None
+                return rankings
+
+            change_map = {}
+            for _, row in changes.iterrows():
+                label = f"{row['prev_tier']}→{row['curr_tier']}"
+                change_map[row["stock_id"]] = label
+                if row["direction"] == "downgrade":
+                    logger.warning("籌碼層級降級: %s %s", row["stock_id"], label)
+                else:
+                    logger.info("籌碼層級升級: %s %s", row["stock_id"], label)
+
+            rankings["chip_tier_change"] = rankings["stock_id"].map(change_map)
+            return rankings
+
+        except Exception:
+            logger.debug("Stage 4.3: 籌碼層級稽核失敗，跳過")
+            rankings["chip_tier_change"] = None
+            return rankings
 
     # ------------------------------------------------------------------ #
     #  Stage 4.1: 同產業分散化

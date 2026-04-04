@@ -61,7 +61,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **SQLAlchemy Session** | `with get_session() as session:`；批次寫入 `sqlite_upsert().on_conflict_do_nothing()`；`init_db()` 含 WAL + `busy_timeout=30000` |
 | **三層資料來源** | ①TWSE/TPEX 官方（免費，全市場）→ ②FinMind 批次（付費）→ ③FinMind 逐股（免費備援） |
 | **Watchlist** | `get_effective_watchlist()`：DB 優先，`settings.yaml` fallback，全模組統一呼叫 |
-| **常數集中** | `src/constants.py`：交易成本/速率/籌碼門檻/VIX 危機/風險預算等全系統共用常數 |
+| **常數集中** | `src/constants.py`：交易成本/速率/籌碼門檻/VIX 危機/風險預算/Kelly/相關性/新聞衰減/Regime/漲跌停等全系統共用常數 |
 
 ### 模組職責
 
@@ -74,7 +74,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/data/pipeline.py` | ETL 調度 + DB 寫入；OHLCV 品質閘門；`_classify_security_type()`；`compute_and_store_daily_features()`；`sync_broker_bootstrap()`（ThreadPoolExecutor）；`save_rotation_backtest()` |
 | `src/data/mops_fetcher.py` | MOPS 重大訊息 + 月營收；`classify_event_type()`（7 類，優先序）；Regex 上下文情緒分類 |
 | `src/data/schema.py` | 27 張 ORM 表（含 Announcement/DiscoveryRecord/WatchEntry/Watchlist/DailyFeature/ConceptGroup/ConceptMembership/RotationPortfolio/RotationPosition/RotationBacktest*） |
-| `src/data/validator.py` | 6 個純函數品質檢查 + orchestrator |
+| `src/data/validator.py` | 7 個純函數品質檢查 + orchestrator（含 `check_per_stock_freshness()`） |
+| `src/data/calendar.py` | TWSE 交易日行事曆（2025-2026）；`is_trading_day()` / `next_trading_day()` / `prev_trading_day()` / `get_trading_days()` |
 | `src/data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
 | `src/data/retry.py` | `request_with_retry()` exponential backoff（429/500/502/503/504） |
 | `src/data/migrate.py` | DB schema 遷移工具 |
@@ -190,6 +191,7 @@ python main.py discover all --skip-sync --top 20
 python main.py discover all --skip-sync --min-appearances 2
 python main.py discover all --skip-sync --export compare.csv
 python main.py discover momentum --weekly-confirm  # 週線多時框確認
+python main.py discover momentum --use-ic-adjustment  # Factor IC 動態權重調整
 python main.py discover-backtest --mode momentum   # 推薦績效回測
 
 # ── 回測 ─────────────────────────────────────────────────
@@ -281,7 +283,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1525 個測試，41 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1605 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -324,6 +326,8 @@ pytest --cov=src --cov-report=term-missing
 | `test_universe.py` | `discovery/universe.py` + DailyFeature ETL | 純函數+SQLite |
 | `test_concepts.py` | `classify_concepts()` + ConceptGroup ORM | 純函數+SQLite |
 | `test_rotation.py` | `portfolio/rotation.py` 全模組 | 純函數+SQLite |
+| `test_calendar.py` | `data/calendar.py` TWSE 交易日行事曆 | 純函數 |
+| `test_morning_atomicity.py` | `cli/morning_cmd.py` 原子性 | mock |
 
 新增或修改模組後，執行 `pytest -v` 確保全部通過，並為新計算邏輯補充測試。
 
@@ -331,9 +335,7 @@ pytest --cov=src --cov-report=term-missing
 
 ## Pending Tasks（未完成）
 
-- **P2：Shrink Kelly** — `engine.py` Kelly sizing 加入 `confidence = min(1, trades/100)` + cap 0.20
-- **P2：Drawdown Guard 連續化** — `rotation.py` 離散三階改為 `max(0, 1 - dd/threshold)` 連續函數
-- **P3：Partial Take Profit** — engine + rotation 支援 `+2R 出 50% + 剩餘 trailing`
+（Phase 1 + Phase 2 全部完成，Phase 3 實盤上線暫緩）
 
 ## 已確認事項（規劃時勿重複提出）
 
@@ -342,9 +344,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 58 項）
+## Completed Tasks（已完成，共 75 項）
 
-測試數從 231 → 1525。各階段摘要：
+測試數從 231 → 1605。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -356,3 +358,5 @@ pytest --cov=src --cov-report=term-missing
 | **Universe + 品質** | 42~49 | Universe 三層漏斗 + Feature Store、同業 PE、EPS 連續性、消息面優化、Swing 強化 |
 | **概念 + Crisis** | 50~53 | 概念股系統、Crisis 第四狀態、隔日沖偵測、風險過濾強化 |
 | **統一重構** | 54~58 | entry_exit.py 共用、市場寬度降級、Hysteresis 狀態機、法人連續性 + HHI 趨勢 |
+| **Phase 1 基盤強化** | 59~67 | Regime 預設值、Kelly 收縮、Drawdown 連續化、相關性危機自適應、分數上限修正、早晨原子性、每股新鮮度、波動率權重、危機強制平倉 |
+| **Phase 2 擬真度** | 68~75 | 假日行事曆、公告衰減分化、籌碼層級稽核、滑價不對稱、Factor IC 動態權重、Regime 部位大小、漲跌停模擬、部分止利 |

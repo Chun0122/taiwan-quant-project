@@ -47,6 +47,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("discovery_record", "daytrade_tags", "VARCHAR(200)"),
     # 輪動持倉止損價持久化（進場時鎖定，不隨 discover 每日更新）
     ("rotation_position", "stop_loss", "REAL"),
+    # 籌碼層級變化稽核（如 "8F→7F"）
+    ("discovery_record", "chip_tier_change", "VARCHAR(20)"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

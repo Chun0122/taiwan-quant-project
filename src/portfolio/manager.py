@@ -13,7 +13,7 @@ from datetime import date, datetime
 import pandas as pd
 from sqlalchemy import select
 
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import COMMISSION_RATE, REGIME_FALLBACK_DEFAULT, SLIPPAGE_RATE, TAX_RATE
 from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
@@ -30,6 +30,7 @@ from src.portfolio.rotation import (
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
+    compute_vol_inverse_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -335,7 +336,18 @@ class RotationManager:
                     if regime:
                         logger.info("從 RegimeStateMachine 讀取 regime=%s", regime)
                 except Exception:
-                    pass  # 無持久化資料時 regime 維持 None
+                    logger.warning(
+                        "Regime 偵測失敗，使用安全預設值 %s",
+                        REGIME_FALLBACK_DEFAULT,
+                    )
+                    regime = REGIME_FALLBACK_DEFAULT
+            # 最終防線：若 rsm.current_regime 回傳 None / 空字串
+            if not regime:
+                logger.warning(
+                    "Regime 為空值，使用安全預設值 %s",
+                    REGIME_FALLBACK_DEFAULT,
+                )
+                regime = REGIME_FALLBACK_DEFAULT
 
             # ── Correlation Budget：計算持倉+候選相關性矩陣 ──
             corr_matrix = None
@@ -365,6 +377,21 @@ class RotationManager:
                             price_data[sid] = pd.Series(prices_list, index=pd.DatetimeIndex(dates_list))
                     if len(price_data) >= 2:
                         corr_matrix = compute_correlation_matrix(price_data, window=60)
+
+            # ── 波動率反比權重：候選股波動率較高者分配較少資金 ──
+            vol_weights = None
+            if candidate_sids and price_rows:
+                vol_dict: dict[str, float] = {}
+                for sid in candidate_sids:
+                    sid_rows = [r[2] for r in price_rows if r[0] == sid]
+                    if len(sid_rows) >= 20:
+                        s = pd.Series(sid_rows)
+                        daily_ret = s.pct_change().dropna()
+                        if len(daily_ret) >= 10:
+                            vol_dict[sid] = float(daily_ret.std() * (252**0.5))
+                if vol_dict:
+                    vol_weights = compute_vol_inverse_weights(vol_dict)
+                    logger.info("波動率反比權重：%s", vol_weights)
 
             # ── Max Drawdown Kill Switch：回撤超過閾值強制平倉 ──
             equity_history = self._compute_equity_history(session, portfolio)
@@ -407,6 +434,7 @@ class RotationManager:
                 today_prices=today_prices,
                 total_capital=portfolio.current_capital,
                 corr_matrix=corr_matrix,
+                vol_weights=vol_weights,
                 regime=regime,
             )
 

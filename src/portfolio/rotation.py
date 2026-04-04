@@ -260,9 +260,12 @@ def compute_rotation_actions(
     corr_matrix: pd.DataFrame | None = None,
     corr_threshold: float = CORRELATION_THRESHOLD,
     corr_penalty: float = CORRELATION_PENALTY,
+    # 波動率反比權重
+    vol_weights: dict[str, float] | None = None,
     # Regime 硬阻擋
     regime: str | None = None,
     crisis_block_new: bool = True,
+    crisis_force_close: bool = False,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -297,9 +300,10 @@ def compute_rotation_actions(
     drawdown_pct : float | None
         目前組合回撤百分比（正值，如 12.0 = -12%），用於 Drawdown Guard。
     drawdown_half_threshold : float
-        回撤達此閾值（%）時新開倉減半（預設 10.0）。
+        已棄用，保留以維持向後相容。連續化後僅使用 drawdown_stop_threshold。
     drawdown_stop_threshold : float
-        回撤達此閾值（%）時停止新開倉（預設 15.0）。
+        回撤達此閾值（%）時 drawdown_scale 降至 0（預設 15.0）。
+        scale = max(0, 1 - drawdown_pct / drawdown_stop_threshold)。
     max_heat : float
         組合最大風險上限（預設 0.12 = 12%），超過時拒絕新開倉。
     per_position_risk_cap : float
@@ -312,10 +316,16 @@ def compute_rotation_actions(
         高相關判定門檻（預設 0.7）。
     corr_penalty : float
         高相關時部位縮減比例（預設 0.5 = 減半）。
+    vol_weights : dict[str, float] | None
+        波動率反比權重 {stock_id: weight}，合計 1.0。
+        None 時等權分配。由 compute_vol_inverse_weights() 計算。
     regime : str | None
         目前市場狀態（bull/sideways/bear/crisis），用於 Crisis 硬阻擋。
     crisis_block_new : bool
         crisis 時是否阻擋所有新開倉（預設 True）。
+    crisis_force_close : bool
+        crisis 時是否強制平倉所有既有持倉（預設 False）。
+        啟用時 regime='crisis' 會觸發全持倉賣出。
 
     Returns
     -------
@@ -395,17 +405,31 @@ def compute_rotation_actions(
             )
             remaining_open.append(pos)
 
+    # ── Crisis 強制平倉：crisis 時清空所有既有持倉 ──
+    if regime == "crisis" and crisis_force_close and remaining_open:
+        for pos in remaining_open:
+            price = (today_prices or {}).get(pos["stock_id"], pos["entry_price"])
+            actions.to_sell.append(
+                {
+                    "stock_id": pos["stock_id"],
+                    "reason": "crisis_exit",
+                    "exit_price": price,
+                    "days_held": count_trading_days_held(pos["entry_date"], today, trading_calendar),
+                    **pos,
+                }
+            )
+        remaining_open = []
+        actions.to_hold = []  # 清除第一輪已加入的 to_hold
+
     # ── Crisis 硬阻擋：crisis 時直接停止新開倉 ──
     if regime == "crisis" and crisis_block_new:
         drawdown_scale = 0.0
     else:
-        # ── Drawdown Guard：回撤嚴重時限制新開倉 ──
-        drawdown_scale = 1.0  # 新開倉資金倍數
-        if drawdown_pct is not None:
-            if drawdown_pct >= drawdown_stop_threshold:
-                drawdown_scale = 0.0  # 停止新開倉
-            elif drawdown_pct >= drawdown_half_threshold:
-                drawdown_scale = 0.5  # 新開倉減半
+        # ── Drawdown Guard（連續化）：回撤越深，新開倉縮減越多 ──
+        # drawdown_scale = max(0, 1 - dd / threshold)，線性遞減
+        drawdown_scale = 1.0
+        if drawdown_pct is not None and drawdown_stop_threshold > 0:
+            drawdown_scale = max(0.0, 1.0 - drawdown_pct / drawdown_stop_threshold)
 
     # ── 計算空位並填補 ──
     free_slots = max_positions - len(remaining_open)
@@ -455,15 +479,34 @@ def compute_rotation_actions(
                 if candidate_sector and sector_counts.get(candidate_sector, 0) >= max_sector_count:
                     continue  # 同產業已達上限，跳過
 
-            # ── Correlation Budget：高相關持倉縮減部位 ──
+            # ── 波動率反比權重：按 vol_weights 調整每股分配資金 ──
             adj_capital = per_position_capital
+            if vol_weights and sid in vol_weights:
+                # vol_weight × max_positions 使總資金不變（weight 合計 1.0）
+                adj_capital = per_position_capital * vol_weights[sid] * max_positions
+
+            # ── Correlation Budget：高相關持倉縮減部位（Regime 自適應）──
+            # 危機/熊市時收緊相關性門檻，避免分散失效
+            effective_corr_threshold = corr_threshold
+            effective_corr_penalty = corr_penalty
+            if regime == "crisis":
+                from src.constants import CORRELATION_PENALTY_CRISIS, CORRELATION_THRESHOLD_CRISIS
+
+                effective_corr_threshold = min(corr_threshold, CORRELATION_THRESHOLD_CRISIS)
+                effective_corr_penalty = min(corr_penalty, CORRELATION_PENALTY_CRISIS)
+            elif regime == "bear":
+                from src.constants import CORRELATION_PENALTY_BEAR, CORRELATION_THRESHOLD_BEAR
+
+                effective_corr_threshold = min(corr_threshold, CORRELATION_THRESHOLD_BEAR)
+                effective_corr_penalty = min(corr_penalty, CORRELATION_PENALTY_BEAR)
+
             if corr_matrix is not None and not corr_matrix.empty:
                 for existing_pos in remaining_open:
                     esid = existing_pos["stock_id"]
                     if esid in corr_matrix.columns and sid in corr_matrix.columns and esid != sid:
                         corr_val = corr_matrix.loc[esid, sid]
-                        if not np.isnan(corr_val) and abs(corr_val) >= corr_threshold:
-                            adj_capital *= corr_penalty
+                        if not np.isnan(corr_val) and abs(corr_val) >= effective_corr_threshold:
+                            adj_capital *= effective_corr_penalty
                             break  # 一次 penalty 即可
 
             # ── Portfolio Heat：檢查新交易是否超過風險上限 ──

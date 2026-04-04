@@ -11,6 +11,7 @@ from src.data.validator import (
     check_date_range_consistency,
     check_limit_streaks,
     check_missing_days,
+    check_per_stock_freshness,
     check_price_anomalies,
     check_zero_volume,
 )
@@ -353,3 +354,53 @@ class TestCheckDataFreshness:
         issues = check_data_freshness(ranges, ref, stale_threshold=7)
         assert len(issues) == 1
         assert "無資料" in issues[0].description
+
+
+# ===========================================================================
+# TestCheckPerStockFreshness
+# ===========================================================================
+
+
+class TestCheckPerStockFreshness:
+    """check_per_stock_freshness 的測試。"""
+
+    def test_all_fresh(self):
+        """全部新鮮 → 空列表。"""
+        ref = date(2025, 1, 10)
+        max_dates = {"2330": date(2025, 1, 9), "2317": date(2025, 1, 8)}
+        stale = check_per_stock_freshness(max_dates, ref, stale_threshold=3)
+        assert stale == []
+
+    def test_one_stale(self):
+        """一支過期 → 回傳該 stock_id。"""
+        ref = date(2025, 1, 17)  # 週五
+        max_dates = {"2330": date(2025, 1, 16), "2317": date(2025, 1, 6)}  # 2317 距今 >3 bdays
+        stale = check_per_stock_freshness(max_dates, ref, stale_threshold=3)
+        assert stale == ["2317"]
+
+    def test_none_max_date_is_stale(self):
+        """max_date=None → 視為過期。"""
+        ref = date(2025, 1, 10)
+        max_dates = {"2330": date(2025, 1, 9), "9999": None}
+        stale = check_per_stock_freshness(max_dates, ref, stale_threshold=3)
+        assert "9999" in stale
+
+    def test_mixed_fresh_and_stale(self):
+        """混合 → 只回傳過期的。"""
+        ref = date(2025, 2, 14)  # 週五
+        max_dates = {
+            "2330": date(2025, 2, 13),  # 新鮮
+            "2317": date(2025, 2, 5),  # 過期（7 bdays）
+            "2454": date(2025, 2, 12),  # 新鮮
+            "3008": date(2025, 1, 20),  # 過期
+        }
+        stale = check_per_stock_freshness(max_dates, ref, stale_threshold=3)
+        assert "2330" not in stale
+        assert "2454" not in stale
+        assert "2317" in stale
+        assert "3008" in stale
+
+    def test_empty_input(self):
+        """空字典 → 空列表。"""
+        stale = check_per_stock_freshness({}, date(2025, 1, 10))
+        assert stale == []

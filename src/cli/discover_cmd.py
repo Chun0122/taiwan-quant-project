@@ -58,6 +58,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
         min_volume=args.min_volume,
         top_n_results=args.top,
         weekly_confirm=getattr(args, "weekly_confirm", False),
+        use_ic_adjustment=getattr(args, "use_ic_adjustment", False),
     )
     result = scanner.run()
 
@@ -293,6 +294,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
             min_volume=args.min_volume,
             top_n_results=args.top,
             weekly_confirm=getattr(args, "weekly_confirm", False),
+            use_ic_adjustment=getattr(args, "use_ic_adjustment", False),
         )
         result = scanner.run()
         results[mode_key] = result
@@ -429,6 +431,7 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 if pd.notna(row.get("daytrade_penalty"))
                 else None,
                 daytrade_tags=str(row.get("daytrade_tags", "")) or None,
+                chip_tier_change=str(row.get("chip_tier_change", "")) or None,
             )
         )
 

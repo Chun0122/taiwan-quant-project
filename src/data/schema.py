@@ -494,6 +494,7 @@ class DiscoveryRecord(Base):
     concept_bonus: Mapped[float | None] = mapped_column(Float, nullable=True)  # 概念熱度加成（Stage 3.3b）
     daytrade_penalty: Mapped[float | None] = mapped_column(Float, nullable=True)  # 隔日沖風險扣分（0~1）
     daytrade_tags: Mapped[str | None] = mapped_column(String(200), nullable=True)  # 隔日沖分點名稱（逗號分隔）
+    chip_tier_change: Mapped[str | None] = mapped_column(String(20), nullable=True)  # 籌碼層級變化（如 "8F→7F"）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

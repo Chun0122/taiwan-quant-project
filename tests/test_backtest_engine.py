@@ -174,36 +174,73 @@ class TestComputeMetrics:
 
 
 class TestComputeKellyFraction:
-    def test_insufficient_trades_returns_fallback(self):
+    def test_insufficient_trades_returns_confidence_scaled(self):
+        """交易不足 5 筆：fallback = max(0.01, KELLY_MAX × confidence)。
+        3 筆 → confidence = 0.03 → 0.20 × 0.03 = 0.006 → clamp 0.01。
+        """
         engine = _make_engine(pd.DataFrame(), pd.Series())
         trades = [TradeRecord(entry_date=date(2024, 1, 1), entry_price=100, pnl=100)] * 3
         result = engine._compute_kelly_fraction(trades)
-        assert result == 0.1
+        assert result == pytest.approx(0.01, abs=0.001)
 
-    def test_known_kelly_value(self):
+    def test_known_kelly_value_with_confidence(self):
+        """10 筆交易：confidence = 0.1。
+        kelly raw = 0.4 → capped 0.20 → 0.20 × 0.1 × 1.0 = 0.02。
+        """
         engine = _make_engine(
             pd.DataFrame(),
             pd.Series(),
             risk_config=RiskConfig(kelly_fraction=1.0),
         )
         # 60% win rate, avg_win=200, avg_loss=100 → W/L=2
-        # kelly = 0.6 - 0.4/2 = 0.4
+        # kelly = 0.6 - 0.4/2 = 0.4 → capped at 0.20
         trades = [TradeRecord(entry_date=date(2024, 1, i + 1), entry_price=100, pnl=200) for i in range(6)] + [
             TradeRecord(entry_date=date(2024, 2, i + 1), entry_price=100, pnl=-100) for i in range(4)
         ]
         result = engine._compute_kelly_fraction(trades)
-        assert result == pytest.approx(0.4, abs=0.01)
+        # 0.20 * (10/100) * 1.0 = 0.02
+        assert result == pytest.approx(0.02, abs=0.001)
 
-    def test_all_wins_returns_capped(self):
+    def test_all_wins_returns_confidence_scaled(self):
+        """全部獲利 → no losses fallback，受信心縮放。"""
         engine = _make_engine(
             pd.DataFrame(),
             pd.Series(),
             risk_config=RiskConfig(kelly_fraction=1.0),
         )
-        # All wins, no losses → fallback 0.1
         trades = [TradeRecord(entry_date=date(2024, 1, i + 1), entry_price=100, pnl=100) for i in range(10)]
         result = engine._compute_kelly_fraction(trades)
-        assert result == 0.1
+        # max(0.01, 0.20 * 0.1) = max(0.01, 0.02) = 0.02
+        assert result == pytest.approx(0.02, abs=0.001)
+
+    def test_full_confidence_at_100_trades(self):
+        """100 筆交易：confidence = 1.0，Kelly 正常計算。"""
+        engine = _make_engine(
+            pd.DataFrame(),
+            pd.Series(),
+            risk_config=RiskConfig(kelly_fraction=1.0),
+        )
+        # 60% win, 40% loss → kelly raw = 0.4 → capped 0.20
+        trades = [TradeRecord(entry_date=date(2024, 1, 1), entry_price=100, pnl=200)] * 60 + [
+            TradeRecord(entry_date=date(2024, 1, 1), entry_price=100, pnl=-100)
+        ] * 40
+        result = engine._compute_kelly_fraction(trades)
+        # 0.20 * 1.0 * 1.0 = 0.20
+        assert result == pytest.approx(0.20, abs=0.01)
+
+    def test_kelly_cap_at_max_fraction(self):
+        """即使 raw kelly 很高，也不超過 KELLY_MAX_FRACTION。"""
+        engine = _make_engine(
+            pd.DataFrame(),
+            pd.Series(),
+            risk_config=RiskConfig(kelly_fraction=1.0),
+        )
+        # 90% win, avg_win=500, avg_loss=50 → kelly = 0.9 - 0.1/(500/50) = 0.89
+        trades = [TradeRecord(entry_date=date(2024, 1, 1), entry_price=100, pnl=500)] * 180 + [
+            TradeRecord(entry_date=date(2024, 1, 1), entry_price=100, pnl=-50)
+        ] * 20
+        result = engine._compute_kelly_fraction(trades)
+        assert result <= 0.20
 
 
 # ─── _compute_atr ─────────────────────────────────────────
@@ -1058,6 +1095,427 @@ class TestDynamicSlippage:
 
         # 動態滑價在低量下成本更高 → 最終資金更少
         assert result_dynamic.final_capital < result_fixed.final_capital
+
+
+# ─── A1b: 賣出滑價不對稱 ────────────────────────────────────
+
+
+class TestSellSlippageMultiplier:
+    """測試賣出滑價放大係數（sell_slippage_multiplier）。"""
+
+    def _make_engine(self, multiplier: float = 1.3, dynamic: bool = False):
+        config = BacktestConfig(
+            dynamic_slippage=dynamic,
+            sell_slippage_multiplier=multiplier,
+        )
+        return _make_engine(pd.DataFrame(), pd.Series(), config=config)
+
+    def test_sell_slippage_higher_than_buy(self):
+        """賣出滑價應 = 基底滑價 × multiplier。"""
+        engine = self._make_engine(multiplier=1.3, dynamic=False)
+        base = BacktestConfig().slippage
+        buy_slip = engine._get_slippage(1_000_000, side="buy")
+        sell_slip = engine._get_slippage(1_000_000, side="sell")
+        assert buy_slip == pytest.approx(base)
+        assert sell_slip == pytest.approx(base * 1.3)
+        assert sell_slip > buy_slip
+
+    def test_multiplier_1_means_symmetric(self):
+        """multiplier=1.0 → 買賣滑價相同。"""
+        engine = self._make_engine(multiplier=1.0)
+        buy_slip = engine._get_slippage(1_000_000, side="buy")
+        sell_slip = engine._get_slippage(1_000_000, side="sell")
+        assert buy_slip == pytest.approx(sell_slip)
+
+    def test_sell_slippage_capped_at_max(self):
+        """放大後的滑價不超過 slippage_max。"""
+        config = BacktestConfig(
+            dynamic_slippage=True,
+            slippage_impact_coeff=10.0,  # 非常高的衝擊係數
+            sell_slippage_multiplier=2.0,
+            slippage_max=0.01,
+        )
+        engine = _make_engine(pd.DataFrame(), pd.Series(), config=config)
+        sell_slip = engine._get_slippage(100, side="sell")  # 極低量
+        assert sell_slip <= config.slippage_max
+
+    def test_asymmetric_slippage_affects_pnl(self):
+        """啟用不對稱滑價後，賣出成本增加 → 最終資金更低。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+
+        # 對稱滑價
+        result_sym = _make_engine(data, signals, config=BacktestConfig(sell_slippage_multiplier=1.0)).run()
+        # 不對稱滑價（賣出 ×1.3）
+        result_asym = _make_engine(data, signals, config=BacktestConfig(sell_slippage_multiplier=1.3)).run()
+        assert result_asym.final_capital < result_sym.final_capital
+
+
+# ─── A1c: Regime 自適應部位大小 ──────────────────────────────
+
+
+class TestRegimePositionSizing:
+    """測試 RiskConfig.regime 對部位大小的影響。"""
+
+    def test_bull_full_position(self):
+        """bull → 部位不縮減（×1.0）。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+        result_none = _make_engine(data, signals, risk_config=RiskConfig(regime=None)).run()
+        result_bull = _make_engine(data, signals, risk_config=RiskConfig(regime="bull")).run()
+        # bull 和無 regime 等效
+        assert result_bull.final_capital == pytest.approx(result_none.final_capital, rel=1e-6)
+
+    def test_bear_smaller_position(self):
+        """bear → 部位縮減至 60%，最終資金波動更小。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+        result_bull = _make_engine(data, signals, risk_config=RiskConfig(regime="bull")).run()
+        result_bear = _make_engine(data, signals, risk_config=RiskConfig(regime="bear")).run()
+        # 上漲行情中，bear 持倉較小 → 賺的較少 → final_capital 較低
+        assert result_bear.final_capital < result_bull.final_capital
+
+    def test_crisis_minimal_position(self):
+        """crisis → 部位僅 30%。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+        result_bear = _make_engine(data, signals, risk_config=RiskConfig(regime="bear")).run()
+        result_crisis = _make_engine(data, signals, risk_config=RiskConfig(regime="crisis")).run()
+        assert result_crisis.final_capital < result_bear.final_capital
+
+    def test_sideways_between_bull_and_bear(self):
+        """sideways (×0.8) 介於 bull (×1.0) 和 bear (×0.6)。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+        r_bull = _make_engine(data, signals, risk_config=RiskConfig(regime="bull")).run()
+        r_side = _make_engine(data, signals, risk_config=RiskConfig(regime="sideways")).run()
+        r_bear = _make_engine(data, signals, risk_config=RiskConfig(regime="bear")).run()
+        assert r_bull.final_capital > r_side.final_capital > r_bear.final_capital
+
+    def test_regime_none_no_scaling(self):
+        """regime=None → 不做縮放，等同無 regime。"""
+        dates = pd.date_range("2024-01-01", periods=6, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100] * 6,
+                "high": [105] * 6,
+                "low": [95] * 6,
+                "close": [100, 102, 104, 106, 108, 110],
+                "volume": [1_000_000] * 6,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0, 0, -1], index=dates)
+        r_default = _make_engine(data, signals, risk_config=RiskConfig()).run()
+        r_none = _make_engine(data, signals, risk_config=RiskConfig(regime=None)).run()
+        assert r_default.final_capital == pytest.approx(r_none.final_capital, rel=1e-6)
+
+
+# ─── A2: 流動性約束 ──────────────────────────────────────
+
+
+# ─── A1d: 漲跌停模擬 ────────────────────────────────────────
+
+
+class TestLimitPriceCheck:
+    """測試漲跌停模擬（limit_price_check）。"""
+
+    def test_limit_up_skips_buy(self):
+        """漲停日買入訊號 → 跳過買入（不建倉）。"""
+        dates = pd.date_range("2024-01-01", periods=4, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100, 110, 112, 115],  # Day 2 open 漲 10% → 漲停
+                "high": [105, 110, 115, 120],
+                "low": [95, 108, 110, 112],
+                "close": [100, 110, 112, 115],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+        # signal_delay=0 讓訊號即日生效，Day 2 嘗試買入
+        signals = pd.Series([0, 1, 0, -1], index=dates)
+        config = BacktestConfig(limit_price_check=True, signal_delay=0)
+        result = _make_engine(data, signals, config=config).run()
+        # 漲停跳過買入 → 無交易
+        assert result.total_trades == 0
+
+    def test_no_limit_check_allows_buy(self):
+        """未啟用 limit_price_check → 漲停日仍可買入。"""
+        dates = pd.date_range("2024-01-01", periods=4, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100, 110, 112, 115],
+                "high": [105, 110, 115, 120],
+                "low": [95, 108, 110, 112],
+                "close": [100, 110, 112, 115],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+        signals = pd.Series([0, 1, 0, -1], index=dates)
+        config = BacktestConfig(limit_price_check=False, signal_delay=0)
+        result = _make_engine(data, signals, config=config).run()
+        assert result.total_trades == 1
+
+    def test_limit_down_sell_at_limit_price(self):
+        """跌停日賣出 → 以跌停價成交（更差的價格）。"""
+        dates = pd.date_range("2024-01-01", periods=4, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100, 100, 90.5, 88],  # Day 3 跌 ~9.5%
+                "high": [105, 105, 91, 90],
+                "low": [95, 95, 90, 85],
+                "close": [100, 100, 90.5, 88],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, -1, 0], index=dates)
+        config_limit = BacktestConfig(limit_price_check=True, signal_delay=0)
+        config_normal = BacktestConfig(limit_price_check=False, signal_delay=0)
+        result_limit = _make_engine(data, signals, config=config_limit).run()
+        result_normal = _make_engine(data, signals, config=config_normal).run()
+        # 跌停時成交價更差 → 最終資金更低
+        assert result_limit.final_capital <= result_normal.final_capital
+
+    def test_normal_day_unaffected(self):
+        """非漲跌停日 → 不受影響。"""
+        dates = pd.date_range("2024-01-01", periods=4, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100, 101, 103, 105],  # 正常波動
+                "high": [105, 106, 108, 110],
+                "low": [95, 96, 98, 100],
+                "close": [100, 101, 103, 105],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, -1], index=dates)
+        config_limit = BacktestConfig(limit_price_check=True, signal_delay=0)
+        config_normal = BacktestConfig(limit_price_check=False, signal_delay=0)
+        result_limit = _make_engine(data, signals, config=config_limit).run()
+        result_normal = _make_engine(data, signals, config=config_normal).run()
+        assert result_limit.final_capital == pytest.approx(result_normal.final_capital, rel=1e-6)
+
+    def test_limit_down_risk_exit(self):
+        """跌停觸發止損 → 以跌停價成交。"""
+        dates = pd.date_range("2024-01-01", periods=4, freq="B")
+        data = pd.DataFrame(
+            {
+                "open": [100, 100, 90.5, 88],  # Day 3 跌停
+                "high": [105, 105, 91, 90],
+                "low": [95, 95, 89, 85],
+                "close": [100, 100, 90, 88],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+        signals = pd.Series([1, 0, 0, 0], index=dates)
+        risk = RiskConfig(stop_loss_pct=5.0)
+        config = BacktestConfig(limit_price_check=True, signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        # 應觸發止損出場
+        assert result.total_trades == 1
+        assert result.trades[0].exit_reason == "stop_loss"
+
+
+# ─── A1e: 部分止利 ──────────────────────────────────────
+
+
+class TestPartialTakeProfit:
+    """測試部分止利機制（partial_tp_atr_multiplier）。"""
+
+    def _make_data_and_signals(self, closes, highs=None, lows=None):
+        """建立測試用資料。"""
+        n = len(closes)
+        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        if highs is None:
+            highs = [c + 5 for c in closes]
+        if lows is None:
+            lows = [c - 5 for c in closes]
+        data = pd.DataFrame(
+            {
+                "open": closes,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": [1_000_000] * n,
+            },
+            index=dates,
+        )
+        return data, dates
+
+    def test_partial_tp_triggers_half_position(self):
+        """價格達 +2R → 出 50% 部位，產生 partial_tp 交易記錄。"""
+        # ATR14 需 >= 15 根 K 棒；用穩定價格讓 ATR ≈ 10
+        closes = [100] * 15 + [100, 110, 125, 125, 125]  # Day 17 high 達觸發價
+        highs = [105] * 15 + [105, 115, 130, 130, 130]
+        lows = [95] * 15 + [95, 105, 120, 120, 120]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        # 買入訊號在 Day 16（index 15），ATR ≈ 10，觸發價 ≈ 100 + 2*10 = 120
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,
+            partial_tp_fraction=0.5,
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        # 應有至少 2 筆交易：partial_tp + 最終賣出
+        partial_trades = [t for t in result.trades if t.exit_reason == "partial_tp"]
+        assert len(partial_trades) >= 1
+        assert partial_trades[0].is_partial is True
+
+    def test_no_partial_tp_without_config(self):
+        """未設定 partial_tp_atr_multiplier → 無部分止利。"""
+        closes = [100] * 15 + [100, 110, 125, 125, 125]
+        highs = [105] * 15 + [105, 115, 130, 130, 130]
+        lows = [95] * 15 + [95, 105, 120, 120, 120]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig()  # 無 partial_tp
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        partial_trades = [t for t in result.trades if t.exit_reason == "partial_tp"]
+        assert len(partial_trades) == 0
+
+    def test_partial_tp_only_triggers_once(self):
+        """部分止利只觸發一次，不會重複出場。"""
+        closes = [100] * 15 + [100, 120, 130, 135, 140, 140]
+        highs = [105] * 15 + [105, 125, 135, 140, 145, 145]
+        lows = [95] * 15 + [95, 115, 125, 130, 135, 135]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,
+            partial_tp_fraction=0.5,
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        partial_trades = [t for t in result.trades if t.exit_reason == "partial_tp"]
+        assert len(partial_trades) == 1
+
+    def test_partial_tp_with_trailing_stop(self):
+        """部分止利後 + trailing stop → 剩餘部位在回落時止損出場。"""
+        closes = [100] * 15 + [100, 120, 130, 128, 115]
+        highs = [105] * 15 + [105, 125, 135, 132, 120]
+        lows = [95] * 15 + [95, 115, 125, 125, 110]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, 0], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,
+            partial_tp_fraction=0.5,
+            partial_tp_trailing_pct=10.0,  # 從高點回落 10% 出場
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        exit_reasons = [t.exit_reason for t in result.trades]
+        assert "partial_tp" in exit_reasons
+        # 剩餘部位應最終出場（trailing_stop 或 force_close）
+        assert len(result.trades) >= 2
+
+    def test_partial_tp_fraction_0_means_no_partial(self):
+        """fraction=0 → 不出場任何部位。"""
+        closes = [100] * 15 + [100, 120, 130, 130, 130]
+        highs = [105] * 15 + [105, 125, 135, 135, 135]
+        lows = [95] * 15 + [95, 115, 125, 125, 125]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,
+            partial_tp_fraction=0.0,  # 不出場
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        partial_trades = [t for t in result.trades if t.exit_reason == "partial_tp"]
+        assert len(partial_trades) == 0
+
+    def test_partial_tp_reduces_position(self):
+        """部分止利後剩餘部位的最終出場 shares 應小於原始進場。"""
+        closes = [100] * 15 + [100, 120, 130, 130, 130]
+        highs = [105] * 15 + [105, 125, 135, 135, 135]
+        lows = [95] * 15 + [95, 115, 125, 125, 125]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,
+            partial_tp_fraction=0.5,
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        if len(result.trades) >= 2:
+            partial = [t for t in result.trades if t.exit_reason == "partial_tp"][0]
+            final = [t for t in result.trades if t.exit_reason != "partial_tp"][-1]
+            # partial 出一半，final 出另一半
+            assert partial.shares + final.shares > 0
+            assert final.shares <= partial.shares + 1  # 允許奇數股四捨五入
+
+    def test_price_below_trigger_no_partial(self):
+        """價格未達觸發價 → 不觸發部分止利。"""
+        closes = [100] * 15 + [100, 105, 108, 105, 105]
+        highs = [105] * 15 + [105, 110, 113, 110, 110]
+        lows = [95] * 15 + [95, 100, 103, 100, 100]
+        data, dates = self._make_data_and_signals(closes, highs, lows)
+        signals = pd.Series([0] * 15 + [1, 0, 0, 0, -1], index=dates)
+        risk = RiskConfig(
+            partial_tp_atr_multiplier=2.0,  # 觸發價 ≈ 120
+            partial_tp_fraction=0.5,
+        )
+        config = BacktestConfig(signal_delay=0)
+        result = _make_engine(data, signals, config=config, risk_config=risk).run()
+        partial_trades = [t for t in result.trades if t.exit_reason == "partial_tp"]
+        assert len(partial_trades) == 0
 
 
 # ─── A2: 流動性約束 ──────────────────────────────────────

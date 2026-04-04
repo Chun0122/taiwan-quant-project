@@ -12,6 +12,9 @@ import pandas as pd
 from src.backtest.metrics import compute_metrics
 from src.constants import (
     COMMISSION_RATE,
+    LIMIT_DETECT_THRESHOLD,
+    REGIME_POSITION_MULTIPLIERS,
+    SELL_SLIPPAGE_MULTIPLIER,
     SLIPPAGE_IMPACT_COEFF,
     SLIPPAGE_MAX_PCT,
     SLIPPAGE_RATE,
@@ -35,8 +38,10 @@ class BacktestConfig:
     slippage_impact_coeff: float = SLIPPAGE_IMPACT_COEFF  # 動態滑價衝擊係數 k
     slippage_max: float = SLIPPAGE_MAX_PCT  # 滑價上限（防止低流動性股票滑價爆炸）
     slippage_spread_weight: float = SLIPPAGE_SPREAD_WEIGHT  # OHLC spread 估算權重
+    sell_slippage_multiplier: float = SELL_SLIPPAGE_MULTIPLIER  # 賣出滑價放大係數（≥1.0）
     liquidity_limit: float | None = None  # 流動性約束（單筆 ≤ 當日量 × 此比例，None=不限制）
     signal_delay: int = 1  # 訊號延遲（1=T+1 執行，消除 look-ahead bias；0=同日執行，僅供向後相容）
+    limit_price_check: bool = False  # 啟用漲跌停模擬（漲停跳過買入，跌停以跌停價賣出）
 
 
 @dataclass
@@ -54,6 +59,10 @@ class RiskConfig:
     atr_multiplier: float = 2.0
     atr_multiplier_stop: float | None = None  # ATR-based 止損乘數（止損 = 進場價 − N×ATR14）
     atr_multiplier_profit: float | None = None  # ATR-based 止利乘數（止利 = 進場價 + N×ATR14）
+    regime: str | None = None  # 市場狀態（bull/sideways/bear/crisis），自動縮放部位大小
+    partial_tp_atr_multiplier: float | None = None  # 部分止利觸發 ATR 倍數（如 2.0 = +2R 時出一半）
+    partial_tp_fraction: float = 0.5  # 部分止利出場比例（0~1，預設 50%）
+    partial_tp_trailing_pct: float | None = None  # 部分止利後剩餘部位的 trailing stop %
 
 
 @dataclass
@@ -67,9 +76,10 @@ class TradeRecord:
     shares: int = 0
     pnl: float = 0.0
     return_pct: float = 0.0
-    exit_reason: str = "signal"  # signal / stop_loss / take_profit / trailing_stop / force_close
+    exit_reason: str = "signal"  # signal / stop_loss / take_profit / trailing_stop / partial_tp / force_close
     stop_price: float | None = None  # 進場時計算並固定的止損價
     target_price: float | None = None  # 進場時計算並固定的目標價
+    is_partial: bool = False  # 是否為部分止利出場
 
 
 @dataclass
@@ -139,12 +149,16 @@ class BacktestEngine:
         peak_since_entry = 0.0  # 移動停損用：進場後最高價
         current_stop_price: float | None = None  # 進場時固定的止損價
         current_target_price: float | None = None  # 進場時固定的目標價
+        partial_tp_triggered = False  # 部分止利已觸發
+        partial_tp_price: float | None = None  # 部分止利觸發價
+        original_position = 0  # 進場時的原始股數（部分止利用）
         trades: list[TradeRecord] = []
         equity_curve: list[float] = []
 
         # 除權息資料（若有）
         has_raw = "raw_close" in data.columns
         dividends = getattr(self.strategy, "_dividends", None)
+        prev_raw_close: float | None = None  # 漲跌停偵測用前日收盤
 
         for dt in data.index:
             close = data.loc[dt, "close"]
@@ -162,6 +176,14 @@ class BacktestEngine:
                 else (data.loc[dt, "open"] if "open" in data.columns else raw_close)
             )
             signal = signals.get(dt, 0)
+
+            # 漲跌停偵測（需前日收盤價）
+            is_limit_up = False
+            is_limit_down = False
+            if self.config.limit_price_check and prev_raw_close is not None and prev_raw_close > 0:
+                change_pct = (raw_open / prev_raw_close) - 1
+                is_limit_up = change_pct >= LIMIT_DETECT_THRESHOLD
+                is_limit_down = change_pct <= -LIMIT_DETECT_THRESHOLD
 
             # --- 除權息處理（持倉中才處理） ---
             if dividends is not None and not dividends.empty and position > 0:
@@ -198,9 +220,16 @@ class BacktestEngine:
                     # 跳空開高 → 用開盤價（更真實）；正常觸停利 → 用目標價
                     raw_close = max(raw_open, current_target_price)
 
-                # 3. 移動停損檢查
-                if not risk_exit and self.risk_config.trailing_stop_pct is not None:
-                    trail_price = peak_since_entry * (1 - self.risk_config.trailing_stop_pct / 100)
+                # 3. 移動停損檢查（含部分止利後的 trailing）
+                trailing_pct = self.risk_config.trailing_stop_pct
+                if (
+                    trailing_pct is None
+                    and partial_tp_triggered
+                    and self.risk_config.partial_tp_trailing_pct is not None
+                ):
+                    trailing_pct = self.risk_config.partial_tp_trailing_pct
+                if not risk_exit and trailing_pct is not None:
+                    trail_price = peak_since_entry * (1 - trailing_pct / 100)
                     if raw_low <= trail_price:
                         risk_exit = True
                         exit_reason = "trailing_stop"
@@ -210,7 +239,13 @@ class BacktestEngine:
             # --- 執行風險出場 ---
             if risk_exit and position > 0:
                 daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                sell_price = raw_close * (1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close))
+                sell_price = raw_close * (
+                    1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                )
+                # 跌停日以跌停價成交（更差的價格）
+                if is_limit_down and prev_raw_close is not None:
+                    limit_down_price = prev_raw_close * (1 - LIMIT_DETECT_THRESHOLD)
+                    sell_price = min(sell_price, limit_down_price)
                 revenue = position * sell_price
                 commission = revenue * self.config.commission_rate
                 tax = revenue * self.config.tax_rate
@@ -240,11 +275,56 @@ class BacktestEngine:
                 peak_since_entry = 0.0
                 current_stop_price = None
                 current_target_price = None
+                partial_tp_triggered = False
+                partial_tp_price = None
+
+            # --- 部分止利檢查（非風險出場、持倉中、尚未觸發）---
+            elif (
+                position > 0
+                and not partial_tp_triggered
+                and partial_tp_price is not None
+                and raw_high >= partial_tp_price
+            ):
+                partial_shares = int(position * self.risk_config.partial_tp_fraction)
+                if partial_shares > 0:
+                    tp_sell_price = partial_tp_price  # 以觸發價成交
+                    daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
+                    slip = self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                    tp_sell_price = tp_sell_price * (1 - slip)
+                    revenue = partial_shares * tp_sell_price
+                    commission = revenue * self.config.commission_rate
+                    tax = revenue * self.config.tax_rate
+                    net_revenue = revenue - commission - tax
+                    capital += net_revenue
+
+                    pnl = net_revenue - partial_shares * entry_price
+                    ret_pct = (tp_sell_price / entry_price - 1) * 100
+
+                    trades.append(
+                        TradeRecord(
+                            entry_date=entry_date,
+                            entry_price=round(entry_price, 2),
+                            exit_date=dt,
+                            exit_price=round(tp_sell_price, 2),
+                            shares=partial_shares,
+                            pnl=round(pnl, 2),
+                            return_pct=round(ret_pct, 2),
+                            exit_reason="partial_tp",
+                            stop_price=round(current_stop_price, 2) if current_stop_price is not None else None,
+                            target_price=round(partial_tp_price, 2),
+                            is_partial=True,
+                        )
+                    )
+                    position -= partial_shares
+                    partial_tp_triggered = True
+                    # 部分止利後啟用 trailing stop（若有設定）
+                    if self.risk_config.partial_tp_trailing_pct is not None:
+                        peak_since_entry = raw_high
 
             # --- 正常訊號處理（風險出場未觸發時） ---
             elif not risk_exit:
                 # --- 買入 ---
-                if signal == 1 and position == 0:
+                if signal == 1 and position == 0 and not is_limit_up:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
                     slip = self._get_slippage(daily_volume, raw_high, raw_low, raw_close)
                     buy_price = raw_close * (1 + slip)
@@ -276,10 +356,24 @@ class BacktestEngine:
                         else:
                             current_target_price = None
 
+                        # 部分止利觸發價（ATR-based）
+                        partial_tp_triggered = False
+                        original_position = shares
+                        if self.risk_config.partial_tp_atr_multiplier is not None and atr_val is not None:
+                            partial_tp_price = entry_price + self.risk_config.partial_tp_atr_multiplier * atr_val
+                        else:
+                            partial_tp_price = None
+
                 # --- 賣出 ---
                 elif signal == -1 and position > 0:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                    sell_price = raw_close * (1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close))
+                    sell_price = raw_close * (
+                        1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                    )
+                    # 跌停日以跌停價成交
+                    if is_limit_down and prev_raw_close is not None:
+                        limit_down_price = prev_raw_close * (1 - LIMIT_DETECT_THRESHOLD)
+                        sell_price = min(sell_price, limit_down_price)
                     revenue = position * sell_price
                     commission = revenue * self.config.commission_rate
                     tax = revenue * self.config.tax_rate
@@ -309,10 +403,13 @@ class BacktestEngine:
                     peak_since_entry = 0.0
                     current_stop_price = None
                     current_target_price = None
+                    partial_tp_triggered = False
+                    partial_tp_price = None
 
             # 記錄每日權益
             mark_to_market = capital + position * raw_close
             equity_curve.append(mark_to_market)
+            prev_raw_close = raw_close
 
         # 若回測結束時仍持有部位，以最後收盤價平倉
         if position > 0:
@@ -320,7 +417,9 @@ class BacktestEngine:
             last_high = data.iloc[-1]["raw_high"] if has_raw else data.iloc[-1]["high"]
             last_low = data.iloc[-1]["raw_low"] if has_raw else data.iloc[-1]["low"]
             last_volume = float(data.iloc[-1]["volume"]) if "volume" in data.columns else 0.0
-            sell_price = last_close * (1 - self._get_slippage(last_volume, last_high, last_low, last_close))
+            sell_price = last_close * (
+                1 - self._get_slippage(last_volume, last_high, last_low, last_close, side="sell")
+            )
             revenue = position * sell_price
             commission = revenue * self.config.commission_rate
             tax = revenue * self.config.tax_rate
@@ -417,7 +516,9 @@ class BacktestEngine:
     #  動態滑價 & 流動性
     # ------------------------------------------------------------------ #
 
-    def _get_slippage(self, volume: float, high: float = 0.0, low: float = 0.0, close: float = 0.0) -> float:
+    def _get_slippage(
+        self, volume: float, high: float = 0.0, low: float = 0.0, close: float = 0.0, side: str = "buy"
+    ) -> float:
         """計算滑價比率。
 
         動態模式（三因子）：
@@ -425,17 +526,24 @@ class BacktestEngine:
           2. 成交量衝擊 k / sqrt(volume) — 低量股懲罰
           3. OHLC spread 估算 (high-low)/close × weight — 隱含 bid-ask spread
         最終取 min(計算值, slippage_max) 防止極端值。
+
+        賣出時乘以 sell_slippage_multiplier（預設 1.3），反映恐慌拋售的額外滑價。
         """
         if not self.config.dynamic_slippage or volume <= 0:
-            return self.config.slippage
-        base = self.config.slippage
-        k = self.config.slippage_impact_coeff
-        impact = base + k / np.sqrt(volume)
-        # OHLC spread proxy：日內高低價差越大，隱含滑價越高
-        if close > 0 and high > low:
-            spread_proxy = (high - low) / close * self.config.slippage_spread_weight
-            impact = max(impact, spread_proxy)
-        return min(impact, self.config.slippage_max)
+            base_slip = self.config.slippage
+        else:
+            base = self.config.slippage
+            k = self.config.slippage_impact_coeff
+            impact = base + k / np.sqrt(volume)
+            # OHLC spread proxy：日內高低價差越大，隱含滑價越高
+            if close > 0 and high > low:
+                spread_proxy = (high - low) / close * self.config.slippage_spread_weight
+                impact = max(impact, spread_proxy)
+            base_slip = min(impact, self.config.slippage_max)
+
+        if side == "sell":
+            return min(base_slip * self.config.sell_slippage_multiplier, self.config.slippage_max)
+        return base_slip
 
     def _apply_liquidity_limit(self, shares: int, daily_volume: float) -> int:
         """流動性約束：限制單筆交易量不超過當日成交量的指定比例。"""
@@ -458,21 +566,24 @@ class BacktestEngine:
         dt,
         trades: list[TradeRecord],
     ) -> int:
-        """根據 RiskConfig.position_sizing 計算應買股數。"""
+        """根據 RiskConfig.position_sizing 計算應買股數。
+
+        若指定 regime，最終股數乘以 REGIME_POSITION_MULTIPLIERS 對應倍率。
+        """
         mode = self.risk_config.position_sizing
 
         if mode == "fixed_fraction":
             available = capital * self.risk_config.fixed_fraction
             available -= available * self.config.commission_rate
-            return int(available // buy_price)
+            shares = int(available // buy_price)
 
-        if mode == "kelly":
+        elif mode == "kelly":
             kelly_f = self._compute_kelly_fraction(trades)
             available = capital * kelly_f
             available -= available * self.config.commission_rate
-            return int(available // buy_price)
+            shares = int(available // buy_price)
 
-        if mode == "atr":
+        elif mode == "atr":
             atr = self._compute_atr(data, dt)
             if atr is not None and atr > 0:
                 risk_amount = capital * (self.risk_config.atr_risk_pct / 100)
@@ -481,42 +592,57 @@ class BacktestEngine:
                 # 也不能超過全部資金
                 available = capital - capital * self.config.commission_rate
                 max_affordable = int(available // buy_price)
-                return min(max_shares, max_affordable)
-            # ATR 資料不足，fallback 到 fixed_fraction
-            available = capital * self.risk_config.fixed_fraction
-            available -= available * self.config.commission_rate
-            return int(available // buy_price)
+                shares = min(max_shares, max_affordable)
+            else:
+                # ATR 資料不足，fallback 到 fixed_fraction
+                available = capital * self.risk_config.fixed_fraction
+                available -= available * self.config.commission_rate
+                shares = int(available // buy_price)
 
-        # all_in（預設，向後相容）
-        commission = capital * self.config.commission_rate
-        available = capital - commission
-        return int(available // buy_price)
+        else:
+            # all_in（預設，向後相容）
+            commission = capital * self.config.commission_rate
+            available = capital - commission
+            shares = int(available // buy_price)
+
+        # Regime 自適應部位縮放
+        if self.risk_config.regime is not None:
+            multiplier = REGIME_POSITION_MULTIPLIERS.get(self.risk_config.regime, 1.0)
+            shares = int(shares * multiplier)
+
+        return shares
 
     def _compute_kelly_fraction(self, trades: list[TradeRecord]) -> float:
-        """從歷史交易計算 Kelly Criterion 比例。
+        """從歷史交易計算 Kelly Criterion 比例（含信心縮放）。
 
         f = W - (1-W) / (avgWin/avgLoss)
-        交易不足 5 筆時 fallback 10%。
+        信心縮放：confidence = min(1, trades / KELLY_CONFIDENCE_DENOMINATOR)
+        最終上限：KELLY_MAX_FRACTION（預設 20%）。
+        交易不足 5 筆時 fallback 至 KELLY_MAX_FRACTION × confidence。
         """
+        from src.constants import KELLY_CONFIDENCE_DENOMINATOR, KELLY_MAX_FRACTION
+
+        confidence = min(1.0, len(trades) / KELLY_CONFIDENCE_DENOMINATOR)
+
         if len(trades) < 5:
-            return 0.1
+            return max(0.01, KELLY_MAX_FRACTION * confidence)
 
         wins = [t for t in trades if t.pnl > 0]
         losses = [t for t in trades if t.pnl < 0]
 
         if not wins or not losses:
-            return 0.1
+            return max(0.01, KELLY_MAX_FRACTION * confidence)
 
         win_rate = len(wins) / len(trades)
         avg_win = sum(t.pnl for t in wins) / len(wins)
         avg_loss = abs(sum(t.pnl for t in losses) / len(losses))
 
         if avg_loss == 0:
-            return 0.1
+            return max(0.01, KELLY_MAX_FRACTION * confidence)
 
         kelly = win_rate - (1 - win_rate) / (avg_win / avg_loss)
-        kelly = max(0.01, min(kelly, 1.0))  # 限制在 1%~100%
-        return kelly * self.risk_config.kelly_fraction
+        kelly = max(0.01, min(kelly, KELLY_MAX_FRACTION))
+        return kelly * confidence * self.risk_config.kelly_fraction
 
     def _compute_atr(self, data: pd.DataFrame, dt, use_raw: bool = False) -> float | None:
         """計算 ATR(N)，資料不足時回傳 None。

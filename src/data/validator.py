@@ -398,6 +398,38 @@ def check_data_freshness(
     return issues
 
 
+def check_per_stock_freshness(
+    stock_max_dates: dict[str, date],
+    reference_date: date,
+    stale_threshold: int = 3,
+) -> list[str]:
+    """檢查每支股票的資料新鮮度，回傳過期的 stock_id 列表。
+
+    Parameters
+    ----------
+    stock_max_dates : dict[str, date]
+        每支股票最新 DailyPrice 日期 {stock_id: max_date}。
+    reference_date : date
+        參考日期（通常為今天）。
+    stale_threshold : int
+        允許的最大營業日落後天數（預設 3）。
+
+    Returns
+    -------
+    list[str]
+        過期的 stock_id 列表。
+    """
+    stale_ids: list[str] = []
+    for sid, max_d in stock_max_dates.items():
+        if max_d is None:
+            stale_ids.append(sid)
+            continue
+        bdays = int(np.busday_count(max_d, reference_date))
+        if bdays > stale_threshold:
+            stale_ids.append(sid)
+    return stale_ids
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------

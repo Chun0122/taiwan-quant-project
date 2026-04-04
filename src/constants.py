@@ -9,6 +9,7 @@ SLIPPAGE_RATE = 0.0005  # 滑價 0.05%
 SLIPPAGE_IMPACT_COEFF = 0.5  # 動態滑價衝擊係數 k（slippage = base + k / sqrt(volume)）
 SLIPPAGE_MAX_PCT = 0.01  # 滑價上限 1%（防止低流動性股票滑價爆炸）
 SLIPPAGE_SPREAD_WEIGHT = 0.5  # OHLC spread 估算權重（spread proxy = (high-low)/close × weight）
+SELL_SLIPPAGE_MULTIPLIER = 1.3  # 賣出滑價放大係數（恐慌賣出時滑價通常高於買入）
 LIQUIDITY_PARTICIPATION_LIMIT = 0.05  # 流動性約束：單筆交易量 ≤ 當日成交量 × 此比例
 
 # ── DB / ETL ─────────────────────────────────────────────────────────
@@ -39,8 +40,43 @@ MAX_PORTFOLIO_HEAT: float = 0.12  # 組合最大風險上限 12%
 PER_POSITION_RISK_CAP: float = 0.03  # 單筆最大風險估算上限 3%（無停損時使用）
 
 # ── 相關性預算（Correlation Budget）──────────────────────────────────
-CORRELATION_THRESHOLD: float = 0.7  # 高相關判定門檻
-CORRELATION_PENALTY: float = 0.5  # 高相關時部位縮減比例
+CORRELATION_THRESHOLD: float = 0.7  # 高相關判定門檻（bull/sideways）
+CORRELATION_PENALTY: float = 0.5  # 高相關時部位縮減比例（bull/sideways）
+CORRELATION_THRESHOLD_BEAR: float = 0.6  # bear 市高相關判定門檻
+CORRELATION_PENALTY_BEAR: float = 0.4  # bear 市部位縮減比例
+CORRELATION_THRESHOLD_CRISIS: float = 0.5  # crisis 高相關判定門檻
+CORRELATION_PENALTY_CRISIS: float = 0.3  # crisis 部位縮減比例
 
 # ── 最大回撤熔斷（Max Drawdown Kill Switch）──────────────────────────
 MAX_DRAWDOWN_LIQUIDATE_PCT: float = 25.0  # 組合回撤超過此值(%)強制平倉所有部位
+
+# ── Kelly Criterion ─────────────────────────────────────────────────────
+KELLY_CONFIDENCE_DENOMINATOR: int = 100  # 信心縮放分母：confidence = min(1, trades / N)
+KELLY_MAX_FRACTION: float = 0.20  # Kelly 比例硬上限 20%（防止少量交易過度激進）
+
+# ── 公告衰減常數（News Decay）─────────────────────────────────────────
+# 結構性事件（董監改選/庫藏股）衰減慢，一般性事件衰減快
+NEWS_DECAY_STRUCTURAL: float = 0.07  # 半衰期 ~10 天（ln2/0.07≈9.9）
+NEWS_DECAY_TRANSIENT: float = 0.15  # 半衰期 ~4.6 天（ln2/0.15≈4.6）
+NEWS_DECAY_DEFAULT: float = 0.12  # 中性事件預設（半衰期 ~5.8 天）
+# 結構性事件類型
+NEWS_STRUCTURAL_TYPES: frozenset[str] = frozenset({"governance_change", "buyback"})
+# 快速衰減事件類型
+NEWS_TRANSIENT_TYPES: frozenset[str] = frozenset({"revenue", "general"})
+# 公告載入窗口（天）
+NEWS_LOAD_WINDOW_DAYS: int = 15
+
+# ── Regime 預設值 ───────────────────────────────────────────────────────
+REGIME_FALLBACK_DEFAULT: str = "sideways"  # Regime 偵測失敗時的安全預設值
+
+# ── 回測 Regime 自適應部位乘數 ─────────────────────────────────────────
+# ── 漲跌停模擬 ─────────────────────────────────────────────────────────
+LIMIT_PRICE_PCT: float = 0.10  # 台股漲跌停幅度 10%
+LIMIT_DETECT_THRESHOLD: float = 0.095  # 偵測門檻（略低於 10% 以涵蓋四捨五入）
+
+REGIME_POSITION_MULTIPLIERS: dict[str, float] = {
+    "bull": 1.0,  # 多頭：全額曝險
+    "sideways": 0.8,  # 盤整：縮減 20%
+    "bear": 0.6,  # 空頭：縮減 40%
+    "crisis": 0.3,  # 危機：僅 30% 曝險
+}

@@ -29,6 +29,7 @@ from src.discovery.scanner._functions import (
     compute_revenue_acceleration_score,
     compute_value_weighted_inst_flow,
     compute_win_rate_threshold_adjustment,
+    detect_chip_tier_changes,
     score_key_player_cost,
 )
 from tests.scanner_helpers import (
@@ -2466,7 +2467,8 @@ class TestComputeNewsDecayWeight:
 
         w0 = compute_news_decay_weight(0, "general")
         w1 = compute_news_decay_weight(1, "general")
-        assert w1 == pytest.approx(math.exp(-0.2), abs=1e-9)
+        # general 使用快速衰減 0.15
+        assert w1 == pytest.approx(math.exp(-0.15), abs=1e-9)
         assert w1 < w0
 
     def test_earnings_call_beats_general_same_age(self):
@@ -2588,23 +2590,45 @@ class TestComputeNewsScores:
 class TestComputeNewsDecayWeightV2:
     """新 decay 常數（0.2）與新事件類型（governance_change/buyback）測試。"""
 
-    def test_decay_constant_is_0_2(self):
-        """1 天後 general 公告的衰減值應為 exp(-0.2)。"""
+    def test_general_uses_transient_decay(self):
+        """general 事件使用快速衰減常數 0.15：1 天後 = exp(-0.15)。"""
         import math
 
         from src.discovery.scanner import compute_news_decay_weight
 
-        assert compute_news_decay_weight(1, "general") == pytest.approx(math.exp(-0.2), abs=1e-9)
+        assert compute_news_decay_weight(1, "general") == pytest.approx(math.exp(-0.15), abs=1e-9)
 
-    def test_seven_days_retention_above_20pct(self):
-        """7 天後仍保留 >20%（exp(-1.4) ≈ 0.247）。"""
+    def test_structural_uses_slow_decay(self):
+        """governance_change 使用慢衰減 0.07：10 天後仍保留 ~50%。"""
         import math
 
         from src.discovery.scanner import compute_news_decay_weight
 
-        w = compute_news_decay_weight(7, "general")
-        assert w == pytest.approx(math.exp(-1.4), abs=1e-9)
-        assert w > 0.20
+        w = compute_news_decay_weight(10, "governance_change")
+        # exp(-0.07 × 10) × 5.0 = exp(-0.7) × 5.0 ≈ 0.497 × 5.0 = 2.48
+        assert w == pytest.approx(math.exp(-0.7) * 5.0, abs=0.01)
+        assert w > 2.0  # 10 天後結構性事件仍有顯著影響
+
+    def test_transient_decays_faster_than_structural(self):
+        """相同天數下，一般性事件衰減更快。"""
+        from src.discovery.scanner import compute_news_decay_weight
+
+        # 7 天後比較（排除 type_weight 差異，只看衰減率）
+        # general: exp(-0.15 × 7) × 1.0 = 0.35
+        # governance: exp(-0.07 × 7) × 5.0 = 3.06
+        # 正規化：general/1.0 vs governance/5.0
+        g = compute_news_decay_weight(7, "general") / 1.0
+        s = compute_news_decay_weight(7, "governance_change") / 5.0
+        assert s > g  # 結構性衰減更慢
+
+    def test_earnings_call_uses_default_decay(self):
+        """earnings_call 使用中性預設衰減 0.12。"""
+        import math
+
+        from src.discovery.scanner import compute_news_decay_weight
+
+        w = compute_news_decay_weight(1, "earnings_call")
+        assert w == pytest.approx(math.exp(-0.12) * 3.0, abs=1e-6)
 
     def test_governance_change_weight_5(self):
         """governance_change 事件類型加權值應為 5.0。"""
@@ -7297,3 +7321,157 @@ class TestComputeMfeMae:
             )
         result = compute_mfe_mae(records, pd.DataFrame(prices), holding_days=5)
         assert len(result) == 2
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 分數加成統一上限（sector + concept + peer ≤ ±8%）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class TestBonusTotalCap:
+    """驗證 peer_rank_bonus 受統一加成上限約束。"""
+
+    def test_peer_capped_when_sector_concept_maxed(self):
+        """sector+concept 已用 8% → peer_rank_bonus 被 clamp 至 0。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["S1"],
+                "composite_score": [0.70],
+                "sector_bonus": [0.05],  # 5%
+                "concept_bonus": [0.03],  # 3% → 合計 8%
+            }
+        )
+        peer_rank_bonus = pd.Series([0.03])  # 想加 3%
+        remaining = (0.08 - (scored["sector_bonus"] + scored["concept_bonus"]).abs()).clip(lower=0.0)
+        capped = peer_rank_bonus.clip(lower=-remaining, upper=remaining)
+        assert capped.iloc[0] == pytest.approx(0.0, abs=0.001)
+
+    def test_peer_allowed_when_headroom_exists(self):
+        """sector+concept 用 4% → 剩餘 4%，peer +3% 可通過。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["S1"],
+                "composite_score": [0.70],
+                "sector_bonus": [0.02],
+                "concept_bonus": [0.02],  # 合計 4%
+            }
+        )
+        peer_rank_bonus = pd.Series([0.03])
+        remaining = (0.08 - (scored["sector_bonus"] + scored["concept_bonus"]).abs()).clip(lower=0.0)
+        capped = peer_rank_bonus.clip(lower=-remaining, upper=remaining)
+        assert capped.iloc[0] == pytest.approx(0.03, abs=0.001)
+
+    def test_negative_peer_capped_symmetrically(self):
+        """sector+concept 用 -6% → 剩餘 2%，peer -3% 被 clamp 至 -2%。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["S1"],
+                "composite_score": [0.70],
+                "sector_bonus": [-0.03],
+                "concept_bonus": [-0.03],  # 合計 -6%
+            }
+        )
+        peer_rank_bonus = pd.Series([-0.03])
+        used = scored["sector_bonus"] + scored["concept_bonus"]
+        remaining = (0.08 - used.abs()).clip(lower=0.0)
+        capped = peer_rank_bonus.clip(lower=-remaining, upper=remaining)
+        assert capped.iloc[0] == pytest.approx(-0.02, abs=0.001)
+
+
+# ─── detect_chip_tier_changes ────────────────────────────────────
+class TestDetectChipTierChanges:
+    """detect_chip_tier_changes 純函數測試。"""
+
+    def test_downgrade_detected(self):
+        """8F → 7F 應偵測為 downgrade。"""
+        current = pd.DataFrame({"stock_id": ["2330", "2317"], "chip_tier": ["7F", "5F"]})
+        previous = pd.DataFrame({"stock_id": ["2330", "2317"], "chip_tier": ["8F", "5F"]})
+        result = detect_chip_tier_changes(current, previous)
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["stock_id"] == "2330"
+        assert row["prev_tier"] == "8F"
+        assert row["curr_tier"] == "7F"
+        assert row["direction"] == "downgrade"
+
+    def test_upgrade_detected(self):
+        """3F → 5F 應偵測為 upgrade。"""
+        current = pd.DataFrame({"stock_id": ["2454"], "chip_tier": ["5F"]})
+        previous = pd.DataFrame({"stock_id": ["2454"], "chip_tier": ["3F"]})
+        result = detect_chip_tier_changes(current, previous)
+        assert len(result) == 1
+        assert result.iloc[0]["direction"] == "upgrade"
+
+    def test_no_overlap_returns_empty(self):
+        """無重疊股票 → 空結果。"""
+        current = pd.DataFrame({"stock_id": ["2330"], "chip_tier": ["8F"]})
+        previous = pd.DataFrame({"stock_id": ["2317"], "chip_tier": ["7F"]})
+        result = detect_chip_tier_changes(current, previous)
+        assert result.empty
+
+    def test_empty_previous_returns_empty(self):
+        """前次為空 → 空結果。"""
+        current = pd.DataFrame({"stock_id": ["2330"], "chip_tier": ["8F"]})
+        previous = pd.DataFrame(columns=["stock_id", "chip_tier"])
+        result = detect_chip_tier_changes(current, previous)
+        assert result.empty
+
+    def test_na_to_3f_is_upgrade(self):
+        """N/A → 3F 視為 upgrade（從無資料到有資料）。"""
+        current = pd.DataFrame({"stock_id": ["2330"], "chip_tier": ["3F"]})
+        previous = pd.DataFrame({"stock_id": ["2330"], "chip_tier": ["N/A"]})
+        result = detect_chip_tier_changes(current, previous)
+        assert len(result) == 1
+        assert result.iloc[0]["direction"] == "upgrade"
+
+
+# ─── use_ic_adjustment flag ──────────────────────────────────────
+class TestUseICAdjustmentFlag:
+    """Scanner use_ic_adjustment 旗標測試。"""
+
+    def test_flag_defaults_to_false(self):
+        """預設不啟用 IC 權重調整。"""
+        s = MarketScanner()
+        assert s.use_ic_adjustment is False
+
+    def test_flag_can_be_enabled(self):
+        """可透過參數啟用。"""
+        s = MarketScanner(use_ic_adjustment=True)
+        assert s.use_ic_adjustment is True
+
+    def test_ic_adjustment_no_data_returns_original(self, monkeypatch):
+        """無歷史推薦時 _apply_ic_weight_adjustment 回傳原始權重。"""
+        from unittest.mock import MagicMock
+
+        # Mock get_session 回傳空結果
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session.execute.return_value.all.return_value = []
+
+        monkeypatch.setattr("src.discovery.scanner._base.get_session", lambda: mock_session)
+
+        s = MarketScanner(use_ic_adjustment=True)
+        s.mode_name = "momentum"
+        s.scan_date = date.today()
+        base = {"technical": 0.45, "chip": 0.25, "fundamental": 0.15, "news": 0.15}
+        result = s._apply_ic_weight_adjustment(base)
+        assert result == base
+
+    def test_ic_weight_adjustments_pure_function_integration(self):
+        """純函數 compute_ic_weight_adjustments 整合測試：weak 因子被衰減。"""
+        ic_df = pd.DataFrame(
+            {
+                "factor": ["technical_score", "chip_score", "fundamental_score", "news_score"],
+                "ic": [0.10, 0.02, -0.08, 0.06],
+                "evaluable_count": [50, 50, 50, 50],
+                "direction": ["effective", "weak", "inverse", "effective"],
+            }
+        )
+        base = {"technical_score": 0.45, "chip_score": 0.25, "fundamental_score": 0.15, "news_score": 0.15}
+        adjusted = compute_ic_weight_adjustments(ic_df, base)
+        # effective → 維持，weak → 衰減，inverse → 大幅衰減
+        # 歸一化後 technical + news 佔比應增加
+        assert adjusted["technical_score"] > base["technical_score"]
+        assert adjusted["chip_score"] < base["chip_score"]
+        assert adjusted["fundamental_score"] < base["fundamental_score"]

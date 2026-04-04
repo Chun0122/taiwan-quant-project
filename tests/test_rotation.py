@@ -12,7 +12,7 @@ from datetime import date
 
 import pandas as pd
 
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import COMMISSION_RATE, REGIME_FALLBACK_DEFAULT, SLIPPAGE_RATE, TAX_RATE
 from src.data.schema import (  # noqa: F401 — 確保 ORM 註冊
     RotationBacktestSummary,
     RotationBacktestTrade,
@@ -809,6 +809,88 @@ class TestVolInverseWeights:
         assert compute_vol_inverse_weights({}) == {}
 
 
+class TestVolWeightsIntegration:
+    """測試 vol_weights 整合進 compute_rotation_actions()。"""
+
+    def test_vol_weights_none_equal_allocation(self):
+        """vol_weights=None → 等權分配（向後相容）。"""
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            vol_weights=None,
+        )
+        assert len(actions.to_buy) == 2
+        # 等權：兩者 allocated_capital 相近
+        cap_a = actions.to_buy[0]["allocated_capital"]
+        cap_b = actions.to_buy[1]["allocated_capital"]
+        assert abs(cap_a - cap_b) < cap_a * 0.1  # 差異 < 10%
+
+    def test_high_vol_gets_less_capital(self):
+        """高波動股票分配較少資金。"""
+        # LOW: weight=0.75, HIGH: weight=0.25（vol inverse of 0.1 vs 0.3）
+        vol_weights = compute_vol_inverse_weights({"A": 0.1, "B": 0.3})
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            vol_weights=vol_weights,
+        )
+        assert len(actions.to_buy) == 2
+        cap_a = actions.to_buy[0]["allocated_capital"]  # A = low vol → more
+        cap_b = actions.to_buy[1]["allocated_capital"]  # B = high vol → less
+        assert cap_a > cap_b
+
+    def test_vol_weights_stock_not_in_dict(self):
+        """候選不在 vol_weights 中 → 使用等權 per_position_capital。"""
+        vol_weights = {"A": 1.0}  # 只有 A，B 不在
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            vol_weights=vol_weights,
+        )
+        assert len(actions.to_buy) == 2
+
+    def test_equal_vol_similar_allocation(self):
+        """等波動率 → 等權分配。"""
+        vol_weights = compute_vol_inverse_weights({"A": 0.2, "B": 0.2})
+        rankings = _make_rankings([("A", 100), ("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            vol_weights=vol_weights,
+        )
+        assert len(actions.to_buy) == 2
+        cap_a = actions.to_buy[0]["allocated_capital"]
+        cap_b = actions.to_buy[1]["allocated_capital"]
+        assert abs(cap_a - cap_b) < cap_a * 0.1
+
+
 # ===========================================================================
 # B4: Drawdown Guard
 # ===========================================================================
@@ -832,8 +914,8 @@ class TestDrawdownGuard:
         )
         assert len(actions.to_buy) == 2
 
-    def test_moderate_drawdown_halves_capital(self):
-        """drawdown 12% → 新開倉資金減半，持倉量更小。"""
+    def test_moderate_drawdown_reduces_capital(self):
+        """drawdown 12% → scale = max(0, 1-12/15) = 0.2，持倉量更小。"""
         rankings = _make_rankings([("A", 100)])
         actions_normal = compute_rotation_actions(
             current_positions=[],
@@ -861,7 +943,7 @@ class TestDrawdownGuard:
             assert actions_dd.to_buy[0]["shares"] < actions_normal.to_buy[0]["shares"]
 
     def test_severe_drawdown_stops_buying(self):
-        """drawdown 16% → 停止新開倉。"""
+        """drawdown 16% >= threshold 15% → scale = 0 → 停止新開倉。"""
         rankings = _make_rankings([("A", 100), ("B", 100)])
         actions = compute_rotation_actions(
             current_positions=[],
@@ -876,8 +958,8 @@ class TestDrawdownGuard:
         )
         assert len(actions.to_buy) == 0
 
-    def test_drawdown_below_threshold_normal(self):
-        """drawdown 5% < 10% → 正常買入。"""
+    def test_drawdown_below_threshold_allows_buying(self):
+        """drawdown 5% → scale = 1-5/15 ≈ 0.667 → 可買入。"""
         rankings = _make_rankings([("A", 100)])
         actions = compute_rotation_actions(
             current_positions=[],
@@ -891,6 +973,69 @@ class TestDrawdownGuard:
             drawdown_pct=5.0,
         )
         assert len(actions.to_buy) == 1
+
+    def test_drawdown_exactly_at_threshold_stops(self):
+        """drawdown 15% = threshold → scale = 0 → 不買。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=15.0,
+        )
+        assert len(actions.to_buy) == 0
+
+    def test_drawdown_half_is_half_scale(self):
+        """drawdown 7.5% → scale = 1 - 7.5/15 = 0.5（連續化驗證）。"""
+        rankings = _make_rankings([("A", 100)])
+        actions_normal = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=None,
+        )
+        actions_half = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=7.5,
+        )
+        if actions_normal.to_buy and actions_half.to_buy:
+            # 7.5% dd → scale 0.5，持倉量約為正常的一半
+            normal_shares = actions_normal.to_buy[0]["shares"]
+            half_shares = actions_half.to_buy[0]["shares"]
+            assert half_shares <= normal_shares * 0.6  # 允許取整誤差
+
+    def test_drawdown_20_above_threshold_still_zero(self):
+        """drawdown 20% > threshold → scale = 0（clamp）。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=2,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=200_000,
+            drawdown_pct=20.0,
+        )
+        assert len(actions.to_buy) == 0
 
 
 class TestPortfolioDrawdown:
@@ -1187,6 +1332,53 @@ class TestCorrelationBudget:
         assert len(actions.to_buy) == 1
 
 
+class TestCorrelationBudgetRegimeAdaptive:
+    """測試相關性預算 Regime 自適應（crisis/bear 收緊門檻）。"""
+
+    def _run_with_regime(self, regime, corr_val=0.55):
+        """建立 corr=corr_val 的持倉+候選，以指定 regime 執行。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100)
+        rankings = _make_rankings([("B", 100)])
+        corr = pd.DataFrame(
+            {"A": {"A": 1.0, "B": corr_val}, "B": {"A": corr_val, "B": 1.0}},
+        )
+        return compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            corr_matrix=corr,
+            regime=regime,
+            crisis_block_new=False,  # 隔離測試相關性，不受 crisis 硬阻擋影響
+        )
+
+    def test_bull_uses_default_threshold(self):
+        """bull + corr=0.55 < 0.7 → 不 penalty。"""
+        actions = self._run_with_regime("bull", 0.55)
+        assert len(actions.to_buy) == 1
+        assert actions.to_buy[0]["allocated_capital"] > 50_000
+
+    def test_crisis_lowers_threshold(self):
+        """crisis + corr=0.55 >= 0.5 → penalty 觸發，部位更小。"""
+        actions_bull = self._run_with_regime("bull", 0.55)
+        actions_crisis = self._run_with_regime("crisis", 0.55)
+        assert len(actions_crisis.to_buy) == 1
+        # crisis penalty = 0.3，bull 無 penalty
+        assert actions_crisis.to_buy[0]["allocated_capital"] < actions_bull.to_buy[0]["allocated_capital"]
+
+    def test_bear_lowers_threshold(self):
+        """bear + corr=0.65 >= 0.6 → penalty 觸發。"""
+        actions_bull = self._run_with_regime("bull", 0.65)
+        actions_bear = self._run_with_regime("bear", 0.65)
+        # bull: 0.65 < 0.7 → 無 penalty；bear: 0.65 >= 0.6 → penalty
+        assert len(actions_bear.to_buy) == 1
+        assert actions_bear.to_buy[0]["allocated_capital"] < actions_bull.to_buy[0]["allocated_capital"]
+
+
 # ===========================================================================
 # Crisis 硬阻擋
 # ===========================================================================
@@ -1260,6 +1452,91 @@ class TestCrisisBlock:
             crisis_block_new=False,
         )
         assert len(actions.to_buy) == 1
+
+
+class TestCrisisForceClose:
+    """測試 crisis_force_close 強制平倉既有持倉。"""
+
+    def test_crisis_force_close_sells_all(self):
+        """crisis + force_close=True → 既有持倉全部賣出。"""
+        pos_a = _make_position("A", date(2025, 1, 6), entry_price=100)
+        pos_b = _make_position("B", date(2025, 1, 6), entry_price=200)
+        rankings = _make_rankings([("C", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[pos_a, pos_b],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=100_000,
+            regime="crisis",
+            crisis_block_new=True,
+            crisis_force_close=True,
+        )
+        assert len(actions.to_sell) == 2
+        assert all(s["reason"] == "crisis_exit" for s in actions.to_sell)
+        assert len(actions.to_hold) == 0
+        assert len(actions.to_buy) == 0  # crisis_block_new 也阻擋
+
+    def test_crisis_force_close_false_holds_positions(self):
+        """crisis + force_close=False → 持倉不受影響（僅擋新開倉）。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100)
+        rankings = _make_rankings([("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=100_000,
+            regime="crisis",
+            crisis_block_new=True,
+            crisis_force_close=False,
+        )
+        assert len(actions.to_sell) == 0
+        assert len(actions.to_hold) == 1
+
+    def test_non_crisis_force_close_ignored(self):
+        """非 crisis + force_close=True → 不強制平倉。"""
+        pos = _make_position("A", date(2025, 1, 6), entry_price=100)
+        rankings = _make_rankings([("B", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=10,
+            allow_renewal=False,
+            today=date(2025, 1, 7),
+            trading_calendar=TRADING_CAL,
+            current_cash=100_000,
+            regime="bull",
+            crisis_force_close=True,
+        )
+        assert len(actions.to_sell) == 0
+        assert len(actions.to_hold) == 1
+
+    def test_crisis_force_close_no_positions(self):
+        """crisis + force_close=True 但無持倉 → 無事發生。"""
+        rankings = _make_rankings([("A", 100)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime="crisis",
+            crisis_block_new=True,
+            crisis_force_close=True,
+        )
+        assert len(actions.to_sell) == 0
+        assert len(actions.to_buy) == 0
 
 
 # ===========================================================================
@@ -1493,3 +1770,32 @@ class TestStopLossPersistence:
         # 無止損 → 不觸發，繼續持有
         assert len(actions.to_sell) == 0
         assert len(actions.to_hold) == 1
+
+
+# ===========================================================================
+# Regime Fallback 安全預設值
+# ===========================================================================
+
+
+class TestRegimeFallbackDefault:
+    """REGIME_FALLBACK_DEFAULT 常數正確性 + 'sideways' 不阻擋交易。"""
+
+    def test_fallback_constant_is_sideways(self):
+        """安全預設值為 sideways。"""
+        assert REGIME_FALLBACK_DEFAULT == "sideways"
+
+    def test_sideways_regime_allows_new_buys(self):
+        """regime='sideways'（fallback 值）不阻擋新開倉。"""
+        rankings = _make_rankings([("A", 100), ("B", 90)])
+        actions = compute_rotation_actions(
+            current_positions=[],
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=3,
+            allow_renewal=False,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=300_000,
+            regime=REGIME_FALLBACK_DEFAULT,
+        )
+        assert len(actions.to_buy) == 2

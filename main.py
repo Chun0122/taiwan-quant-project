@@ -324,6 +324,12 @@ def main() -> None:
         help="啟用週線多時框確認（週線多頭 +5%%，週線空頭 -5%%，預設關閉）",
     )
     sp_disc.add_argument(
+        "--use-ic-adjustment",
+        action="store_true",
+        default=False,
+        help="啟用 Factor IC 動態權重調整（需 ≥20 筆歷史推薦，預設關閉）",
+    )
+    sp_disc.add_argument(
         "--ai-summary",
         action="store_true",
         default=False,
