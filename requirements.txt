@@ -5,7 +5,7 @@ beautifulsoup4>=4.12.0
 yfinance>=0.2.36
 
 # Data processing
-pandas>=2.1.0
+pandas>=2.3.0,<3
 numpy>=1.24.0
 scipy>=1.10.0
 
