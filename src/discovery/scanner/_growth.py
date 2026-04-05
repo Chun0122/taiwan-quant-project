@@ -42,7 +42,16 @@ class GrowthScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)  # 共用動能技術面評分，F3 季線突破需 60 交易日（80 曆日）
-        kwargs.setdefault("universe_config", UniverseConfig(trend_ma=20, volume_ratio_min=2.0, min_available_days=30))
+        kwargs.setdefault(
+            "universe_config",
+            UniverseConfig(
+                min_close=5.0,
+                trend_ma=20,
+                volume_ratio_min=2.0,
+                min_available_days=30,
+                trend_filter_mode="trend_or_breakout",
+            ),
+        )
         super().__init__(**kwargs)
 
     def run(self) -> DiscoveryResult:

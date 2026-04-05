@@ -47,7 +47,9 @@ class MomentumScanner(MarketScanner):
         kwargs.setdefault("lookback_days", 80)  # F3 季線突破需 60 交易日（80 曆日）
         kwargs.setdefault(
             "universe_config",
-            UniverseConfig(min_available_days=30, volume_ratio_min=None),
+            UniverseConfig(
+                min_close=5.0, min_available_days=30, volume_ratio_min=None, trend_filter_mode="trend_or_breakout"
+            ),
         )
         super().__init__(**kwargs)
 

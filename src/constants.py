@@ -80,3 +80,13 @@ REGIME_POSITION_MULTIPLIERS: dict[str, float] = {
     "bear": 0.6,  # 空頭：縮減 40%
     "crisis": 0.3,  # 危機：僅 30% 曝險
 }
+
+# ── Universe Filter Regime 自適應調整 ─────────────────────────────────
+# turnover_multiplier: 乘在流動性門檻上（<1 放寬、>1 收緊）
+# volume_ratio_override: 覆寫 UniverseConfig.volume_ratio_min（None = 跳過量比過濾）
+REGIME_UNIVERSE_ADJUSTMENTS: dict[str, dict] = {
+    "bull": {"turnover_multiplier": 0.8},  # 放寬流動性，更多中型股進入
+    "sideways": {"turnover_multiplier": 1.0},  # 預設不調整
+    "bear": {"turnover_multiplier": 1.3, "volume_ratio_override": None},  # 收緊流動性、放寬量比
+    "crisis": {"turnover_multiplier": 1.5, "volume_ratio_override": None},  # 嚴格流動性、跳過量比
+}

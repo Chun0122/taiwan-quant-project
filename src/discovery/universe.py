@@ -24,8 +24,16 @@ from datetime import date, timedelta
 import pandas as pd
 from sqlalchemy import func, select
 
+from src.constants import REGIME_UNIVERSE_ADJUSTMENTS
 from src.data.database import get_session
 from src.data.schema import DailyFeature, DailyPrice, DiscoveryRecord, StockInfo
+
+# Sentinel 值：區分「未傳入」與「明確傳入 None」
+_SENTINEL = object()
+
+# Candidate Memory 門檻衰減乘數（days_ago → 流動性門檻乘數）
+# Day 1: ×0.8（寬鬆，容易留下）→ Day 2: ×0.9 → Day 3: ×1.0（原始門檻）
+MEMORY_DECAY: dict[int, float] = {1: 0.8, 2: 0.9, 3: 1.0}
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +64,16 @@ class UniverseConfig:
     turnover_ma20_min: float = 20_000_000.0  # Stage 2 20 日均成交金額下限（防短暫放量誘多）
     trend_ma: int | None = 60
     volume_ratio_min: float | None = 1.5
-    candidate_memory_days: int = 1
+    candidate_memory_days: int = 3  # 記憶回溯天數（0 = 停用），越老門檻越嚴
+    regime: str | None = None  # bull/bear/sideways/crisis；None = 不調整（由 Scanner 傳入）
+    trend_filter_mode: str = "trend_only"  # "trend_only" | "breakout_only" | "trend_or_breakout"
 
     # 模式覆寫建議（由 Scanner.__init__ 傳入）
-    # MomentumScanner: 預設
+    # MomentumScanner: min_close=5.0, min_available_days=30, volume_ratio_min=None
     # SwingScanner:    volume_ratio_min=1.2
     # ValueScanner:    trend_ma=None, volume_ratio_min=None
     # DividendScanner: trend_ma=None, volume_ratio_min=None
-    # GrowthScanner:   trend_ma=20, volume_ratio_min=2.0
+    # GrowthScanner:   min_close=5.0, trend_ma=20, volume_ratio_min=2.0
     extra: dict = field(default_factory=dict)
 
 
@@ -72,7 +82,7 @@ class UniverseConfig:
 # ────────────────────────────────────────────────────────────────
 
 
-def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig) -> list[str]:
+def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig, turnover_multiplier: float = 1.0) -> list[str]:
     """Stage 2 純函數：依成交金額過濾，回傳通過的 stock_id 清單。
 
     雙窗口確認邏輯：
@@ -85,6 +95,7 @@ def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig) -> list[str]:
         df_5d: 含 [stock_id, turnover] 欄位的 DataFrame；
                可選含 turnover_ma20（每股最新一日的 20 日均成交金額）
         config: UniverseConfig
+        turnover_multiplier: Regime 門檻乘數（<1 放寬、>1 收緊，預設 1.0 不調整）
 
     Returns:
         通過流動性門檻的 stock_id 清單
@@ -92,23 +103,45 @@ def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig) -> list[str]:
     if df_5d.empty or "turnover" not in df_5d.columns:
         return []
 
+    # 套用 Regime 乘數到門檻值
+    eff_avg_min = config.avg_turnover_5d_min * turnover_multiplier
+    eff_min_min = config.min_turnover_5d_min * turnover_multiplier
+    eff_ma20_min = config.turnover_ma20_min * turnover_multiplier
+
     grp = df_5d.groupby("stock_id")["turnover"]
     avg5 = grp.mean()
     min5 = grp.min()
-    mask = (avg5 >= config.avg_turnover_5d_min) & (min5 >= config.min_turnover_5d_min)
+    mask = (avg5 >= eff_avg_min) & (min5 >= eff_min_min)
 
     # 雙窗口確認：若提供 20 日均成交金額，額外驗證中期流動性穩定
     # NaN = 資料不足（新股或 DailyFeature 尚未重算），跳過該股的 ma20 門檻
     if "turnover_ma20" in df_5d.columns:
         ma20 = df_5d.groupby("stock_id")["turnover_ma20"].last()
         ma20 = ma20.reindex(avg5.index)
-        ma20_ok = ma20.isna() | (ma20 >= config.turnover_ma20_min)
+        ma20_ok = ma20.isna() | (ma20 >= eff_ma20_min)
         mask = mask & ma20_ok
 
-    return list(avg5[mask].index)
+    passed_absolute = list(avg5[mask].index)
+
+    # 相對流動性救援：未通過絕對門檻但 turnover_ratio_5d_20d > 2.0 且 avg5 > 門檻 50%
+    # 偵測「突然被市場關注」的股票（平常成交低但近期急升）
+    if "turnover_ratio_5d_20d" in df_5d.columns:
+        ratio = df_5d.groupby("stock_id")["turnover_ratio_5d_20d"].last()
+        failed_ids = avg5.index.difference(passed_absolute)
+        if len(failed_ids) > 0:
+            half_threshold = eff_avg_min * 0.5
+            rescue_ratio = ratio.reindex(failed_ids)
+            rescue_avg = avg5.reindex(failed_ids)
+            rescue_mask = (rescue_ratio >= 2.0) & (rescue_avg >= half_threshold)
+            rescued = list(rescue_mask[rescue_mask].index)
+            if rescued:
+                logger.info("流動性救援：%d 支股票因相對流動性 > 2x 加入", len(rescued))
+                return passed_absolute + rescued
+
+    return passed_absolute
 
 
-def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
+def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig, volume_ratio_override: object = _SENTINEL) -> list[str]:
     """Stage 3 純函數：依趨勢條件過濾，回傳通過的 stock_id 清單。
 
     過濾條件：
@@ -121,6 +154,10 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
         df_hist: 含 [stock_id, date, close, volume, ma60, volume_ma20] 的 DataFrame
                  （若 trend_ma=20 則需 ma20 欄；欄位來自 DailyFeature 或即時計算）
         config: UniverseConfig
+        volume_ratio_override: Regime 覆寫量比門檻。
+            _SENTINEL = 使用 config.volume_ratio_min（預設）；
+            None = 跳過量比過濾；
+            float = 使用該值作為門檻。
 
     Returns:
         通過趨勢動能門檻的 stock_id 清單
@@ -137,6 +174,9 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
         logger.warning("filter_trend: 缺少欄位 %s，跳過趨勢過濾", ma_col)
         return list(df_hist["stock_id"].unique())
 
+    # 決定有效的量比門檻（Regime 覆寫 > config 預設）
+    eff_volume_ratio_min = config.volume_ratio_min if volume_ratio_override is _SENTINEL else volume_ratio_override
+
     # 取最新一日
     latest_date = df_hist["date"].max()
     latest = df_hist[df_hist["date"] == latest_date].copy()
@@ -145,10 +185,10 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
     close_ok = latest[ma_col].notna() & (latest["close"] >= latest[ma_col])
 
     # 2. 量比過濾
-    if config.volume_ratio_min is not None and "volume_ma20" in df_hist.columns:
+    if eff_volume_ratio_min is not None and "volume_ma20" in df_hist.columns:
         vol_ma20 = latest["volume_ma20"].replace(0, float("nan"))
         vol_ratio = latest["volume"] / vol_ma20
-        vol_ok = vol_ratio >= config.volume_ratio_min
+        vol_ok = vol_ratio >= eff_volume_ratio_min
     else:
         vol_ok = pd.Series(True, index=latest.index)
 
@@ -161,6 +201,71 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
     not_anomaly = ~latest["stock_id"].isin(anomaly_ids)
 
     pass_mask = close_ok & vol_ok & not_anomaly
+    return list(latest.loc[pass_mask, "stock_id"])
+
+
+def filter_trend_breakout(df_hist: pd.DataFrame, config: UniverseConfig) -> list[str]:
+    """Type B 突破型過濾：捕捉剛從底部轉強的標的（即使尚未站穩 MA60）。
+
+    條件（全部須滿足）：
+    1. close >= ma20（短期趨勢向上）
+    2. momentum_20d > 0（正向動能，排除死貓反彈）
+    3. close / high_20d >= 0.9（接近 20 日高點，確認是真突破）
+    4. volume / volume_ma20 >= 1.5（量能擴張確認）
+    5. 異常排除（同 filter_trend：7 日內 3+ 次漲跌停）
+
+    Args:
+        df_hist: 含 [stock_id, date, close, volume, ma20, momentum_20d,
+                 high_20d, volume_ma20] 的 DataFrame
+        config: UniverseConfig
+
+    Returns:
+        通過突破型過濾的 stock_id 清單
+    """
+    if df_hist.empty:
+        return []
+
+    # 必要欄位檢查
+    required = {"ma20", "volume_ma20"}
+    if not required.issubset(df_hist.columns):
+        logger.warning("filter_trend_breakout: 缺少欄位 %s，跳過突破過濾", required - set(df_hist.columns))
+        return []
+
+    # 取最新一日
+    latest_date = df_hist["date"].max()
+    latest = df_hist[df_hist["date"] == latest_date].copy()
+
+    # 1. close >= ma20
+    close_above_ma20 = latest["ma20"].notna() & (latest["close"] >= latest["ma20"])
+
+    # 2. momentum_20d > 0
+    if "momentum_20d" in latest.columns:
+        momentum_ok = latest["momentum_20d"].fillna(0) > 0
+    else:
+        momentum_ok = pd.Series(True, index=latest.index)
+
+    # 3. close / high_20d >= 0.9（接近近期高點）
+    if "high_20d" in latest.columns:
+        high_20d = latest["high_20d"].replace(0, float("nan"))
+        near_high = (latest["close"] / high_20d) >= 0.9
+        near_high = near_high.fillna(True)  # 無資料時不阻擋
+    else:
+        near_high = pd.Series(True, index=latest.index)
+
+    # 4. volume / volume_ma20 >= 1.5（量能擴張）
+    vol_ma20 = latest["volume_ma20"].replace(0, float("nan"))
+    vol_ratio = latest["volume"] / vol_ma20
+    vol_ok = vol_ratio >= 1.5
+
+    # 5. 異常排除：近 7 天內出現 3 次以上漲跌停
+    recent_7 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)]
+    pct_chg = recent_7.sort_values("date").groupby("stock_id")["close"].pct_change().abs()
+    limit_days = pct_chg >= 0.095
+    consecutive_limit = limit_days.groupby(level=0).sum() if not limit_days.empty else pd.Series(dtype=float)
+    anomaly_ids = set(consecutive_limit[consecutive_limit >= 3].index) if not consecutive_limit.empty else set()
+    not_anomaly = ~latest["stock_id"].isin(anomaly_ids)
+
+    pass_mask = close_above_ma20 & momentum_ok & near_high & vol_ok & not_anomaly
     return list(latest.loc[pass_mask, "stock_id"])
 
 
@@ -195,6 +300,18 @@ class UniverseFilter:
         """
         stats: dict[str, int] = {}
 
+        # Regime 自適應：查表取得門檻調整參數
+        adjustments = REGIME_UNIVERSE_ADJUSTMENTS.get(self.config.regime or "", {})
+        self._turnover_multiplier = adjustments.get("turnover_multiplier", 1.0)
+        self._volume_ratio_override = adjustments.get("volume_ratio_override", _SENTINEL)
+        if self.config.regime:
+            logger.info(
+                "UniverseFilter Regime=%s: turnover_mult=%.1f, vol_ratio_override=%s",
+                self.config.regime,
+                self._turnover_multiplier,
+                self._volume_ratio_override,
+            )
+
         # Stage 1: SQL 硬過濾
         stage1_ids = self._stage1_sql_filter()
         stats["total_after_sql"] = len(stage1_ids)
@@ -209,7 +326,7 @@ class UniverseFilter:
                 "final_candidates": 0,
             }
 
-        # Stage 2: 流動性過濾
+        # Stage 2: 流動性過濾（套用 Regime 乘數）
         stage2_ids = self._stage2_liquidity_filter(stage1_ids)
         stats["total_after_liquidity"] = len(stage2_ids)
         logger.info("UniverseFilter Stage 2: 流動性過濾後 %d 支", len(stage2_ids))
@@ -217,7 +334,7 @@ class UniverseFilter:
         if not stage2_ids:
             return [], {**stats, "total_after_trend": 0, "from_memory": 0, "final_candidates": 0}
 
-        # Stage 3: 趨勢動能過濾
+        # Stage 3: 趨勢動能過濾（套用 Regime 量比覆寫）
         stage3_ids = self._stage3_trend_filter(stage2_ids)
         stats["total_after_trend"] = len(stage3_ids)
         logger.info("UniverseFilter Stage 3: 趨勢過濾後 %d 支", len(stage3_ids))
@@ -232,16 +349,39 @@ class UniverseFilter:
             )
             stage3_ids = stage2_ids
 
-        # Candidate Memory: union 前一日推薦（降低每日換股率）
-        memory_ids = set()
+        # Candidate Memory: 漸進衰減記憶（降低每日換股率）
+        # Day 1: 門檻 ×0.8（寬鬆）→ Day 2: ×0.9 → Day 3: ×1.0（原始門檻）→ Day 4+: 淘汰
+        memory_added = 0
         if self.config.candidate_memory_days > 0:
-            memory_ids = self._load_candidate_memory(mode, stage1_ids)
-            extra = memory_ids - set(stage3_ids)
-            if extra:
-                stage3_ids = stage3_ids + list(extra)
-                logger.info("UniverseFilter Memory: 加入 %d 支昨日候選", len(extra))
+            memory_map = self._load_candidate_memory(mode, stage1_ids)
+            stage3_set = set(stage3_ids)
+            stage2_set = set(stage2_ids)
+            turnover_cache = getattr(self, "_turnover_cache", {})
+            t_mult = getattr(self, "_turnover_multiplier", 1.0)
+            base_threshold = self.config.avg_turnover_5d_min * t_mult
 
-        stats["from_memory"] = len(memory_ids & (set(stage3_ids) - set(stage3_ids[: stats["total_after_trend"]])))
+            for sid, days_ago in memory_map.items():
+                if sid in stage3_set:
+                    continue  # 今天已入選，不需記憶加持
+                # 漸進衰減：越老的記憶門檻越嚴
+                decay = MEMORY_DECAY.get(days_ago, None)
+                if decay is None:
+                    continue  # 超出記憶範圍
+                # 檢查是否通過放寬後的流動性門檻
+                sid_turnover = turnover_cache.get(sid, 0)
+                relaxed_threshold = base_threshold * decay
+                if sid_turnover >= relaxed_threshold and sid in stage2_set:
+                    stage3_ids.append(sid)
+                    memory_added += 1
+                elif days_ago <= 1 and sid not in stage2_set:
+                    # Day 1 特例：即使不在 Stage 2（無 turnover 快取），只要通過 Stage 1 也加入
+                    stage3_ids.append(sid)
+                    memory_added += 1
+
+            if memory_added:
+                logger.info("UniverseFilter Memory: 加入 %d 支記憶候選（衰減門檻）", memory_added)
+
+        stats["from_memory"] = memory_added
         stats["final_candidates"] = len(stage3_ids)
 
         return stage3_ids, stats
@@ -333,23 +473,48 @@ class UniverseFilter:
         """
         cutoff_5d = date.today() - timedelta(days=10)  # 多抓幾天以應對假日
 
+        # Regime 門檻乘數
+        t_mult = getattr(self, "_turnover_multiplier", 1.0)
+
         # 嘗試從 DailyFeature 讀取（有最新特徵快取時）
         df_feature = self._load_feature_turnover(stage1_ids)
         if not df_feature.empty and "turnover_ma5" in df_feature.columns:
             latest = df_feature.dropna(subset=["turnover_ma5"])
             # 用 turnover_ma5 作為 5 日均值代理
             avg5_map = latest.set_index("stock_id")["turnover_ma5"]
+            # 快取每股 avg turnover 供 Candidate Memory 衰減門檻使用
+            self._turnover_cache = avg5_map.to_dict()
             # DailyFeature 中無 min_turnover_5d，使用 0.33×avg5 作為保守估計
             conservative_min = avg5_map * 0.33
-            mask = (avg5_map >= self.config.avg_turnover_5d_min) & (conservative_min >= self.config.min_turnover_5d_min)
+            eff_avg_min = self.config.avg_turnover_5d_min * t_mult
+            eff_min_min = self.config.min_turnover_5d_min * t_mult
+            mask = (avg5_map >= eff_avg_min) & (conservative_min >= eff_min_min)
             # 雙窗口確認：若有 turnover_ma20，額外驗證中期流動性穩定（防短暫放量誘多）
             # NaN = DailyFeature 欄位剛新增尚未重算 → 跳過該股的 ma20 門檻
             if "turnover_ma20" in df_feature.columns:
                 ma20_map = latest.set_index("stock_id")["turnover_ma20"]
                 ma20_map = ma20_map.reindex(avg5_map.index)
-                ma20_ok = ma20_map.isna() | (ma20_map >= self.config.turnover_ma20_min)
+                eff_ma20_min = self.config.turnover_ma20_min * t_mult
+                ma20_ok = ma20_map.isna() | (ma20_map >= eff_ma20_min)
                 mask = mask & ma20_ok
-            return list(avg5_map[mask].index)
+            passed_absolute = list(avg5_map[mask].index)
+
+            # 相對流動性救援（DailyFeature 快速路徑）
+            if "turnover_ratio_5d_20d" in latest.columns:
+                ratio_map = latest.set_index("stock_id")["turnover_ratio_5d_20d"]
+                ratio_map = ratio_map.reindex(avg5_map.index)
+                failed_ids = avg5_map.index.difference(passed_absolute)
+                if len(failed_ids) > 0:
+                    half_threshold = eff_avg_min * 0.5
+                    rescue_ratio = ratio_map.reindex(failed_ids)
+                    rescue_avg = avg5_map.reindex(failed_ids)
+                    rescue_mask = (rescue_ratio >= 2.0) & (rescue_avg >= half_threshold)
+                    rescued = list(rescue_mask[rescue_mask].index)
+                    if rescued:
+                        logger.info("流動性救援：%d 支股票因相對流動性 > 2x 加入", len(rescued))
+                        return passed_absolute + rescued
+
+            return passed_absolute
 
         # Fallback: 從 DailyPrice 計算（多抓 30 天以計算 turnover_ma20）
         cutoff_30d = date.today() - timedelta(days=30)
@@ -383,21 +548,31 @@ class UniverseFilter:
         df_5d = df_5d.drop(columns=["turnover_ma20"], errors="ignore")
         df_5d = df_5d.merge(latest_ma20, on="stock_id", how="left")
 
-        return filter_liquidity(df_5d, self.config)
+        # 快取每股 avg turnover 供 Candidate Memory 衰減門檻使用
+        self._turnover_cache = df_5d.groupby("stock_id")["turnover"].mean().to_dict()
+
+        return filter_liquidity(df_5d, self.config, turnover_multiplier=t_mult)
 
     def _load_feature_turnover(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DailyFeature 讀取最新一日的 turnover_ma5 與 turnover_ma20。"""
+        """從 DailyFeature 讀取最新一日的 turnover_ma5、turnover_ma20、turnover_ratio_5d_20d。"""
         try:
             with get_session() as session:
                 latest_date_subq = (
                     select(func.max(DailyFeature.date)).where(DailyFeature.stock_id.in_(stock_ids)).scalar_subquery()
                 )
                 rows = session.execute(
-                    select(DailyFeature.stock_id, DailyFeature.turnover_ma5, DailyFeature.turnover_ma20)
+                    select(
+                        DailyFeature.stock_id,
+                        DailyFeature.turnover_ma5,
+                        DailyFeature.turnover_ma20,
+                        DailyFeature.turnover_ratio_5d_20d,
+                    )
                     .where(DailyFeature.stock_id.in_(stock_ids))
                     .where(DailyFeature.date == latest_date_subq)
                 ).all()
-                return pd.DataFrame(rows, columns=["stock_id", "turnover_ma5", "turnover_ma20"])
+                return pd.DataFrame(
+                    rows, columns=["stock_id", "turnover_ma5", "turnover_ma20", "turnover_ratio_5d_20d"]
+                )
         except Exception:
             return pd.DataFrame()
 
@@ -408,16 +583,23 @@ class UniverseFilter:
     def _stage3_trend_filter(self, stage2_ids: list[str]) -> list[str]:
         """Stage 3: 趨勢動能過濾。
 
-        優先從 DailyFeature 讀取 ma60/volume_ma20；
-        若無，fallback 從 DailyPrice 即時計算。
+        依 trend_filter_mode 分派：
+        - "trend_only"（預設）：原始 Type A 趨勢過濾（close >= MA60）
+        - "breakout_only"：Type B 突破型過濾
+        - "trend_or_breakout"：Type A ∪ Type B
+
+        優先從 DailyFeature 讀取；若無，fallback 從 DailyPrice 即時計算。
         """
         if self.config.trend_ma is None:
             return stage2_ids  # Value/Dividend Scanner 跳過
 
+        vol_override = getattr(self, "_volume_ratio_override", _SENTINEL)
+        mode = self.config.trend_filter_mode
+
         # 嘗試從 DailyFeature 讀取
         df_feat = self._load_feature_trend(stage2_ids)
         if not df_feat.empty:
-            return filter_trend(df_feat, self.config)
+            return self._dispatch_trend_filter(df_feat, vol_override, mode)
 
         # Fallback: 從 DailyPrice 即時計算
         ma_period = self.config.trend_ma
@@ -427,7 +609,13 @@ class UniverseFilter:
         try:
             with get_session() as session:
                 rows = session.execute(
-                    select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close, DailyPrice.volume)
+                    select(
+                        DailyPrice.stock_id,
+                        DailyPrice.date,
+                        DailyPrice.high,
+                        DailyPrice.close,
+                        DailyPrice.volume,
+                    )
                     .where(DailyPrice.date >= cutoff)
                     .where(DailyPrice.stock_id.in_(stage2_ids))
                 ).all()
@@ -438,7 +626,7 @@ class UniverseFilter:
         if not rows:
             return stage2_ids
 
-        df = pd.DataFrame(rows, columns=["stock_id", "date", "close", "volume"])
+        df = pd.DataFrame(rows, columns=["stock_id", "date", "high", "close", "volume"])
         df = df.sort_values(["stock_id", "date"])
 
         # 向量化計算 MA 與量比
@@ -446,12 +634,29 @@ class UniverseFilter:
         df[ma_col] = df.groupby("stock_id")["close"].transform(
             lambda s: s.rolling(ma_period, min_periods=max(ma_period // 2, 5)).mean()
         )
+        df["ma20"] = df.groupby("stock_id")["close"].transform(lambda s: s.rolling(20, min_periods=10).mean())
         df["volume_ma20"] = df.groupby("stock_id")["volume"].transform(lambda s: s.rolling(20, min_periods=10).mean())
+        df["momentum_20d"] = df.groupby("stock_id")["close"].transform(lambda s: s.pct_change(20) * 100)
+        df["high_20d"] = df.groupby("stock_id")["high"].transform(lambda s: s.rolling(20, min_periods=10).max())
 
-        return filter_trend(df, self.config)
+        return self._dispatch_trend_filter(df, vol_override, mode)
+
+    def _dispatch_trend_filter(self, df: pd.DataFrame, vol_override: object, mode: str) -> list[str]:
+        """依 trend_filter_mode 分派到 Type A / Type B / 聯集。"""
+        if mode == "trend_or_breakout":
+            trend_ids = filter_trend(df, self.config, volume_ratio_override=vol_override)
+            breakout_ids = filter_trend_breakout(df, self.config)
+            combined = list(set(trend_ids) | set(breakout_ids))
+            if breakout_only := set(breakout_ids) - set(trend_ids):
+                logger.info("Stage 3 突破型加入 %d 支（趨勢型 %d 支）", len(breakout_only), len(trend_ids))
+            return combined
+        elif mode == "breakout_only":
+            return filter_trend_breakout(df, self.config)
+        else:  # "trend_only"
+            return filter_trend(df, self.config, volume_ratio_override=vol_override)
 
     def _load_feature_trend(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DailyFeature 讀取最新一日的趨勢相關欄位。"""
+        """從 DailyFeature 讀取最新一日的趨勢相關欄位（含突破型所需欄位）。"""
         try:
             with get_session() as session:
                 latest_date_subq = (
@@ -466,13 +671,25 @@ class UniverseFilter:
                         DailyFeature.ma20,
                         DailyFeature.ma60,
                         DailyFeature.volume_ma20,
+                        DailyFeature.momentum_20d,
+                        DailyFeature.high_20d,
                     )
                     .where(DailyFeature.stock_id.in_(stock_ids))
                     .where(DailyFeature.date == latest_date_subq)
                 ).all()
                 return pd.DataFrame(
                     rows,
-                    columns=["stock_id", "date", "close", "volume", "ma20", "ma60", "volume_ma20"],
+                    columns=[
+                        "stock_id",
+                        "date",
+                        "close",
+                        "volume",
+                        "ma20",
+                        "ma60",
+                        "volume_ma20",
+                        "momentum_20d",
+                        "high_20d",
+                    ],
                 )
         except Exception:
             return pd.DataFrame()
@@ -481,28 +698,43 @@ class UniverseFilter:
     #  Candidate Memory
     # ------------------------------------------------------------------ #
 
-    def _load_candidate_memory(self, mode: str, stage1_ids: list[str]) -> set[str]:
-        """讀取前 N 天同模式的 DiscoveryRecord，回傳驗證過的 stock_id 集合。
+    def _load_candidate_memory(self, mode: str, stage1_ids: list[str]) -> dict[str, int]:
+        """讀取前 N 天同模式的 DiscoveryRecord，回傳 {stock_id: days_ago} 字典。
 
         只回傳仍通過 Stage 1 的 stock_ids（確保 close > 10 等基本條件）。
+        多日出現的股票取最近的 days_ago（最小值）。
         """
         if self.config.candidate_memory_days <= 0:
-            return set()
+            return {}
 
         cutoff = date.today() - timedelta(days=self.config.candidate_memory_days)
+        today = date.today()
         try:
             with get_session() as session:
                 rows = session.execute(
-                    select(DiscoveryRecord.stock_id)
+                    select(DiscoveryRecord.stock_id, DiscoveryRecord.scan_date)
                     .where(DiscoveryRecord.scan_date >= cutoff)
                     .where(DiscoveryRecord.mode == mode)
                 ).all()
-            memory_ids = {r[0] for r in rows}
         except Exception:
-            return set()
+            return {}
 
-        # 只保留仍通過 Stage 1 的 IDs
-        valid = memory_ids & set(stage1_ids)
-        if valid:
-            logger.debug("UniverseFilter Memory: 找到 %d 支昨日候選（有效 %d 支）", len(memory_ids), len(valid))
-        return valid
+        # 計算 days_ago，多日出現取最近的
+        stage1_set = set(stage1_ids)
+        memory_map: dict[str, int] = {}
+        for stock_id, scan_date in rows:
+            if stock_id not in stage1_set:
+                continue
+            days_ago = (today - scan_date).days
+            if days_ago <= 0:
+                continue  # 今天的記錄不算記憶
+            if stock_id not in memory_map or days_ago < memory_map[stock_id]:
+                memory_map[stock_id] = days_ago
+
+        if memory_map:
+            logger.debug(
+                "UniverseFilter Memory: 找到 %d 支候選（有效 %d 支）",
+                len(rows),
+                len(memory_map),
+            )
+        return memory_map

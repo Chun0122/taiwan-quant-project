@@ -3,9 +3,13 @@
 涵蓋：
 - TestFilterLiquidity (4):           filter_liquidity() 純函數
 - TestFilterTrend (5):               filter_trend() 純函數
+- TestRegimeAwareFiltering (4):      Regime 自適應門檻調整
+- TestRelativeLiquidity (4):         相對流動性救援通道
+- TestFilterTrendBreakout (8):       突破型過濾純函數
 - TestStage1SqlFilter (6):           UniverseFilter._stage1_sql_filter() DB 整合
 - TestStage2LiquidityFilter (4):     Stage 2 DB fallback
-- TestCandidateMemory (3):           _load_candidate_memory() DB 整合
+- TestCandidateMemory (5):           _load_candidate_memory() DB 整合（含 days_ago）
+- TestMemoryDecay (4):               Candidate Memory 漸進衰減門檻
 - TestComputeAndStoreDailyFeatures (4): pipeline ETL 整合
 - TestClassifySecurityType (8):      _classify_security_type() 純函數
 - TestFilterLiquidityDualWindow (5): 雙窗口流動性確認（turnover_ma20 欄位）
@@ -24,7 +28,13 @@ from src.data.schema import (
     DiscoveryRecord,
     StockInfo,
 )
-from src.discovery.universe import UniverseConfig, UniverseFilter, filter_liquidity, filter_trend
+from src.discovery.universe import (
+    UniverseConfig,
+    UniverseFilter,
+    filter_liquidity,
+    filter_trend,
+    filter_trend_breakout,
+)
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -172,6 +182,219 @@ class TestFilterTrend:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  TestRegimeAwareFiltering — 純函數
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestRegimeAwareFiltering:
+    """Regime 自適應門檻測試（filter_liquidity / filter_trend 純函數）。"""
+
+    def _liquidity_df(self, turnover: int) -> pd.DataFrame:
+        return pd.DataFrame([{"stock_id": "2330", "turnover": turnover}] * 5)
+
+    def test_bull_regime_relaxes_turnover_threshold(self):
+        """Bull: multiplier=0.8 → 有效門檻 24M，25M 應通過。"""
+        df = self._liquidity_df(25_000_000)
+        cfg = UniverseConfig(avg_turnover_5d_min=30_000_000, min_turnover_5d_min=8_000_000)
+        # 預設門檻 30M → ×0.8 = 24M，25M > 24M → 通過
+        result = filter_liquidity(df, cfg, turnover_multiplier=0.8)
+        assert "2330" in result
+
+    def test_crisis_regime_tightens_turnover_threshold(self):
+        """Crisis: multiplier=1.5 → 有效門檻 45M，40M 不應通過。"""
+        df = self._liquidity_df(40_000_000)
+        cfg = UniverseConfig(avg_turnover_5d_min=30_000_000, min_turnover_5d_min=10_000_000)
+        # 預設門檻 30M → ×1.5 = 45M，40M < 45M → 不通過
+        result = filter_liquidity(df, cfg, turnover_multiplier=1.5)
+        assert "2330" not in result
+
+    def test_bear_regime_disables_volume_ratio(self):
+        """Bear: volume_ratio_override=None → 量比門檻失效，低量比也通過。"""
+        today = date.today()
+        df = pd.DataFrame(
+            [
+                {
+                    "stock_id": "2330",
+                    "date": today,
+                    "close": 110.0,
+                    "volume": 500_000,  # 量比 = 0.5 < 1.5
+                    "ma60": 100.0,
+                    "volume_ma20": 1_000_000.0,
+                }
+            ]
+        )
+        cfg = UniverseConfig(trend_ma=60, volume_ratio_min=1.5)
+        # volume_ratio_override=None → 跳過量比過濾
+        result = filter_trend(df, cfg, volume_ratio_override=None)
+        assert "2330" in result
+
+    def test_none_regime_uses_defaults(self):
+        """regime=None → 不調整，使用原始門檻。"""
+        df = self._liquidity_df(25_000_000)
+        cfg = UniverseConfig(avg_turnover_5d_min=30_000_000, min_turnover_5d_min=10_000_000)
+        # 不傳 multiplier → 預設 1.0，25M < 30M → 不通過
+        result = filter_liquidity(df, cfg)
+        assert "2330" not in result
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestRelativeLiquidity — 純函數
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestRelativeLiquidity:
+    """相對流動性救援通道測試（filter_liquidity 純函數）。"""
+
+    def _cfg(self) -> UniverseConfig:
+        return UniverseConfig(avg_turnover_5d_min=30_000_000, min_turnover_5d_min=10_000_000)
+
+    def test_relative_liquidity_rescues_high_ratio_stock(self):
+        """avg5=20M（< 30M 絕對門檻），但 ratio=3.0 且 avg5 > 15M（半門檻）→ 救援通過。"""
+        df = pd.DataFrame([{"stock_id": "9876", "turnover": 20_000_000, "turnover_ratio_5d_20d": 3.0}] * 5)
+        result = filter_liquidity(df, self._cfg())
+        assert "9876" in result
+
+    def test_relative_liquidity_no_rescue_below_half_threshold(self):
+        """avg5=10M（< 15M 半門檻），即使 ratio 高也不救援。"""
+        df = pd.DataFrame([{"stock_id": "9876", "turnover": 10_000_000, "turnover_ratio_5d_20d": 5.0}] * 5)
+        result = filter_liquidity(df, self._cfg())
+        assert "9876" not in result
+
+    def test_relative_liquidity_no_rescue_low_ratio(self):
+        """avg5=20M 但 ratio=1.5（< 2.0）→ 不救援。"""
+        df = pd.DataFrame([{"stock_id": "9876", "turnover": 20_000_000, "turnover_ratio_5d_20d": 1.5}] * 5)
+        result = filter_liquidity(df, self._cfg())
+        assert "9876" not in result
+
+    def test_already_passed_not_duplicated(self):
+        """已通過絕對門檻的股票不應重複出現。"""
+        df = pd.DataFrame([{"stock_id": "2330", "turnover": 50_000_000, "turnover_ratio_5d_20d": 3.0}] * 5)
+        result = filter_liquidity(df, self._cfg())
+        assert result.count("2330") == 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestFilterTrendBreakout — 純函數
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestFilterTrendBreakout:
+    """filter_trend_breakout() 突破型過濾純函數測試。"""
+
+    def _make_df(
+        self,
+        stock_id: str = "2330",
+        close: float = 105.0,
+        ma20: float = 100.0,
+        momentum_20d: float = 5.0,
+        high_20d: float = 110.0,
+        volume: int = 2_000_000,
+        volume_ma20: float = 1_000_000.0,
+    ) -> pd.DataFrame:
+        today = date.today()
+        return pd.DataFrame(
+            [
+                {
+                    "stock_id": stock_id,
+                    "date": today,
+                    "close": close,
+                    "ma20": ma20,
+                    "momentum_20d": momentum_20d,
+                    "high_20d": high_20d,
+                    "volume": volume,
+                    "volume_ma20": volume_ma20,
+                }
+            ]
+        )
+
+    def test_breakout_passes_all_conditions(self):
+        """close > ma20, momentum > 0, near high, volume expansion → 通過。"""
+        df = self._make_df(close=105, ma20=100, momentum_20d=5.0, high_20d=110, volume=2_000_000, volume_ma20=1_000_000)
+        # close/high_20d = 105/110 = 0.954 > 0.9 ✓
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert "2330" in result
+
+    def test_breakout_rejects_below_ma20(self):
+        """close < ma20 → 不通過。"""
+        df = self._make_df(close=95, ma20=100)
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert "2330" not in result
+
+    def test_breakout_rejects_negative_momentum(self):
+        """momentum_20d < 0 → 死貓反彈，不通過。"""
+        df = self._make_df(momentum_20d=-3.0)
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert "2330" not in result
+
+    def test_breakout_rejects_far_from_high(self):
+        """close / high_20d < 0.9 → 離高點太遠，非真突破。"""
+        df = self._make_df(close=80, high_20d=110)
+        # 80/110 = 0.727 < 0.9
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert "2330" not in result
+
+    def test_breakout_rejects_low_volume(self):
+        """volume / volume_ma20 < 1.5 → 量能不足。"""
+        df = self._make_df(volume=800_000, volume_ma20=1_000_000)
+        # 0.8 < 1.5
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert "2330" not in result
+
+    def test_trend_or_breakout_returns_union(self):
+        """trend_or_breakout 模式：Type A ∪ Type B。"""
+        today = date.today()
+        # Stock A: 只通過趨勢（close > MA60，but below MA20 — won't happen）
+        # Stock B: 只通過突破（close > MA20 but < MA60）
+        # Stock C: 都通過
+        df = pd.DataFrame(
+            [
+                # B: close=105 > ma20=100, but close=105 < ma60=120 → 趨勢不過，突破過
+                {
+                    "stock_id": "B",
+                    "date": today,
+                    "close": 105,
+                    "ma20": 100,
+                    "ma60": 120,
+                    "momentum_20d": 5.0,
+                    "high_20d": 110,
+                    "volume": 2_000_000,
+                    "volume_ma20": 1_000_000,
+                },
+                # C: close=130 > ma60=120 > ma20=100 → 都過
+                {
+                    "stock_id": "C",
+                    "date": today,
+                    "close": 130,
+                    "ma20": 100,
+                    "ma60": 120,
+                    "momentum_20d": 5.0,
+                    "high_20d": 135,
+                    "volume": 2_000_000,
+                    "volume_ma20": 1_000_000,
+                },
+            ]
+        )
+        cfg = UniverseConfig(trend_ma=60, volume_ratio_min=1.5)
+        trend_ids = filter_trend(df, cfg)
+        breakout_ids = filter_trend_breakout(df, cfg)
+        union = set(trend_ids) | set(breakout_ids)
+        assert "B" in union  # 突破型通過
+        assert "C" in union  # 兩種都通過
+        assert "B" not in trend_ids  # B 不在趨勢型中
+
+    def test_breakout_missing_required_columns_returns_empty(self):
+        """缺少必要欄位（ma20, volume_ma20）→ 回傳空清單。"""
+        today = date.today()
+        df = pd.DataFrame([{"stock_id": "X", "date": today, "close": 100, "volume": 1_000_000}])
+        result = filter_trend_breakout(df, UniverseConfig())
+        assert result == []
+
+    def test_empty_df_returns_empty(self):
+        result = filter_trend_breakout(pd.DataFrame(), UniverseConfig())
+        assert result == []
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  TestStage1SqlFilter — DB 整合
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -289,21 +512,22 @@ class TestStage2LiquidityFilter:
 
 
 class TestCandidateMemory:
-    """_load_candidate_memory() 的 DB 整合測試。"""
+    """_load_candidate_memory() 的 DB 整合測試（回傳 dict[str, int]）。"""
 
-    def test_returns_yesterday_candidate(self, db_session):
+    def test_returns_yesterday_candidate_with_days_ago(self, db_session):
         yesterday = date.today() - timedelta(days=1)
         db_session.add(_make_dr("2330", mode="momentum", scan_date=yesterday))
         db_session.flush()
-        uf = UniverseFilter(UniverseConfig(candidate_memory_days=1))
+        uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
         result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])
         assert "2330" in result
+        assert result["2330"] == 1  # days_ago = 1
 
     def test_excludes_stock_not_in_stage1_ids(self, db_session):
         yesterday = date.today() - timedelta(days=1)
         db_session.add(_make_dr("2454", mode="momentum", scan_date=yesterday))
         db_session.flush()
-        uf = UniverseFilter(UniverseConfig(candidate_memory_days=1))
+        uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
         # stage1_ids 不含 2454
         result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])
         assert "2454" not in result
@@ -312,10 +536,68 @@ class TestCandidateMemory:
         yesterday = date.today() - timedelta(days=1)
         db_session.add(_make_dr("2330", mode="swing", scan_date=yesterday))
         db_session.flush()
-        uf = UniverseFilter(UniverseConfig(candidate_memory_days=1))
+        uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
         # 查詢 momentum 模式，不應看到 swing 記錄
         result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])
         assert "2330" not in result
+
+    def test_multi_day_uses_most_recent(self, db_session):
+        """同股在 Day1 和 Day3 都出現 → 取 days_ago=1。"""
+        db_session.add(_make_dr("2330", mode="momentum", scan_date=date.today() - timedelta(days=1)))
+        db_session.add(_make_dr("2330", mode="momentum", scan_date=date.today() - timedelta(days=3)))
+        db_session.flush()
+        uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
+        result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])
+        assert result["2330"] == 1  # 最近的
+
+    def test_day4_excluded_by_memory_window(self, db_session):
+        """4 天前的推薦 → 超出 memory_days=3，不回傳。"""
+        db_session.add(_make_dr("2330", mode="momentum", scan_date=date.today() - timedelta(days=4)))
+        db_session.flush()
+        uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
+        result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])
+        assert "2330" not in result
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestMemoryDecay — 純函數（衰減門檻邏輯）
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestMemoryDecay:
+    """Candidate Memory 漸進衰減機制測試。
+
+    使用 UniverseFilter 物件直接操控內部狀態，測試 run() 中的衰減邏輯。
+    """
+
+    def test_day1_memory_relaxes_threshold_to_80pct(self):
+        """Day 1 記憶：門檻 ×0.8 = 24M，25M turnover 應通過。"""
+        from src.discovery.universe import MEMORY_DECAY
+
+        assert MEMORY_DECAY[1] == 0.8
+        # 基底門檻 30M × 0.8 = 24M，25M > 24M → 通過
+        base = 30_000_000
+        assert 25_000_000 >= base * 0.8
+
+    def test_day2_memory_relaxes_threshold_to_90pct(self):
+        """Day 2 記憶：門檻 ×0.9 = 27M，25M turnover 不通過。"""
+        from src.discovery.universe import MEMORY_DECAY
+
+        assert MEMORY_DECAY[2] == 0.9
+        base = 30_000_000
+        assert 25_000_000 < base * 0.9  # 25M < 27M → 不通過
+
+    def test_day3_memory_uses_full_threshold(self):
+        """Day 3 記憶：門檻 ×1.0 = 30M，需完全達標。"""
+        from src.discovery.universe import MEMORY_DECAY
+
+        assert MEMORY_DECAY[3] == 1.0
+
+    def test_day4_not_in_decay_map(self):
+        """Day 4+ 不在衰減表中 → 不保留。"""
+        from src.discovery.universe import MEMORY_DECAY
+
+        assert 4 not in MEMORY_DECAY
 
 
 # ────────────────────────────────────────────────────────────────────────────

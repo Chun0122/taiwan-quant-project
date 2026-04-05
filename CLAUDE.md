@@ -61,7 +61,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **SQLAlchemy Session** | `with get_session() as session:`；批次寫入 `sqlite_upsert().on_conflict_do_nothing()`；`init_db()` 含 WAL + `busy_timeout=30000` |
 | **三層資料來源** | ①TWSE/TPEX 官方（免費，全市場）→ ②FinMind 批次（付費）→ ③FinMind 逐股（免費備援） |
 | **Watchlist** | `get_effective_watchlist()`：DB 優先，`settings.yaml` fallback，全模組統一呼叫 |
-| **常數集中** | `src/constants.py`：交易成本/速率/籌碼門檻/VIX 危機/風險預算/Kelly/相關性/新聞衰減/Regime/漲跌停等全系統共用常數 |
+| **常數集中** | `src/constants.py`：交易成本/速率/籌碼門檻/VIX 危機/風險預算/Kelly/相關性/新聞衰減/Regime/漲跌停/`REGIME_UNIVERSE_ADJUSTMENTS`（Universe 流動性×Regime 乘數）等全系統共用常數 |
 
 ### 模組職責
 
@@ -98,7 +98,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 模組 | 職責 |
 |------|------|
 | `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
-| `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory |
+| `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
 | `src/regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）；三訊號多數決；市場寬度降級（>60% 跌破 MA20）；Crisis 快速覆蓋（7 訊號 ≥2 觸發）；Hysteresis 狀態機（JSON 持久化） |
 | `src/industry/analyzer.py` | 產業輪動（法人+價格動能）；`compute_sector_relative_strength()`（個股 vs 同業中位數，±3%） |
@@ -283,7 +283,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1605 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1627 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -344,9 +344,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 75 項）
+## Completed Tasks（已完成，共 76 項）
 
-測試數從 231 → 1605。各階段摘要：
+測試數從 231 → 1627。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -360,3 +360,4 @@ pytest --cov=src --cov-report=term-missing
 | **統一重構** | 54~58 | entry_exit.py 共用、市場寬度降級、Hysteresis 狀態機、法人連續性 + HHI 趨勢 |
 | **Phase 1 基盤強化** | 59~67 | Regime 預設值、Kelly 收縮、Drawdown 連續化、相關性危機自適應、分數上限修正、早晨原子性、每股新鮮度、波動率權重、危機強制平倉 |
 | **Phase 2 擬真度** | 68~75 | 假日行事曆、公告衰減分化、籌碼層級稽核、滑價不對稱、Factor IC 動態權重、Regime 部位大小、漲跌停模擬、部分止利 |
+| **Universe 強化** | 76 | Regime 自適應門檻、min_close 軟化（Momentum/Growth=5）、相對流動性救援（turnover_ratio>2x）、突破型過濾器（Type B）、Candidate Memory 3 天漸進衰減 |

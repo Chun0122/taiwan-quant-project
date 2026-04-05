@@ -49,6 +49,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("rotation_position", "stop_loss", "REAL"),
     # 籌碼層級變化稽核（如 "8F→7F"）
     ("discovery_record", "chip_tier_change", "VARCHAR(20)"),
+    # Universe Filter 強化：DailyFeature 新增相對流動性 + 20 日最高價
+    ("daily_feature", "turnover_ratio_5d_20d", "REAL"),
+    ("daily_feature", "high_20d", "REAL"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

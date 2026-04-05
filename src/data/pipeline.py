@@ -1406,6 +1406,7 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
             select(
                 DailyPrice.stock_id,
                 DailyPrice.date,
+                DailyPrice.high,
                 DailyPrice.close,
                 DailyPrice.volume,
                 DailyPrice.turnover,
@@ -1416,7 +1417,7 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
         logger.warning("[DailyFeature] 無 DailyPrice 資料可計算")
         return 0
 
-    df = pd.DataFrame(rows, columns=["stock_id", "date", "close", "volume", "turnover"])
+    df = pd.DataFrame(rows, columns=["stock_id", "date", "high", "close", "volume", "turnover"])
     df = df.sort_values(["stock_id", "date"])
 
     logger.info("[DailyFeature] 共 %d 筆原始資料，開始向量化計算...", len(df))
@@ -1440,6 +1441,13 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
         lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
     )
 
+    # 5日/20日成交金額比（相對流動性：偵測「突然被市場關注」的股票）
+    df["turnover_ratio_5d_20d"] = df["turnover_ma5"] / df["turnover_ma20"].replace(0, float("nan"))
+
+    # 20 日最高價（突破型過濾：close / high_20d >= 0.9 確認真突破）
+    g_high = df.groupby("stock_id")["high"]
+    df["high_20d"] = g_high.transform(lambda s: s.rolling(20, min_periods=10).max())
+
     # 只取最新一日（增量更新策略）
     latest_date = df["date"].max()
     df_latest = df[df["date"] == latest_date].copy()
@@ -1458,6 +1466,8 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
         "turnover_ma20",
         "momentum_20d",
         "volatility_20d",
+        "turnover_ratio_5d_20d",
+        "high_20d",
         "computed_at",
     ]
     df_out = df_latest[keep_cols].reset_index(drop=True)

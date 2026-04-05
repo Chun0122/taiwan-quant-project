@@ -596,6 +596,10 @@ class DailyFeature(Base):
     turnover_ma20: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日均成交金額（雙窗口流動性確認用）
     momentum_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日報酬率 (%)
     volatility_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日年化波動率 (%)
+    turnover_ratio_5d_20d: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )  # 5日/20日成交金額比（相對流動性）
+    high_20d: Mapped[float | None] = mapped_column(Float, nullable=True)  # 20 日最高價
     computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

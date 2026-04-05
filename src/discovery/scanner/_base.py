@@ -255,6 +255,8 @@ class MarketScanner:
         供 _load_market_data() 及子類覆寫版本呼叫，以 IN 子句限定 SQL 查詢範圍。
         若 UniverseFilter 失敗（DB 空等原因）回傳空清單，呼叫端的 SQL 不加 IN 子句。
         """
+        # 將 Regime 傳入 UniverseFilter，使流動性/趨勢門檻自適應市場狀態
+        self._universe_config.regime = getattr(self, "regime", None)
         universe_ids, universe_stats = self._universe_filter.run(mode=self.mode_name)
         logger.info(
             "Stage 0.5 UniverseFilter: SQL=%d → 流動性=%d → 趨勢=%d → 最終候選=%d",
