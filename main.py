@@ -110,7 +110,7 @@ import sys
 
 from src.cli.anomaly_cmd import cmd_anomaly_scan, cmd_revenue_scan
 from src.cli.backtest_cmd import cmd_backtest, cmd_walk_forward
-from src.cli.discover_cmd import cmd_discover, cmd_discover_backtest, cmd_factor_diagnostics
+from src.cli.discover_cmd import cmd_ablation_test, cmd_discover, cmd_discover_backtest, cmd_factor_diagnostics
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
     cmd_dashboard,
@@ -354,6 +354,21 @@ def main() -> None:
     sp_fd.add_argument("--lookback-days", type=int, default=30, help="回溯天數（預設 30）")
     sp_fd.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
     sp_fd.add_argument("--export", default=None, help="匯出 CSV 路徑（相關性矩陣）")
+
+    # ablation-test 子命令
+    sp_ab = subparsers.add_parser("ablation-test", help="因子消融測試 — 量化各因子對選股的邊際貢獻")
+    sp_ab.add_argument(
+        "--mode",
+        required=True,
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="掃描模式",
+    )
+    sp_ab.add_argument("--top", type=int, default=20, help="比較前 N 名（預設 20）")
+    sp_ab.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
+    sp_ab.add_argument("--with-performance", action="store_true", help="包含歷史績效消融分析")
+    sp_ab.add_argument("--holding-days", type=int, default=5, help="績效消融持有天數（預設 5）")
+    sp_ab.add_argument("--lookback-days", type=int, default=60, help="績效消融回溯天數（預設 60）")
+    sp_ab.add_argument("--export", default=None, help="匯出消融結果 CSV")
 
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
@@ -727,6 +742,8 @@ def main() -> None:
         cmd_discover_backtest(args)
     elif args.command == "factor-diagnostics":
         cmd_factor_diagnostics(args)
+    elif args.command == "ablation-test":
+        cmd_ablation_test(args)
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":

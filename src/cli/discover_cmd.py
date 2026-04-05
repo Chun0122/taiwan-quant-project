@@ -772,3 +772,173 @@ def cmd_factor_diagnostics(args: "argparse.Namespace") -> None:
                     print(f"{row['factor']:<25} {row['ic']:>8.4f} {int(row['evaluable_count']):>6} {label:<10}")
 
     print(f"\n{'=' * 70}")
+
+
+def cmd_ablation_test(args: "argparse.Namespace") -> None:
+    """因子消融測試 — 維度級 + 子因子級消融分析。
+
+    1. 執行一次掃描（取得候選分數 + 子因子 rank）
+    2. 維度級：逐一歸零每個維度權重，觀察排名位移
+    3. 子因子級：在 technical / chip 維度內逐一移除子因子
+    4. 歷史績效消融（若有歷史推薦記錄）
+    """
+    from src.discovery.ablation import (
+        AblationReport,
+        compute_ablation_performance,
+        format_ablation_report,
+        run_dimension_ablation,
+        run_sub_factor_ablation,
+    )
+    from src.discovery.scanner import (
+        DividendScanner,
+        GrowthScanner,
+        MomentumScanner,
+        SwingScanner,
+        ValueScanner,
+    )
+
+    init_db()
+
+    mode = args.mode
+    top_n = getattr(args, "top", 20)
+    mode_label = {
+        "momentum": "Momentum",
+        "swing": "Swing",
+        "value": "Value",
+        "dividend": "Dividend",
+        "growth": "Growth",
+    }[mode]
+
+    scanner_map = {
+        "momentum": MomentumScanner,
+        "swing": SwingScanner,
+        "value": ValueScanner,
+        "dividend": DividendScanner,
+        "growth": GrowthScanner,
+    }
+
+    if not getattr(args, "skip_sync", False):
+        sync_days = 80 if mode == "swing" else 25
+        ensure_sync_market_data(sync_days, args)
+
+    print(f"正在執行 {mode_label} 掃描以收集因子分數...")
+    scanner = scanner_map[mode](top_n_results=top_n, use_ic_adjustment=False)
+    result = scanner.run()
+
+    if result.rankings.empty:
+        print("無符合條件的股票，無法進行消融分析")
+        return
+
+    # 取得 regime 權重
+    from src.regime.detector import MarketRegimeDetector
+
+    regime = getattr(scanner, "regime", "sideways")
+    baseline_weights = MarketRegimeDetector.get_weights(mode, regime)
+
+    report = AblationReport(
+        mode=mode_label,
+        regime=regime,
+        baseline_top_n=top_n,
+    )
+
+    # ── 維度級消融 ─────────────────────────
+    scored_df = result.rankings.copy()
+    dim_results = run_dimension_ablation(scored_df, baseline_weights, top_n=top_n)
+    report.dimension_results = dim_results
+
+    # ── 子因子級消融 ───────────────────────
+    sub_df = result.sub_factor_df
+    if sub_df is not None and not sub_df.empty:
+        for dim in ["technical", "chip"]:
+            sub_results = run_sub_factor_ablation(sub_df, dim)
+            report.sub_factor_results.extend(sub_results)
+
+    # ── 輸出報告 ──────────────────────────
+    print(format_ablation_report(report))
+
+    # ── 歷史績效消融（若有歷史推薦記錄）────
+    if getattr(args, "with_performance", False):
+        from datetime import timedelta
+
+        from sqlalchemy import select
+
+        from src.data.database import get_session
+        from src.data.schema import DailyPrice, DiscoveryRecord
+
+        holding_days = getattr(args, "holding_days", 5)
+        lookback = getattr(args, "lookback_days", 60)
+        cutoff = result.scan_date - timedelta(days=lookback + holding_days + 10)
+
+        with get_session() as session:
+            stmt = select(
+                DiscoveryRecord.scan_date,
+                DiscoveryRecord.stock_id,
+                DiscoveryRecord.close,
+                DiscoveryRecord.rank,
+                DiscoveryRecord.technical_score,
+                DiscoveryRecord.chip_score,
+                DiscoveryRecord.fundamental_score,
+                DiscoveryRecord.news_score,
+            ).where(DiscoveryRecord.mode == mode, DiscoveryRecord.scan_date >= cutoff)
+            rows = session.execute(stmt).all()
+            df_records = pd.DataFrame(
+                rows,
+                columns=[
+                    "scan_date",
+                    "stock_id",
+                    "close",
+                    "rank",
+                    "technical_score",
+                    "chip_score",
+                    "fundamental_score",
+                    "news_score",
+                ],
+            )
+
+            if df_records.empty:
+                print("\n無歷史推薦記錄，跳過績效消融分析")
+            else:
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+                perf_df = compute_ablation_performance(
+                    df_records,
+                    df_prices,
+                    baseline_weights,
+                    holding_days=holding_days,
+                    top_n=top_n,
+                )
+
+                if not perf_df.empty:
+                    print(f"\n{'─' * 70}")
+                    print(f"歷史績效消融（{holding_days} 日持有，回溯 {lookback} 天）")
+                    print(f"{'─' * 70}")
+                    print(f"{'移除維度':<20}  {'勝率':>7}  {'均報酬':>8}  {'勝率Δ':>7}  {'均報酬Δ':>8}")
+                    for _, row in perf_df.iterrows():
+                        wr = f"{row['win_rate']:.1%}"
+                        avg = f"{row['avg_return']:+.2%}"
+                        wd = f"{row['win_rate_delta']:+.1%}" if row["win_rate_delta"] != 0 else "  —  "
+                        ad = f"{row['avg_return_delta']:+.2%}" if row["avg_return_delta"] != 0 else "   —   "
+                        print(f"{row['removed_dimension']:<20}  {wr:>7}  {avg:>8}  {wd:>7}  {ad:>8}")
+
+    # ── 匯出 CSV ──────────────────────────
+    if getattr(args, "export", None) and report.dimension_results:
+        rows = []
+        for r in report.dimension_results:
+            rows.append(
+                {
+                    "removed_dimension": r.removed_dimension,
+                    "rank_correlation": r.rank_correlation,
+                    "mean_rank_shift": r.mean_rank_shift,
+                    "max_rank_shift": r.max_rank_shift,
+                    "stocks_dropped": len(r.stocks_dropped),
+                    "stocks_added": len(r.stocks_added),
+                }
+            )
+        pd.DataFrame(rows).to_csv(args.export, index=False, encoding="utf-8-sig")
+        print(f"\n消融結果已匯出至: {args.export}")

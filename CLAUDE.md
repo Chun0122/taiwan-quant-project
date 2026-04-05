@@ -100,6 +100,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
+| `src/discovery/ablation.py` | 因子消融測試：維度級（歸零重分配 Spearman ρ）+ 子因子級 + 歷史績效消融；CLI `ablation-test` |
 | `src/regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）；三訊號多數決；市場寬度降級（>60% 跌破 MA20）；Crisis 快速覆蓋（7 訊號 ≥2 觸發）；Hysteresis 狀態機（JSON 持久化） |
 | `src/industry/analyzer.py` | 產業輪動（法人+價格動能）；`compute_sector_relative_strength()`（個股 vs 同業中位數，±3%） |
 | `src/industry/concept_analyzer.py` | 概念股輪動；`ConceptRotationAnalyzer` Percentile Rank；±5% 加成（scanner Stage 3.3b） |
@@ -122,10 +123,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/features/ml_features.py` | ML 特徵矩陣（動能/波動/量比/交互特徵/Lag 5-10-20/sector_ranks）+ SHAP 特徵篩選 |
 | `src/config.py` | Pydantic 設定模型；`QuantConfig`（TradingCost/AtrMultiplier/ScoreThreshold/RiskBudget 四子模型）；啟動驗證 |
 | `src/cli/detection.py` | 5 個籌碼異動偵測純函數（volume_spike/institutional_buy/sbl_spike/broker_concentration/daytrade_risk） |
-| `main.py` | CLI 調度器（argparse，36 子命令 + dispatch table） |
+| `main.py` | CLI 調度器（argparse，38 子命令 + dispatch table） |
 | `src/cli/helpers.py` | `safe_print()`/`setup_logging()`/`init_db()`/`ensure_sync_market_data()`/`read_stocks_from_file()` |
 | `src/cli/sync.py` | sync/compute/sync-mops/sync-revenue/sync-financial/sync-info/sync-features/sync-holding/sync-vix/sync-sbl/sync-broker/alert-check |
-| `src/cli/discover_cmd.py` | discover/discover-backtest（cross-comparison/save records/comparison） |
+| `src/cli/discover_cmd.py` | discover/discover-backtest/factor-diagnostics/ablation-test |
 | `src/cli/backtest_cmd.py` | backtest/walk-forward（attribution/trade stats） |
 | `src/cli/watch_cmd.py` | watch add/list/close/update-status；`_compute_watch_status()`/`_compute_trailing_stop()` |
 | `src/cli/morning_cmd.py` | morning-routine（Step 0~15+8b）；全市場同步；TAIEX 資料新鮮度驗證 |
@@ -193,6 +194,10 @@ python main.py discover all --skip-sync --export compare.csv
 python main.py discover momentum --weekly-confirm  # 週線多時框確認
 python main.py discover momentum --use-ic-adjustment  # Factor IC 動態權重調整
 python main.py discover-backtest --mode momentum   # 推薦績效回測
+python main.py factor-diagnostics --mode momentum  # 因子 IC + 相關性矩陣
+python main.py ablation-test --mode momentum       # 因子消融測試
+python main.py ablation-test --mode momentum --with-performance  # 含歷史績效消融
+python main.py ablation-test --mode momentum --skip-sync --export ablation.csv
 
 # ── 回測 ─────────────────────────────────────────────────
 python main.py backtest --stock 2330 --strategy sma_cross
@@ -283,7 +288,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1653 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1677 個測試，44 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -328,6 +333,7 @@ pytest --cov=src --cov-report=term-missing
 | `test_rotation.py` | `portfolio/rotation.py` 全模組 | 純函數+SQLite |
 | `test_calendar.py` | `data/calendar.py` TWSE 交易日行事曆 | 純函數 |
 | `test_morning_atomicity.py` | `cli/morning_cmd.py` 原子性 | mock |
+| `test_ablation.py` | `discovery/ablation.py` 因子消融 | 純函數 |
 
 新增或修改模組後，執行 `pytest -v` 確保全部通過，並為新計算邏輯補充測試。
 
