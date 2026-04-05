@@ -31,6 +31,7 @@ from src.discovery.scanner._functions import (
     SECTOR_MAX_RATIO,
     SECTOR_MIN_CAP,
     DiscoveryResult,
+    ScanAuditTrail,
     _calc_atr14,
     compute_abnormal_announcement_rate,
     compute_adaptive_atr_multiplier,
@@ -84,7 +85,7 @@ class MarketScanner:
         top_n_results: int = 30,
         lookback_days: int = 5,
         weekly_confirm: bool = False,
-        use_ic_adjustment: bool = False,
+        use_ic_adjustment: bool = True,
         universe_config: UniverseConfig | None = None,
     ) -> None:
         self.min_price = min_price
@@ -95,13 +96,27 @@ class MarketScanner:
         self.lookback_days = lookback_days
         self.weekly_confirm = weekly_confirm
         self.use_ic_adjustment = use_ic_adjustment
+        # 子因子 rank 收集器（供 IC 診斷使用）
+        self._sub_factor_ranks: dict[str, pd.DataFrame] = {}
         # Universe Filter：各子類可在 __init__ 中傳入模式專屬 config
         self._universe_config = universe_config or UniverseConfig()
         self._universe_filter = UniverseFilter(self._universe_config)
 
     def run(self) -> DiscoveryResult:
-        """執行四階段漏斗掃描。"""
+        """執行四階段漏斗掃描。
+
+        流程清楚分為三大區塊：
+        1. 資料準備（Stage 0~2.7）
+        2. 評分 + 軟加成（Stage 3~3.6）— 調整 composite_score，不剔除
+        3. 硬風控（Stage 3.5/3.5b/3.5e/3.7/4.1/4.2）— 通過或剔除
+        """
         self.scan_date = date.today()
+        audit = ScanAuditTrail()
+        self._audit_trail = audit
+
+        # ============================================================ #
+        #  區塊 1: 資料準備（Stage 0 ~ 2.7）
+        # ============================================================ #
 
         # Stage 0: 偵測市場狀態（Regime）
         try:
@@ -123,6 +138,7 @@ class MarketScanner:
                 total_stocks=0,
                 after_coarse=0,
                 mode=self.mode_name,
+                audit_trail=audit,
             )
 
         total_stocks = df_price["stock_id"].nunique()
@@ -139,6 +155,7 @@ class MarketScanner:
                 total_stocks=total_stocks,
                 after_coarse=0,
                 mode=self.mode_name,
+                audit_trail=audit,
             )
 
         # Stage 2.5: 補抓候選股月營收（從 FinMind 逐股取得）
@@ -173,63 +190,104 @@ class MarketScanner:
         else:
             logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
 
-        # Stage 3: 細評
+        # ============================================================ #
+        #  區塊 2: 評分 + 軟加成（Score Adjustments — 只調分不剔除）
+        # ============================================================ #
+
+        # Stage 3: 四維度加權評分
         scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
-        # Stage 3.3: 產業加成
+        # --- 軟加成：產業 / 概念 / 同業 ---
         scored = self._apply_sector_bonus(scored)
+        audit.record_score_adjustments_from_column("3.3 產業輪動", scored, "sector_bonus", "產業輪動加成")
 
-        # Stage 3.3a: 產業同儕相對強度加成
         scored = self._apply_sector_relative_strength(scored)
+        if "rs_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column("3.3a 同業強度", scored, "rs_bonus", "同業相對強度")
 
-        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
         scored = self._apply_concept_bonus(scored)
+        if "concept_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column("3.3b 概念熱度", scored, "concept_bonus", "概念股輪動加成")
 
-        # Stage 3.3c: 同業基本面排名（C3 — 同產業 ROE/毛利率/營收排名 ±3%）
         scored = self._apply_peer_fundamental_ranking(scored)
+        if "peer_rank_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column("3.3c 同業基本面", scored, "peer_rank_bonus", "同業基本面排名")
 
-        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
+        # --- 軟加成：週線趨勢 ---
         if self.weekly_confirm:
             scored = self._apply_weekly_trend_bonus(scored)
+            if "weekly_bonus" in scored.columns:
+                audit.record_score_adjustments_from_column("3.4 週線確認", scored, "weekly_bonus", "週線多時框確認")
 
-        # Stage 3.5: 風險過濾
-        scored = self._apply_risk_filter(scored, df_price)
-
-        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
-        scored = self._apply_crisis_filter(scored, df_price)
-
-        # Stage 3.5c: 動量衰減偵測（RSI 頂背離 + MACD 柱縮短 → 降分）
+        # --- 軟加成：動量衰減 ---
         scored = self._apply_momentum_decay(scored, df_price)
+        if "momentum_decay" in scored.columns:
+            audit.record_score_adjustments_from_column("3.5c 動量衰減", scored, "momentum_decay", "RSI背離/MACD柱縮")
 
-        # Stage 3.5d: 籌碼加速度加成（法人連買且加速 → 加分）
+        # --- 軟加成：籌碼加速度 ---
         scored = self._apply_institutional_acceleration(scored, df_inst)
+        if "inst_accel_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column("3.5d 籌碼加速", scored, "inst_accel_bonus", "法人買超加速")
 
-        # Stage 3.5e: 多時框一致性（日線+週線方向一致 → 加分，矛盾 → 降分）
-        scored = self._apply_multi_timeframe_alignment(scored)
-
-        # Stage 3.5f: 籌碼面 MACD（法人淨買超短期 vs 長期 EMA 交叉 → 加/減分）
+        # --- 軟加成：籌碼 MACD ---
         scored = self._apply_chip_macd(scored, df_inst)
+        if "chip_macd_adj" in scored.columns:
+            audit.record_score_adjustments_from_column("3.5f 籌碼MACD", scored, "chip_macd_adj", "法人淨買超MACD")
 
-        # Stage 3.5g: 主力成本分析（B2 — 現價 vs 主力估計成本 → 加/減分）
+        # --- 軟加成：主力成本 ---
         scored = self._apply_key_player_cost(scored, df_price)
+        if "kp_adj" in scored.columns:
+            audit.record_score_adjustments_from_column("3.5g 主力成本", scored, "kp_adj", "現價vs主力成本")
 
-        # Stage 3.6: 量價背離偵測（價漲量縮 → 降分）
+        # --- 軟加成：量價背離 ---
         scored = self._apply_volume_price_divergence(scored, df_price)
+        if "vp_divergence" in scored.columns:
+            audit.record_score_adjustments_from_column("3.6 量價背離", scored, "vp_divergence", "量價背離調整")
 
-        # Stage 3.7: 動態評分閾值（Regime 越差門檻越高，寧缺勿濫）
-        # E1: 勝率回饋循環 — 近期勝率低 → 提高門檻
+        # ============================================================ #
+        #  區塊 3: 硬風控（Hard Filters — 通過或剔除）
+        # ============================================================ #
+
+        # 硬風控 1: 風險過濾（ATR/波動率百分位）
+        ids_before = set(scored["stock_id"])
+        scored = self._apply_risk_filter(scored, df_price)
+        audit.record_hard_filter("3.5 風險過濾", ids_before, set(scored["stock_id"]), "ATR/波動率超過百分位門檻")
+
+        # 硬風控 2: Crisis 相對強度 + 絕對趨勢
+        ids_before = set(scored["stock_id"])
+        scored = self._apply_crisis_filter(scored, df_price)
+        audit.record_hard_filter("3.5b Crisis過濾", ids_before, set(scored["stock_id"]), "跑輸TAIEX或跌破MA60")
+
+        # 硬風控 3: 多時框強制排除（momentum/growth 日多週空）
+        ids_before = set(scored["stock_id"])
+        scored = self._apply_multi_timeframe_alignment(scored)
+        audit.record_hard_filter("3.5e 多時框共振", ids_before, set(scored["stock_id"]), "日線多頭+週線空頭矛盾")
+        if "mtf_alignment" in scored.columns:
+            # 未被排除的仍有調分（±4%），記錄到軟加成
+            audit.record_score_adjustments_from_column("3.5e 多時框共振", scored, "mtf_alignment", "日週一致性調分")
+
+        # 硬風控 4: 動態評分門檻（Regime + 勝率回饋）
+        ids_before = set(scored["stock_id"])
         scored = self._apply_score_threshold(scored)
+        audit.record_hard_filter("3.7 分數門檻", ids_before, set(scored["stock_id"]), "composite_score低於Regime門檻")
+
         # E2: 因子有效性日誌（不影響評分，僅記錄 IC 供參考）
         self._log_factor_effectiveness()
+
+        # ============================================================ #
+        #  區塊 4: 排名 + 結構化輸出
+        # ============================================================ #
 
         # Stage 4: 排名 + 產業標籤
         rankings = self._rank_and_enrich(scored)
 
-        # Stage 4.1: 同產業分散化（限制同產業推薦數量）
+        # 硬風控 5: 同產業分散化
+        ids_before = set(rankings["stock_id"])
         rankings = self._apply_sector_diversification(rankings)
+        audit.record_hard_filter("4.1 產業分散", ids_before, set(rankings["stock_id"]), "同產業超過25%上限")
 
-        # Stage 4.2: 回撤降頻（D3 — Bear/Crisis 市場減少推薦數量）
+        # 硬風控 6: 回撤降頻
         effective_top_n = self._compute_drawdown_adjusted_top_n(df_price)
         sector_summary = self._compute_sector_summary(rankings)
         logger.info("Stage 4: 輸出 Top %d（原始 Top %d）", min(effective_top_n, len(rankings)), self.top_n_results)
@@ -237,12 +295,34 @@ class MarketScanner:
         # Stage 4.3: 籌碼層級降級稽核（比對前次掃描 chip_tier，記錄升降級）
         rankings = self._audit_chip_tier_changes(rankings)
 
+        # 記錄被 top_n 截斷的股票
+        final_rankings = rankings.head(effective_top_n)
+        if len(rankings) > effective_top_n:
+            truncated = set(rankings["stock_id"]) - set(final_rankings["stock_id"])
+            audit.record_hard_filter(
+                "4.2 Drawdown縮表", set(rankings["stock_id"]), set(final_rankings["stock_id"]), "TAIEX回撤降頻截斷"
+            )
+
+        # 輸出審計摘要到日誌
+        summary = audit.summary()
+        if summary["total_hard_filters"] > 0 or summary["total_score_adjustments"] > 0:
+            logger.info(
+                "審計摘要: 硬風控剔除 %d 支, 軟加成影響 %d 筆",
+                summary["total_hard_filters"],
+                summary["total_score_adjustments"],
+            )
+
+        # 收集子因子 rank（供因子診斷使用）
+        sub_factors = self.get_sub_factor_df()
+
         return DiscoveryResult(
-            rankings=rankings.head(effective_top_n),
+            rankings=final_rankings,
             total_stocks=total_stocks,
             after_coarse=after_coarse,
             sector_summary=sector_summary,
             mode=self.mode_name,
+            audit_trail=audit,
+            sub_factor_df=sub_factors if not sub_factors.empty else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -1132,7 +1212,8 @@ class MarketScanner:
         regime = getattr(self, "regime", "sideways")
         w = MarketRegimeDetector.get_weights(self.mode_name, regime)
 
-        # E2b: Factor IC 動態權重調整（需 >= 20 筆歷史推薦）
+        # E2b: Factor IC 動態權重調整（資料充足時自動啟用）
+        # ≥20 筆歷史推薦即自動校準；use_ic_adjustment=False 可關閉（測試用）
         if self.use_ic_adjustment:
             w = self._apply_ic_weight_adjustment(w)
 
@@ -1152,6 +1233,22 @@ class MarketScanner:
         candidates = candidates.merge(entry_exit, on="stock_id", how="left")
 
         return candidates
+
+    def get_sub_factor_df(self) -> pd.DataFrame:
+        """合併所有子因子 rank 為單一 DataFrame（供因子診斷使用）。
+
+        回傳 DataFrame 含 stock_id + 所有子因子欄位（如 tech_ret5d, chip_consec 等）。
+        若無子因子資料（未執行 run() 或子類未實作），回傳空 DataFrame。
+        """
+        if not self._sub_factor_ranks:
+            return pd.DataFrame()
+        result = None
+        for _key, df in self._sub_factor_ranks.items():
+            if result is None:
+                result = df.copy()
+            else:
+                result = result.merge(df, on="stock_id", how="outer")
+        return result if result is not None else pd.DataFrame()
 
     def _compute_extra_scores(self, stock_ids: list[str]) -> list[pd.DataFrame]:
         """hook：子類可覆寫以新增額外評分維度。回傳 DataFrame 的 list。"""
@@ -2533,6 +2630,22 @@ class MarketScanner:
         scores = scores.fillna(0.5)
 
         tech_score = scores.mean(axis=1)
+
+        # 保存子因子 rank 供 IC 診斷使用
+        sub_df = scores.copy()
+        sub_df["stock_id"] = idx.tolist()
+        sub_df = sub_df.rename(
+            columns={
+                "r5": "tech_ret5d",
+                "r10": "tech_ret10d",
+                "rb": "tech_breakout60d",
+                "rv": "tech_vol_ratio",
+                "ra": "tech_vol_accel",
+                "rs": "tech_sharpe_proxy",
+            }
+        )
+        self._sub_factor_ranks["technical"] = sub_df
+
         return pd.DataFrame({"stock_id": idx.tolist(), "technical_score": tech_score.to_numpy()})
 
     # ------------------------------------------------------------------ #

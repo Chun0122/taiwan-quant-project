@@ -91,7 +91,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/backtest/attribution.py` | 五因子歸因（momentum/reversal/quality/size/liquidity × Pearson）；雙接口 `compute()` / `compute_from_df()` |
 | `src/backtest/allocator.py` | risk_parity / mean_variance 配置（scipy） |
 | `src/backtest/portfolio.py` | 多股票組合回測（equal_weight / custom / risk_parity / mean_variance） |
-| `src/backtest/walk_forward.py` | Walk-Forward 滾動驗證（防過擬合） |
+| `src/backtest/walk_forward.py` | Walk-Forward 滾動驗證（防過擬合）；T+1 訊號延遲（與 BacktestEngine 一致） |
 
 **選股/Universe 層**
 
@@ -99,7 +99,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
-| `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
+| `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
 | `src/regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）；三訊號多數決；市場寬度降級（>60% 跌破 MA20）；Crisis 快速覆蓋（7 訊號 ≥2 觸發）；Hysteresis 狀態機（JSON 持久化） |
 | `src/industry/analyzer.py` | 產業輪動（法人+價格動能）；`compute_sector_relative_strength()`（個股 vs 同業中位數，±3%） |
 | `src/industry/concept_analyzer.py` | 概念股輪動；`ConceptRotationAnalyzer` Percentile Rank；±5% 加成（scanner Stage 3.3b） |
@@ -283,7 +283,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1627 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1653 個測試，43 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|

@@ -75,19 +75,20 @@ class TestSimulateFold:
 
     def test_buy_sell_trade(self):
         engine = self._make_engine()
-        dates = pd.bdate_range("2024-01-01", periods=5)
+        # signal_delay=1: day0 buy → day1 進場, day3 sell → day4 出場
+        dates = pd.bdate_range("2024-01-01", periods=6)
         idx = [d.date() for d in dates]
         data = pd.DataFrame(
             {
-                "close": [100, 101, 102, 103, 104],
-                "open": [100, 101, 102, 103, 104],
-                "high": [101, 102, 103, 104, 105],
-                "low": [99, 100, 101, 102, 103],
-                "volume": [1000] * 5,
+                "close": [100, 101, 102, 103, 104, 105],
+                "open": [100, 101, 102, 103, 104, 105],
+                "high": [101, 102, 103, 104, 105, 106],
+                "low": [99, 100, 101, 102, 103, 104],
+                "volume": [1000] * 6,
             },
             index=idx,
         )
-        signals = pd.Series([1, 0, 0, 0, -1], index=idx)
+        signals = pd.Series([1, 0, 0, -1, 0, 0], index=idx)
 
         result = engine._simulate_fold(data, signals, 1_000_000)
         assert len(result["trades"]) == 1
@@ -230,3 +231,67 @@ class TestWalkForwardRun:
         )
         result = engine.run()
         assert len(result.equity_curve) > 0
+
+
+# ================================================================
+# Signal Delay（T+1）
+# ================================================================
+
+
+class TestSignalDelay:
+    """驗證 _simulate_fold 應用 T+1 訊號延遲。"""
+
+    def _make_engine(self, signal_delay=1):
+        engine = object.__new__(WalkForwardEngine)
+        engine.config = BacktestConfig(signal_delay=signal_delay)
+        return engine
+
+    def test_signal_delay_shifts_entry(self):
+        """signal_delay=1 時，day0 的買訊號應在 day1 執行。"""
+        engine = self._make_engine(signal_delay=1)
+        dates = pd.bdate_range("2024-01-01", periods=6)
+        idx = [d.date() for d in dates]
+        data = pd.DataFrame(
+            {
+                "close": [100, 101, 102, 103, 104, 105],
+                "open": [100, 101, 102, 103, 104, 105],
+                "high": [101, 102, 103, 104, 105, 106],
+                "low": [99, 100, 101, 102, 103, 104],
+                "volume": [1000] * 6,
+            },
+            index=idx,
+        )
+        # 買在 day0，賣在 day3 → shift 後 → 買在 day1，賣在 day4
+        signals = pd.Series([1, 0, 0, -1, 0, 0], index=idx)
+        result = engine._simulate_fold(data, signals, 1_000_000)
+
+        assert len(result["trades"]) == 1
+        trade = result["trades"][0]
+        # 進場日應為 day1（shift 後）
+        assert trade.entry_date == idx[1]
+        # 出場日應為 day4（shift 後）
+        assert trade.exit_date == idx[4]
+
+    def test_no_delay_trades_same_day(self):
+        """signal_delay=0 時不 shift，day0 訊號 day0 執行。"""
+        engine = self._make_engine(signal_delay=0)
+        dates = pd.bdate_range("2024-01-01", periods=5)
+        idx = [d.date() for d in dates]
+        data = pd.DataFrame(
+            {
+                "close": [100, 101, 102, 103, 104],
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "volume": [1000] * 5,
+            },
+            index=idx,
+        )
+        signals = pd.Series([1, 0, 0, 0, -1], index=idx)
+        result = engine._simulate_fold(data, signals, 1_000_000)
+
+        assert len(result["trades"]) == 1
+        trade = result["trades"][0]
+        # 無 delay，day0 進場，day4 出場
+        assert trade.entry_date == idx[0]
+        assert trade.exit_date == idx[4]

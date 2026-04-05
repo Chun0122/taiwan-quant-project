@@ -110,7 +110,7 @@ import sys
 
 from src.cli.anomaly_cmd import cmd_anomaly_scan, cmd_revenue_scan
 from src.cli.backtest_cmd import cmd_backtest, cmd_walk_forward
-from src.cli.discover_cmd import cmd_discover, cmd_discover_backtest
+from src.cli.discover_cmd import cmd_discover, cmd_discover_backtest, cmd_factor_diagnostics
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
     cmd_dashboard,
@@ -326,8 +326,8 @@ def main() -> None:
     sp_disc.add_argument(
         "--use-ic-adjustment",
         action="store_true",
-        default=False,
-        help="啟用 Factor IC 動態權重調整（需 ≥20 筆歷史推薦，預設關閉）",
+        default=True,
+        help="Factor IC 動態權重調整（預設啟用，資料充足 ≥20 筆時自動校準）",
     )
     sp_disc.add_argument(
         "--ai-summary",
@@ -335,6 +335,25 @@ def main() -> None:
         default=False,
         help="呼叫 Claude API 生成 AI 選股摘要（需在 settings.yaml 設定 anthropic.api_key）",
     )
+    sp_disc.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="輸出掃描審計追蹤（硬風控剔除原因 + 軟加成調分明細）",
+    )
+
+    # factor-diagnostics 子命令
+    sp_fd = subparsers.add_parser("factor-diagnostics", help="因子診斷 — 子因子 IC + 相關性矩陣")
+    sp_fd.add_argument(
+        "--mode",
+        required=True,
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="掃描模式",
+    )
+    sp_fd.add_argument("--holding-days", type=int, default=5, help="前瞻報酬持有天數（預設 5）")
+    sp_fd.add_argument("--lookback-days", type=int, default=30, help="回溯天數（預設 30）")
+    sp_fd.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
+    sp_fd.add_argument("--export", default=None, help="匯出 CSV 路徑（相關性矩陣）")
 
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
@@ -706,6 +725,8 @@ def main() -> None:
         cmd_discover(args)
     elif args.command == "discover-backtest":
         cmd_discover_backtest(args)
+    elif args.command == "factor-diagnostics":
+        cmd_factor_diagnostics(args)
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":

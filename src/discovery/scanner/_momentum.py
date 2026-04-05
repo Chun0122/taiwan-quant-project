@@ -398,6 +398,25 @@ class MomentumScanner(MarketScanner):
         )
 
         df["chip_tier"] = chip_tier
+
+        # 保存子因子 rank 供 IC 診斷使用
+        chip_sub = pd.DataFrame({"stock_id": df["stock_id"].tolist()})
+        chip_sub["chip_consec"] = consec_rank.to_numpy()
+        chip_sub["chip_bvr"] = bvr_rank.to_numpy()
+        chip_sub["chip_total_net"] = total_rank.to_numpy()
+        chip_sub["chip_persist"] = persist_rank.to_numpy()
+        if has_margin:
+            chip_sub["chip_smr"] = smr_rank.to_numpy()
+        if has_whale:
+            chip_sub["chip_whale"] = whale_rank.to_numpy()
+        if has_sbl:
+            chip_sub["chip_sbl"] = sbl_rank.to_numpy()
+        if has_broker:
+            chip_sub["chip_broker"] = broker_rank.to_numpy()
+        if has_smart_broker:
+            chip_sub["chip_smart_broker"] = smart_broker_rank.to_numpy()
+        self._sub_factor_ranks["chip"] = chip_sub
+
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:

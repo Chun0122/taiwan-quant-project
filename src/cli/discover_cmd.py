@@ -122,6 +122,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 f"{ep_str:>8}  {sl_str:>12}  {tp_str:>12}  {trigger:<18}  {valid}"
             )
 
+    # 審計追蹤（--verbose 時輸出完整軌跡）
+    if getattr(args, "verbose", False) and result.audit_trail:
+        print(f"\n{result.audit_trail.format_verbose()}")
+
     # 儲存推薦記錄到 DB
     _save_discovery_records(result, mode, scanner)
 
@@ -570,3 +574,201 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
     if args.export and not result["detail"].empty:
         result["detail"].to_csv(args.export, index=False, encoding="utf-8-sig")
         print(f"\n明細已匯出至: {args.export}")
+
+
+def cmd_factor_diagnostics(args: "argparse.Namespace") -> None:
+    """因子診斷 — 子因子 IC + 相關性矩陣。
+
+    1. 執行一次掃描（取得子因子 rank）
+    2. 計算四維度 IC + 子因子 IC
+    3. 計算子因子間相關性矩陣
+    """
+    from src.discovery.scanner import (
+        DividendScanner,
+        GrowthScanner,
+        MomentumScanner,
+        SwingScanner,
+        ValueScanner,
+    )
+    from src.discovery.scanner._functions import (
+        compute_factor_correlation_matrix,
+        compute_factor_ic,
+        compute_sub_factor_ic,
+    )
+
+    init_db()
+
+    mode = args.mode
+    mode_label = {
+        "momentum": "Momentum",
+        "swing": "Swing",
+        "value": "Value",
+        "dividend": "Dividend",
+        "growth": "Growth",
+    }[mode]
+
+    # Step 1: 執行掃描取得子因子
+    scanner_map = {
+        "momentum": MomentumScanner,
+        "swing": SwingScanner,
+        "value": ValueScanner,
+        "dividend": DividendScanner,
+        "growth": GrowthScanner,
+    }
+
+    if not getattr(args, "skip_sync", False):
+        sync_days = 80 if mode == "swing" else 25
+        ensure_sync_market_data(sync_days, args)
+
+    print(f"正在執行 {mode_label} 掃描以收集子因子...")
+    scanner = scanner_map[mode](top_n_results=50)
+    result = scanner.run()
+
+    if result.rankings.empty:
+        print("無符合條件的股票，無法進行因子診斷")
+        return
+
+    # Step 2: 四維度 IC（使用歷史推薦記錄）
+    holding_days = getattr(args, "holding_days", 5)
+    lookback_days = getattr(args, "lookback_days", 30)
+
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import DailyPrice, DiscoveryRecord
+
+    cutoff = result.scan_date - timedelta(days=lookback_days + holding_days + 10)
+
+    with get_session() as session:
+        stmt = select(
+            DiscoveryRecord.scan_date,
+            DiscoveryRecord.stock_id,
+            DiscoveryRecord.close,
+            DiscoveryRecord.technical_score,
+            DiscoveryRecord.chip_score,
+            DiscoveryRecord.fundamental_score,
+            DiscoveryRecord.news_score,
+        ).where(DiscoveryRecord.mode == mode, DiscoveryRecord.scan_date >= cutoff)
+        rows = session.execute(stmt).all()
+        df_records = pd.DataFrame(
+            rows,
+            columns=[
+                "scan_date",
+                "stock_id",
+                "close",
+                "technical_score",
+                "chip_score",
+                "fundamental_score",
+                "news_score",
+            ],
+        )
+
+        if df_records.empty:
+            print(f"無 {mode} 模式的歷史推薦記錄，無法計算 IC")
+            print("請先執行幾次 discover 掃描累積資料")
+            return
+
+        stock_ids = df_records["stock_id"].unique().tolist()
+        price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+            DailyPrice.stock_id.in_(stock_ids),
+            DailyPrice.date >= cutoff,
+        )
+        price_rows = session.execute(price_stmt).all()
+        df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+    # 四維度 IC
+    ic_df = compute_factor_ic(df_records, df_prices, holding_days=holding_days, lookback_days=lookback_days)
+
+    print(f"\n{'=' * 70}")
+    print(f"因子診斷報告 [{mode_label}] — {holding_days} 日持有期, {lookback_days} 日回溯")
+    print(f"歷史推薦: {len(df_records)} 筆")
+    print(f"{'=' * 70}")
+
+    if not ic_df.empty:
+        print(f"\n{'─' * 50}")
+        print("四維度 IC（Information Coefficient）")
+        print(f"{'因子':<25} {'IC':>8} {'樣本':>6} {'評價':<10}")
+        print(f"{'─' * 50}")
+        for _, row in ic_df.iterrows():
+            label = {"effective": "✓ 有效", "weak": "○ 弱", "inverse": "✗ 反向"}.get(row["direction"], "?")
+            print(f"{row['factor']:<25} {row['ic']:>8.4f} {int(row['evaluable_count']):>6} {label:<10}")
+    else:
+        print("\n四維度 IC: 資料不足（需 ≥10 筆可評估推薦）")
+
+    # Step 3: 子因子相關性矩陣
+    sub_df = result.sub_factor_df
+    if sub_df is not None and not sub_df.empty:
+        corr_matrix = compute_factor_correlation_matrix(sub_df)
+        if not corr_matrix.empty:
+            print(f"\n{'─' * 50}")
+            print("子因子相關性矩陣（Spearman）")
+            print(f"{'─' * 50}")
+
+            # 找出高相關對
+            high_corr_pairs: list[tuple[str, str, float]] = []
+            cols = corr_matrix.columns.tolist()
+            for i, c1 in enumerate(cols):
+                for c2 in cols[i + 1 :]:
+                    corr = corr_matrix.loc[c1, c2]
+                    if abs(corr) > 0.6:
+                        high_corr_pairs.append((c1, c2, corr))
+
+            if high_corr_pairs:
+                print("\n高相關因子對（|r| > 0.6 — 可能冗餘）:")
+                high_corr_pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+                for c1, c2, r in high_corr_pairs:
+                    print(f"  {c1:<22} × {c2:<22} r={r:+.3f}")
+            else:
+                print("\n無高相關因子對（|r| > 0.6）— 因子獨立性良好")
+
+            # 簡潔矩陣輸出
+            print(f"\n完整矩陣（{len(cols)} 因子）:")
+            # 只打印對角線以下
+            header = f"{'':>22}" + "".join(f"{c[:8]:>9}" for c in cols)
+            print(header)
+            for i, c1 in enumerate(cols):
+                row_str = f"{c1:<22}"
+                for j, c2 in enumerate(cols):
+                    if j > i:
+                        row_str += f"{'':>9}"
+                    else:
+                        row_str += f"{corr_matrix.loc[c1, c2]:>+9.3f}"
+                print(row_str)
+
+            # 匯出
+            if args.export:
+                corr_matrix.to_csv(args.export, encoding="utf-8-sig")
+                print(f"\n相關性矩陣已匯出至: {args.export}")
+    else:
+        print("\n子因子 rank: 此模式尚未實作子因子輸出")
+
+    # Step 4: 子因子 IC（需要歷史推薦 + 子因子 rank 合併）
+    # 當前掃描的子因子只有今天的 snapshot，若歷史也有 sub_factor_df 可擴展
+    # 此處以今天的 sub_factor + 歷史 close → 計算今天候選的單截面 IC
+    if sub_df is not None and not sub_df.empty:
+        # 合併 scan_date 和 close 到 sub_factor_df
+        close_map = dict(zip(result.rankings["stock_id"], result.rankings["close"]))
+        sub_with_meta = sub_df.copy()
+        sub_with_meta["scan_date"] = result.scan_date
+        sub_with_meta["close"] = sub_with_meta["stock_id"].map(close_map)
+        sub_with_meta = sub_with_meta.dropna(subset=["close"])
+
+        if not sub_with_meta.empty:
+            sub_ic = compute_sub_factor_ic(
+                sub_with_meta,
+                df_prices,
+                holding_days=holding_days,
+                lookback_days=lookback_days + 30,
+            )
+            if not sub_ic.empty:
+                print(f"\n{'─' * 50}")
+                print("子因子 IC（當前截面 — 需累積更多歷史方具統計意義）")
+                print(f"{'因子':<25} {'IC':>8} {'樣本':>6} {'評價':<10}")
+                print(f"{'─' * 50}")
+                for _, row in sub_ic.iterrows():
+                    label = {"effective": "✓ 有效", "weak": "○ 弱", "inverse": "✗ 反向"}.get(row["direction"], "?")
+                    print(f"{row['factor']:<25} {row['ic']:>8.4f} {int(row['evaluable_count']):>6} {label:<10}")
+
+    print(f"\n{'=' * 70}")

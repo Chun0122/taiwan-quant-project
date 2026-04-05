@@ -292,6 +292,10 @@ class WalkForwardEngine:
         initial_capital: float,
     ) -> dict:
         """模擬單個 fold 的 test 期間交易。"""
+        # T+1 訊號延遲：與 BacktestEngine 一致，今日訊號次日執行
+        if self.config.signal_delay > 0:
+            signals = signals.shift(self.config.signal_delay).fillna(0).astype(int)
+
         capital = initial_capital
         position = 0
         entry_price = 0.0

@@ -1988,6 +1988,94 @@ def compute_factor_ic(
     return pd.DataFrame(results)
 
 
+def compute_sub_factor_ic(
+    sub_factor_df: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    holding_days: int = 5,
+    lookback_days: int = 30,
+    reference_date: date | None = None,
+) -> pd.DataFrame:
+    """計算子因子與後續報酬率的 IC（Spearman Rank Correlation）。
+
+    與 compute_factor_ic 類似，��接受任意欄位名的子因子 DataFrame。
+    要求 sub_factor_df 含 scan_date / stock_id / close 欄位，
+    其餘所有數值欄位視為子因子。
+
+    Returns:
+        DataFrame(factor, ic, evaluable_count, direction)
+    """
+    if sub_factor_df.empty or df_prices.empty:
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    ref_date = reference_date or date.today()
+    cutoff = ref_date - timedelta(days=lookback_days)
+
+    mask = sub_factor_df["scan_date"].apply(lambda d: d >= cutoff if isinstance(d, date) else False)
+    recent = sub_factor_df[mask].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    # 計算前瞻報酬
+    ret_map: dict[tuple, float] = {}
+    for _, rec in recent.iterrows():
+        scan_d = rec["scan_date"]
+        sid = rec["stock_id"]
+        entry_close = float(rec["close"])
+        if entry_close <= 0:
+            continue
+        future = df_prices[(df_prices["stock_id"] == sid) & (df_prices["date"] > scan_d)].sort_values("date")
+        if len(future) >= holding_days:
+            exit_close = float(future.iloc[holding_days - 1]["close"])
+            ret_map[(scan_d, sid)] = (exit_close - entry_close) / entry_close
+
+    if len(ret_map) < 10:
+        return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
+
+    recent["forward_return"] = recent.apply(lambda r: ret_map.get((r["scan_date"], r["stock_id"]), None), axis=1)
+    recent = recent.dropna(subset=["forward_return"])
+
+    # 找出所有子因子欄位（排除 metadata 欄位）
+    meta_cols = {"scan_date", "stock_id", "close", "forward_return", "mode"}
+    factor_cols = [
+        c for c in recent.columns if c not in meta_cols and recent[c].dtype in ("float64", "float32", "int64")
+    ]
+
+    results: list[dict] = []
+    for factor in factor_cols:
+        valid = recent[[factor, "forward_return"]].dropna()
+        if len(valid) < 10:
+            continue
+        ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
+        if np.isnan(ic):
+            ic = 0.0
+        direction = "effective" if ic > 0.05 else ("inverse" if ic < -0.05 else "weak")
+        results.append({"factor": factor, "ic": round(ic, 4), "evaluable_count": len(valid), "direction": direction})
+
+    return pd.DataFrame(results)
+
+
+def compute_factor_correlation_matrix(
+    sub_factor_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """計算子因子間的 Spearman 相關性矩陣。
+
+    Args:
+        sub_factor_df: 含子因子 rank 欄位的 DataFrame（stock_id + 因子欄位）
+
+    Returns:
+        相關性矩陣 DataFrame（index/columns 皆為因子名稱）
+    """
+    meta_cols = {"scan_date", "stock_id", "close", "mode", "forward_return"}
+    factor_cols = [
+        c
+        for c in sub_factor_df.columns
+        if c not in meta_cols and sub_factor_df[c].dtype in ("float64", "float32", "int64")
+    ]
+    if len(factor_cols) < 2:
+        return pd.DataFrame()
+    return sub_factor_df[factor_cols].corr(method="spearman")
+
+
 def compute_ic_weight_adjustments(
     ic_df: pd.DataFrame,
     base_weights: dict[str, float],
@@ -2577,6 +2665,152 @@ def detect_chip_tier_changes(
     ].reset_index(drop=True)
 
 
+class ScanAuditTrail:
+    """掃描流程審計追蹤器。
+
+    記錄每支股票在各階段的過濾/調分原因，供 debug 與效能分析使用。
+    事件分為兩類：
+    - hard_filter: 硬風控（通過或剔除，不可逆）
+    - score_adj: 軟加成（composite_score 乘數調整，可累加）
+    """
+
+    def __init__(self) -> None:
+        self._events: list[dict] = []
+
+    def record_hard_filter(
+        self,
+        stage: str,
+        stock_ids_before: set[str],
+        stock_ids_after: set[str],
+        reason: str,
+    ) -> None:
+        """記錄硬風控事件（剔除型）。"""
+        removed = stock_ids_before - stock_ids_after
+        if not removed:
+            return
+        for sid in removed:
+            self._events.append(
+                {
+                    "stock_id": sid,
+                    "stage": stage,
+                    "type": "hard_filter",
+                    "reason": reason,
+                    "detail": "剔除",
+                }
+            )
+
+    def record_score_adjustment(
+        self,
+        stage: str,
+        stock_id: str,
+        adjustment: float,
+        reason: str,
+    ) -> None:
+        """記錄軟加成事件（調分型）。"""
+        if abs(adjustment) < 1e-6:
+            return
+        self._events.append(
+            {
+                "stock_id": stock_id,
+                "stage": stage,
+                "type": "score_adj",
+                "reason": reason,
+                "detail": f"{adjustment:+.4f}",
+            }
+        )
+
+    def record_score_adjustments_from_column(
+        self,
+        stage: str,
+        df: pd.DataFrame,
+        adj_column: str,
+        reason: str,
+    ) -> None:
+        """從 DataFrame 欄位批次記錄調分事件。"""
+        if adj_column not in df.columns:
+            return
+        for _, row in df.iterrows():
+            val = row[adj_column]
+            if pd.notna(val) and abs(val) >= 1e-6:
+                self._events.append(
+                    {
+                        "stock_id": row["stock_id"],
+                        "stage": stage,
+                        "type": "score_adj",
+                        "reason": reason,
+                        "detail": f"{val:+.4f}",
+                    }
+                )
+
+    def get_events(self) -> list[dict]:
+        """回傳所有事件（原始 list）。"""
+        return self._events
+
+    def get_stock_trail(self, stock_id: str) -> list[dict]:
+        """查詢特定股票的完整審計軌跡。"""
+        return [e for e in self._events if e["stock_id"] == stock_id]
+
+    def summary(self) -> dict:
+        """產生摘要統計。"""
+        hard = [e for e in self._events if e["type"] == "hard_filter"]
+        adj = [e for e in self._events if e["type"] == "score_adj"]
+        # 按 stage 分組統計硬風控剔除數
+        hard_by_stage: dict[str, int] = {}
+        for e in hard:
+            hard_by_stage[e["stage"]] = hard_by_stage.get(e["stage"], 0) + 1
+        # 按 stage 分組統計調分影響數
+        adj_by_stage: dict[str, int] = {}
+        for e in adj:
+            adj_by_stage[e["stage"]] = adj_by_stage.get(e["stage"], 0) + 1
+        return {
+            "total_hard_filters": len(hard),
+            "total_score_adjustments": len(adj),
+            "hard_filters_by_stage": hard_by_stage,
+            "score_adjustments_by_stage": adj_by_stage,
+            "unique_stocks_filtered": len({e["stock_id"] for e in hard}),
+            "unique_stocks_adjusted": len({e["stock_id"] for e in adj}),
+        }
+
+    def format_verbose(self, top_n: int = 10) -> str:
+        """格式化為人類可讀的 verbose 輸出。"""
+        lines: list[str] = []
+        s = self.summary()
+        lines.append("=" * 60)
+        lines.append("掃描審計摘要")
+        lines.append("=" * 60)
+        lines.append(f"硬風控剔除: {s['total_hard_filters']} 支（{s['unique_stocks_filtered']} 支不重複）")
+        lines.append(f"軟加成調分: {s['total_score_adjustments']} 筆（{s['unique_stocks_adjusted']} 支不重複）")
+
+        if s["hard_filters_by_stage"]:
+            lines.append("")
+            lines.append("硬風控分階段剔除數:")
+            for stage, count in sorted(s["hard_filters_by_stage"].items()):
+                lines.append(f"  {stage}: {count}")
+
+        if s["score_adjustments_by_stage"]:
+            lines.append("")
+            lines.append("軟加成分階段影響數:")
+            for stage, count in sorted(s["score_adjustments_by_stage"].items()):
+                lines.append(f"  {stage}: {count}")
+
+        # 顯示前 N 支被剔除的股票詳情
+        hard = [e for e in self._events if e["type"] == "hard_filter"]
+        if hard:
+            lines.append("")
+            lines.append(f"被剔除股票（前 {top_n} 支）:")
+            shown: set[str] = set()
+            for e in hard:
+                if e["stock_id"] in shown:
+                    continue
+                shown.add(e["stock_id"])
+                lines.append(f"  {e['stock_id']} — {e['stage']}: {e['reason']}")
+                if len(shown) >= top_n:
+                    break
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
 @dataclass
 class DiscoveryResult:
     """掃描結果資料容器。"""
@@ -2587,3 +2821,5 @@ class DiscoveryResult:
     scan_date: date = field(default_factory=date.today)
     sector_summary: pd.DataFrame | None = None
     mode: str = "momentum"
+    audit_trail: ScanAuditTrail | None = None
+    sub_factor_df: pd.DataFrame | None = None

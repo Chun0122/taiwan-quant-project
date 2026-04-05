@@ -49,6 +49,7 @@ def scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -358,6 +359,7 @@ def momentum_scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -893,6 +895,7 @@ def swing_scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -1469,6 +1472,7 @@ def value_scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -1731,6 +1735,7 @@ def dividend_scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -1974,6 +1979,7 @@ def growth_scanner():
         min_volume=100_000,
         top_n_candidates=10,
         top_n_results=5,
+        use_ic_adjustment=False,
     )
 
 
@@ -7429,15 +7435,15 @@ class TestDetectChipTierChanges:
 class TestUseICAdjustmentFlag:
     """Scanner use_ic_adjustment 旗標測試。"""
 
-    def test_flag_defaults_to_false(self):
-        """預設不啟用 IC 權重調整。"""
+    def test_flag_defaults_to_true(self):
+        """預設啟用 IC 權重調整（資料充足時自動校準）。"""
         s = MarketScanner()
-        assert s.use_ic_adjustment is False
-
-    def test_flag_can_be_enabled(self):
-        """可透過參數啟用。"""
-        s = MarketScanner(use_ic_adjustment=True)
         assert s.use_ic_adjustment is True
+
+    def test_flag_can_be_disabled(self):
+        """可透過參數關閉（測試環境使用）。"""
+        s = MarketScanner(use_ic_adjustment=False)
+        assert s.use_ic_adjustment is False
 
     def test_ic_adjustment_no_data_returns_original(self, monkeypatch):
         """無歷史推薦時 _apply_ic_weight_adjustment 回傳原始權重。"""
@@ -7475,3 +7481,258 @@ class TestUseICAdjustmentFlag:
         assert adjusted["technical_score"] > base["technical_score"]
         assert adjusted["chip_score"] < base["chip_score"]
         assert adjusted["fundamental_score"] < base["fundamental_score"]
+
+
+# ================================================================== #
+#  ScanAuditTrail 測試
+# ================================================================== #
+
+
+def test_audit_trail_record_hard_filter():
+    """硬風控記錄：記錄被剔除的股票。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    before = {"2330", "2317", "2454", "3008"}
+    after = {"2330", "2317"}
+    audit.record_hard_filter("3.5 風險過濾", before, after, "ATR超過門檻")
+
+    events = audit.get_events()
+    assert len(events) == 2
+    removed_ids = {e["stock_id"] for e in events}
+    assert removed_ids == {"2454", "3008"}
+    assert all(e["type"] == "hard_filter" for e in events)
+    assert all(e["stage"] == "3.5 風險過濾" for e in events)
+
+
+def test_audit_trail_record_hard_filter_no_removal():
+    """硬風控記錄：無股票被剔除時不產生事件。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    ids = {"2330", "2317"}
+    audit.record_hard_filter("3.5 風險過濾", ids, ids, "ATR超過門檻")
+    assert audit.get_events() == []
+
+
+def test_audit_trail_record_score_adjustment():
+    """軟加成記錄：單筆調分。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    audit.record_score_adjustment("3.3 產業輪動", "2330", 0.05, "半導體產業加成")
+    audit.record_score_adjustment("3.3 產業輪動", "2317", 0.0, "無加成")  # 零值不記錄
+
+    events = audit.get_events()
+    assert len(events) == 1
+    assert events[0]["stock_id"] == "2330"
+    assert events[0]["detail"] == "+0.0500"
+
+
+def test_audit_trail_record_from_column():
+    """從 DataFrame 欄位批次記錄調分。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    df = pd.DataFrame(
+        {
+            "stock_id": ["2330", "2317", "2454"],
+            "sector_bonus": [0.05, 0.0, -0.03],
+        }
+    )
+    audit.record_score_adjustments_from_column("3.3 產業輪動", df, "sector_bonus", "產業加成")
+
+    events = audit.get_events()
+    assert len(events) == 2  # 0.0 被跳過
+    ids = {e["stock_id"] for e in events}
+    assert ids == {"2330", "2454"}
+
+
+def test_audit_trail_get_stock_trail():
+    """查詢特定股票的完整審計軌跡。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    audit.record_score_adjustment("3.3 產業輪動", "2330", 0.05, "半導體加成")
+    audit.record_score_adjustment("3.4 週線確認", "2330", -0.05, "週線空頭")
+    audit.record_score_adjustment("3.3 產業輪動", "2317", 0.03, "電子加成")
+
+    trail = audit.get_stock_trail("2330")
+    assert len(trail) == 2
+    assert trail[0]["stage"] == "3.3 產業輪動"
+    assert trail[1]["stage"] == "3.4 週線確認"
+
+
+def test_audit_trail_summary():
+    """摘要統計。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    # 2 次硬風控
+    audit.record_hard_filter("3.5 風險過濾", {"A", "B", "C"}, {"A"}, "波動過高")
+    audit.record_hard_filter("3.7 分數門檻", {"A"}, set(), "分數不足")
+    # 3 次軟加成
+    audit.record_score_adjustment("3.3 產業輪動", "X", 0.05, "加成")
+    audit.record_score_adjustment("3.3 產業輪動", "Y", -0.03, "扣分")
+    audit.record_score_adjustment("3.4 週線確認", "X", 0.05, "加分")
+
+    s = audit.summary()
+    assert s["total_hard_filters"] == 3  # B, C 在 3.5; A 在 3.7
+    assert s["total_score_adjustments"] == 3
+    assert s["unique_stocks_filtered"] == 3  # A, B, C
+    assert s["unique_stocks_adjusted"] == 2  # X, Y
+    assert s["hard_filters_by_stage"]["3.5 風險過濾"] == 2
+    assert s["hard_filters_by_stage"]["3.7 分數門檻"] == 1
+
+
+def test_audit_trail_format_verbose():
+    """format_verbose 輸出格式檢查。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    audit.record_hard_filter("3.5 風險過濾", {"2330", "2317"}, {"2330"}, "波動過高")
+    audit.record_score_adjustment("3.3 產業輪動", "2330", 0.05, "半導體加成")
+
+    output = audit.format_verbose()
+    assert "掃描審計摘要" in output
+    assert "硬風控剔除" in output
+    assert "軟加成調分" in output
+    assert "2317" in output  # 被剔除的股票
+
+
+def test_audit_trail_empty():
+    """空審計軌跡的摘要。"""
+    from src.discovery.scanner._functions import ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    s = audit.summary()
+    assert s["total_hard_filters"] == 0
+    assert s["total_score_adjustments"] == 0
+    assert audit.format_verbose()  # 不應拋錯
+
+
+def test_discovery_result_has_audit_trail():
+    """DiscoveryResult 包含 audit_trail 欄位。"""
+    from src.discovery.scanner._functions import DiscoveryResult, ScanAuditTrail
+
+    audit = ScanAuditTrail()
+    result = DiscoveryResult(
+        rankings=pd.DataFrame(),
+        total_stocks=100,
+        after_coarse=50,
+        mode="momentum",
+        audit_trail=audit,
+    )
+    assert result.audit_trail is audit
+
+    # 不傳 audit_trail 時預設 None
+    result2 = DiscoveryResult(
+        rankings=pd.DataFrame(),
+        total_stocks=100,
+        after_coarse=50,
+        mode="momentum",
+    )
+    assert result2.audit_trail is None
+
+
+# ================================================================== #
+#  子因子 IC / 相關性矩陣測試
+# ================================================================== #
+
+
+def test_compute_factor_correlation_matrix():
+    """子因子相關性矩陣基本功能。"""
+    from src.discovery.scanner._functions import compute_factor_correlation_matrix
+
+    df = pd.DataFrame(
+        {
+            "stock_id": ["A", "B", "C", "D", "E"],
+            "f1": [0.9, 0.8, 0.7, 0.6, 0.5],
+            "f2": [0.85, 0.75, 0.65, 0.55, 0.45],  # 與 f1 高度相關
+            "f3": [0.1, 0.9, 0.5, 0.3, 0.7],  # 與 f1 低相關
+        }
+    )
+    corr = compute_factor_correlation_matrix(df)
+    assert not corr.empty
+    assert "f1" in corr.columns
+    assert "f2" in corr.columns
+    assert "f3" in corr.columns
+    # f1-f2 高相關
+    assert corr.loc["f1", "f2"] > 0.8
+    # 對角線為 1
+    assert corr.loc["f1", "f1"] == pytest.approx(1.0)
+
+
+def test_compute_factor_correlation_matrix_empty():
+    """空 DataFrame 回傳空矩陣。"""
+    from src.discovery.scanner._functions import compute_factor_correlation_matrix
+
+    df = pd.DataFrame({"stock_id": ["A"], "f1": [0.5]})
+    corr = compute_factor_correlation_matrix(df)
+    assert corr.empty  # 只有 1 個因子，無法計算相關性
+
+
+def test_compute_sub_factor_ic_basic():
+    """子因子 IC 基本功能。"""
+    from src.discovery.scanner._functions import compute_sub_factor_ic
+
+    # 建立子因子 DataFrame
+    dates = [date.today() - timedelta(days=20)] * 15
+    sub_df = pd.DataFrame(
+        {
+            "scan_date": dates,
+            "stock_id": [f"S{i:02d}" for i in range(15)],
+            "close": [100 + i for i in range(15)],
+            "factor_a": [i * 0.1 for i in range(15)],
+            "factor_b": [0.5] * 15,  # 常數因子
+        }
+    )
+    # 建立價格（讓報酬與 factor_a 正相關）
+    price_rows = []
+    for i in range(15):
+        sid = f"S{i:02d}"
+        for d in range(30):
+            price_rows.append(
+                {
+                    "stock_id": sid,
+                    "date": date.today() - timedelta(days=25) + timedelta(days=d),
+                    "close": 100 + i + d * 0.5 + i * 0.2,
+                }
+            )
+    df_prices = pd.DataFrame(price_rows)
+
+    result = compute_sub_factor_ic(sub_df, df_prices, holding_days=5, lookback_days=30)
+    # factor_a 應有正 IC（與報酬正相關）
+    if not result.empty:
+        fa_row = result[result["factor"] == "factor_a"]
+        if not fa_row.empty:
+            assert fa_row.iloc[0]["ic"] > 0
+
+
+def test_compute_sub_factor_ic_empty():
+    """空輸入回傳空結果。"""
+    from src.discovery.scanner._functions import compute_sub_factor_ic
+
+    result = compute_sub_factor_ic(pd.DataFrame(), pd.DataFrame())
+    assert result.empty
+
+
+def test_get_sub_factor_df_empty():
+    """未執行掃描時子因子 DataFrame 為空。"""
+    s = MarketScanner(use_ic_adjustment=False)
+    assert s.get_sub_factor_df().empty
+
+
+def test_momentum_scanner_stores_sub_factors(momentum_scanner):
+    """MomentumScanner 執行後保存技術面子因子。"""
+    from tests.scanner_helpers import make_momentum_price_df
+
+    df_price = make_momentum_price_df(25, 5)
+    sids = df_price["stock_id"].unique().tolist()
+    momentum_scanner._compute_momentum_style_technical_scores(sids, df_price)
+
+    assert "technical" in momentum_scanner._sub_factor_ranks
+    sub = momentum_scanner._sub_factor_ranks["technical"]
+    assert "tech_ret5d" in sub.columns
+    assert "tech_sharpe_proxy" in sub.columns
+    assert len(sub) == len(sids)

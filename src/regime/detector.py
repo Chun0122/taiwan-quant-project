@@ -80,14 +80,16 @@ REGIME_WEIGHTS: dict[str, dict[str, dict[str, float]]] = {
         "sideways": {"technical": 0.30, "chip": 0.50, "fundamental": 0.10, "news": 0.10},
         # Bear：技術面降至 25%，消息面提升至 20%，確保選出有事件催化劑的錯殺股
         "bear": {"technical": 0.25, "chip": 0.40, "fundamental": 0.15, "news": 0.20},
-        # Crisis：技術訊號失真，籌碼為主要防禦指標，消息面催化劑最高優先
-        "crisis": {"technical": 0.10, "chip": 0.30, "fundamental": 0.20, "news": 0.40},
+        # Crisis：技術訊號失真，籌碼+基本面為主要防禦指標；
+        # 消息面（MOPS）涵蓋範圍有限，過高權重易在無公告時失真，降至 0.25
+        "crisis": {"technical": 0.10, "chip": 0.35, "fundamental": 0.30, "news": 0.25},
     },
     "swing": {
         "bull": {"technical": 0.30, "chip": 0.20, "fundamental": 0.40, "news": 0.10},
         "sideways": {"technical": 0.25, "chip": 0.25, "fundamental": 0.35, "news": 0.15},
         "bear": {"technical": 0.15, "chip": 0.25, "fundamental": 0.45, "news": 0.15},
-        "crisis": {"technical": 0.05, "chip": 0.20, "fundamental": 0.50, "news": 0.25},
+        # Crisis：基本面防禦力最重要，消息面從 0.25 降至 0.20
+        "crisis": {"technical": 0.05, "chip": 0.20, "fundamental": 0.55, "news": 0.20},
     },
     "value": {
         "bull": {"fundamental": 0.40, "valuation": 0.35, "chip": 0.15, "news": 0.10},
@@ -105,7 +107,8 @@ REGIME_WEIGHTS: dict[str, dict[str, dict[str, float]]] = {
         "bull": {"fundamental": 0.45, "technical": 0.30, "chip": 0.15, "news": 0.10},
         "sideways": {"fundamental": 0.40, "technical": 0.25, "chip": 0.20, "news": 0.15},
         "bear": {"fundamental": 0.50, "technical": 0.15, "chip": 0.15, "news": 0.20},
-        "crisis": {"fundamental": 0.55, "technical": 0.05, "chip": 0.15, "news": 0.25},
+        # Crisis：基本面為核心防禦，消息面從 0.25 降至 0.20
+        "crisis": {"fundamental": 0.60, "technical": 0.05, "chip": 0.15, "news": 0.20},
     },
 }
 

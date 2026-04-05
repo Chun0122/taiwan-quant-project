@@ -373,18 +373,20 @@ class TestRegimeWeightsCrisis:
             w = REGIME_WEIGHTS[mode]["crisis"]
             assert sum(w.values()) == pytest.approx(1.0), f"{mode}/crisis 權重和不為 1"
 
-    def test_momentum_crisis_news_dominant(self):
-        """momentum/crisis：消息面（0.40）應為最高權重（技術失真時事件催化劑優先）。"""
+    def test_momentum_crisis_chip_fundamental_dominant(self):
+        """momentum/crisis：籌碼+基本面為主要防禦，消息面降至 0.25（MOPS 涵蓋有限）。"""
         w = REGIME_WEIGHTS["momentum"]["crisis"]
-        assert w["news"] == 0.40
+        assert w["news"] == 0.25
+        assert w["chip"] == 0.35
+        assert w["fundamental"] == 0.30
+        assert w["chip"] > w["news"]
+        assert w["fundamental"] > w["news"]
         assert w["news"] > w["technical"]
-        assert w["news"] > w["chip"]
-        assert w["news"] > w["fundamental"]
 
     def test_swing_crisis_fundamental_dominant(self):
-        """swing/crisis：基本面（0.50）應為最高權重（品質防禦）。"""
+        """swing/crisis：基本面（0.55）應為最高權重（品質防禦）。"""
         w = REGIME_WEIGHTS["swing"]["crisis"]
-        assert w["fundamental"] == 0.50
+        assert w["fundamental"] == 0.55
         assert w["fundamental"] > w["news"]
 
     def test_crisis_technical_weight_lower_than_bear(self):
@@ -397,7 +399,7 @@ class TestRegimeWeightsCrisis:
     def test_get_weights_crisis_returns_correct_dict(self):
         """get_weights('momentum', 'crisis') 回傳正確權重字典。"""
         w = MarketRegimeDetector.get_weights("momentum", "crisis")
-        assert w["news"] == 0.40
+        assert w["news"] == 0.25
         assert w["technical"] == 0.10
         assert sum(w.values()) == pytest.approx(1.0)
 

@@ -8,7 +8,7 @@ from src.data.schema import DailyPrice, DiscoveryRecord
 from src.discovery.performance import DiscoveryPerformance, compute_strategy_decay
 
 
-def _insert_discovery(session, scan_date, mode, rank, stock_id, close, score=0.8, name=None):
+def _insert_discovery(session, scan_date, mode, rank, stock_id, close, score=0.8, name=None, regime=None):
     """輔助：插入一筆 DiscoveryRecord。"""
     session.add(
         DiscoveryRecord(
@@ -19,6 +19,7 @@ def _insert_discovery(session, scan_date, mode, rank, stock_id, close, score=0.8
             stock_name=name or stock_id,
             close=close,
             composite_score=score,
+            regime=regime,
         )
     )
     session.flush()
@@ -391,3 +392,168 @@ class TestComputeStrategyDecay:
 
         # win_rate_decay = (40% - 80%) * 100 = -40 pct points
         assert result["win_rate_decay"] == -40.0
+
+
+# ─── Regime 分組績效 ──────────────────────────────────────
+
+
+class TestByRegime:
+    """Regime 分組績效統計。"""
+
+    def test_regime_grouping(self, db_session):
+        """不同 regime 的推薦應分別統計。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "R001", 100.0, regime="bull")
+        _insert_discovery(db_session, scan_date, "momentum", 2, "R002", 100.0, regime="bull")
+        _insert_discovery(db_session, scan_date, "momentum", 3, "R003", 100.0, regime="bear")
+
+        # R001: +10%, R002: +5%, R003: -5%
+        _insert_prices(db_session, "R001", "2025-06-03", [102, 104, 106, 108, 110])
+        _insert_prices(db_session, "R002", "2025-06-03", [101, 102, 103, 104, 105])
+        _insert_prices(db_session, "R003", "2025-06-03", [99, 98, 97, 96, 95])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+
+        by_regime = result["by_regime"]
+        assert not by_regime.empty
+
+        bull = by_regime[by_regime["regime"] == "bull"]
+        bear = by_regime[by_regime["regime"] == "bear"]
+        assert len(bull) == 1
+        assert len(bear) == 1
+        assert bull.iloc[0]["count"] == 2
+        assert bull.iloc[0]["win_rate"] == 1.0
+        assert bear.iloc[0]["count"] == 1
+        assert bear.iloc[0]["win_rate"] == 0.0
+
+    def test_no_regime_returns_empty(self, db_session):
+        """所有 regime 為 None 時 by_regime 為空。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "NR01", 100.0, regime=None)
+        _insert_prices(db_session, "NR01", "2025-06-03", [101, 102, 103, 104, 105])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        assert result["by_regime"].empty
+
+
+# ─── 換手率 ──────────────────────────────────────────────
+
+
+class TestTurnover:
+    """推薦清單換手率計算。"""
+
+    def test_turnover_basic(self, db_session):
+        """兩次掃描有部分重疊，驗證換手率。"""
+        # 第一次掃描：A, B, C
+        d1 = date(2025, 6, 2)
+        for i, sid in enumerate(["T001", "T002", "T003"], 1):
+            _insert_discovery(db_session, d1, "momentum", i, sid, 100.0)
+            _insert_prices(db_session, sid, "2025-06-03", [101, 102, 103, 104, 105])
+
+        # 第二次掃描：B, C, D（A 退出，D 新增）
+        d2 = date(2025, 6, 9)
+        for i, sid in enumerate(["T002", "T003", "T004"], 1):
+            _insert_discovery(db_session, d2, "momentum", i, sid, 100.0)
+        _insert_prices(db_session, "T004", "2025-06-10", [101, 102, 103, 104, 105])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+
+        turnover = result["turnover"]
+        assert len(turnover) == 1
+        row = turnover.iloc[0]
+        assert row["overlap"] == 2  # B, C
+        assert row["new_entries"] == 1  # D
+        assert row["exits"] == 1  # A
+        # turnover = 1 - 2/3 = 0.3333
+        assert abs(row["turnover"] - (1 - 2 / 3)) < 0.01
+
+    def test_single_scan_no_turnover(self, db_session):
+        """只有一次掃描，turnover 為空。"""
+        d1 = date(2025, 6, 2)
+        _insert_discovery(db_session, d1, "momentum", 1, "TN01", 100.0)
+        _insert_prices(db_session, "TN01", "2025-06-03", [101, 102, 103, 104, 105])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        assert result["turnover"].empty
+
+    def test_complete_turnover(self, db_session):
+        """完全不重疊 → turnover = 1.0。"""
+        d1 = date(2025, 6, 2)
+        _insert_discovery(db_session, d1, "momentum", 1, "CT01", 100.0)
+        _insert_prices(db_session, "CT01", "2025-06-03", [101, 102, 103, 104, 105])
+
+        d2 = date(2025, 6, 9)
+        _insert_discovery(db_session, d2, "momentum", 1, "CT02", 100.0)
+        _insert_prices(db_session, "CT02", "2025-06-10", [101, 102, 103, 104, 105])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        assert result["turnover"].iloc[0]["turnover"] == 1.0
+
+
+# ─── MFE/MAE 整合 ────────────────────────────────────────
+
+
+class TestMfeMae:
+    """MFE/MAE 整合測試。"""
+
+    def test_mfe_mae_computed(self, db_session):
+        """驗證 MFE/MAE 在 evaluate() 中被計算。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "MM01", 100.0)
+
+        # 持續上漲：high 比 close 高 1，low 比 close 低 1
+        _insert_prices(db_session, "MM01", "2025-06-03", [102, 104, 106, 108, 110])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+
+        mfe_mae = result["mfe_mae"]
+        assert not mfe_mae.empty
+        row = mfe_mae.iloc[0]
+        # MFE: (high=111 - 100) / 100 = 0.11
+        assert row["mfe"] > 0
+        # MAE: (low=101 - 100) / 100 = 0.01
+        assert row["mae"] < row["mfe"]
+        assert row["mfe_mae_ratio"] > 1.0
+
+    def test_mfe_mae_empty_when_no_data(self, db_session):
+        """無足夠價格資料時 MFE/MAE 為空。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "ME01", 100.0)
+        # 不插入任何價格
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        # 沒有價格 → evaluate 整體為空
+        assert result["mfe_mae"].empty
+
+
+# ─── evaluate 回傳格式完整性 ──────────────────────────────
+
+
+class TestEvaluateReturnKeys:
+    """驗證 evaluate() 回傳包含所有新增 key。"""
+
+    def test_empty_result_has_all_keys(self):
+        """無資料時仍應回傳所有 key。"""
+        perf = DiscoveryPerformance(mode="momentum")
+        result = perf.evaluate()
+        for key in ["summary", "by_scan", "detail", "by_regime", "turnover", "mfe_mae"]:
+            assert key in result
+            assert isinstance(result[key], pd.DataFrame)
+
+    def test_detail_has_regime_column(self, db_session):
+        """detail DataFrame 應包含 regime 欄位。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "RG01", 100.0, regime="bull")
+        _insert_prices(db_session, "RG01", "2025-06-03", [101, 102, 103, 104, 105])
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        assert "regime" in result["detail"].columns
+        assert result["detail"].iloc[0]["regime"] == "bull"

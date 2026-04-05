@@ -33,6 +33,7 @@ from src.discovery.scanner._base import MarketScanner
 from src.discovery.scanner._dividend import DividendScanner
 from src.discovery.scanner._functions import (
     DiscoveryResult,
+    ScanAuditTrail,
     _calc_atr14,
     _extract_level_lower_bound,
     compute_abnormal_announcement_rate,
@@ -41,6 +42,7 @@ from src.discovery.scanner._functions import (
     compute_chip_macd,
     compute_daytrade_penalty,
     compute_eps_sustainability,
+    compute_factor_correlation_matrix,
     compute_factor_ic,
     compute_hhi_trend,
     compute_ic_weight_adjustments,
@@ -54,6 +56,7 @@ from src.discovery.scanner._functions import (
     compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_smart_broker_score,
+    compute_sub_factor_ic,
     compute_taiex_relative_strength,
     compute_vcp_score,
     compute_whale_score,
@@ -97,8 +100,11 @@ __all__ = [
     "compute_revenue_acceleration_score",
     "compute_peer_fundamental_ranking",
     "compute_mfe_mae",
+    "compute_sub_factor_ic",
+    "compute_factor_correlation_matrix",
     # 資料容器
     "DiscoveryResult",
+    "ScanAuditTrail",
     # 類別
     "MarketScanner",
     "MomentumScanner",

@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from src.data.database import get_session
 from src.data.schema import DailyPrice, DiscoveryRecord
+from src.discovery.scanner._functions import compute_mfe_mae
 
 logger = logging.getLogger(__name__)
 
@@ -67,29 +68,60 @@ class DiscoveryPerformance:
         self.end_date = date.fromisoformat(end_date) if end_date else None
 
     def evaluate(self) -> dict:
-        """回傳 { "summary": DataFrame, "by_scan": DataFrame, "detail": DataFrame }。
+        """回傳 { "summary", "by_scan", "detail", "by_regime", "turnover", "mfe_mae" }。
 
-        若無推薦記錄，回傳三個空 DataFrame。
+        若無推薦記錄，回傳空 DataFrame。
         """
         records_df = self._load_records()
         if records_df.empty:
             empty = pd.DataFrame()
-            return {"summary": empty, "by_scan": empty, "detail": empty}
+            return {
+                "summary": empty,
+                "by_scan": empty,
+                "detail": empty,
+                "by_regime": empty,
+                "turnover": empty,
+                "mfe_mae": empty,
+            }
 
         prices_df = self._load_prices(records_df)
         if prices_df.empty:
             empty = pd.DataFrame()
-            return {"summary": empty, "by_scan": empty, "detail": empty}
+            return {
+                "summary": empty,
+                "by_scan": empty,
+                "detail": empty,
+                "by_regime": empty,
+                "turnover": empty,
+                "mfe_mae": empty,
+            }
 
         detail = self._calc_returns(records_df, prices_df)
         if detail.empty:
             empty = pd.DataFrame()
-            return {"summary": empty, "by_scan": empty, "detail": empty}
+            return {
+                "summary": empty,
+                "by_scan": empty,
+                "detail": empty,
+                "by_regime": empty,
+                "turnover": empty,
+                "mfe_mae": empty,
+            }
 
         summary = self._aggregate_summary(detail)
         by_scan = self._aggregate_by_scan(detail)
+        by_regime = self._aggregate_by_regime(detail)
+        turnover = self._compute_turnover(detail)
+        mfe_mae = self._compute_mfe_mae(records_df, prices_df)
 
-        return {"summary": summary, "by_scan": by_scan, "detail": detail}
+        return {
+            "summary": summary,
+            "by_scan": by_scan,
+            "detail": detail,
+            "by_regime": by_regime,
+            "turnover": turnover,
+            "mfe_mae": mfe_mae,
+        }
 
     # ------------------------------------------------------------------
     # 內部方法
@@ -105,6 +137,7 @@ class DiscoveryPerformance:
                 DiscoveryRecord.rank,
                 DiscoveryRecord.close,
                 DiscoveryRecord.composite_score,
+                DiscoveryRecord.regime,
             ).where(DiscoveryRecord.mode == self.mode)
 
             if self.start_date:
@@ -122,18 +155,23 @@ class DiscoveryPerformance:
 
         return pd.DataFrame(
             rows,
-            columns=["scan_date", "stock_id", "stock_name", "rank", "close", "composite_score"],
+            columns=["scan_date", "stock_id", "stock_name", "rank", "close", "composite_score", "regime"],
         )
 
     def _load_prices(self, records_df: pd.DataFrame) -> pd.DataFrame:
-        """批次載入所有相關股票在推薦日之後的 DailyPrice。"""
+        """批次載入所有相關股票在推薦日之後的 DailyPrice（含 high/low for MFE/MAE）。"""
         stock_ids = records_df["stock_id"].unique().tolist()
         min_date = records_df["scan_date"].min()
-        max_holding = max(self.holding_days)
 
         with get_session() as session:
             stmt = (
-                select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+                select(
+                    DailyPrice.stock_id,
+                    DailyPrice.date,
+                    DailyPrice.close,
+                    DailyPrice.high,
+                    DailyPrice.low,
+                )
                 .where(
                     DailyPrice.stock_id.in_(stock_ids),
                     DailyPrice.date > min_date,
@@ -145,7 +183,7 @@ class DiscoveryPerformance:
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows, columns=["stock_id", "date", "close"])
+        return pd.DataFrame(rows, columns=["stock_id", "date", "close", "high", "low"])
 
     def _calc_returns(self, records_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
         """計算每筆推薦在各持有天數的報酬率。"""
@@ -170,6 +208,7 @@ class DiscoveryPerformance:
                 "rank": rec["rank"],
                 "entry_close": entry_close,
                 "composite_score": rec["composite_score"],
+                "regime": rec.get("regime"),
             }
 
             for days in self.holding_days:
@@ -253,6 +292,74 @@ class DiscoveryPerformance:
 
         return pd.DataFrame(rows)
 
+    def _aggregate_by_regime(self, detail: pd.DataFrame) -> pd.DataFrame:
+        """每個 regime × 持有天數的績效統計。"""
+        if "regime" not in detail.columns or detail["regime"].isna().all():
+            return pd.DataFrame()
+
+        rows = []
+        for days in self.holding_days:
+            col = f"return_{days}d"
+            for regime, group in detail.groupby("regime"):
+                if pd.isna(regime):
+                    continue
+                valid = group[col].dropna()
+                if valid.empty:
+                    continue
+                rows.append(
+                    {
+                        "holding_days": days,
+                        "regime": regime,
+                        "count": len(valid),
+                        "win_rate": (valid > 0).mean(),
+                        "avg_return": valid.mean(),
+                        "median_return": valid.median(),
+                        "max_gain": valid.max(),
+                        "max_loss": valid.min(),
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def _compute_turnover(self, detail: pd.DataFrame) -> pd.DataFrame:
+        """計算每次掃描之間推薦清單的換手率。
+
+        turnover = 1 − |A ∩ B| / max(|A|, |B|)
+        A = 上次推薦清單, B = 本次推薦清單
+        """
+        scan_dates = sorted(detail["scan_date"].unique())
+        if len(scan_dates) < 2:
+            return pd.DataFrame()
+
+        rows = []
+        for i in range(1, len(scan_dates)):
+            prev_date = scan_dates[i - 1]
+            curr_date = scan_dates[i]
+            prev_ids = set(detail[detail["scan_date"] == prev_date]["stock_id"])
+            curr_ids = set(detail[detail["scan_date"] == curr_date]["stock_id"])
+
+            overlap = len(prev_ids & curr_ids)
+            max_size = max(len(prev_ids), len(curr_ids), 1)
+            turnover = 1.0 - overlap / max_size
+
+            rows.append(
+                {
+                    "scan_date": curr_date,
+                    "prev_date": prev_date,
+                    "prev_count": len(prev_ids),
+                    "curr_count": len(curr_ids),
+                    "overlap": overlap,
+                    "new_entries": len(curr_ids - prev_ids),
+                    "exits": len(prev_ids - curr_ids),
+                    "turnover": round(turnover, 4),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _compute_mfe_mae(self, records_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
+        """整合 compute_mfe_mae 計算每筆推薦的 MFE/MAE。"""
+        holding = max(self.holding_days)
+        return compute_mfe_mae(records_df, prices_df, holding_days=holding)
+
 
 def print_performance_report(result: dict, mode: str, start_date=None, end_date=None) -> None:
     """輸出績效報告到 console。"""
@@ -300,6 +407,59 @@ def print_performance_report(result: dict, mode: str, start_date=None, end_date=
         mg = f"{row['max_gain']:+.2%}"
         ml = f"{row['max_loss']:+.2%}"
         print(f"  {days:>3}天     {evaluable:>5}  {wr:>7}  {avg:>8}  {med:>8}  {mg:>8}  {ml:>8}")
+
+    # Regime 分組績效
+    by_regime = result.get("by_regime", pd.DataFrame())
+    if not by_regime.empty:
+        print(f"\n{'─' * 75}")
+        print("Regime 分組績效")
+        print(f"{'─' * 75}")
+        print(f"{'持有天數':>8}  {'Regime':<10}  {'筆數':>5}  {'勝率':>7}  {'平均報酬':>8}  {'中位數':>8}")
+        for _, row in by_regime.iterrows():
+            days = int(row["holding_days"])
+            regime = str(row["regime"])
+            cnt = int(row["count"])
+            wr = f"{row['win_rate']:.1%}"
+            avg = f"{row['avg_return']:+.2%}"
+            med = f"{row['median_return']:+.2%}"
+            print(f"  {days:>3}天     {regime:<10}  {cnt:>5}  {wr:>7}  {avg:>8}  {med:>8}")
+
+    # MFE/MAE 摘要
+    mfe_mae = result.get("mfe_mae", pd.DataFrame())
+    if not mfe_mae.empty:
+        avg_mfe = mfe_mae["mfe"].mean()
+        avg_mae = mfe_mae["mae"].mean()
+        valid_ratio = mfe_mae["mfe_mae_ratio"].replace([float("inf"), float("-inf")], pd.NA).dropna()
+        avg_ratio = valid_ratio.mean() if not valid_ratio.empty else 0.0
+        print(f"\n{'─' * 75}")
+        print(f"MFE/MAE 分析（持有 {int(mfe_mae['final_return'].count())} 筆，最長持有期）")
+        print(f"{'─' * 75}")
+        print(f"  平均 MFE（最大有利偏移）: {avg_mfe:+.2%}")
+        print(f"  平均 MAE（最大不利偏移）: {avg_mae:+.2%}")
+        print(f"  平均 MFE/MAE 比率:        {avg_ratio:.2f}")
+        if avg_ratio >= 1.5:
+            print("  評價: 推薦品質良好 — 有利偏移遠大於不利偏移")
+        elif avg_ratio >= 1.0:
+            print("  評價: 推薦品質尚可 — 有利偏移略大於不利偏移")
+        else:
+            print("  評價: 推薦品質需改善 — 不利偏移大於有利偏移")
+
+    # 換手率
+    turnover = result.get("turnover", pd.DataFrame())
+    if not turnover.empty:
+        avg_turnover = turnover["turnover"].mean()
+        print(f"\n{'─' * 75}")
+        print(f"推薦清單換手率（共 {len(turnover)} 次變動，平均換手率 {avg_turnover:.1%}）")
+        print(f"{'─' * 75}")
+        print(f"{'掃描日期':>10}  {'前次':>5}  {'本次':>5}  {'重疊':>4}  {'新增':>4}  {'退出':>4}  {'換手率':>7}")
+        for _, row in turnover.sort_values("scan_date", ascending=False).head(10).iterrows():
+            print(
+                f"{row['scan_date']}  {int(row['prev_count']):>5}  {int(row['curr_count']):>5}"
+                f"  {int(row['overlap']):>4}  {int(row['new_entries']):>4}"
+                f"  {int(row['exits']):>4}  {row['turnover']:>7.1%}"
+            )
+        if len(turnover) > 10:
+            print(f"  ...（省略 {len(turnover) - 10} 筆）")
 
     # 逐次掃描明細（每個持有天數各一段）
     if not by_scan.empty:
