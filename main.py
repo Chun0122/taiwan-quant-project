@@ -353,6 +353,7 @@ def main() -> None:
     sp_fd.add_argument("--holding-days", type=int, default=5, help="前瞻報酬持有天數（預設 5）")
     sp_fd.add_argument("--lookback-days", type=int, default=30, help="回溯天數（預設 30）")
     sp_fd.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
+    sp_fd.add_argument("--max-stocks", type=int, default=200, help="備案逐股抓取上限 (預設 200)")
     sp_fd.add_argument("--export", default=None, help="匯出 CSV 路徑（相關性矩陣）")
 
     # ablation-test 子命令
@@ -365,6 +366,7 @@ def main() -> None:
     )
     sp_ab.add_argument("--top", type=int, default=20, help="比較前 N 名（預設 20）")
     sp_ab.add_argument("--skip-sync", action="store_true", help="跳過全市場資料同步")
+    sp_ab.add_argument("--max-stocks", type=int, default=200, help="備案逐股抓取上限 (預設 200)")
     sp_ab.add_argument("--with-performance", action="store_true", help="包含歷史績效消融分析")
     sp_ab.add_argument("--holding-days", type=int, default=5, help="績效消融持有天數（預設 5）")
     sp_ab.add_argument("--lookback-days", type=int, default=60, help="績效消融回溯天數（預設 60）")
