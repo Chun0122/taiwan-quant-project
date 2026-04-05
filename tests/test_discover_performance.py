@@ -539,7 +539,7 @@ class TestMfeMae:
 class TestEvaluateReturnKeys:
     """驗證 evaluate() 回傳包含所有新增 key。"""
 
-    def test_empty_result_has_all_keys(self):
+    def test_empty_result_has_all_keys(self, db_session):
         """無資料時仍應回傳所有 key。"""
         perf = DiscoveryPerformance(mode="momentum")
         result = perf.evaluate()
