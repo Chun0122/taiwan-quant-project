@@ -596,6 +596,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                     min_appearances=1,
                     export=None,
                     notify=False,
+                    use_ic_adjustment=True,
                 )
             ),
         ),

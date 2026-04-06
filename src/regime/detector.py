@@ -74,15 +74,14 @@ _BREADTH_BELOW_MA20_THRESHOLD: float = 0.60  # >60% 股票跌破 MA20 → regime
 # 新聞/基本面（品質防禦）提升至最高，只留有真實催化劑的防禦股
 REGIME_WEIGHTS: dict[str, dict[str, dict[str, float]]] = {
     "momentum": {
-        # Bull：技術/籌碼等重 40/40，降低「技術突破 + 外資買超同步」的共線性偏誤
-        "bull": {"technical": 0.40, "chip": 0.40, "fundamental": 0.10, "news": 0.10},
-        # Sideways：籌碼面拉至 50%，盤整期 Smart Broker 蓄積訊號最有效；壓縮技術面避免追假突破
-        "sideways": {"technical": 0.30, "chip": 0.50, "fundamental": 0.10, "news": 0.10},
-        # Bear：技術面降至 25%，消息面提升至 20%，確保選出有事件催化劑的錯殺股
-        "bear": {"technical": 0.25, "chip": 0.40, "fundamental": 0.15, "news": 0.20},
-        # Crisis：技術訊號失真，籌碼+基本面為主要防禦指標；
-        # 消息面（MOPS）涵蓋範圍有限，過高權重易在無公告時失真，降至 0.25
-        "crisis": {"technical": 0.10, "chip": 0.35, "fundamental": 0.30, "news": 0.25},
+        # Bull：技術主導 + 消息面提權（IC=0.18 最高）；籌碼降權（IC≈0，預測力弱）
+        "bull": {"technical": 0.40, "chip": 0.30, "fundamental": 0.10, "news": 0.20},
+        # Sideways：籌碼保留 0.35（盤整期 Smart Broker 蓄積仍有參考）；消息面提升
+        "sideways": {"technical": 0.30, "chip": 0.35, "fundamental": 0.10, "news": 0.25},
+        # Bear：消息面最重要（事件催化劑）；籌碼進一步降權
+        "bear": {"technical": 0.25, "chip": 0.25, "fundamental": 0.15, "news": 0.35},
+        # Crisis：消息面最高（MOPS 事件是崩盤時關鍵信號）；籌碼降至底線
+        "crisis": {"technical": 0.10, "chip": 0.20, "fundamental": 0.30, "news": 0.40},
     },
     "swing": {
         "bull": {"technical": 0.30, "chip": 0.20, "fundamental": 0.40, "news": 0.10},

@@ -2624,12 +2624,19 @@ class MarketScanner:
         rv = rv.where(~limit_up_mask, other=1.0)
         ra = ra.where(~limit_up_mask, other=1.0)
 
-        # NaN（資料不足）以中性 0.5 填補，取六因子等權平均
+        # NaN（資料不足）以中性 0.5 填補
         scores = pd.concat([r5, r10, rb, rv, ra, rs], axis=1)
         scores.columns = ["r5", "r10", "rb", "rv", "ra", "rs"]
         scores = scores.fillna(0.5)
 
-        tech_score = scores.mean(axis=1)
+        # Cluster 等權：將 6 因子依相關性分群，消除冗餘加權
+        # Cluster A（報酬動能）：ret5d, ret10d, sharpe_proxy（r=0.65~0.95）
+        # Cluster B（量能擴張）：vol_ratio, vol_accel（r=0.80）
+        # Cluster C（突破強度）：breakout60d（獨立）
+        cluster_a = scores[["r5", "r10", "rs"]].mean(axis=1)
+        cluster_b = scores[["rv", "ra"]].mean(axis=1)
+        cluster_c = scores["rb"]
+        tech_score = (cluster_a + cluster_b + cluster_c) / 3
 
         # 保存子因子 rank 供 IC 診斷使用
         sub_df = scores.copy()

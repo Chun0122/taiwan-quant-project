@@ -97,7 +97,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組 | 職責 |
 |------|------|
-| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
+| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權**（3 群：報酬動能 mean(ret5d,ret10d,sharpe_proxy) / 量能 mean(vol_ratio,vol_accel) / 突破 breakout60d，各 1/3）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
 | `src/discovery/ablation.py` | 因子消融測試：維度級（歸零重分配 Spearman ρ）+ 子因子級 + 歷史績效消融；CLI `ablation-test` |
@@ -367,3 +367,4 @@ pytest --cov=src --cov-report=term-missing
 | **Phase 1 基盤強化** | 59~67 | Regime 預設值、Kelly 收縮、Drawdown 連續化、相關性危機自適應、分數上限修正、早晨原子性、每股新鮮度、波動率權重、危機強制平倉 |
 | **Phase 2 擬真度** | 68~75 | 假日行事曆、公告衰減分化、籌碼層級稽核、滑價不對稱、Factor IC 動態權重、Regime 部位大小、漲跌停模擬、部分止利 |
 | **Universe 強化** | 76 | Regime 自適應門檻、min_close 軟化（Momentum/Growth=5）、相對流動性救援（turnover_ratio>2x）、突破型過濾器（Type B）、Candidate Memory 3 天漸進衰減 |
+| **因子權重優化** | 77 | 技術面 Cluster 等權（3 群 mean 降維）、Momentum Regime 權重 IC 校準（chip 降權/news 升權）、morning-routine 啟用 IC 動態調整 |
