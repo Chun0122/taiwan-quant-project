@@ -49,13 +49,28 @@ def cmd_optimize(args: argparse.Namespace) -> None:
         optimizer.export_to_csv(results, args.export)
 
 
+def _resolve_schedule_mode(mode: str) -> str:
+    """解析排程模式：auto 時依平台自動選擇。"""
+    if mode != "auto":
+        return mode
+    import sys as _sys
+
+    return "macos" if _sys.platform == "darwin" else "windows"
+
+
 def cmd_schedule(args: argparse.Namespace) -> None:
     """設定排程任務。"""
-    if args.mode == "simple":
+    mode = _resolve_schedule_mode(args.mode)
+
+    if mode == "simple":
         from src.scheduler.simple_scheduler import run_scheduler
 
         run_scheduler()
-    elif args.mode == "windows":
+    elif mode == "macos":
+        from src.scheduler.launchd_task import generate_scripts
+
+        generate_scripts()
+    elif mode == "windows":
         from src.scheduler.windows_task import generate_scripts
 
         generate_scripts()

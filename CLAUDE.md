@@ -145,6 +145,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `src/visualization/pages/` | 12 分頁（market_overview/stock_analysis/backtest_review/portfolio_review/strategy_comparison/screener_results/ml_analysis/industry_rotation/concept_rotation/discovery_history/position_monitoring/risk_control） |
 | `src/scheduler/simple_scheduler.py` | 前景排程；`daily_sync_job()` → `cmd_morning_routine()`；`weekly_holding_job()` 每週四 TDCC |
 | `src/scheduler/windows_task.py` | Windows Task Scheduler .bat + XML 產生器 |
+| `src/scheduler/launchd_task.py` | macOS LaunchAgent .sh + .plist 產生器 |
 
 **設定**：`config/settings.yaml` → `src/config.py` Pydantic 載入。存取：`settings.finmind.api_token`、`settings.fetcher.watchlist`。FinMind token 為逐股資料必需；TWSE/TPEX 免 token，SSL `verify=False`（刻意設計）。
 
@@ -276,6 +277,12 @@ python main.py export daily_price --format parquet -o data/export/dp.parquet
 python main.py import-data daily_price data/export/daily_price.csv
 python main.py import-data daily_price data.csv --dry-run
 
+# ── 排程 ──────────────────────────────────────────────────
+python main.py schedule                          # auto 偵測平台（Windows→Task Scheduler / macOS→LaunchAgent）
+python main.py schedule --mode simple            # 前景阻塞式排程（跨平台）
+python main.py schedule --mode windows           # 產生 .bat + Task Scheduler XML
+python main.py schedule --mode macos             # 產生 .sh + LaunchAgent .plist
+
 # ── 儀表板 ────────────────────────────────────────────────
 python main.py dashboard              # Streamlit localhost:8501
 ```
@@ -288,7 +295,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1677 個測試，44 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1688 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -334,6 +341,7 @@ pytest --cov=src --cov-report=term-missing
 | `test_calendar.py` | `data/calendar.py` TWSE 交易日行事曆 | 純函數 |
 | `test_morning_atomicity.py` | `cli/morning_cmd.py` 原子性 | mock |
 | `test_ablation.py` | `discovery/ablation.py` 因子消融 | 純函數 |
+| `test_scheduler.py` | `scheduler/` launchd + windows + auto 偵測 | 純函數+mock |
 
 新增或修改模組後，執行 `pytest -v` 確保全部通過，並為新計算邏輯補充測試。
 
@@ -352,7 +360,7 @@ pytest --cov=src --cov-report=term-missing
 
 ## Completed Tasks（已完成，共 76 項）
 
-測試數從 231 → 1627。各階段摘要：
+測試數從 231 → 1688。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -368,3 +376,4 @@ pytest --cov=src --cov-report=term-missing
 | **Phase 2 擬真度** | 68~75 | 假日行事曆、公告衰減分化、籌碼層級稽核、滑價不對稱、Factor IC 動態權重、Regime 部位大小、漲跌停模擬、部分止利 |
 | **Universe 強化** | 76 | Regime 自適應門檻、min_close 軟化（Momentum/Growth=5）、相對流動性救援（turnover_ratio>2x）、突破型過濾器（Type B）、Candidate Memory 3 天漸進衰減 |
 | **因子權重優化** | 77 | 技術面 Cluster 等權（3 群 mean 降維）、Momentum Regime 權重 IC 校準（chip 降權/news 升權）、morning-routine 啟用 IC 動態調整 |
+| **跨平台排程** | 78 | macOS LaunchAgent 排程（`launchd_task.py` .sh+.plist）、`--mode auto` 平台自動偵測、Windows 既有流程不變（+11 測試） |

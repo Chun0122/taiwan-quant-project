@@ -220,9 +220,9 @@ def main() -> None:
     sp_sched = subparsers.add_parser("schedule", help="設定自動排程")
     sp_sched.add_argument(
         "--mode",
-        choices=["simple", "windows"],
-        default="windows",
-        help="排程模式: simple=前景執行, windows=產生 Task Scheduler 腳本",
+        choices=["auto", "simple", "windows", "macos"],
+        default="auto",
+        help="排程模式: auto=自動偵測平台, simple=前景執行, windows=Task Scheduler, macos=LaunchAgent",
     )
 
     # scan 子命令
