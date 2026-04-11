@@ -13,7 +13,13 @@ from datetime import date, datetime
 import pandas as pd
 from sqlalchemy import select
 
-from src.constants import COMMISSION_RATE, REGIME_FALLBACK_DEFAULT, SLIPPAGE_RATE, TAX_RATE
+from src.constants import (
+    COMMISSION_RATE,
+    LIQUIDITY_PARTICIPATION_LIMIT,
+    REGIME_FALLBACK_DEFAULT,
+    SLIPPAGE_RATE,
+    TAX_RATE,
+)
 from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
@@ -25,12 +31,15 @@ from src.portfolio.rotation import (
     RotationActions,
     check_drawdown_kill_switch,
     compute_correlation_matrix,
+    compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
+    compute_trade_costs,
     compute_vol_inverse_weights,
+    detect_limit_price,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +62,17 @@ class RotationBacktestResult:
     trades: list[dict] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     config: dict = field(default_factory=dict)
+
+
+@dataclass
+class _TradeAdapter:
+    """適配器：讓 trade dict 能被 compute_metrics() 使用（需 .pnl 屬性）。"""
+
+    pnl: float
+    return_pct: float = 0.0
+    entry_date: date | None = None
+    exit_date: date | None = None
+    exit_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +251,95 @@ def _get_prices_on_date(session, stock_ids: list[str], target_date: date) -> dic
             result[row[0]] = row[1]
 
     return result
+
+
+def _get_ohlcv_on_date(session, stock_ids: list[str], target_date: date) -> dict[str, dict]:
+    """取得指定日期（或最近交易日）的 OHLCV 完整資料。
+
+    先嘗試精確比對 target_date，若某些股票找不到資料，
+    則 fallback 取最近 5 天內的最新資料（fallback 時 volume 設為 0 以避免錯誤流動性估算）。
+
+    Returns
+    -------
+    dict[str, dict]
+        {stock_id: {"open": .., "high": .., "low": .., "close": .., "volume": ..}}
+    """
+    if not stock_ids:
+        return {}
+
+    # 精確比對
+    stmt = select(
+        DailyPrice.stock_id,
+        DailyPrice.open,
+        DailyPrice.high,
+        DailyPrice.low,
+        DailyPrice.close,
+        DailyPrice.volume,
+    ).where(
+        DailyPrice.stock_id.in_(stock_ids),
+        DailyPrice.date == target_date,
+    )
+    result: dict[str, dict] = {}
+    for row in session.execute(stmt).all():
+        result[row[0]] = {
+            "open": row[1],
+            "high": row[2],
+            "low": row[3],
+            "close": row[4],
+            "volume": row[5] or 0,
+        }
+
+    # Fallback：最近 5 天（volume 歸零，避免用非當日量做流動性約束）
+    missing = [sid for sid in stock_ids if sid not in result]
+    if missing:
+        from datetime import timedelta
+
+        from sqlalchemy import func
+
+        fallback_start = target_date - timedelta(days=5)
+        sub = (
+            select(
+                DailyPrice.stock_id,
+                func.max(DailyPrice.date).label("max_date"),
+            )
+            .where(
+                DailyPrice.stock_id.in_(missing),
+                DailyPrice.date >= fallback_start,
+                DailyPrice.date <= target_date,
+            )
+            .group_by(DailyPrice.stock_id)
+            .subquery()
+        )
+        stmt2 = select(
+            DailyPrice.stock_id,
+            DailyPrice.open,
+            DailyPrice.high,
+            DailyPrice.low,
+            DailyPrice.close,
+        ).join(
+            sub,
+            (DailyPrice.stock_id == sub.c.stock_id) & (DailyPrice.date == sub.c.max_date),
+        )
+        for row in session.execute(stmt2).all():
+            result[row[0]] = {
+                "open": row[1],
+                "high": row[2],
+                "low": row[3],
+                "close": row[4],
+                "volume": 0,  # fallback 資料不代表今日流動性
+            }
+
+    return result
+
+
+def _get_taiex_prices(session, start: date, end: date) -> dict[date, float]:
+    """取得 TAIEX 收盤價序列，用於 benchmark 計算。"""
+    stmt = select(DailyPrice.date, DailyPrice.close).where(
+        DailyPrice.stock_id == "TAIEX",
+        DailyPrice.date >= start,
+        DailyPrice.date <= end,
+    )
+    return {row[0]: row[1] for row in session.execute(stmt).all()}
 
 
 # ---------------------------------------------------------------------------
@@ -485,11 +594,23 @@ class RotationManager:
         holding_days: int | None = None,
         capital: float | None = None,
         allow_renewal: bool = True,
+        dynamic_slippage: bool = True,
+        liquidity_limit: float = LIQUIDITY_PARTICIPATION_LIMIT,
+        limit_price_check: bool = False,
     ) -> RotationBacktestResult:
         """歷史回測：逐日模擬 rotation 策略。
 
         可直接從已建立的 portfolio 讀取參數，
         或用傳入參數覆蓋（適用於 ad-hoc 回測）。
+
+        Parameters
+        ----------
+        dynamic_slippage : bool
+            啟用三因子動態滑價模型（預設 True）。
+        liquidity_limit : float
+            流動性約束比例（預設 5%）。
+        limit_price_check : bool
+            啟用漲跌停模擬（預設 False，向後相容）。
         """
         with get_session() as session:
             # 參數解析
@@ -535,12 +656,24 @@ class RotationManager:
             for sd in scan_dates:
                 all_rankings[sd] = resolve_rankings(mode, sd, session, top_n=max_positions * 3)
 
+            # TAIEX benchmark 資料
+            taiex_prices = _get_taiex_prices(session, trading_cal[0], trading_cal[-1])
+
             # 逐日模擬
             positions: list[dict] = []  # 模擬持倉
             cash = capital
             equity_curve: list[dict] = []
             all_trades: list[dict] = []
             last_rankings: list[dict] = []
+
+            # 成本歸因累計器
+            total_commission = 0.0
+            total_tax = 0.0
+            total_slippage_cost = 0.0
+            turnover_value = 0.0
+
+            # 漲跌停偵測用前日收盤價
+            prev_close_map: dict[str, float] = {}
 
             for day in trading_cal:
                 # 取今日排名
@@ -551,13 +684,13 @@ class RotationManager:
                     equity_curve.append({"date": day, "equity": cash})
                     continue
 
-                # 取今日收盤價
+                # 取今日 OHLCV（動態滑價需要完整 OHLCV）
                 all_sids = list({p["stock_id"] for p in positions} | {r["stock_id"] for r in last_rankings})
-                today_prices = _get_prices_on_date(session, all_sids, day)
+                today_ohlcv = _get_ohlcv_on_date(session, all_sids, day)
+                today_prices = {sid: d["close"] for sid, d in today_ohlcv.items()}
 
                 # 止損價：從持倉記錄取進場時鎖定的止損價
                 stop_losses = {p["stock_id"]: p["stop_loss"] for p in positions if p.get("stop_loss") is not None}
-                # 新買入候選的止損價從 rankings 取
                 for r in last_rankings:
                     if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
                         stop_losses[r["stock_id"]] = r["stop_loss"]
@@ -576,15 +709,51 @@ class RotationManager:
                     today_prices=today_prices,
                 )
 
-                # 執行賣出
+                # ── 執行賣出 ──
                 sold_ids = set()
                 for sell in actions.to_sell:
                     sid = sell["stock_id"]
                     exit_price = sell.get("exit_price", sell.get("entry_price", 0))
                     shares = sell.get("shares", 0)
-                    pnl, return_pct = compute_position_pnl(sell["entry_price"], exit_price, shares)
-                    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+                    ohlcv = today_ohlcv.get(sid, {})
+
+                    # 動態滑價
+                    if dynamic_slippage:
+                        sell_slip = compute_dynamic_slippage(
+                            ohlcv.get("volume", 0),
+                            ohlcv.get("high", 0),
+                            ohlcv.get("low", 0),
+                            exit_price,
+                            side="sell",
+                        )
+                    else:
+                        sell_slip = SLIPPAGE_RATE
+
+                    # 跌停模擬：跌停時以跌停價成交
+                    if limit_price_check:
+                        prev_c = prev_close_map.get(sid)
+                        if prev_c:
+                            _, is_down = detect_limit_price(ohlcv.get("open", exit_price), prev_c)
+                            if is_down:
+                                exit_price = min(exit_price, prev_c * (1 - SLIPPAGE_RATE))
+
+                    buy_slip = sell.get("buy_slippage", SLIPPAGE_RATE)
+                    pnl, return_pct = compute_position_pnl(
+                        sell["entry_price"],
+                        exit_price,
+                        shares,
+                        buy_slippage=buy_slip,
+                        sell_slippage=sell_slip,
+                    )
+                    costs = compute_trade_costs(exit_price, shares, sell_slip, side="sell")
+                    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
                     cash += sell_proceeds
+
+                    total_commission += costs.commission
+                    total_tax += costs.tax
+                    total_slippage_cost += costs.slippage_cost
+                    turnover_value += exit_price * shares
+
                     all_trades.append(
                         {
                             "stock_id": sid,
@@ -598,6 +767,11 @@ class RotationManager:
                             "exit_reason": sell["reason"],
                             "entry_rank": sell.get("entry_rank"),
                             "entry_score": sell.get("entry_score"),
+                            "buy_slippage": buy_slip,
+                            "sell_slippage": sell_slip,
+                            "commission": costs.commission,
+                            "tax": costs.tax,
+                            "slippage_cost": costs.slippage_cost,
                         }
                     )
                     sold_ids.add(sid)
@@ -622,16 +796,51 @@ class RotationManager:
                             if old_sl is None or new_sl > old_sl:
                                 pos["stop_loss"] = new_sl
 
-                # 執行買入
+                # ── 執行買入 ──
                 for buy in actions.to_buy:
                     sid = buy["stock_id"]
                     price = buy["entry_price"]
                     alloc = buy["allocated_capital"]
-                    shares = compute_shares(alloc, price)
+                    ohlcv = today_ohlcv.get(sid, {})
+
+                    # 漲停跳過
+                    if limit_price_check:
+                        prev_c = prev_close_map.get(sid)
+                        if prev_c:
+                            is_up, _ = detect_limit_price(ohlcv.get("open", price), prev_c)
+                            if is_up:
+                                continue
+
+                    # 動態滑價
+                    if dynamic_slippage:
+                        buy_slip = compute_dynamic_slippage(
+                            ohlcv.get("volume", 0),
+                            ohlcv.get("high", 0),
+                            ohlcv.get("low", 0),
+                            price,
+                            side="buy",
+                        )
+                    else:
+                        buy_slip = SLIPPAGE_RATE
+
+                    shares = compute_shares(
+                        alloc,
+                        price,
+                        slippage=buy_slip,
+                        daily_volume=ohlcv.get("volume"),
+                        participation_limit=liquidity_limit,
+                    )
                     if shares <= 0:
                         continue
-                    buy_cost = price * shares * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+
+                    costs = compute_trade_costs(price, shares, buy_slip, side="buy")
+                    buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
                     cash -= buy_cost
+
+                    total_commission += costs.commission
+                    total_slippage_cost += costs.slippage_cost
+                    turnover_value += price * shares
+
                     planned_exit = compute_planned_exit_date(day, holding_days, trading_cal)
                     positions.append(
                         {
@@ -645,6 +854,7 @@ class RotationManager:
                             "allocated_capital": alloc,
                             "planned_exit_date": planned_exit,
                             "stop_loss": buy.get("stop_loss"),
+                            "buy_slippage": buy_slip,
                         }
                     )
 
@@ -652,16 +862,46 @@ class RotationManager:
                 market_value = sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions)
                 equity_curve.append({"date": day, "equity": cash + market_value})
 
+                # 更新 prev_close_map（漲跌停偵測用）
+                for sid, ohlcv_data in today_ohlcv.items():
+                    prev_close_map[sid] = ohlcv_data["close"]
+
             # 強制平倉期末持倉
             if positions and trading_cal:
                 last_day = trading_cal[-1]
-                last_prices = _get_prices_on_date(session, [p["stock_id"] for p in positions], last_day)
+                last_ohlcv = _get_ohlcv_on_date(session, [p["stock_id"] for p in positions], last_day)
                 for pos in positions:
                     sid = pos["stock_id"]
-                    exit_p = last_prices.get(sid, pos["entry_price"])
-                    pnl, return_pct = compute_position_pnl(pos["entry_price"], exit_p, pos["shares"])
-                    sell_proceeds = exit_p * pos["shares"] * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+                    ohlcv = last_ohlcv.get(sid, {})
+                    exit_p = ohlcv.get("close", pos["entry_price"])
+
+                    if dynamic_slippage:
+                        sell_slip = compute_dynamic_slippage(
+                            ohlcv.get("volume", 0),
+                            ohlcv.get("high", 0),
+                            ohlcv.get("low", 0),
+                            exit_p,
+                            side="sell",
+                        )
+                    else:
+                        sell_slip = SLIPPAGE_RATE
+
+                    buy_slip = pos.get("buy_slippage", SLIPPAGE_RATE)
+                    pnl, return_pct = compute_position_pnl(
+                        pos["entry_price"],
+                        exit_p,
+                        pos["shares"],
+                        buy_slippage=buy_slip,
+                        sell_slippage=sell_slip,
+                    )
+                    costs = compute_trade_costs(exit_p, pos["shares"], sell_slip, side="sell")
+                    sell_proceeds = exit_p * pos["shares"] * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
                     cash += sell_proceeds
+
+                    total_commission += costs.commission
+                    total_tax += costs.tax
+                    total_slippage_cost += costs.slippage_cost
+
                     all_trades.append(
                         {
                             "stock_id": sid,
@@ -675,11 +915,66 @@ class RotationManager:
                             "exit_reason": "backtest_end",
                             "entry_rank": pos.get("entry_rank"),
                             "entry_score": pos.get("entry_score"),
+                            "buy_slippage": buy_slip,
+                            "sell_slippage": sell_slip,
+                            "commission": costs.commission,
+                            "tax": costs.tax,
+                            "slippage_cost": costs.slippage_cost,
                         }
                     )
 
-            # 計算績效指標
-            metrics = self._compute_backtest_metrics(equity_curve, all_trades, capital)
+            # ── 計算績效指標（委託 compute_metrics）──
+            from src.backtest.metrics import compute_metrics as _compute_full_metrics
+
+            equities = [e["equity"] for e in equity_curve]
+            trade_adapters = [_TradeAdapter(pnl=t["pnl"]) for t in all_trades]
+            raw_metrics = _compute_full_metrics(equities, trade_adapters, start_date, end_date, capital)
+
+            # 交易統計（保留既有欄位格式）
+            trade_returns = [t["return_pct"] for t in all_trades if t.get("return_pct") is not None]
+            wins = [r for r in trade_returns if r > 0]
+            losses = [r for r in trade_returns if r <= 0]
+
+            # TAIEX benchmark（含交易成本）
+            benchmark_return = None
+            if taiex_prices and len(trading_cal) >= 2:
+                first_t = taiex_prices.get(trading_cal[0])
+                last_t = taiex_prices.get(trading_cal[-1])
+                if first_t and last_t and first_t > 0:
+                    buy_cost_bm = first_t * (1 + COMMISSION_RATE)
+                    sell_net_bm = last_t * (1 - COMMISSION_RATE - TAX_RATE)
+                    benchmark_return = round((sell_net_bm / buy_cost_bm - 1) * 100, 2)
+
+            # 轉換為 rotation 既有格式（小數制），維持 CLI 向後相容
+            metrics = {
+                "total_return": round(raw_metrics["total_return"] / 100, 4),
+                "annual_return": round(raw_metrics["annual_return"] / 100, 4),
+                "max_drawdown": round(raw_metrics["max_drawdown"] / 100, 4),
+                "sharpe_ratio": raw_metrics["sharpe_ratio"] or 0.0,
+                "sortino_ratio": raw_metrics.get("sortino_ratio"),
+                "calmar_ratio": raw_metrics.get("calmar_ratio"),
+                "var_95": raw_metrics.get("var_95"),
+                "cvar_95": raw_metrics.get("cvar_95"),
+                "profit_factor": raw_metrics.get("profit_factor"),
+                # 保留既有欄位
+                "total_trades": len(all_trades),
+                "win_rate": round(raw_metrics["win_rate"] / 100, 4) if raw_metrics.get("win_rate") else 0,
+                "avg_return_per_trade": round(sum(trade_returns) / len(trade_returns), 4) if trade_returns else 0,
+                "avg_win": round(sum(wins) / len(wins), 4) if wins else 0,
+                "avg_loss": round(sum(losses) / len(losses), 4) if losses else 0,
+                "final_capital": round(equities[-1], 2) if equities else capital,
+                "trading_days": len(equity_curve),
+                # 成本歸因
+                "total_commission": round(total_commission, 2),
+                "total_tax": round(total_tax, 2),
+                "total_slippage_cost": round(total_slippage_cost, 2),
+                "total_cost": round(total_commission + total_tax + total_slippage_cost, 2),
+                "cost_drag_pct": round((total_commission + total_tax + total_slippage_cost) / capital * 100, 4)
+                if capital > 0
+                else 0,
+                # TAIEX Benchmark
+                "benchmark_return": benchmark_return,
+            }
 
             result = RotationBacktestResult(
                 equity_curve=equity_curve,

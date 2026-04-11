@@ -52,6 +52,19 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # Universe Filter 強化：DailyFeature 新增相對流動性 + 20 日最高價
     ("daily_feature", "turnover_ratio_5d_20d", "REAL"),
     ("daily_feature", "high_20d", "REAL"),
+    # P0 Rotation 回測擬真度：Summary 新增指標
+    ("rotation_backtest_summary", "sortino_ratio", "REAL"),
+    ("rotation_backtest_summary", "calmar_ratio", "REAL"),
+    ("rotation_backtest_summary", "var_95", "REAL"),
+    ("rotation_backtest_summary", "cvar_95", "REAL"),
+    ("rotation_backtest_summary", "profit_factor", "REAL"),
+    ("rotation_backtest_summary", "benchmark_return", "REAL"),
+    ("rotation_backtest_summary", "total_cost", "REAL"),
+    ("rotation_backtest_summary", "cost_drag_pct", "REAL"),
+    # P0 Rotation 回測擬真度：Trade 新增成本明細
+    ("rotation_backtest_trade", "buy_slippage", "REAL"),
+    ("rotation_backtest_trade", "sell_slippage", "REAL"),
+    ("rotation_backtest_trade", "trade_cost", "REAL"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

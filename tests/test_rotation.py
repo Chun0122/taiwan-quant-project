@@ -20,7 +20,9 @@ from src.data.schema import (  # noqa: F401 — 確保 ORM 註冊
     RotationPosition,
 )
 from src.portfolio.rotation import (
+    apply_liquidity_limit,
     compute_correlation_matrix,
+    compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
     compute_portfolio_heat,
@@ -28,8 +30,10 @@ from src.portfolio.rotation import (
     compute_rotation_actions,
     compute_shares,
     compute_single_trade_risk,
+    compute_trade_costs,
     compute_vol_inverse_weights,
     count_trading_days_held,
+    detect_limit_price,
     find_high_correlation_pairs,
     get_trading_dates_from_prices,
 )
@@ -1799,3 +1803,292 @@ class TestRegimeFallbackDefault:
             regime=REGIME_FALLBACK_DEFAULT,
         )
         assert len(actions.to_buy) == 2
+
+
+# ===========================================================================
+# P0: 動態滑價
+# ===========================================================================
+
+
+class TestDynamicSlippage:
+    """測試 compute_dynamic_slippage() 三因子模型。"""
+
+    def test_sell_higher_than_buy(self):
+        """賣出滑價 >= 買入滑價（恐慌拋售加成）。"""
+        buy = compute_dynamic_slippage(1_000_000, 105, 95, 100, side="buy")
+        sell = compute_dynamic_slippage(1_000_000, 105, 95, 100, side="sell")
+        assert sell >= buy
+        assert sell <= 0.01  # SLIPPAGE_MAX_PCT
+
+    def test_low_volume_higher_slippage(self):
+        """低成交量 → 較高滑價（high=low 消除 spread proxy，純測 volume impact）。"""
+        low = compute_dynamic_slippage(10_000, 100, 100, 100, max_pct=0.10)
+        high = compute_dynamic_slippage(10_000_000, 100, 100, 100, max_pct=0.10)
+        assert low > high
+
+    def test_zero_volume_fallback(self):
+        """volume=0 → fallback 到 base_slippage。"""
+        slip = compute_dynamic_slippage(0, 105, 95, 100)
+        assert slip == SLIPPAGE_RATE
+
+    def test_negative_volume_fallback(self):
+        """volume<0 → fallback 到 base_slippage。"""
+        slip = compute_dynamic_slippage(-100, 105, 95, 100)
+        assert slip == SLIPPAGE_RATE
+
+    def test_max_cap(self):
+        """極低量時滑價受 max_pct 限制。"""
+        slip = compute_dynamic_slippage(1, 200, 50, 100, max_pct=0.01)
+        assert slip <= 0.01
+
+    def test_wide_spread_increases_slippage(self):
+        """大價差（high - low 大）→ spread proxy 提高滑價（提高 max_pct 避免觸頂）。"""
+        narrow = compute_dynamic_slippage(1_000_000, 101, 99, 100, max_pct=0.15)
+        wide = compute_dynamic_slippage(1_000_000, 110, 90, 100, max_pct=0.15)
+        assert wide > narrow
+
+
+# ===========================================================================
+# P0: 流動性約束
+# ===========================================================================
+
+
+class TestLiquidityLimit:
+    """測試 apply_liquidity_limit()。"""
+
+    def test_caps_shares(self):
+        """超過 participation limit 時被裁切。"""
+        assert apply_liquidity_limit(100_000, 500_000, 0.05) == 25_000
+
+    def test_no_volume_passthrough(self):
+        """volume=0 → 不約束，原樣回傳。"""
+        assert apply_liquidity_limit(1000, 0, 0.05) == 1000
+
+    def test_negative_volume_passthrough(self):
+        """volume<0 → 不約束。"""
+        assert apply_liquidity_limit(1000, -100, 0.05) == 1000
+
+    def test_within_limit_no_change(self):
+        """未超 limit 時不變。"""
+        assert apply_liquidity_limit(100, 500_000, 0.05) == 100
+
+
+# ===========================================================================
+# P0: 漲跌停偵測
+# ===========================================================================
+
+
+class TestLimitPrice:
+    """測試 detect_limit_price()。"""
+
+    def test_limit_up(self):
+        """開盤漲停。"""
+        up, down = detect_limit_price(110.0, 100.0)
+        assert up is True and down is False
+
+    def test_limit_down(self):
+        """開盤跌停。"""
+        up, down = detect_limit_price(90.0, 100.0)
+        assert up is False and down is True
+
+    def test_normal_open(self):
+        """正常開盤。"""
+        up, down = detect_limit_price(101.0, 100.0)
+        assert up is False and down is False
+
+    def test_zero_prev_close(self):
+        """prev_close=0 → 安全回傳 (False, False)。"""
+        up, down = detect_limit_price(100.0, 0.0)
+        assert up is False and down is False
+
+
+# ===========================================================================
+# P0: 交易成本分解
+# ===========================================================================
+
+
+class TestTradeCosts:
+    """測試 compute_trade_costs()。"""
+
+    def test_buy_no_tax(self):
+        """買入不含交易稅。"""
+        costs = compute_trade_costs(100.0, 1000, 0.001, "buy")
+        assert costs.tax == 0.0
+        assert costs.commission > 0
+        assert costs.slippage_cost > 0
+        assert costs.total == costs.commission + costs.slippage_cost
+
+    def test_sell_has_tax(self):
+        """賣出含交易稅。"""
+        costs = compute_trade_costs(100.0, 1000, 0.001, "sell")
+        assert costs.tax > 0
+        assert costs.total == costs.commission + costs.tax + costs.slippage_cost
+
+    def test_sell_tax_matches_rate(self):
+        """賣出交易稅 = notional × TAX_RATE。"""
+        costs = compute_trade_costs(100.0, 1000, 0.001, "sell")
+        expected_tax = 100.0 * 1000 * TAX_RATE
+        assert abs(costs.tax - round(expected_tax, 2)) < 0.01
+
+
+# ===========================================================================
+# P0: compute_position_pnl 新參數向後相容
+# ===========================================================================
+
+
+class TestPositionPnlSlippageParams:
+    """測試 compute_position_pnl() 新增 buy_slippage / sell_slippage 參數。"""
+
+    def test_default_same_as_before(self):
+        """不帶新參數時行為不變。"""
+        pnl, ret = compute_position_pnl(100, 110, 1000)
+        # 驗算
+        buy_cost = 100 * 1000 * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+        sell_proceeds = 110 * 1000 * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+        expected_pnl = sell_proceeds - buy_cost
+        assert abs(pnl - round(expected_pnl, 2)) < 0.01
+
+    def test_higher_slippage_lowers_pnl(self):
+        """較高滑價 → 較低 PnL。"""
+        pnl_low, _ = compute_position_pnl(100, 110, 1000, buy_slippage=0.001, sell_slippage=0.001)
+        pnl_high, _ = compute_position_pnl(100, 110, 1000, buy_slippage=0.005, sell_slippage=0.005)
+        assert pnl_low > pnl_high
+
+
+# ===========================================================================
+# P0: compute_shares 新參數向後相容
+# ===========================================================================
+
+
+class TestComputeSharesEnhanced:
+    """測試 compute_shares() 新增流動性約束參數。"""
+
+    def test_default_same_as_before(self):
+        """不帶新參數時行為不變。"""
+        shares = compute_shares(100_000, 100)
+        expected = int(100_000 / (100 * (1 + COMMISSION_RATE + SLIPPAGE_RATE)))
+        assert shares == expected
+
+    def test_with_slippage_override(self):
+        """自訂滑價。"""
+        shares = compute_shares(100_000, 100, slippage=0.01)
+        expected = int(100_000 / (100 * (1 + COMMISSION_RATE + 0.01)))
+        assert shares == expected
+
+    def test_with_liquidity_cap(self):
+        """流動性約束裁切。"""
+        shares = compute_shares(10_000_000, 100, daily_volume=50_000, participation_limit=0.05)
+        assert shares <= 2500  # 50000 * 0.05
+
+    def test_no_volume_no_cap(self):
+        """daily_volume=None 不約束。"""
+        shares_uncapped = compute_shares(100_000, 100)
+        shares_none = compute_shares(100_000, 100, daily_volume=None)
+        assert shares_uncapped == shares_none
+
+
+# ===========================================================================
+# P0: TAIEX Benchmark DB 查詢
+# ===========================================================================
+
+
+class TestTaiexBenchmark:
+    """測試 _get_taiex_prices() DB 查詢。"""
+
+    def test_taiex_benchmark_with_costs(self, db_session):
+        """TAIEX benchmark 含手續費 + 交易稅。"""
+        from src.data.schema import DailyPrice as DP
+        from src.portfolio.manager import _get_taiex_prices
+
+        # 插入 TAIEX 資料
+        for i, d in enumerate(TRADING_CAL[:5]):
+            db_session.add(
+                DP(
+                    stock_id="TAIEX",
+                    date=d,
+                    open=20000 + i * 100,
+                    high=20050 + i * 100,
+                    low=19950 + i * 100,
+                    close=20000 + i * 100,
+                    volume=100_000_000,
+                    turnover=0,
+                )
+            )
+        db_session.commit()
+
+        prices = _get_taiex_prices(db_session, TRADING_CAL[0], TRADING_CAL[4])
+        assert len(prices) == 5
+        assert TRADING_CAL[0] in prices
+        assert prices[TRADING_CAL[0]] == 20000
+
+    def test_empty_range(self, db_session):
+        """無資料期間回傳空 dict。"""
+        from src.portfolio.manager import _get_taiex_prices
+
+        prices = _get_taiex_prices(db_session, date(2020, 1, 1), date(2020, 1, 31))
+        assert prices == {}
+
+
+# ===========================================================================
+# P0: _get_ohlcv_on_date DB 查詢
+# ===========================================================================
+
+
+class TestGetOhlcvOnDate:
+    """測試 _get_ohlcv_on_date()。"""
+
+    def test_exact_date(self, db_session):
+        """精確日期有資料。"""
+        from src.data.schema import DailyPrice as DP
+        from src.portfolio.manager import _get_ohlcv_on_date
+
+        db_session.add(
+            DP(
+                stock_id="2330",
+                date=TRADING_CAL[0],
+                open=600,
+                high=610,
+                low=595,
+                close=605,
+                volume=30_000_000,
+                turnover=0,
+            )
+        )
+        db_session.commit()
+
+        result = _get_ohlcv_on_date(db_session, ["2330"], TRADING_CAL[0])
+        assert "2330" in result
+        assert result["2330"]["close"] == 605
+        assert result["2330"]["volume"] == 30_000_000
+
+    def test_fallback_volume_zero(self, db_session):
+        """Fallback 日期的 volume 歸零（安全措施）。"""
+        from src.data.schema import DailyPrice as DP
+        from src.portfolio.manager import _get_ohlcv_on_date
+
+        # 只有前一天有資料
+        db_session.add(
+            DP(
+                stock_id="2330",
+                date=TRADING_CAL[0],
+                open=600,
+                high=610,
+                low=595,
+                close=605,
+                volume=30_000_000,
+                turnover=0,
+            )
+        )
+        db_session.commit()
+
+        # 查詢隔天（fallback）
+        result = _get_ohlcv_on_date(db_session, ["2330"], TRADING_CAL[1])
+        assert "2330" in result
+        assert result["2330"]["close"] == 605
+        assert result["2330"]["volume"] == 0  # fallback 資料 volume 歸零
+
+    def test_empty_ids(self, db_session):
+        """空 stock_ids → 空 dict。"""
+        from src.portfolio.manager import _get_ohlcv_on_date
+
+        assert _get_ohlcv_on_date(db_session, [], TRADING_CAL[0]) == {}

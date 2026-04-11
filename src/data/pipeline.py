@@ -1345,6 +1345,15 @@ def save_rotation_backtest(result) -> int:
             avg_win=metrics.get("avg_win"),
             avg_loss=metrics.get("avg_loss"),
             trading_days=metrics.get("trading_days"),
+            # P0 擬真度新增指標
+            sortino_ratio=metrics.get("sortino_ratio"),
+            calmar_ratio=metrics.get("calmar_ratio"),
+            var_95=metrics.get("var_95"),
+            cvar_95=metrics.get("cvar_95"),
+            profit_factor=metrics.get("profit_factor"),
+            benchmark_return=metrics.get("benchmark_return"),
+            total_cost=metrics.get("total_cost"),
+            cost_drag_pct=metrics.get("cost_drag_pct"),
         )
         session.add(summary)
         session.flush()
@@ -1364,6 +1373,14 @@ def save_rotation_backtest(result) -> int:
                 exit_reason=t.get("exit_reason"),
                 entry_rank=t.get("entry_rank"),
                 entry_score=t.get("entry_score"),
+                buy_slippage=t.get("buy_slippage"),
+                sell_slippage=t.get("sell_slippage"),
+                trade_cost=t.get("trade_cost")
+                or (
+                    (t.get("commission", 0) + t.get("tax", 0) + t.get("slippage_cost", 0))
+                    if any(t.get(k) for k in ("commission", "tax", "slippage_cost"))
+                    else None
+                ),
             )
             session.add(trade)
 

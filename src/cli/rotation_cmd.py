@@ -268,6 +268,14 @@ def _print_rotation_backtest(result) -> None:
     print(f"  年化報酬:   {metrics.get('annual_return', 0):>+8.2%}")
     print(f"  最大回撤:   {metrics.get('max_drawdown', 0):>8.2%}")
     print(f"  Sharpe:     {metrics.get('sharpe_ratio', 0):>8.4f}")
+    if metrics.get("sortino_ratio") is not None:
+        print(f"  Sortino:    {metrics['sortino_ratio']:>8.4f}")
+    if metrics.get("calmar_ratio") is not None:
+        print(f"  Calmar:     {metrics['calmar_ratio']:>8.4f}")
+    if metrics.get("profit_factor") is not None:
+        print(f"  盈虧比:     {metrics['profit_factor']:>8.4f}")
+    if metrics.get("var_95") is not None:
+        print(f"  VaR(95%):   {metrics['var_95']:>+8.4f}%")
     print(f"  交易次數:   {metrics.get('total_trades', 0):>8d}")
     print(f"  勝率:       {metrics.get('win_rate', 0):>8.2%}")
     print(f"  平均報酬:   {metrics.get('avg_return_per_trade', 0):>+8.4f}")
@@ -275,3 +283,13 @@ def _print_rotation_backtest(result) -> None:
     print(f"  平均虧損:   {metrics.get('avg_loss', 0):>+8.4f}")
     print(f"  最終資金:   {metrics.get('final_capital', 0):>14,.0f}")
     print(f"  交易天數:   {metrics.get('trading_days', 0):>8d}")
+    # TAIEX Benchmark + Alpha
+    if metrics.get("benchmark_return") is not None:
+        bm = metrics["benchmark_return"]
+        alpha = metrics.get("total_return", 0) * 100 - bm
+        print(f"  TAIEX 同期: {bm:>+8.2f}%")
+        print(f"  Alpha:      {alpha:>+8.2f}%")
+    # 成本歸因
+    if metrics.get("total_cost") is not None:
+        print(f"  交易成本:   {metrics['total_cost']:>14,.0f}")
+        print(f"  成本拖累:   {metrics.get('cost_drag_pct', 0):>8.4f}%")

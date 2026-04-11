@@ -17,10 +17,16 @@ from src.constants import (
     COMMISSION_RATE,
     CORRELATION_PENALTY,
     CORRELATION_THRESHOLD,
+    LIMIT_DETECT_THRESHOLD,
+    LIQUIDITY_PARTICIPATION_LIMIT,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
     MAX_PORTFOLIO_HEAT,
     PER_POSITION_RISK_CAP,
+    SELL_SLIPPAGE_MULTIPLIER,
+    SLIPPAGE_IMPACT_COEFF,
+    SLIPPAGE_MAX_PCT,
     SLIPPAGE_RATE,
+    SLIPPAGE_SPREAD_WEIGHT,
     TAX_RATE,
 )
 
@@ -119,11 +125,20 @@ def compute_position_pnl(
     entry_price: float,
     exit_price: float,
     shares: int,
+    buy_slippage: float = SLIPPAGE_RATE,
+    sell_slippage: float = SLIPPAGE_RATE,
 ) -> tuple[float, float]:
     """計算單筆部位的已實現損益（含交易成本）。
 
-    買入成本 = entry_price × shares × (1 + 手續費 + 滑價)
-    賣出收入 = exit_price × shares × (1 - 手續費 - 交易稅 - 滑價)
+    買入成本 = entry_price × shares × (1 + 手續費 + buy_slippage)
+    賣出收入 = exit_price × shares × (1 - 手續費 - 交易稅 - sell_slippage)
+
+    Parameters
+    ----------
+    buy_slippage : float
+        買入滑價比率（預設 SLIPPAGE_RATE，向後相容）。
+    sell_slippage : float
+        賣出滑價比率（預設 SLIPPAGE_RATE，向後相容）。
 
     Returns
     -------
@@ -131,22 +146,210 @@ def compute_position_pnl(
         pnl = 賣出收入 - 買入成本（新台幣）。
         return_pct = pnl / 買入成本（小數，如 0.05 表示 5%）。
     """
-    buy_cost = entry_price * shares * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
-    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+    buy_cost = entry_price * shares * (1 + COMMISSION_RATE + buy_slippage)
+    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slippage)
     pnl = sell_proceeds - buy_cost
     return_pct = pnl / buy_cost if buy_cost > 0 else 0.0
     return round(pnl, 2), round(return_pct, 6)
 
 
-def compute_shares(capital: float, price: float) -> int:
+def compute_shares(
+    capital: float,
+    price: float,
+    slippage: float | None = None,
+    daily_volume: float | None = None,
+    participation_limit: float = LIQUIDITY_PARTICIPATION_LIMIT,
+) -> int:
     """計算可買入的股數（台股以 1000 股為一張，但此處以股為單位）。
 
     扣除買入手續費與滑價後計算。回傳整數股數。
+    可選流動性約束：計算後以 daily_volume × participation_limit 為上限。
+
+    Parameters
+    ----------
+    capital : float
+        可用資金。
+    price : float
+        買入價格。
+    slippage : float | None
+        滑價比率。None 時使用預設 SLIPPAGE_RATE。
+    daily_volume : float | None
+        當日成交量（股），用於流動性約束。None 時不約束。
+    participation_limit : float
+        流動性約束比例（預設 5%）。
     """
     if price <= 0:
         return 0
-    effective_price = price * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
-    return int(capital / effective_price)
+    slip = slippage if slippage is not None else SLIPPAGE_RATE
+    effective_price = price * (1 + COMMISSION_RATE + slip)
+    shares = int(capital / effective_price)
+    if daily_volume is not None:
+        shares = apply_liquidity_limit(shares, daily_volume, participation_limit)
+    return shares
+
+
+# ---------------------------------------------------------------------------
+# 動態滑價 / 流動性約束 / 漲跌停偵測
+# ---------------------------------------------------------------------------
+
+
+def compute_dynamic_slippage(
+    volume: float,
+    high: float,
+    low: float,
+    close: float,
+    side: str = "buy",
+    base_slippage: float = SLIPPAGE_RATE,
+    impact_coeff: float = SLIPPAGE_IMPACT_COEFF,
+    spread_weight: float = SLIPPAGE_SPREAD_WEIGHT,
+    max_pct: float = SLIPPAGE_MAX_PCT,
+    sell_multiplier: float = SELL_SLIPPAGE_MULTIPLIER,
+) -> float:
+    """計算動態滑價比率（三因子模型，從 BacktestEngine._get_slippage 提取）。
+
+    三因子：
+      1. 基底滑價 base（0.05%）
+      2. 成交量衝擊 k / sqrt(volume) — 低量股懲罰
+      3. OHLC spread 估算 (high-low)/close × weight — 隱含 bid-ask spread
+
+    Parameters
+    ----------
+    volume : float
+        當日成交量（股）。volume <= 0 時 fallback 到 base_slippage。
+    high, low, close : float
+        當日 OHLC 價格。
+    side : str
+        "buy" 或 "sell"。賣出乘以 sell_multiplier。
+    base_slippage : float
+        基底滑價率。
+    impact_coeff : float
+        成交量衝擊係數 k。
+    spread_weight : float
+        OHLC spread 估算權重。
+    max_pct : float
+        滑價上限。
+    sell_multiplier : float
+        賣出滑價放大係數。
+
+    Returns
+    -------
+    float
+        滑價比率（正數），買入時 price × (1 + slip)，賣出時 price × (1 - slip)。
+    """
+    if volume <= 0:
+        base_slip = base_slippage
+    else:
+        impact = base_slippage + impact_coeff / math.sqrt(volume)
+        # OHLC spread proxy
+        if close > 0 and high > low:
+            spread_proxy = (high - low) / close * spread_weight
+            impact = max(impact, spread_proxy)
+        base_slip = min(impact, max_pct)
+
+    if side == "sell":
+        return min(base_slip * sell_multiplier, max_pct)
+    return base_slip
+
+
+def apply_liquidity_limit(
+    shares: int,
+    daily_volume: float,
+    participation_limit: float = LIQUIDITY_PARTICIPATION_LIMIT,
+) -> int:
+    """流動性約束：限制單筆交易量不超過當日成交量的指定比例。
+
+    Parameters
+    ----------
+    shares : int
+        原始計算股數。
+    daily_volume : float
+        當日成交量（股）。<= 0 時不約束（passthrough）。
+    participation_limit : float
+        上限比例（預設 5%）。
+
+    Returns
+    -------
+    int
+        約束後的股數。
+    """
+    if daily_volume <= 0:
+        return shares
+    max_shares = int(daily_volume * participation_limit)
+    if max_shares < 1:
+        return 0
+    return min(shares, max_shares)
+
+
+def detect_limit_price(
+    open_price: float,
+    prev_close: float,
+    threshold: float = LIMIT_DETECT_THRESHOLD,
+) -> tuple[bool, bool]:
+    """偵測漲跌停（從 BacktestEngine 提取）。
+
+    Parameters
+    ----------
+    open_price : float
+        當日開盤價。
+    prev_close : float
+        前日收盤價。
+    threshold : float
+        偵測門檻（預設 0.095，略低於 10% 以涵蓋四捨五入）。
+
+    Returns
+    -------
+    (is_limit_up, is_limit_down) : tuple[bool, bool]
+    """
+    if prev_close <= 0:
+        return False, False
+    change = (open_price - prev_close) / prev_close
+    return change >= threshold, change <= -threshold
+
+
+@dataclass
+class TradeCostBreakdown:
+    """交易成本分解（記帳用途，不從 PnL 中重複扣除）。"""
+
+    commission: float = 0.0
+    tax: float = 0.0
+    slippage_cost: float = 0.0
+    total: float = 0.0
+
+
+def compute_trade_costs(
+    price: float,
+    shares: int,
+    slippage: float,
+    side: str = "buy",
+) -> TradeCostBreakdown:
+    """計算單筆交易的成本分解。
+
+    Parameters
+    ----------
+    price : float
+        成交價格。
+    shares : int
+        股數。
+    slippage : float
+        滑價比率。
+    side : str
+        "buy" 或 "sell"。賣出時含交易稅。
+
+    Returns
+    -------
+    TradeCostBreakdown
+        含 commission, tax, slippage_cost, total。
+    """
+    notional = price * shares
+    commission = notional * COMMISSION_RATE
+    tax = notional * TAX_RATE if side == "sell" else 0.0
+    slippage_cost = notional * slippage
+    return TradeCostBreakdown(
+        commission=round(commission, 2),
+        tax=round(tax, 2),
+        slippage_cost=round(slippage_cost, 2),
+        total=round(commission + tax + slippage_cost, 2),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -740,6 +740,15 @@ class RotationBacktestSummary(Base):
     avg_win: Mapped[float | None] = mapped_column(Float, nullable=True)
     avg_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
     trading_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # P0 擬真度新增指標
+    sortino_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calmar_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    var_95: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cvar_95: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    benchmark_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_drag_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
@@ -766,6 +775,10 @@ class RotationBacktestTrade(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
     entry_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
     entry_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # P0 擬真度新增
+    buy_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sell_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trade_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     def __repr__(self) -> str:
         return f"<RotationBacktestTrade {self.stock_id} {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
