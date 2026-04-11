@@ -163,6 +163,15 @@ def cmd_rotation(args: argparse.Namespace) -> None:
 
         _print_rotation_backtest(result)
 
+        # 匯出每日持倉快照
+        export_pos = getattr(args, "export_positions", None)
+        if export_pos and result.daily_positions:
+            import pandas as pd
+
+            df_pos = pd.DataFrame(result.daily_positions)
+            df_pos.to_csv(export_pos, index=False, encoding="utf-8-sig")
+            print(f"\n每日持倉快照已匯出: {export_pos}（{len(df_pos)} 筆）")
+
     elif action == "list":
         portfolios = RotationManager.list_portfolios()
         if not portfolios:

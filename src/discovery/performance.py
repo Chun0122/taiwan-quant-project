@@ -60,12 +60,16 @@ class DiscoveryPerformance:
         top_n: Optional[int] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        include_costs: bool = False,
+        entry_at_next_open: bool = False,
     ):
         self.mode = mode
         self.holding_days = holding_days or self.MODE_HORIZONS.get(mode, [5, 10, 20])
         self.top_n = top_n
         self.start_date = date.fromisoformat(start_date) if start_date else None
         self.end_date = date.fromisoformat(end_date) if end_date else None
+        self.include_costs = include_costs
+        self.entry_at_next_open = entry_at_next_open
 
     def evaluate(self) -> dict:
         """回傳 { "summary", "by_scan", "detail", "by_regime", "turnover", "mfe_mae" }。
@@ -159,7 +163,7 @@ class DiscoveryPerformance:
         )
 
     def _load_prices(self, records_df: pd.DataFrame) -> pd.DataFrame:
-        """批次載入所有相關股票在推薦日之後的 DailyPrice（含 high/low for MFE/MAE）。"""
+        """批次載入所有相關股票在推薦日之後的 DailyPrice（含 open/high/low）。"""
         stock_ids = records_df["stock_id"].unique().tolist()
         min_date = records_df["scan_date"].min()
 
@@ -168,6 +172,7 @@ class DiscoveryPerformance:
                 select(
                     DailyPrice.stock_id,
                     DailyPrice.date,
+                    DailyPrice.open,
                     DailyPrice.close,
                     DailyPrice.high,
                     DailyPrice.low,
@@ -183,48 +188,85 @@ class DiscoveryPerformance:
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows, columns=["stock_id", "date", "close", "high", "low"])
+        return pd.DataFrame(rows, columns=["stock_id", "date", "open", "close", "high", "low"])
 
     def _calc_returns(self, records_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
-        """計算每筆推薦在各持有天數的報酬率。"""
-        results = []
+        """計算每筆推薦在各持有天數的報酬率（向量化版）。
 
-        for _, rec in records_df.iterrows():
-            scan_date = rec["scan_date"]
-            stock_id = rec["stock_id"]
-            entry_close = rec["close"]
+        支援 include_costs（扣交易成本）與 entry_at_next_open（T+1 開盤價進場）。
+        """
+        if records_df.empty or prices_df.empty:
+            return pd.DataFrame()
 
-            # 取該股票在推薦日之後的價格序列
-            future_prices = (
-                prices_df[(prices_df["stock_id"] == stock_id) & (prices_df["date"] > scan_date)]
-                .sort_values("date")
-                .reset_index(drop=True)
+        # 交易成本常數（僅在 include_costs=True 時使用）
+        if self.include_costs:
+            from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+
+        # 為每筆推薦建立唯一索引
+        recs = records_df.copy()
+        recs["_rec_idx"] = range(len(recs))
+
+        # 合併推薦與未來價格
+        prices = prices_df.sort_values(["stock_id", "date"]).copy()
+        merged = recs[["_rec_idx", "scan_date", "stock_id", "close"]].merge(
+            prices.rename(
+                columns={
+                    "date": "future_date",
+                    "open": "future_open",
+                    "close": "future_close",
+                }
+            )[["stock_id", "future_date", "future_open", "future_close"]],
+            on="stock_id",
+            how="inner",
+        )
+        merged = merged[merged["future_date"] > merged["scan_date"]]
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        # 計算每筆推薦-未來價格的「第幾個交易日」（0-based）
+        merged = merged.sort_values(["_rec_idx", "future_date"])
+        merged["day_rank"] = merged.groupby("_rec_idx").cumcount()
+
+        # 建立基礎結果
+        base_cols = ["_rec_idx", "scan_date", "stock_id", "stock_name", "rank", "close", "composite_score"]
+        if "regime" in recs.columns:
+            base_cols.append("regime")
+        result = recs[[c for c in base_cols if c in recs.columns]].copy()
+
+        # T+1 開盤價進場：取 day_rank=0 的 future_open 作為實際進場價
+        if self.entry_at_next_open:
+            t1_rows = merged[merged["day_rank"] == 0][["_rec_idx", "future_open"]].copy()
+            t1_rows = t1_rows.rename(columns={"future_open": "_t1_open"})
+            result = result.merge(t1_rows, on="_rec_idx", how="left")
+            # fallback: open 為 NULL 時使用 scan_date close
+            result["entry_close"] = result["_t1_open"].fillna(result["close"])
+            result = result.drop(columns=["_t1_open", "close"])
+        else:
+            result = result.rename(columns={"close": "entry_close"})
+
+        # 對每個 holding_days，取第 (days-1) 天的收盤價
+        for days in self.holding_days:
+            target_rows = (
+                merged[merged["day_rank"] == days - 1][["_rec_idx", "future_close"]]
+                .drop_duplicates(subset=["_rec_idx"])
+                .set_index("_rec_idx")
             )
 
-            row = {
-                "scan_date": scan_date,
-                "stock_id": stock_id,
-                "stock_name": rec["stock_name"],
-                "rank": rec["rank"],
-                "entry_close": entry_close,
-                "composite_score": rec["composite_score"],
-                "regime": rec.get("regime"),
-            }
+            col_ret = f"return_{days}d"
+            col_exit = f"exit_close_{days}d"
+            result = result.join(
+                target_rows.rename(columns={"future_close": col_exit}),
+                on="_rec_idx",
+            )
+            if self.include_costs:
+                buy_cost = result["entry_close"] * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+                sell_net = result[col_exit] * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+                result[col_ret] = (sell_net - buy_cost) / buy_cost
+            else:
+                result[col_ret] = (result[col_exit] - result["entry_close"]) / result["entry_close"]
 
-            for days in self.holding_days:
-                col_ret = f"return_{days}d"
-                col_exit = f"exit_close_{days}d"
-                if len(future_prices) >= days:
-                    exit_close = future_prices.iloc[days - 1]["close"]
-                    row[col_ret] = (exit_close - entry_close) / entry_close
-                    row[col_exit] = exit_close
-                else:
-                    row[col_ret] = None
-                    row[col_exit] = None
-
-            results.append(row)
-
-        return pd.DataFrame(results)
+        return result.drop(columns=["_rec_idx"])
 
     def _aggregate_summary(self, detail: pd.DataFrame) -> pd.DataFrame:
         """每個持有天數一行，整體統計。"""
@@ -361,7 +403,14 @@ class DiscoveryPerformance:
         return compute_mfe_mae(records_df, prices_df, holding_days=holding)
 
 
-def print_performance_report(result: dict, mode: str, start_date=None, end_date=None) -> None:
+def print_performance_report(
+    result: dict,
+    mode: str,
+    start_date=None,
+    end_date=None,
+    include_costs: bool = False,
+    entry_at_next_open: bool = False,
+) -> None:
     """輸出績效報告到 console。"""
     summary = result["summary"]
     by_scan = result["by_scan"]
@@ -385,8 +434,12 @@ def print_performance_report(result: dict, mode: str, start_date=None, end_date=
     if end_date:
         date_max = end_date
 
+    # 設定標籤
+    cost_tag = " [含交易成本]" if include_costs else ""
+    entry_tag = " [T+1開��進場]" if entry_at_next_open else ""
+
     print(f"\n{'=' * 80}")
-    print(f"Discover 推薦績效回測 [{mode_label}]")
+    print(f"Discover 推薦績效回測 [{mode_label}]{cost_tag}{entry_tag}")
     print(f"掃描期間：{date_min} ~ {date_max}（共 {scan_count} 次掃描，{total_recs} 筆推薦）")
     print(f"{'=' * 80}")
 

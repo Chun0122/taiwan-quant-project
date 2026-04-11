@@ -386,6 +386,8 @@ def main() -> None:
     sp_db.add_argument("--start", default=None, help="掃描日期範圍起始 (YYYY-MM-DD)")
     sp_db.add_argument("--end", default=None, help="掃描日期範圍結束 (YYYY-MM-DD)")
     sp_db.add_argument("--export", default=None, help="匯出明細 CSV 路徑")
+    sp_db.add_argument("--include-costs", action="store_true", help="績效計算納入交易成本（手續費+稅+滑價）")
+    sp_db.add_argument("--entry-next-open", action="store_true", help="以 T+1 開盤價作為進場價（消除 look-ahead bias）")
 
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")
@@ -698,6 +700,12 @@ def main() -> None:
     sp_rb.add_argument("--capital", type=float, default=None, help="覆蓋初始資金")
     sp_rb.add_argument("--start", required=True, help="回測起始日 (YYYY-MM-DD)")
     sp_rb.add_argument("--end", required=True, help="回測結束日 (YYYY-MM-DD)")
+    sp_rb.add_argument(
+        "--export-positions",
+        default=None,
+        metavar="FILE",
+        help="匯出每日持倉快照至 CSV",
+    )
 
     # rotation list
     rot_sub.add_parser("list", help="列出所有輪動組合")

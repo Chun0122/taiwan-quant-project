@@ -994,6 +994,15 @@ python main.py discover-backtest --mode momentum --start 2025-06-01 --end 2025-1
 
 # 匯出明細 CSV
 python main.py discover-backtest --mode momentum --export result.csv
+
+# 含交易成本（手續費+稅+滑價）
+python main.py discover-backtest --mode momentum --include-costs
+
+# T+1 開盤價進場（消除 look-ahead bias）
+python main.py discover-backtest --mode momentum --entry-next-open
+
+# 同時啟用成本 + T+1 開盤進場
+python main.py discover-backtest --mode momentum --include-costs --entry-next-open
 ```
 
 **參數說明：**
@@ -1006,6 +1015,8 @@ python main.py discover-backtest --mode momentum --export result.csv
 | `--start` | 掃描日期範圍起始（YYYY-MM-DD） |
 | `--end` | 掃描日期範圍結束（YYYY-MM-DD） |
 | `--export` | 匯出明細 CSV 路徑 |
+| `--include-costs` | 績效計算納入交易成本（手續費 0.1425% + 交易稅 0.3% + 滑價 0.05%） |
+| `--entry-next-open` | 以 T+1 開盤價作為進場價（預設使用推薦日收盤價） |
 
 **輸出三層聚合：**
 
@@ -1568,6 +1579,9 @@ python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12
 
 # Ad-hoc 回測（不需先建立組合）
 python main.py rotation backtest --mode momentum --max-positions 5 --holding-days 3 --capital 1000000 --start 2025-01-01 --end 2025-12-31
+
+# 匯出每日持倉快照 CSV（含日期/股票/股數/進場價/現價/市值/未實現損益/權重）
+python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12-31 --export-positions positions.csv
 ```
 
 回測結果（績效摘要 + 逐筆交易含 entry_rank/entry_score）會自動寫入 DB（`rotation_backtest_summary` + `rotation_backtest_trade`），供後續比較與分析。

@@ -64,6 +64,7 @@ class RotationBacktestResult:
     trades: list[dict] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     config: dict = field(default_factory=dict)
+    daily_positions: list[dict] = field(default_factory=list)  # 每日持倉快照
 
 
 @dataclass
@@ -685,6 +686,36 @@ class RotationManager:
             # TAIEX benchmark 資料
             taiex_prices = _get_taiex_prices(session, trading_cal[0], trading_cal[-1])
 
+            # ── OHLCV 預載入：一次查詢整段時間範圍，避免逐日 DB 查詢 ──
+            _bt_stock_ids: set[str] = {"TAIEX"}
+            for _sd_rankings in all_rankings.values():
+                for _r in _sd_rankings:
+                    _bt_stock_ids.add(_r["stock_id"])
+            _ohlcv_cache: dict[date, dict[str, dict]] = {}
+            if _bt_stock_ids:
+                _ohlcv_stmt = select(
+                    DailyPrice.stock_id,
+                    DailyPrice.date,
+                    DailyPrice.open,
+                    DailyPrice.high,
+                    DailyPrice.low,
+                    DailyPrice.close,
+                    DailyPrice.volume,
+                ).where(
+                    DailyPrice.stock_id.in_(list(_bt_stock_ids)),
+                    DailyPrice.date >= start_date,
+                    DailyPrice.date <= end_date,
+                )
+                for row in session.execute(_ohlcv_stmt).all():
+                    sid, d, o, h, lo, c, v = row
+                    _ohlcv_cache.setdefault(d, {})[sid] = {
+                        "open": o,
+                        "high": h,
+                        "low": lo,
+                        "close": c,
+                        "volume": v or 0,
+                    }
+
             # 逐日模擬
             positions: list[dict] = []  # 模擬持倉
             cash = capital
@@ -704,6 +735,9 @@ class RotationManager:
             # VaR 計算用：累計每日收盤價（最近 60 日窗口）
             daily_close_history: dict[str, list[float]] = {}  # {stock_id: [close1, close2, ...]}
 
+            # 每日持倉快照
+            daily_positions_snapshot: list[dict] = []
+
             for day in trading_cal:
                 # 取今日排名
                 if day in all_rankings:
@@ -713,9 +747,19 @@ class RotationManager:
                     equity_curve.append({"date": day, "equity": cash})
                     continue
 
-                # 取今日 OHLCV（動態滑價需要完整 OHLCV）
+                # 取今日 OHLCV（優先從預載入快取取得，cache miss 時 fallback 到 DB 查詢）
                 all_sids = list({p["stock_id"] for p in positions} | {r["stock_id"] for r in last_rankings})
-                today_ohlcv = _get_ohlcv_on_date(session, all_sids, day)
+                today_ohlcv: dict[str, dict] = {}
+                _cache_day = _ohlcv_cache.get(day, {})
+                _cache_miss: list[str] = []
+                for sid in all_sids:
+                    if sid in _cache_day:
+                        today_ohlcv[sid] = _cache_day[sid]
+                    else:
+                        _cache_miss.append(sid)
+                if _cache_miss:
+                    _fb = _get_ohlcv_on_date(session, _cache_miss, day)
+                    today_ohlcv.update(_fb)
                 today_prices = {sid: d["close"] for sid, d in today_ohlcv.items()}
 
                 # 止損價：從持倉記錄取進場時鎖定的止損價
@@ -919,6 +963,27 @@ class RotationManager:
 
                 equity_curve.append({"date": day, "equity": total_equity, "var_pct": var_pct})
 
+                # 記錄持倉快照
+                for pos in positions:
+                    _sid = pos["stock_id"]
+                    _cur_p = today_prices.get(_sid, pos["entry_price"])
+                    _mv = _cur_p * pos["shares"]
+                    daily_positions_snapshot.append(
+                        {
+                            "date": day,
+                            "stock_id": _sid,
+                            "stock_name": pos.get("stock_name", ""),
+                            "shares": pos["shares"],
+                            "entry_price": pos["entry_price"],
+                            "current_price": _cur_p,
+                            "market_value": round(_mv, 2),
+                            "unrealized_pct": round((_cur_p - pos["entry_price"]) / pos["entry_price"], 6)
+                            if pos["entry_price"] > 0
+                            else 0.0,
+                            "weight": round(_mv / total_equity, 6) if total_equity > 0 else 0.0,
+                        }
+                    )
+
                 # 更新 prev_close_map（漲跌停偵測用）
                 for sid, ohlcv_data in today_ohlcv.items():
                     prev_close_map[sid] = ohlcv_data["close"]
@@ -926,7 +991,12 @@ class RotationManager:
             # 強制平倉期末持倉
             if positions and trading_cal:
                 last_day = trading_cal[-1]
-                last_ohlcv = _get_ohlcv_on_date(session, [p["stock_id"] for p in positions], last_day)
+                _last_sids = [p["stock_id"] for p in positions]
+                _cache_last = _ohlcv_cache.get(last_day, {})
+                last_ohlcv = {sid: _cache_last[sid] for sid in _last_sids if sid in _cache_last}
+                _last_miss = [sid for sid in _last_sids if sid not in last_ohlcv]
+                if _last_miss:
+                    last_ohlcv.update(_get_ohlcv_on_date(session, _last_miss, last_day))
                 for pos in positions:
                     sid = pos["stock_id"]
                     ohlcv = last_ohlcv.get(sid, {})
@@ -1037,6 +1107,7 @@ class RotationManager:
                 equity_curve=equity_curve,
                 trades=all_trades,
                 metrics=metrics,
+                daily_positions=daily_positions_snapshot,
                 config={
                     "portfolio_name": self.portfolio_name,
                     "mode": mode,

@@ -563,12 +563,21 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
         top_n=args.top,
         start_date=args.start,
         end_date=args.end,
+        include_costs=getattr(args, "include_costs", False),
+        entry_at_next_open=getattr(args, "entry_next_open", False),
     )
 
     print(f"正在計算 {args.mode} 推薦績效...")
     result = perf.evaluate()
 
-    print_performance_report(result, args.mode, args.start, args.end)
+    print_performance_report(
+        result,
+        args.mode,
+        args.start,
+        args.end,
+        include_costs=getattr(args, "include_costs", False),
+        entry_at_next_open=getattr(args, "entry_next_open", False),
+    )
 
     # 匯出 CSV
     if args.export and not result["detail"].empty:

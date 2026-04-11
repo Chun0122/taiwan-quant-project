@@ -118,9 +118,9 @@ class TestInsufficientData:
         assert len(detail) == 1
 
         row = detail.iloc[0]
-        assert row["return_5d"] is None
-        assert row["return_10d"] is None
-        assert row["return_20d"] is None
+        assert pd.isna(row["return_5d"])
+        assert pd.isna(row["return_10d"])
+        assert pd.isna(row["return_20d"])
 
         # summary 可評估數應為 0
         summary = result["summary"]
@@ -557,3 +557,138 @@ class TestEvaluateReturnKeys:
         result = perf.evaluate()
         assert "regime" in result["detail"].columns
         assert result["detail"].iloc[0]["regime"] == "bull"
+
+
+class TestIncludeCosts:
+    """改進 2：交易成本扣減。"""
+
+    def test_costs_reduce_return(self, db_session):
+        """啟用 include_costs 後，報酬率應低於不含成本版本。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "2330", 100.0)
+        _insert_prices(db_session, "2330", "2025-06-03", list(range(101, 121)))
+
+        perf_no_cost = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        r_no = perf_no_cost.evaluate()
+
+        perf_cost = DiscoveryPerformance(mode="momentum", holding_days=[5], include_costs=True)
+        r_cost = perf_cost.evaluate()
+
+        ret_no = r_no["detail"].iloc[0]["return_5d"]
+        ret_cost = r_cost["detail"].iloc[0]["return_5d"]
+        assert ret_cost < ret_no
+
+    def test_costs_formula_correct(self, db_session):
+        """交易成本公式驗算：buy_cost = entry*(1+fee+slip), sell_net = exit*(1-fee-tax-slip)。"""
+        from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "COS1", 100.0)
+        _insert_prices(db_session, "COS1", "2025-06-03", [110] * 5)
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5], include_costs=True)
+        result = perf.evaluate()
+        row = result["detail"].iloc[0]
+
+        entry = 100.0
+        exit_p = 110.0
+        buy_cost = entry * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+        sell_net = exit_p * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+        expected = (sell_net - buy_cost) / buy_cost
+
+        assert abs(row["return_5d"] - expected) < 1e-10
+
+    def test_no_cost_by_default(self, db_session):
+        """預設不啟用成本。"""
+        perf = DiscoveryPerformance(mode="momentum")
+        assert perf.include_costs is False
+
+
+class TestEntryAtNextOpen:
+    """改進 3：T+1 開盤價進場。"""
+
+    def test_entry_uses_open_price(self, db_session):
+        """啟用 entry_at_next_open 後進場價應為 T+1 開盤價。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "2330", 100.0)
+        # open=90, close=105...; entry should use open=90
+        dates = pd.bdate_range("2025-06-03", periods=5)
+        for i, dt in enumerate(dates):
+            db_session.add(
+                DailyPrice(
+                    stock_id="2330",
+                    date=dt.date(),
+                    open=90 + i,
+                    high=110 + i,
+                    low=85 + i,
+                    close=105 + i,
+                    volume=1_000_000,
+                    turnover=100_000_000,
+                    spread=0.5,
+                )
+            )
+        db_session.flush()
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5], entry_at_next_open=True)
+        result = perf.evaluate()
+        row = result["detail"].iloc[0]
+
+        # entry=90 (T+1 open), exit=109 (day 5 close)
+        expected = (109 - 90) / 90
+        assert abs(row["return_5d"] - expected) < 1e-10
+
+    def test_default_entry_uses_scan_close(self, db_session):
+        """預設以 scan_date close 為進場價。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "DEF1", 100.0)
+        _insert_prices(db_session, "DEF1", "2025-06-03", [110] * 5)
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        row = result["detail"].iloc[0]
+
+        expected = (110 - 100) / 100
+        assert abs(row["return_5d"] - expected) < 1e-10
+
+    def test_entry_at_next_open_default_false(self, db_session):
+        """預設不啟用 T+1 開盤進場。"""
+        perf = DiscoveryPerformance(mode="momentum")
+        assert perf.entry_at_next_open is False
+
+
+class TestVectorizedCalcReturns:
+    """改進 4：向量化 _calc_returns 邊界測試。"""
+
+    def test_multiple_recommendations_same_day(self, db_session):
+        """同日多檔推薦各自正確計算。"""
+        scan_date = date(2025, 6, 2)
+        _insert_discovery(db_session, scan_date, "momentum", 1, "A001", 100.0)
+        _insert_discovery(db_session, scan_date, "momentum", 2, "B001", 200.0)
+        _insert_prices(db_session, "A001", "2025-06-03", [110] * 5)
+        _insert_prices(db_session, "B001", "2025-06-03", [220] * 5)
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+
+        detail = result["detail"]
+        assert len(detail) == 2
+        a_row = detail[detail["stock_id"] == "A001"].iloc[0]
+        b_row = detail[detail["stock_id"] == "B001"].iloc[0]
+        assert abs(a_row["return_5d"] - 0.10) < 1e-10
+        assert abs(b_row["return_5d"] - 0.10) < 1e-10
+
+    def test_different_scan_dates_independent(self, db_session):
+        """不同日推薦的同一檔股票各自獨立計算。"""
+        _insert_discovery(db_session, date(2025, 6, 2), "momentum", 1, "X001", 100.0)
+        _insert_discovery(db_session, date(2025, 6, 4), "momentum", 1, "X001", 105.0)
+
+        # 20 天價格
+        _insert_prices(db_session, "X001", "2025-06-03", list(range(101, 125)))
+
+        perf = DiscoveryPerformance(mode="momentum", holding_days=[5])
+        result = perf.evaluate()
+        detail = result["detail"]
+        assert len(detail) == 2
+        # 兩筆推薦的進場價不同，報酬率應不同
+        rets = sorted(detail["return_5d"].tolist())
+        assert rets[0] != rets[1]

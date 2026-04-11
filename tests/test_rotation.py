@@ -2212,3 +2212,76 @@ class TestPortfolioVaR:
         # 只算 A 的部分
         assert r["var_amount"] > 0
         assert "MISSING" not in r["component_var"]
+
+
+# ===========================================================================
+#  改進 5：RotationBacktestResult.daily_positions 持倉快照
+# ===========================================================================
+
+
+class TestBacktestResultDailyPositions:
+    """RotationBacktestResult 的 daily_positions 欄位。"""
+
+    def test_default_empty(self):
+        """預設 daily_positions 為空 list。"""
+        from src.portfolio.manager import RotationBacktestResult
+
+        r = RotationBacktestResult()
+        assert r.daily_positions == []
+
+    def test_populated_snapshot(self):
+        """帶入持倉快照後可正常存取。"""
+        from src.portfolio.manager import RotationBacktestResult
+
+        snapshot = [
+            {
+                "date": date(2025, 1, 6),
+                "stock_id": "2330",
+                "stock_name": "台積電",
+                "shares": 1000,
+                "entry_price": 600.0,
+                "current_price": 620.0,
+                "market_value": 620_000.0,
+                "unrealized_pct": 0.033333,
+                "weight": 0.6,
+            },
+            {
+                "date": date(2025, 1, 6),
+                "stock_id": "2317",
+                "stock_name": "鴻海",
+                "shares": 5000,
+                "entry_price": 100.0,
+                "current_price": 98.0,
+                "market_value": 490_000.0,
+                "unrealized_pct": -0.02,
+                "weight": 0.4,
+            },
+        ]
+        r = RotationBacktestResult(daily_positions=snapshot)
+        assert len(r.daily_positions) == 2
+        assert r.daily_positions[0]["stock_id"] == "2330"
+        assert r.daily_positions[1]["unrealized_pct"] == -0.02
+
+    def test_snapshot_export_to_dataframe(self):
+        """持倉快照可轉為 DataFrame 匯出。"""
+        from src.portfolio.manager import RotationBacktestResult
+
+        snapshot = [
+            {
+                "date": date(2025, 1, 6),
+                "stock_id": "2330",
+                "shares": 1000,
+                "weight": 0.5,
+            },
+            {
+                "date": date(2025, 1, 7),
+                "stock_id": "2330",
+                "shares": 1000,
+                "weight": 0.48,
+            },
+        ]
+        r = RotationBacktestResult(daily_positions=snapshot)
+        df = pd.DataFrame(r.daily_positions)
+        assert len(df) == 2
+        assert list(df.columns) == ["date", "stock_id", "shares", "weight"]
+        assert df.iloc[1]["weight"] == 0.48

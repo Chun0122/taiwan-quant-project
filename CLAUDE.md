@@ -99,7 +99,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權**（3 群：報酬動能 mean(ret5d,ret10d,sharpe_proxy) / 量能 mean(vol_ratio,vol_accel) / 突破 breakout60d，各 1/3）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；**子因子 IC 自動權重調整**（`compute_sub_factor_weight_adjustments` + `_get_chip_base_weights` 純函數，chip 層級 IC-driven 權重微調）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
-| `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
+| `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告）；`--include-costs`（交易成本扣減）；`--entry-next-open`（T+1 開盤價進場）；向量化 `_calc_returns()` |
 | `src/discovery/ablation.py` | 因子消融測試：維度級（歸零重分配 Spearman ρ）+ 子因子級 + 歷史績效消融；CLI `ablation-test` |
 | `src/regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）；三訊號多數決；市場寬度降級（>60% 跌破 MA20）；Crisis 快速覆蓋（7 訊號 ≥2 觸發）；Hysteresis 狀態機（JSON 持久化） |
 | `src/industry/analyzer.py` | 產業輪動（法人+價格動能）；`compute_sector_relative_strength()`（個股 vs 同業中位數，±3%） |
@@ -113,7 +113,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `src/entry_exit.py` | 共用純函數：`REGIME_ATR_PARAMS`（bull/sideways/bear/crisis ATR 倍數）；`compute_atr_stops()`（ATR≤0 fallback 百分比）；`compute_entry_trigger()`；`assess_timing()`（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
 | `src/portfolio/rotation.py` | 輪動核心：`compute_rotation_actions()`（到期/續持/止損/換股 + 產業集中度 + Drawdown Guard + Portfolio Heat + Correlation Budget + Crisis 硬阻擋）；`check_drawdown_kill_switch()`（回撤≥25% 清倉）；波動率反比權重；60 日 rolling 相關性/共變異數矩陣；`compute_dynamic_slippage()`（三因子動態滑價）；`apply_liquidity_limit()`（流動性約束）；`detect_limit_price()`（漲跌停偵測）；`TradeCostBreakdown` / `compute_trade_costs()`（成本歸因）；`compute_portfolio_var()`（Ex-Ante VaR + Component VaR） |
-| `src/portfolio/manager.py` | `RotationManager`：每日更新 / Kill Switch / 歷史回測（動態滑價+流動性約束+漲跌停模擬+TAIEX Benchmark+成本歸因+委託 `compute_metrics()`）/ `resolve_rankings()`（單模式 / all avg_score）/ `_get_ohlcv_on_date()` / `_get_taiex_prices()` |
+| `src/portfolio/manager.py` | `RotationManager`：每日更新 / Kill Switch / 歷史回測（OHLCV 預載入快取+動態滑價+流動性約束+漲跌停模擬+TAIEX Benchmark+成本歸因+委託 `compute_metrics()`+每日持倉快照 `daily_positions`）/ `resolve_rankings()`（單模式 / all avg_score）/ `_get_ohlcv_on_date()` / `_get_taiex_prices()` |
 
 **特徵/CLI/報告層**
 
@@ -195,6 +195,8 @@ python main.py discover all --skip-sync --export compare.csv
 python main.py discover momentum --weekly-confirm  # 週線多時框確認
 python main.py discover momentum --use-ic-adjustment  # Factor IC 動態權重調整
 python main.py discover-backtest --mode momentum   # 推薦績效回測
+python main.py discover-backtest --mode momentum --include-costs  # 含交易成本
+python main.py discover-backtest --mode momentum --entry-next-open  # T+1 開盤進場
 python main.py factor-diagnostics --mode momentum  # 因子 IC + 相關性矩陣
 python main.py ablation-test --mode momentum       # 因子消融測試
 python main.py ablation-test --mode momentum --with-performance  # 含歷史績效消融
@@ -215,6 +217,7 @@ python main.py rotation status --all
 python main.py rotation history --name mom5_3d --limit 30
 python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12-31
 python main.py rotation backtest --mode momentum --max-positions 5 --holding-days 3 --start 2025-01-01 --end 2025-12-31
+python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12-31 --export-positions positions.csv
 python main.py rotation list
 python main.py rotation pause --name mom5_3d
 python main.py rotation resume --name mom5_3d
@@ -295,7 +298,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1738 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1749 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -358,9 +361,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 81 項）
+## Completed Tasks（已完成，共 82 項）
 
-測試數從 231 → 1738。各階段摘要：
+測試數從 231 → 1749。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -380,3 +383,4 @@ pytest --cov=src --cov-report=term-missing
 | **Rotation 回測擬真度** | 79 | 三因子動態滑價（`compute_dynamic_slippage`）、流動性約束（`apply_liquidity_limit`）、漲跌停模擬（`detect_limit_price`）、成本歸因（`TradeCostBreakdown`）、TAIEX Benchmark+Alpha、委託 `compute_metrics()`（Sortino/Calmar/VaR/CVaR/PF）、Schema 遷移 11 欄位（+28 測試） |
 | **Ex-Ante VaR** | 80 | `compute_covariance_matrix()`（共變異數矩陣+ridge正則化）、`compute_portfolio_var()`（參數化VaR+Component VaR分解）、backtest 每日 VaR 記錄、update() VaR 日誌（+11 測試） |
 | **子因子 IC 自動化** | 81 | `compute_sub_factor_weight_adjustments()`（子因子 IC 權重調整+min_samples 防護）、`_get_chip_base_weights()`（15 分支→純函數）、`_compute_chip_scores()` 重構整合 IC 調整、`_load_chip_sub_factor_ic()` DB 歷史 IC 載入+graceful degradation（+11 測試） |
+| **Discover+Rotation 效能強化** | 82 | Rotation 回測 OHLCV 預載入快取（消除 N×M 逐日查詢）、Discover 回測交易成本扣減（`--include-costs`）、T+1 開盤價進場（`--entry-next-open`）、`_calc_returns()` 向量化（iterrows→merge+join）、Rotation 回測每日持倉快照（`--export-positions` CSV）（+11 測試） |
