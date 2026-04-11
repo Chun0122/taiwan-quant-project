@@ -505,6 +505,44 @@ class TestStage2LiquidityFilter:
         result = uf._stage2_liquidity_filter(["9999_no_data"])
         assert "9999_no_data" in result
 
+    def test_falls_back_when_feature_coverage_insufficient(self, db_session):
+        """DailyFeature 僅覆蓋極少數股票時，應 fallback 至 DailyPrice。
+
+        模擬：10 支股票送入 Stage 2，但 DailyFeature 只有 1 支（覆蓋率 10% < 30%），
+        DailyPrice 有充足 turnover 的 5 支應全部通過。
+        """
+        today = date.today()
+        all_ids = [f"S{i:04d}" for i in range(10)]
+
+        # 5 支高流動性 + 5 支低流動性（DailyPrice）
+        for i, sid in enumerate(all_ids):
+            turnover = 50_000_000 if i < 5 else 1_000_000
+            for d in range(5):
+                dt = today - timedelta(days=5 - d)
+                db_session.add(_make_dp(sid, dt, turnover=turnover))
+
+        # DailyFeature 只覆蓋 1 支（覆蓋率 1/10 = 10% < 30%）
+        db_session.add(
+            DailyFeature(
+                stock_id="S0000",
+                date=today - timedelta(days=1),
+                close=100.0,
+                volume=1_000_000,
+                turnover=50_000_000,
+                turnover_ma5=50_000_000,
+            )
+        )
+        db_session.flush()
+
+        uf = UniverseFilter(UniverseConfig(avg_turnover_5d_min=30_000_000, min_turnover_5d_min=10_000_000))
+        result = uf._stage2_liquidity_filter(all_ids)
+
+        # 應該用 DailyPrice fallback，5 支高流動性全部通過
+        for sid in all_ids[:5]:
+            assert sid in result, f"{sid} 應通過流動性過濾（DailyPrice fallback）"
+        for sid in all_ids[5:]:
+            assert sid not in result, f"{sid} 不應通過流動性過濾"
+
 
 # ────────────────────────────────────────────────────────────────────────────
 #  TestCandidateMemory — DB 整合

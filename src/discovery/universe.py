@@ -465,11 +465,14 @@ class UniverseFilter:
     #  Stage 2: 流動性過濾
     # ------------------------------------------------------------------ #
 
+    # DailyFeature 覆蓋率門檻：低於此比例時 fallback 到 DailyPrice
+    _FEATURE_COVERAGE_MIN = 0.3
+
     def _stage2_liquidity_filter(self, stage1_ids: list[str]) -> list[str]:
         """Stage 2: 讀取近 5 日 turnover，過濾流動性不足的股票。
 
         優先從 DailyFeature（turnover_ma5）讀取；
-        若 DailyFeature 無資料，fallback 從 DailyPrice 計算。
+        若 DailyFeature 覆蓋率不足（< 30% Stage 1 股票），fallback 從 DailyPrice 計算。
         """
         cutoff_5d = date.today() - timedelta(days=10)  # 多抓幾天以應對假日
 
@@ -478,7 +481,13 @@ class UniverseFilter:
 
         # 嘗試從 DailyFeature 讀取（有最新特徵快取時）
         df_feature = self._load_feature_turnover(stage1_ids)
-        if not df_feature.empty and "turnover_ma5" in df_feature.columns:
+        # 覆蓋率檢查：DailyFeature 須涵蓋 ≥30% 的 Stage 1 股票，否則 fallback
+        feature_coverage = len(df_feature) / max(len(stage1_ids), 1)
+        if (
+            not df_feature.empty
+            and "turnover_ma5" in df_feature.columns
+            and feature_coverage >= self._FEATURE_COVERAGE_MIN
+        ):
             latest = df_feature.dropna(subset=["turnover_ma5"])
             # 用 turnover_ma5 作為 5 日均值代理
             avg5_map = latest.set_index("stock_id")["turnover_ma5"]
@@ -515,6 +524,15 @@ class UniverseFilter:
                         return passed_absolute + rescued
 
             return passed_absolute
+
+        # 覆蓋率不足時記錄原因
+        if not df_feature.empty and feature_coverage < self._FEATURE_COVERAGE_MIN:
+            logger.info(
+                "UniverseFilter Stage 2: DailyFeature 覆蓋率不足（%d/%d=%.0f%%），fallback 至 DailyPrice",
+                len(df_feature),
+                len(stage1_ids),
+                feature_coverage * 100,
+            )
 
         # Fallback: 從 DailyPrice 計算（多抓 30 天以計算 turnover_ma20）
         cutoff_30d = date.today() - timedelta(days=30)
@@ -596,10 +614,19 @@ class UniverseFilter:
         vol_override = getattr(self, "_volume_ratio_override", _SENTINEL)
         mode = self.config.trend_filter_mode
 
-        # 嘗試從 DailyFeature 讀取
+        # 嘗試從 DailyFeature 讀取（覆蓋率不足時 fallback）
         df_feat = self._load_feature_trend(stage2_ids)
-        if not df_feat.empty:
+        feat_coverage = len(df_feat) / max(len(stage2_ids), 1)
+        if not df_feat.empty and feat_coverage >= self._FEATURE_COVERAGE_MIN:
             return self._dispatch_trend_filter(df_feat, vol_override, mode)
+
+        if not df_feat.empty and feat_coverage < self._FEATURE_COVERAGE_MIN:
+            logger.info(
+                "UniverseFilter Stage 3: DailyFeature 覆蓋率不足（%d/%d=%.0f%%），fallback 至 DailyPrice",
+                len(df_feat),
+                len(stage2_ids),
+                feat_coverage * 100,
+            )
 
         # Fallback: 從 DailyPrice 即時計算
         ma_period = self.config.trend_ma
