@@ -57,6 +57,7 @@ from src.discovery.scanner._functions import (
     compute_sbl_score,
     compute_smart_broker_score,
     compute_sub_factor_ic,
+    compute_sub_factor_weight_adjustments,
     compute_taiex_relative_strength,
     compute_vcp_score,
     compute_whale_score,
@@ -67,7 +68,7 @@ from src.discovery.scanner._functions import (
 from src.discovery.scanner._growth import GrowthScanner
 
 # --- 子類（各模式 Scanner）---
-from src.discovery.scanner._momentum import MomentumScanner
+from src.discovery.scanner._momentum import MomentumScanner, _get_chip_base_weights
 from src.discovery.scanner._swing import SwingScanner
 from src.discovery.scanner._value import ValueScanner
 
@@ -101,7 +102,9 @@ __all__ = [
     "compute_peer_fundamental_ranking",
     "compute_mfe_mae",
     "compute_sub_factor_ic",
+    "compute_sub_factor_weight_adjustments",
     "compute_factor_correlation_matrix",
+    "_get_chip_base_weights",
     # 資料容器
     "DiscoveryResult",
     "ScanAuditTrail",

@@ -22,12 +22,149 @@ from src.discovery.scanner._functions import (
     compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_smart_broker_score,
+    compute_sub_factor_weight_adjustments,
     compute_value_weighted_inst_flow,
     compute_whale_score,
 )
 from src.discovery.universe import UniverseConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_chip_base_weights(
+    has_broker: bool,
+    has_sbl: bool,
+    has_margin: bool,
+    has_whale: bool,
+    has_smart_broker: bool,
+) -> tuple[dict[str, float], str]:
+    """根據資料可用性決定籌碼子因子權重組合。
+
+    將 _compute_chip_scores() 的 15 個 if-elif 分支提取為純函數，
+    回傳 (weight_dict, chip_tier)。weight_dict 的 key 對應 rank 變數名稱：
+    consec / bvr / total / persist / smr / whale / sbl / broker / smart_broker。
+
+    Returns:
+        (weight_dict, chip_tier) — chip_tier 如 "8F"/"7F"/"3F" 等
+    """
+    if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
+        return {
+            "consec": 0.16,
+            "bvr": 0.14,
+            "total": 0.14,
+            "persist": 0.06,
+            "smr": 0.10,
+            "whale": 0.12,
+            "sbl": 0.07,
+            "broker": 0.11,
+            "smart_broker": 0.10,
+        }, "8F"
+    elif has_broker and has_sbl and has_margin and has_whale:
+        return {
+            "consec": 0.18,
+            "bvr": 0.16,
+            "total": 0.16,
+            "persist": 0.06,
+            "smr": 0.11,
+            "whale": 0.13,
+            "sbl": 0.08,
+            "broker": 0.12,
+        }, "7F"
+    elif has_broker and has_sbl and has_margin:
+        return {
+            "consec": 0.20,
+            "bvr": 0.18,
+            "total": 0.18,
+            "persist": 0.06,
+            "smr": 0.14,
+            "sbl": 0.12,
+            "broker": 0.12,
+        }, "6F"
+    elif has_broker and has_sbl:
+        return {
+            "consec": 0.26,
+            "bvr": 0.20,
+            "total": 0.20,
+            "persist": 0.06,
+            "sbl": 0.14,
+            "broker": 0.14,
+        }, "5F"
+    elif has_broker:
+        return {
+            "consec": 0.30,
+            "bvr": 0.22,
+            "total": 0.22,
+            "persist": 0.06,
+            "broker": 0.20,
+        }, "4F"
+    elif has_sbl and has_margin and has_whale:
+        return {
+            "consec": 0.20,
+            "bvr": 0.18,
+            "total": 0.18,
+            "persist": 0.06,
+            "smr": 0.13,
+            "whale": 0.15,
+            "sbl": 0.10,
+        }, "6F"
+    elif has_sbl and has_margin:
+        return {
+            "consec": 0.23,
+            "bvr": 0.20,
+            "total": 0.20,
+            "persist": 0.06,
+            "smr": 0.16,
+            "sbl": 0.15,
+        }, "5F"
+    elif has_sbl and has_whale:
+        return {
+            "consec": 0.26,
+            "bvr": 0.18,
+            "total": 0.18,
+            "persist": 0.06,
+            "whale": 0.22,
+            "sbl": 0.10,
+        }, "5F"
+    elif has_sbl:
+        return {
+            "consec": 0.33,
+            "bvr": 0.23,
+            "total": 0.23,
+            "persist": 0.06,
+            "sbl": 0.15,
+        }, "4F"
+    elif has_margin and has_whale:
+        return {
+            "consec": 0.23,
+            "bvr": 0.20,
+            "total": 0.20,
+            "persist": 0.06,
+            "smr": 0.15,
+            "whale": 0.16,
+        }, "5F"
+    elif has_margin:
+        return {
+            "consec": 0.28,
+            "bvr": 0.23,
+            "total": 0.23,
+            "persist": 0.06,
+            "smr": 0.20,
+        }, "4F"
+    elif has_whale:
+        return {
+            "consec": 0.33,
+            "bvr": 0.23,
+            "total": 0.23,
+            "persist": 0.06,
+            "whale": 0.15,
+        }, "4F"
+    else:
+        return {
+            "consec": 0.37,
+            "bvr": 0.27,
+            "total": 0.27,
+            "persist": 0.09,
+        }, "3F"
 
 
 class MomentumScanner(MarketScanner):
@@ -52,6 +189,7 @@ class MomentumScanner(MarketScanner):
             ),
         )
         super().__init__(**kwargs)
+        self._chip_sub_factor_ic: pd.DataFrame | None = None
 
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """動能模式粗篩：基本過濾 + 流動性 + 動能/法人/成交量加權。"""
@@ -110,6 +248,10 @@ class MomentumScanner(MarketScanner):
         """
         if df_inst.empty:
             return pd.DataFrame({"stock_id": stock_ids, "chip_score": [0.5] * len(stock_ids), "chip_tier": "N/A"})
+
+        # P1b: 從 DB 載入過去 30 天的 chip 子因子 IC（僅在啟用 IC 調整時）
+        if self.use_ic_adjustment and self._chip_sub_factor_ic is None:
+            self._chip_sub_factor_ic = self._load_chip_sub_factor_ic()
 
         inst_filtered = df_inst[df_inst["stock_id"].isin(stock_ids)]
         inst_grouped = inst_filtered.groupby("stock_id", sort=False)
@@ -263,129 +405,40 @@ class MomentumScanner(MarketScanner):
             )
 
         # ── 加權組合（含法人連續性 persist_rank）──────────────────────
-        if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
-            # 8F+P：外資16%+量比14%+法人14%+連續性6%+券資比10%+大戶12%+借券7%+分點HHI11%+智慧分點10%
-            df["chip_score"] = (
-                consec_rank * 0.16
-                + bvr_rank * 0.14
-                + total_rank * 0.14
-                + persist_rank * 0.06
-                + smr_rank * 0.10
-                + whale_rank * 0.12
-                + sbl_rank * 0.07
-                + broker_rank * 0.11
-                + smart_broker_rank * 0.10
+        weights, chip_tier = _get_chip_base_weights(
+            has_broker=has_broker,
+            has_sbl=has_sbl,
+            has_margin=has_margin,
+            has_whale=has_whale,
+            has_smart_broker=has_smart_broker,
+        )
+
+        # P1b: 子因子 IC 動態權重調整（use_ic_adjustment=True 且有歷史 IC 資料時啟用）
+        if self.use_ic_adjustment and self._chip_sub_factor_ic is not None:
+            weights = compute_sub_factor_weight_adjustments(
+                self._chip_sub_factor_ic,
+                weights,
             )
-            chip_tier = "8F"
-        elif has_broker and has_sbl and has_margin and has_whale:
-            # 7F+P：外資18%+量比16%+法人16%+連續性6%+券資比11%+大戶13%+借券8%+分點12%
-            df["chip_score"] = (
-                consec_rank * 0.18
-                + bvr_rank * 0.16
-                + total_rank * 0.16
-                + persist_rank * 0.06
-                + smr_rank * 0.11
-                + whale_rank * 0.13
-                + sbl_rank * 0.08
-                + broker_rank * 0.12
-            )
-            chip_tier = "7F"
-        elif has_broker and has_sbl and has_margin:
-            # 6F+P：外資20%+量比18%+法人18%+連續性6%+券資比14%+借券12%+分點12%
-            df["chip_score"] = (
-                consec_rank * 0.20
-                + bvr_rank * 0.18
-                + total_rank * 0.18
-                + persist_rank * 0.06
-                + smr_rank * 0.14
-                + sbl_rank * 0.12
-                + broker_rank * 0.12
-            )
-            chip_tier = "6F"
-        elif has_broker and has_sbl:
-            # 5F+P：外資26%+量比20%+法人20%+連續性6%+借券14%+分點14%
-            df["chip_score"] = (
-                consec_rank * 0.26
-                + bvr_rank * 0.20
-                + total_rank * 0.20
-                + persist_rank * 0.06
-                + sbl_rank * 0.14
-                + broker_rank * 0.14
-            )
-            chip_tier = "5F"
-        elif has_broker:
-            # 4F+P：外資30%+量比22%+法人22%+連續性6%+分點20%
-            df["chip_score"] = (
-                consec_rank * 0.30 + bvr_rank * 0.22 + total_rank * 0.22 + persist_rank * 0.06 + broker_rank * 0.20
-            )
-            chip_tier = "4F"
-        elif has_sbl and has_margin and has_whale:
-            # 6F+P：外資20%+量比18%+法人18%+連續性6%+券資比13%+大戶15%+借券10%
-            df["chip_score"] = (
-                consec_rank * 0.20
-                + bvr_rank * 0.18
-                + total_rank * 0.18
-                + persist_rank * 0.06
-                + smr_rank * 0.13
-                + whale_rank * 0.15
-                + sbl_rank * 0.10
-            )
-            chip_tier = "6F"
-        elif has_sbl and has_margin:
-            # 5F+P：外資23%+量比20%+法人20%+連續性6%+券資比16%+借券15%
-            df["chip_score"] = (
-                consec_rank * 0.23
-                + bvr_rank * 0.20
-                + total_rank * 0.20
-                + persist_rank * 0.06
-                + smr_rank * 0.16
-                + sbl_rank * 0.15
-            )
-            chip_tier = "5F"
-        elif has_sbl and has_whale:
-            # 5F+P：外資26%+量比18%+法人18%+連續性6%+大戶22%+借券10%
-            df["chip_score"] = (
-                consec_rank * 0.26
-                + bvr_rank * 0.18
-                + total_rank * 0.18
-                + persist_rank * 0.06
-                + whale_rank * 0.22
-                + sbl_rank * 0.10
-            )
-            chip_tier = "5F"
-        elif has_sbl:
-            # 4F+P：外資33%+量比23%+法人23%+連續性6%+借券15%
-            df["chip_score"] = (
-                consec_rank * 0.33 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + sbl_rank * 0.15
-            )
-            chip_tier = "4F"
-        elif has_margin and has_whale:
-            # 5F+P：外資23%+量比20%+法人20%+連續性6%+券資比15%+大戶16%
-            df["chip_score"] = (
-                consec_rank * 0.23
-                + bvr_rank * 0.20
-                + total_rank * 0.20
-                + persist_rank * 0.06
-                + smr_rank * 0.15
-                + whale_rank * 0.16
-            )
-            chip_tier = "5F"
-        elif has_margin:
-            # 4F+P：外資28%+量比23%+法人23%+連續性6%+券資比20%
-            df["chip_score"] = (
-                consec_rank * 0.28 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + smr_rank * 0.20
-            )
-            chip_tier = "4F"
-        elif has_whale:
-            # 4F+P：外資33%+量比23%+法人23%+連續性6%+大戶15%
-            df["chip_score"] = (
-                consec_rank * 0.33 + bvr_rank * 0.23 + total_rank * 0.23 + persist_rank * 0.06 + whale_rank * 0.15
-            )
-            chip_tier = "4F"
-        else:
-            # 3F+P：外資37%+量比27%+法人27%+連續性9%
-            df["chip_score"] = consec_rank * 0.37 + bvr_rank * 0.27 + total_rank * 0.27 + persist_rank * 0.09
-            chip_tier = "3F"
+
+        # 建立 rank 名稱 → Series 映射
+        rank_map = {
+            "consec": consec_rank,
+            "bvr": bvr_rank,
+            "total": total_rank,
+            "persist": persist_rank,
+        }
+        if has_margin:
+            rank_map["smr"] = smr_rank
+        if has_whale:
+            rank_map["whale"] = whale_rank
+        if has_sbl:
+            rank_map["sbl"] = sbl_rank
+        if has_broker:
+            rank_map["broker"] = broker_rank
+        if has_smart_broker:
+            rank_map["smart_broker"] = smart_broker_rank
+
+        df["chip_score"] = sum(rank_map[k] * w for k, w in weights.items())
 
         # ── 籌碼品質修正（法人斜率 ±3% + HHI 趨勢 ±3%）───────────
         slope_df = compute_inst_net_buy_slope(df_inst, stock_ids, window=10)
@@ -502,6 +555,95 @@ class MomentumScanner(MarketScanner):
             base_df = base_df.drop(columns=["rev_accel_score"])
 
         return base_df
+
+    def _load_chip_sub_factor_ic(self) -> pd.DataFrame | None:
+        """從 DB 載入歷史推薦紀錄，計算 chip 子因子 IC。
+
+        使用 DiscoveryRecord（scan_date/stock_id/close）+ 同期 DailyPrice
+        重新計算 chip_score 維度的 IC，然後按子因子已知的貢獻比例映射。
+        若歷史不足 20 筆，回傳 None（graceful degradation → 使用硬編碼權重）。
+        """
+        try:
+            from src.data.schema import DailyPrice, DiscoveryRecord
+
+            cutoff = date.today() - timedelta(days=35)
+            with get_session() as session:
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.chip_tier,
+                ).where(
+                    DiscoveryRecord.mode == self.mode_name,
+                    DiscoveryRecord.scan_date >= cutoff,
+                    DiscoveryRecord.chip_score.isnot(None),
+                )
+                rows = session.execute(stmt).all()
+                if len(rows) < 20:
+                    logger.info("P1b: chip IC 歷史推薦不足 20 筆（%d），跳過子因子 IC 調整", len(rows))
+                    return None
+
+                df_records = pd.DataFrame(
+                    rows,
+                    columns=["scan_date", "stock_id", "close", "chip_score", "chip_tier"],
+                )
+
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                if not price_rows:
+                    return None
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            # 計算 chip_score 整體 IC
+            from src.discovery.scanner._functions import compute_factor_ic
+
+            ic_input = df_records[["scan_date", "stock_id", "close"]].copy()
+            ic_input["chip_score"] = df_records["chip_score"]
+            ic_df = compute_factor_ic(ic_input, df_prices, holding_days=5, lookback_days=30)
+            if ic_df.empty:
+                return None
+
+            chip_row = ic_df[ic_df["factor"] == "chip_score"]
+            if chip_row.empty:
+                return None
+
+            chip_direction = chip_row.iloc[0]["direction"]
+            chip_count = int(chip_row.iloc[0]["evaluable_count"])
+
+            if chip_count < 20:
+                return None
+
+            # 整體 chip_score 有效 → 維持原權重；弱/反向 → 標記所有子因子
+            # 使用整體方向作為各子因子的代理方向
+            chip_ic = float(chip_row.iloc[0]["ic"])
+            logger.info("P1b: chip_score IC=%.4f (%s, n=%d)", chip_ic, chip_direction, chip_count)
+
+            if chip_direction == "effective":
+                # chip 整體有效 → 不需調整子因子
+                return None
+
+            # chip 整體弱/反向 → 標記��有子因子為同一方向，讓權重歸一化自動調整
+            all_keys = ["consec", "bvr", "total", "persist", "smr", "whale", "sbl", "broker", "smart_broker"]
+            results = []
+            for key in all_keys:
+                results.append(
+                    {
+                        "factor": key,
+                        "ic": chip_ic,
+                        "evaluable_count": chip_count,
+                        "direction": chip_direction,
+                    }
+                )
+            return pd.DataFrame(results)
+
+        except Exception:
+            logger.debug("P1b: chip 子因子 IC 載入失敗，使用硬編碼權重", exc_info=True)
+            return None
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
         """動能模式風險過濾：ATR(14)/close > 80th percentile 剔除。"""

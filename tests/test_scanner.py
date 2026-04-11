@@ -7736,3 +7736,194 @@ def test_momentum_scanner_stores_sub_factors(momentum_scanner):
     assert "tech_ret5d" in sub.columns
     assert "tech_sharpe_proxy" in sub.columns
     assert len(sub) == len(sids)
+
+
+# ─── P1b: compute_sub_factor_weight_adjustments ─────────────────────
+
+
+class TestSubFactorICWeights:
+    """P1b: 子因子 IC 權重調整測試。"""
+
+    def test_effective_preserves_total(self):
+        """有效因子維持原權重，總和不變。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        ic_df = pd.DataFrame(
+            [
+                {"factor": "consec", "ic": 0.12, "evaluable_count": 30, "direction": "effective"},
+                {"factor": "bvr", "ic": 0.08, "evaluable_count": 30, "direction": "effective"},
+            ]
+        )
+        base = {"consec": 0.16, "bvr": 0.14}
+        adj = compute_sub_factor_weight_adjustments(ic_df, base)
+        assert abs(sum(adj.values()) - sum(base.values())) < 0.001
+        # effective → 不調整
+        assert abs(adj["consec"] - 0.16) < 0.001
+        assert abs(adj["bvr"] - 0.14) < 0.001
+
+    def test_weak_dampens(self):
+        """弱因子被衰減，總和仍保持不變。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        ic_df = pd.DataFrame(
+            [
+                {"factor": "consec", "ic": 0.02, "evaluable_count": 30, "direction": "weak"},
+                {"factor": "bvr", "ic": 0.10, "evaluable_count": 30, "direction": "effective"},
+            ]
+        )
+        base = {"consec": 0.16, "bvr": 0.14}
+        adj = compute_sub_factor_weight_adjustments(ic_df, base)
+        # 調整後總和不變
+        assert abs(sum(adj.values()) - sum(base.values())) < 0.001
+        # weak consec 被衰減（相對於 bvr 而言比例降低）
+        assert adj["consec"] / adj["bvr"] < base["consec"] / base["bvr"]
+
+    def test_inverse_dampens_more(self):
+        """反向因子被大幅衰減。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        ic_df = pd.DataFrame(
+            [
+                {"factor": "consec", "ic": -0.15, "evaluable_count": 30, "direction": "inverse"},
+                {"factor": "bvr", "ic": 0.10, "evaluable_count": 30, "direction": "effective"},
+            ]
+        )
+        base = {"consec": 0.16, "bvr": 0.14}
+        adj = compute_sub_factor_weight_adjustments(ic_df, base)
+        assert abs(sum(adj.values()) - sum(base.values())) < 0.001
+        # inverse 被衰減更多 (dampen² = 0.25)
+        assert adj["consec"] < base["consec"] * 0.5
+
+    def test_low_samples_safe(self):
+        """樣本不足時維持原權重。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        ic_df = pd.DataFrame(
+            [
+                {"factor": "consec", "ic": -0.15, "evaluable_count": 5, "direction": "inverse"},
+            ]
+        )
+        adj = compute_sub_factor_weight_adjustments(ic_df, {"consec": 0.16, "bvr": 0.14}, min_samples=20)
+        # 樣本不足 → 不調整（只觸發歸一化）
+        assert abs(adj["consec"] - 0.16) < 0.001
+        assert abs(adj["bvr"] - 0.14) < 0.001
+
+    def test_empty_ic_df_returns_copy(self):
+        """空 IC DataFrame 回傳原始權重的複本。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        base = {"consec": 0.37, "bvr": 0.27}
+        adj = compute_sub_factor_weight_adjustments(pd.DataFrame(), base)
+        assert adj == base
+        assert adj is not base  # 確保是複本
+
+    def test_unknown_factor_ignored(self):
+        """IC 中的未知因子名稱被忽略。"""
+        from src.discovery.scanner._functions import compute_sub_factor_weight_adjustments
+
+        ic_df = pd.DataFrame(
+            [
+                {"factor": "unknown_factor", "ic": -0.20, "evaluable_count": 50, "direction": "inverse"},
+            ]
+        )
+        base = {"consec": 0.16, "bvr": 0.14}
+        adj = compute_sub_factor_weight_adjustments(ic_df, base)
+        assert abs(adj["consec"] - 0.16) < 0.001
+        assert abs(adj["bvr"] - 0.14) < 0.001
+
+
+# ─── P1b: _get_chip_base_weights ────────────────────────────────────
+
+
+class TestGetChipBaseWeights:
+    """P1b: 籌碼子因子權重提取純函數測試。"""
+
+    def test_8f_weights(self):
+        """8F 全資料層級權重正確。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        weights, tier = _get_chip_base_weights(
+            has_broker=True,
+            has_sbl=True,
+            has_margin=True,
+            has_whale=True,
+            has_smart_broker=True,
+        )
+        assert tier == "8F"
+        assert abs(sum(weights.values()) - 1.0) < 0.001
+        assert abs(weights["consec"] - 0.16) < 0.001
+        assert abs(weights["smart_broker"] - 0.10) < 0.001
+        assert len(weights) == 9
+
+    def test_7f_weights(self):
+        """7F（無 smart_broker）權重正確。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        weights, tier = _get_chip_base_weights(
+            has_broker=True,
+            has_sbl=True,
+            has_margin=True,
+            has_whale=True,
+            has_smart_broker=False,
+        )
+        assert tier == "7F"
+        assert abs(sum(weights.values()) - 1.0) < 0.001
+        assert "smart_broker" not in weights
+        assert len(weights) == 8
+
+    def test_3f_fallback(self):
+        """3F 最低配備權重正確。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        weights, tier = _get_chip_base_weights(
+            has_broker=False,
+            has_sbl=False,
+            has_margin=False,
+            has_whale=False,
+            has_smart_broker=False,
+        )
+        assert tier == "3F"
+        assert abs(sum(weights.values()) - 1.0) < 0.001
+        assert abs(weights["consec"] - 0.37) < 0.001
+        assert abs(weights["persist"] - 0.09) < 0.001
+        assert len(weights) == 4
+
+    def test_4f_broker_only(self):
+        """4F（僅 broker）。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        weights, tier = _get_chip_base_weights(
+            has_broker=True,
+            has_sbl=False,
+            has_margin=False,
+            has_whale=False,
+            has_smart_broker=False,
+        )
+        assert tier == "4F"
+        assert abs(sum(weights.values()) - 1.0) < 0.001
+        assert "broker" in weights
+        assert "sbl" not in weights
+
+    def test_all_tiers_sum_to_one(self):
+        """所有 15 種組合的權重總和都應為 1.0。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        # 測試所有 bool 組合（2^5 = 32 種，其中多數映射到同一分支）
+        for b in range(32):
+            has_broker = bool(b & 1)
+            has_sbl = bool(b & 2)
+            has_margin = bool(b & 4)
+            has_whale = bool(b & 8)
+            has_smart_broker = bool(b & 16)
+            weights, tier = _get_chip_base_weights(
+                has_broker=has_broker,
+                has_sbl=has_sbl,
+                has_margin=has_margin,
+                has_whale=has_whale,
+                has_smart_broker=has_smart_broker,
+            )
+            assert abs(sum(weights.values()) - 1.0) < 0.001, (
+                f"權重總和 ≠ 1.0 for broker={has_broker} sbl={has_sbl} "
+                f"margin={has_margin} whale={has_whale} smart={has_smart_broker}: "
+                f"sum={sum(weights.values())}, tier={tier}"
+            )

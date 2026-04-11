@@ -2121,6 +2121,56 @@ def compute_ic_weight_adjustments(
     return adjusted
 
 
+def compute_sub_factor_weight_adjustments(
+    sub_factor_ic_df: pd.DataFrame,
+    base_weights: dict[str, float],
+    dampen_factor: float = 0.5,
+    min_samples: int = 20,
+) -> dict[str, float]:
+    """根據子因子 IC 結果調整子因子權重（chip 層級）。
+
+    與 compute_ic_weight_adjustments() 同邏輯，額外新增 min_samples 防護：
+    evaluable_count < min_samples 的因子視為 "effective"（不調整）。
+
+    Args:
+        sub_factor_ic_df: 含 (factor, ic, evaluable_count, direction) 的 DataFrame
+        base_weights: 原始子因子權重字典（如 {"consec": 0.16, "bvr": 0.14, ...}）
+        dampen_factor: 衰減因子（預設 0.5）
+        min_samples: 最低有效樣本數（預設 20）
+
+    Returns:
+        調整後權重字典（總和等於原始 base_weights 總和）
+    """
+    if sub_factor_ic_df.empty:
+        return dict(base_weights)
+
+    adjusted = dict(base_weights)
+
+    # 建立 factor → direction 映射，但過濾掉樣本不足的因子
+    for _, row in sub_factor_ic_df.iterrows():
+        factor = row["factor"]
+        if factor not in adjusted:
+            continue
+        evaluable = row.get("evaluable_count", 0)
+        if evaluable < min_samples:
+            continue  # 樣本不足 → 維持原權重
+        direction = row.get("direction", "effective")
+        if direction == "weak":
+            adjusted[factor] = adjusted[factor] * dampen_factor
+        elif direction == "inverse":
+            adjusted[factor] = adjusted[factor] * (dampen_factor**2)
+        # "effective" → 維持
+
+    # 歸一化：保持原始權重總和不變
+    original_total = sum(base_weights.values())
+    adjusted_total = sum(adjusted.values())
+    if adjusted_total > 0:
+        scale = original_total / adjusted_total
+        adjusted = {k: v * scale for k, v in adjusted.items()}
+
+    return adjusted
+
+
 # ── P3-B2: 主力成本分析 ──────────────────────────────────────────────
 
 

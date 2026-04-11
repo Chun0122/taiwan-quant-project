@@ -97,7 +97,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組 | 職責 |
 |------|------|
-| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權**（3 群：報酬動能 mean(ret5d,ret10d,sharpe_proxy) / 量能 mean(vol_ratio,vol_accel) / 突破 breakout60d，各 1/3）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；MFE/MAE 分析（E3） |
+| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權**（3 群：報酬動能 mean(ret5d,ret10d,sharpe_proxy) / 量能 mean(vol_ratio,vol_accel) / 突破 breakout60d，各 1/3）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；**子因子 IC 自動權重調整**（`compute_sub_factor_weight_adjustments` + `_get_chip_base_weights` 純函數，chip 層級 IC-driven 權重微調）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/DailyPrice fallback + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告） |
 | `src/discovery/ablation.py` | 因子消融測試：維度級（歸零重分配 Spearman ρ）+ 子因子級 + 歷史績效消融；CLI `ablation-test` |
@@ -295,7 +295,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1727 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1738 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -358,9 +358,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 80 項）
+## Completed Tasks（已完成，共 81 項）
 
-測試數從 231 → 1727。各階段摘要：
+測試數從 231 → 1738。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -379,3 +379,4 @@ pytest --cov=src --cov-report=term-missing
 | **跨平台排程** | 78 | macOS LaunchAgent 排程（`launchd_task.py` .sh+.plist）、`--mode auto` 平台自動偵測、Windows 既有流程不變（+11 測試） |
 | **Rotation 回測擬真度** | 79 | 三因子動態滑價（`compute_dynamic_slippage`）、流動性約束（`apply_liquidity_limit`）、漲跌停模擬（`detect_limit_price`）、成本歸因（`TradeCostBreakdown`）、TAIEX Benchmark+Alpha、委託 `compute_metrics()`（Sortino/Calmar/VaR/CVaR/PF）、Schema 遷移 11 欄位（+28 測試） |
 | **Ex-Ante VaR** | 80 | `compute_covariance_matrix()`（共變異數矩陣+ridge正則化）、`compute_portfolio_var()`（參數化VaR+Component VaR分解）、backtest 每日 VaR 記錄、update() VaR 日誌（+11 測試） |
+| **子因子 IC 自動化** | 81 | `compute_sub_factor_weight_adjustments()`（子因子 IC 權重調整+min_samples 防護）、`_get_chip_base_weights()`（15 分支→純函數）、`_compute_chip_scores()` 重構整合 IC 調整、`_load_chip_sub_factor_ic()` DB 歷史 IC 載入+graceful degradation（+11 測試） |
