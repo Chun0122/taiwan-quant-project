@@ -22,10 +22,12 @@ from src.data.schema import (  # noqa: F401 — 確保 ORM 註冊
 from src.portfolio.rotation import (
     apply_liquidity_limit,
     compute_correlation_matrix,
+    compute_covariance_matrix,
     compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
     compute_portfolio_heat,
+    compute_portfolio_var,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
@@ -2092,3 +2094,121 @@ class TestGetOhlcvOnDate:
         from src.portfolio.manager import _get_ohlcv_on_date
 
         assert _get_ohlcv_on_date(db_session, [], TRADING_CAL[0]) == {}
+
+
+# ===========================================================================
+# P1a: 共變異數矩陣
+# ===========================================================================
+
+
+class TestCovarianceMatrix:
+    """測試 compute_covariance_matrix()。"""
+
+    def test_single_stock(self):
+        """單支股票也能計算（1×1 矩陣）。"""
+        import numpy as np
+
+        prices = {"A": pd.Series(np.random.lognormal(0, 0.02, 100).cumprod() * 100)}
+        cov = compute_covariance_matrix(prices, window=60)
+        assert not cov.empty
+        assert cov.shape == (1, 1)
+        assert cov.loc["A", "A"] > 0
+
+    def test_two_stocks_shape(self):
+        """兩支股票 → 2×2 矩陣。"""
+        import numpy as np
+
+        np.random.seed(42)
+        prices = {
+            "A": pd.Series(np.random.lognormal(0, 0.02, 100).cumprod() * 100),
+            "B": pd.Series(np.random.lognormal(0, 0.03, 100).cumprod() * 50),
+        }
+        cov = compute_covariance_matrix(prices, window=60)
+        assert cov.shape == (2, 2)
+        # 對角線 > 0（變異數為正）
+        assert cov.loc["A", "A"] > 0
+        assert cov.loc["B", "B"] > 0
+
+    def test_insufficient_data_returns_empty(self):
+        """資料不足 min_periods → 空 DataFrame。"""
+        prices = {"A": pd.Series([100, 101, 102])}
+        cov = compute_covariance_matrix(prices, window=60, min_periods=20)
+        assert cov.empty
+
+    def test_empty_input(self):
+        """空輸入 → 空 DataFrame。"""
+        cov = compute_covariance_matrix({})
+        assert cov.empty
+
+
+# ===========================================================================
+# P1a: 組合層級 Ex-Ante VaR
+# ===========================================================================
+
+
+class TestPortfolioVaR:
+    """測試 compute_portfolio_var()。"""
+
+    def test_single_stock(self):
+        """單支股票 VaR 驗算：z × σ × capital。"""
+        # σ² = 0.0004 → σ = 0.02 → VaR = 1.6449 × 0.02 × 1M ≈ 32,898
+        cov = pd.DataFrame({"2330": [0.0004]}, index=["2330"])
+        r = compute_portfolio_var({"2330": 1.0}, cov, 1_000_000)
+        assert 32_000 < r["var_amount"] < 34_000
+        assert r["var_pct"] > 0
+        assert "2330" in r["component_var"]
+
+    def test_diversification_benefit(self):
+        """低相關的兩支股票分散持有 → VaR 小於集中單支。"""
+        cov = pd.DataFrame(
+            {"A": [0.0004, 0.00004], "B": [0.00004, 0.0004]},
+            index=["A", "B"],
+        )
+        single = compute_portfolio_var({"A": 1.0}, cov.loc[["A"], ["A"]], 1_000_000)
+        pair = compute_portfolio_var({"A": 0.5, "B": 0.5}, cov, 1_000_000)
+        assert pair["var_amount"] < single["var_amount"]
+
+    def test_empty_portfolio(self):
+        """空組合 → VaR = 0。"""
+        r = compute_portfolio_var({}, pd.DataFrame(), 1_000_000)
+        assert r["var_amount"] == 0.0
+        assert r["var_pct"] == 0.0
+
+    def test_zero_capital(self):
+        """資本為零 → VaR = 0。"""
+        cov = pd.DataFrame({"A": [0.0004]}, index=["A"])
+        r = compute_portfolio_var({"A": 1.0}, cov, 0)
+        assert r["var_amount"] == 0.0
+
+    def test_component_var_sums_approximately(self):
+        """Component VaR 合計近似等於 Total VaR（正則化後微小誤差可接受）。"""
+        import numpy as np
+
+        np.random.seed(42)
+        cov = pd.DataFrame(
+            {"A": [0.0004, 0.0001], "B": [0.0001, 0.0009]},
+            index=["A", "B"],
+        )
+        r = compute_portfolio_var({"A": 0.6, "B": 0.4}, cov, 1_000_000)
+        comp_sum = sum(r["component_var"].values())
+        # Component VaR 合計應與 total VaR 相近（因正則化有微小偏差）
+        assert abs(comp_sum - r["var_amount"]) / r["var_amount"] < 0.05
+
+    def test_horizon_scaling(self):
+        """多日 horizon → VaR 按 √horizon 放大。"""
+        cov = pd.DataFrame({"A": [0.0004]}, index=["A"])
+        var_1d = compute_portfolio_var({"A": 1.0}, cov, 1_000_000, horizon_days=1)
+        var_5d = compute_portfolio_var({"A": 1.0}, cov, 1_000_000, horizon_days=5)
+        import math
+
+        expected_ratio = math.sqrt(5)
+        actual_ratio = var_5d["var_amount"] / var_1d["var_amount"]
+        assert abs(actual_ratio - expected_ratio) < 0.01
+
+    def test_missing_stock_in_cov_ignored(self):
+        """position_weights 中有股票不在共變異數矩陣中 → 安全忽略。"""
+        cov = pd.DataFrame({"A": [0.0004]}, index=["A"])
+        r = compute_portfolio_var({"A": 0.5, "MISSING": 0.5}, cov, 1_000_000)
+        # 只算 A 的部分
+        assert r["var_amount"] > 0
+        assert "MISSING" not in r["component_var"]

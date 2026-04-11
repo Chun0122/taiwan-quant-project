@@ -856,6 +856,127 @@ def find_high_correlation_pairs(
 
 
 # ---------------------------------------------------------------------------
+# B2b: 組合層級 Ex-Ante VaR
+# ---------------------------------------------------------------------------
+
+# 95% 信賴水準對應的 z 值（避免 scipy import）
+_Z_95 = 1.6449
+
+
+def compute_covariance_matrix(
+    price_data: dict[str, pd.Series],
+    window: int = 60,
+    min_periods: int = 20,
+) -> pd.DataFrame:
+    """計算持倉間的共變異數矩陣（從日報酬率）。
+
+    與 compute_correlation_matrix() 平行，用於 VaR 計算。
+
+    Parameters
+    ----------
+    price_data : dict[str, pd.Series]
+        {stock_id: 收盤價 Series（日期索引）}。
+    window : int
+        滾動窗口天數（預設 60）。
+    min_periods : int
+        最小有效樣本數（預設 20），低於此值的估計不穩定。
+
+    Returns
+    -------
+    pd.DataFrame
+        covariance matrix（stock_id × stock_id）。空組合回傳空 DataFrame。
+    """
+    if len(price_data) < 1:
+        return pd.DataFrame()
+
+    prices_df = pd.DataFrame(price_data)
+    returns_df = prices_df.pct_change(fill_method=None).dropna()
+
+    if len(returns_df) < min_periods:
+        return pd.DataFrame()
+
+    recent = returns_df.tail(window) if len(returns_df) >= window else returns_df
+    return recent.cov(min_periods=min_periods)
+
+
+def compute_portfolio_var(
+    position_weights: dict[str, float],
+    covariance_matrix: pd.DataFrame,
+    total_capital: float,
+    confidence_z: float = _Z_95,
+    horizon_days: int = 1,
+) -> dict[str, float]:
+    """計算組合層級的參數化 VaR（Ex-Ante）。
+
+    VaR = z × σ_p × capital × √horizon
+    σ_p = √(w^T × Σ × w)
+
+    Parameters
+    ----------
+    position_weights : dict[str, float]
+        {stock_id: 投資比例}，僅 invested 部分（不含現金）。
+        權重合計可 < 1.0（部分現金），VaR 只算 invested 部分。
+    covariance_matrix : pd.DataFrame
+        日報酬率共變異數矩陣。
+    total_capital : float
+        組合總資本。
+    confidence_z : float
+        信賴水準 z 值（預設 1.6449 = 95%）。
+    horizon_days : int
+        預測天數（預設 1 天）。
+
+    Returns
+    -------
+    dict[str, float]
+        {"var_amount": 金額, "var_pct": 百分比, "component_var": {sid: 金額}}
+    """
+    empty_result: dict[str, float] = {"var_amount": 0.0, "var_pct": 0.0, "component_var": {}}
+
+    if not position_weights or covariance_matrix.empty or total_capital <= 0:
+        return empty_result
+
+    # 取交集：只用共變異數矩陣中有的股票
+    common_ids = [sid for sid in position_weights if sid in covariance_matrix.columns]
+    if not common_ids:
+        return empty_result
+
+    # 建構權重向量
+    w = np.array([position_weights[sid] for sid in common_ids], dtype=np.float64)
+    cov = covariance_matrix.loc[common_ids, common_ids].values.astype(np.float64)
+
+    # 正則化：避免奇異矩陣（高相關 ETF 等邊界情況）
+    n = len(common_ids)
+    cov = cov + np.eye(n) * 1e-8
+
+    # 組合標準差
+    portfolio_var_raw = float(w @ cov @ w)
+    if portfolio_var_raw <= 0:
+        return empty_result
+    portfolio_std = math.sqrt(portfolio_var_raw)
+
+    # VaR 金額
+    sqrt_horizon = math.sqrt(horizon_days) if horizon_days > 1 else 1.0
+    var_amount = confidence_z * portfolio_std * total_capital * sqrt_horizon
+    var_pct = confidence_z * portfolio_std * sqrt_horizon * 100  # 百分比
+
+    # Component VaR：各持倉對總 VaR 的貢獻
+    sigma_w = cov @ w  # Σ × w
+    component_var: dict[str, float] = {}
+    for i, sid in enumerate(common_ids):
+        if portfolio_std > 0:
+            comp = w[i] * sigma_w[i] / portfolio_std * confidence_z * total_capital * sqrt_horizon
+        else:
+            comp = 0.0
+        component_var[sid] = round(comp, 2)
+
+    return {
+        "var_amount": round(var_amount, 2),
+        "var_pct": round(var_pct, 4),
+        "component_var": component_var,
+    }
+
+
+# ---------------------------------------------------------------------------
 # B3: 波動率反比部位大小
 # ---------------------------------------------------------------------------
 

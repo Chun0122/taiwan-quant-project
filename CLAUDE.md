@@ -112,7 +112,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 模組 | 職責 |
 |------|------|
 | `src/entry_exit.py` | 共用純函數：`REGIME_ATR_PARAMS`（bull/sideways/bear/crisis ATR 倍數）；`compute_atr_stops()`（ATR≤0 fallback 百分比）；`compute_entry_trigger()`；`assess_timing()`（RSI+SMA+Regime 決策矩陣）；Discover/Suggest/Watch 三系統共用 |
-| `src/portfolio/rotation.py` | 輪動核心：`compute_rotation_actions()`（到期/續持/止損/換股 + 產業集中度 + Drawdown Guard + Portfolio Heat + Correlation Budget + Crisis 硬阻擋）；`check_drawdown_kill_switch()`（回撤≥25% 清倉）；波動率反比權重；60 日 rolling 相關性矩陣；`compute_dynamic_slippage()`（三因子動態滑價）；`apply_liquidity_limit()`（流動性約束）；`detect_limit_price()`（漲跌停偵測）；`TradeCostBreakdown` / `compute_trade_costs()`（成本歸因） |
+| `src/portfolio/rotation.py` | 輪動核心：`compute_rotation_actions()`（到期/續持/止損/換股 + 產業集中度 + Drawdown Guard + Portfolio Heat + Correlation Budget + Crisis 硬阻擋）；`check_drawdown_kill_switch()`（回撤≥25% 清倉）；波動率反比權重；60 日 rolling 相關性/共變異數矩陣；`compute_dynamic_slippage()`（三因子動態滑價）；`apply_liquidity_limit()`（流動性約束）；`detect_limit_price()`（漲跌停偵測）；`TradeCostBreakdown` / `compute_trade_costs()`（成本歸因）；`compute_portfolio_var()`（Ex-Ante VaR + Component VaR） |
 | `src/portfolio/manager.py` | `RotationManager`：每日更新 / Kill Switch / 歷史回測（動態滑價+流動性約束+漲跌停模擬+TAIEX Benchmark+成本歸因+委託 `compute_metrics()`）/ `resolve_rankings()`（單模式 / all avg_score）/ `_get_ohlcv_on_date()` / `_get_taiex_prices()` |
 
 **特徵/CLI/報告層**
@@ -295,7 +295,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1716 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1727 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -358,9 +358,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 79 項）
+## Completed Tasks（已完成，共 80 項）
 
-測試數從 231 → 1716。各階段摘要：
+測試數從 231 → 1727。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -378,3 +378,4 @@ pytest --cov=src --cov-report=term-missing
 | **因子權重優化** | 77 | 技術面 Cluster 等權（3 群 mean 降維）、Momentum Regime 權重 IC 校準（chip 降權/news 升權）、morning-routine 啟用 IC 動態調整 |
 | **跨平台排程** | 78 | macOS LaunchAgent 排程（`launchd_task.py` .sh+.plist）、`--mode auto` 平台自動偵測、Windows 既有流程不變（+11 測試） |
 | **Rotation 回測擬真度** | 79 | 三因子動態滑價（`compute_dynamic_slippage`）、流動性約束（`apply_liquidity_limit`）、漲跌停模擬（`detect_limit_price`）、成本歸因（`TradeCostBreakdown`）、TAIEX Benchmark+Alpha、委託 `compute_metrics()`（Sortino/Calmar/VaR/CVaR/PF）、Schema 遷移 11 欄位（+28 測試） |
+| **Ex-Ante VaR** | 80 | `compute_covariance_matrix()`（共變異數矩陣+ridge正則化）、`compute_portfolio_var()`（參數化VaR+Component VaR分解）、backtest 每日 VaR 記錄、update() VaR 日誌（+11 測試） |

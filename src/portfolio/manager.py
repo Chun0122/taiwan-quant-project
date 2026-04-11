@@ -31,9 +31,11 @@ from src.portfolio.rotation import (
     RotationActions,
     check_drawdown_kill_switch,
     compute_correlation_matrix,
+    compute_covariance_matrix,
     compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
+    compute_portfolio_var,
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
@@ -460,6 +462,7 @@ class RotationManager:
 
             # ── Correlation Budget：計算持倉+候選相關性矩陣 ──
             corr_matrix = None
+            price_rows = None  # 用於後續 VaR 計算
             held_sids = [p["stock_id"] for p in open_positions]
             candidate_sids = [r["stock_id"] for r in rankings[: portfolio.max_positions]]
             corr_sids = list(set(held_sids + candidate_sids))
@@ -571,6 +574,29 @@ class RotationManager:
             portfolio.updated_at = datetime.utcnow()
             session.commit()
 
+            # Ex-Ante VaR（不阻擋交易，僅記錄日誌）
+            if open_after and portfolio.current_capital > 0 and price_rows:
+                after_sids = [p["stock_id"] for p in open_after]
+                var_price_data: dict[str, pd.Series] = {}
+                for sid in after_sids:
+                    sid_closes = [r[2] for r in price_rows if r[0] == sid]
+                    if len(sid_closes) >= 20:
+                        var_price_data[sid] = pd.Series(sid_closes)
+                if var_price_data:
+                    cov_mat = compute_covariance_matrix(var_price_data, window=60, min_periods=20)
+                    if not cov_mat.empty:
+                        pos_weights = {}
+                        for p in open_after:
+                            mv = today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"]
+                            pos_weights[p["stock_id"]] = mv / portfolio.current_capital
+                        var_result = compute_portfolio_var(pos_weights, cov_mat, portfolio.current_capital)
+                        logger.info(
+                            "[%s] Ex-Ante VaR(95%%): %.0f (%.2f%%)",
+                            self.portfolio_name,
+                            var_result["var_amount"],
+                            var_result["var_pct"],
+                        )
+
             logger.info(
                 "[%s] 更新完成: 賣出=%d, 續持=%d, 買入=%d, 保持=%d | 現金=%.0f, 總資產=%.0f",
                 self.portfolio_name,
@@ -674,6 +700,9 @@ class RotationManager:
 
             # 漲跌停偵測用前日收盤價
             prev_close_map: dict[str, float] = {}
+
+            # VaR 計算用：累計每日收盤價（最近 60 日窗口）
+            daily_close_history: dict[str, list[float]] = {}  # {stock_id: [close1, close2, ...]}
 
             for day in trading_cal:
                 # 取今日排名
@@ -859,8 +888,36 @@ class RotationManager:
                     )
 
                 # 計算當日權益
-                market_value = sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions)
-                equity_curve.append({"date": day, "equity": cash + market_value})
+                total_equity = cash + sum(
+                    today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions
+                )
+
+                # 累計每日收盤價（VaR 用，保留最近 65 日供 60 日窗口）
+                for sid, ohlcv_data in today_ohlcv.items():
+                    daily_close_history.setdefault(sid, []).append(ohlcv_data["close"])
+                    if len(daily_close_history[sid]) > 65:
+                        daily_close_history[sid] = daily_close_history[sid][-65:]
+
+                # Ex-Ante VaR（有持倉時計算）
+                var_pct = None
+                if positions and total_equity > 0:
+                    held_sids = [p["stock_id"] for p in positions]
+                    price_series = {
+                        sid: pd.Series(daily_close_history[sid])
+                        for sid in held_sids
+                        if sid in daily_close_history and len(daily_close_history[sid]) >= 20
+                    }
+                    if price_series:
+                        cov_mat = compute_covariance_matrix(price_series, window=60, min_periods=20)
+                        if not cov_mat.empty:
+                            pos_weights = {}
+                            for p in positions:
+                                mv = today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"]
+                                pos_weights[p["stock_id"]] = mv / total_equity
+                            var_result = compute_portfolio_var(pos_weights, cov_mat, total_equity)
+                            var_pct = var_result["var_pct"]
+
+                equity_curve.append({"date": day, "equity": total_equity, "var_pct": var_pct})
 
                 # 更新 prev_close_map（漲跌停偵測用）
                 for sid, ohlcv_data in today_ohlcv.items():
