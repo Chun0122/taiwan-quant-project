@@ -6838,6 +6838,107 @@ class TestComputeFactorIc:
             assert row["evaluable_count"] >= 10
 
 
+class TestComputeRollingIc:
+    """Rolling IC 時間序列測試。"""
+
+    @staticmethod
+    def _make_data(n=30):
+        ref = date.today()
+        records, prices = [], []
+        for i in range(n):
+            scan_d = ref - timedelta(days=n - i)
+            sid = f"R{i:03d}"
+            tech = 0.3 + (i / n) * 0.5
+            records.append(
+                {
+                    "scan_date": scan_d,
+                    "stock_id": sid,
+                    "close": 100.0,
+                    "technical_score": tech,
+                    "chip_score": 0.5,
+                    "fundamental_score": 0.5,
+                    "news_score": 0.5,
+                }
+            )
+            exit_close = 100 + (tech - 0.5) * 20
+            for d in range(1, 7):
+                prices.append(
+                    {"stock_id": sid, "date": scan_d + timedelta(days=d), "close": exit_close if d >= 5 else 100.0}
+                )
+        return pd.DataFrame(records), pd.DataFrame(prices)
+
+    def test_returns_time_series(self):
+        """應回傳含 window_end 的時間序列 DataFrame。"""
+        from src.discovery.scanner._functions import compute_rolling_ic
+
+        df_rec, df_price = self._make_data()
+        result = compute_rolling_ic(df_rec, df_price, window_days=14, step_days=7)
+        assert not result.empty
+        assert "window_end" in result.columns
+        assert "factor" in result.columns
+        assert "ic" in result.columns
+        # 至少有 2 個窗口（30 天資料 / 14 天窗口 / 7 天步進）
+        assert len(result["window_end"].unique()) >= 2
+
+    def test_empty_returns_empty(self):
+        from src.discovery.scanner._functions import compute_rolling_ic
+
+        result = compute_rolling_ic(pd.DataFrame(), pd.DataFrame())
+        assert result.empty
+
+
+class TestComputeRegimeIc:
+    """Per-Regime IC 測試。"""
+
+    def test_returns_regime_factor_matrix(self):
+        """應回傳含 regime / factor / ic 欄位的 DataFrame。"""
+        from src.discovery.scanner._functions import compute_regime_ic
+
+        ref = date.today()
+        n = 30
+        records, prices = [], []
+        for i in range(n):
+            scan_d = ref - timedelta(days=n - i)
+            sid = f"G{i:03d}"
+            tech = 0.3 + (i / n) * 0.5
+            records.append(
+                {
+                    "scan_date": scan_d,
+                    "stock_id": sid,
+                    "close": 100.0,
+                    "technical_score": tech,
+                    "chip_score": 0.5,
+                    "fundamental_score": 0.5,
+                    "news_score": 0.5,
+                }
+            )
+            exit_close = 100 + (tech - 0.5) * 20
+            for d in range(1, 7):
+                prices.append(
+                    {"stock_id": sid, "date": scan_d + timedelta(days=d), "close": exit_close if d >= 5 else 100.0}
+                )
+
+        # TAIEX 上升趨勢（>120 天資料，全部判定為 bull）
+        taiex = []
+        for d in range(200):
+            taiex.append({"date": ref - timedelta(days=200 - d), "close": 18000 + d * 10})
+        df_rec = pd.DataFrame(records)
+        df_price = pd.DataFrame(prices)
+        df_taiex = pd.DataFrame(taiex)
+
+        result = compute_regime_ic(df_rec, df_price, df_taiex, holding_days=5)
+        assert not result.empty
+        assert "regime" in result.columns
+        assert "factor" in result.columns
+        assert "ic" in result.columns
+
+    def test_empty_returns_empty(self):
+        from src.discovery.scanner._functions import compute_regime_ic
+
+        result = compute_regime_ic(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        assert result.empty
+
+
 class TestComputeIcWeightAdjustments:
     """測試 IC 驅動的權重調整。"""
 

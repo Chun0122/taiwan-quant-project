@@ -283,8 +283,13 @@ def compute_ablation_performance(
     baseline_weights: dict[str, float],
     holding_days: int = 5,
     top_n: int = 20,
+    select_ratio: float = 0.5,
 ) -> pd.DataFrame:
     """用歷史推薦記錄，比較消融後的假設績效差異。
+
+    v2 修正：baseline 與消融均以 select_ratio（預設 50%）cutoff 取 top-N，
+    確保消融後不同的分數排序會導致不同的股票被選入/排除。
+    原 v1 問題：每日推薦數 ≈ top_n，消融後全選名單不變。
 
     records_df 需含：scan_date, stock_id, close,
                      technical_score, chip_score, fundamental_score, news_score
@@ -292,7 +297,7 @@ def compute_ablation_performance(
 
     Returns:
         DataFrame(removed_dimension, win_rate, avg_return, baseline_win_rate, baseline_avg_return,
-                  win_rate_delta, avg_return_delta)
+                  win_rate_delta, avg_return_delta, selection_overlap)
     """
     if records_df.empty or prices_df.empty:
         return pd.DataFrame()
@@ -308,12 +313,27 @@ def compute_ablation_performance(
 
     ret_col = f"return_{holding_days}d"
 
-    # 基線績效（全部推薦，按原 rank）
-    baseline_valid = records_with_return[ret_col].dropna()
-    if baseline_valid.empty:
+    # 用原始權重計算 baseline composite score
+    records_with_return = records_with_return.copy()
+    records_with_return["_baseline_score"] = recompute_composite(records_with_return, baseline_weights)
+
+    # Baseline: 每日 top select_ratio 選股
+    baseline_returns = []
+    baseline_selections: dict = {}  # scan_date → set(stock_id)
+    for scan_date, group in records_with_return.groupby("scan_date"):
+        n = max(1, int(len(group) * select_ratio))
+        n = min(n, top_n)
+        top = group.nlargest(n, "_baseline_score")
+        valid = top[ret_col].dropna()
+        baseline_returns.extend(valid.tolist())
+        baseline_selections[scan_date] = set(top["stock_id"].tolist())
+
+    if not baseline_returns:
         return pd.DataFrame()
-    baseline_wr = float((baseline_valid > 0).mean())
-    baseline_avg = float(baseline_valid.mean())
+
+    baseline_s = pd.Series(baseline_returns)
+    baseline_wr = float((baseline_s > 0).mean())
+    baseline_avg = float(baseline_s.mean())
 
     results = []
 
@@ -327,6 +347,7 @@ def compute_ablation_performance(
             "baseline_avg_return": baseline_avg,
             "win_rate_delta": 0.0,
             "avg_return_delta": 0.0,
+            "selection_overlap": 1.0,
         }
     )
 
@@ -334,15 +355,24 @@ def compute_ablation_performance(
     for dim in baseline_weights:
         ablated_w = redistribute_weights(baseline_weights, dim)
 
-        # 重算每次掃描的 composite score，取 top_n
         ablated_returns = []
+        overlap_ratios = []
         for scan_date, group in records_with_return.groupby("scan_date"):
+            n = max(1, int(len(group) * select_ratio))
+            n = min(n, top_n)
             ablated_score = recompute_composite(group, ablated_w)
             group = group.copy()
             group["_ablated_score"] = ablated_score
-            top = group.nlargest(top_n, "_ablated_score")
+            top = group.nlargest(n, "_ablated_score")
             valid = top[ret_col].dropna()
             ablated_returns.extend(valid.tolist())
+
+            # 計算選股重疊率
+            ablated_set = set(top["stock_id"].tolist())
+            baseline_set = baseline_selections.get(scan_date, set())
+            if baseline_set:
+                overlap = len(ablated_set & baseline_set) / len(baseline_set)
+                overlap_ratios.append(overlap)
 
         if not ablated_returns:
             continue
@@ -350,6 +380,7 @@ def compute_ablation_performance(
         ablated_s = pd.Series(ablated_returns)
         abl_wr = float((ablated_s > 0).mean())
         abl_avg = float(ablated_s.mean())
+        avg_overlap = float(np.mean(overlap_ratios)) if overlap_ratios else 1.0
 
         results.append(
             {
@@ -360,6 +391,7 @@ def compute_ablation_performance(
                 "baseline_avg_return": baseline_avg,
                 "win_rate_delta": round(abl_wr - baseline_wr, 4),
                 "avg_return_delta": round(abl_avg - baseline_avg, 4),
+                "selection_overlap": round(avg_overlap, 4),
             }
         )
 

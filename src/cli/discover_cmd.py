@@ -780,6 +780,73 @@ def cmd_factor_diagnostics(args: "argparse.Namespace") -> None:
                     label = {"effective": "✓ 有效", "weak": "○ 弱", "inverse": "✗ 反向"}.get(row["direction"], "?")
                     print(f"{row['factor']:<25} {row['ic']:>8.4f} {int(row['evaluable_count']):>6} {label:<10}")
 
+    # Step 5: Rolling IC 時間序列
+    from src.discovery.scanner._functions import compute_rolling_ic
+
+    rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=holding_days)
+    if not rolling_df.empty:
+        print(f"\n{'─' * 50}")
+        print("Rolling IC 時間序列（14 日窗口 / 7 日步進）")
+        print(f"{'─' * 50}")
+        pivoted = rolling_df.pivot(index="window_end", columns="factor", values="ic")
+        if not pivoted.empty:
+            print(f"{'窗口結束':<14}", end="")
+            for col in pivoted.columns:
+                print(f" {col[:12]:>13}", end="")
+            print()
+            for dt, row in pivoted.iterrows():
+                print(f"{str(dt):<14}", end="")
+                for val in row.values:
+                    if pd.isna(val):
+                        print(f" {'—':>13}", end="")
+                    else:
+                        print(f" {val:>+13.4f}", end="")
+                print()
+            # 趨勢摘要
+            print()
+            for col in pivoted.columns:
+                series = pivoted[col].dropna()
+                if len(series) >= 2:
+                    trend = "↑ 改善" if series.iloc[-1] > series.iloc[0] else "↓ 衰退"
+                    print(f"  {col[:20]:<20} {series.iloc[0]:>+.4f} → {series.iloc[-1]:>+.4f} ({trend})")
+
+    # Step 6: Per-Regime IC 分析
+    from src.discovery.scanner._functions import compute_regime_ic
+
+    with get_session() as session:
+        taiex_rows = session.execute(
+            select(DailyPrice.date, DailyPrice.close).where(DailyPrice.stock_id == "TAIEX").order_by(DailyPrice.date)
+        ).all()
+    df_taiex = pd.DataFrame(taiex_rows, columns=["date", "close"])
+
+    if not df_taiex.empty:
+        regime_ic_df = compute_regime_ic(df_records, df_prices, df_taiex, holding_days=holding_days)
+        if not regime_ic_df.empty:
+            print(f"\n{'─' * 50}")
+            print("Per-Regime IC（各市場狀態下因子有效性）")
+            print(f"{'─' * 50}")
+            regime_pivot = regime_ic_df.pivot(index="factor", columns="regime", values="ic")
+            sample_pivot = regime_ic_df.pivot(index="factor", columns="regime", values="sample_count")
+            regimes = sorted(regime_pivot.columns.tolist())
+            print(f"{'因子':<25}", end="")
+            for r in regimes:
+                print(f" {r:>12}", end="")
+            print()
+            for factor in regime_pivot.index:
+                print(f"{factor:<25}", end="")
+                for r in regimes:
+                    ic_val = regime_pivot.loc[factor, r] if r in regime_pivot.columns else None
+                    n = (
+                        int(sample_pivot.loc[factor, r])
+                        if r in sample_pivot.columns and not pd.isna(sample_pivot.loc[factor, r])
+                        else 0
+                    )
+                    if pd.isna(ic_val):
+                        print(f" {'—':>12}", end="")
+                    else:
+                        print(f" {ic_val:>+.4f}(n={n:>3})", end="")
+                print()
+
     print(f"\n{'=' * 70}")
 
 
@@ -925,15 +992,22 @@ def cmd_ablation_test(args: "argparse.Namespace") -> None:
 
                 if not perf_df.empty:
                     print(f"\n{'─' * 70}")
-                    print(f"歷史績效消融（{holding_days} 日持有，回溯 {lookback} 天）")
+                    print(f"歷史績效消融（{holding_days} 日持有，回溯 {lookback} 天，Top 50% cutoff）")
                     print(f"{'─' * 70}")
-                    print(f"{'移除維度':<20}  {'勝率':>7}  {'均報酬':>8}  {'勝率Δ':>7}  {'均報酬Δ':>8}")
+                    has_overlap = "selection_overlap" in perf_df.columns
+                    header = f"{'移除維度':<20}  {'勝率':>7}  {'均報酬':>8}  {'勝率Δ':>7}  {'均報酬Δ':>8}"
+                    if has_overlap:
+                        header += f"  {'選股重疊':>8}"
+                    print(header)
                     for _, row in perf_df.iterrows():
                         wr = f"{row['win_rate']:.1%}"
                         avg = f"{row['avg_return']:+.2%}"
                         wd = f"{row['win_rate_delta']:+.1%}" if row["win_rate_delta"] != 0 else "  —  "
                         ad = f"{row['avg_return_delta']:+.2%}" if row["avg_return_delta"] != 0 else "   —   "
-                        print(f"{row['removed_dimension']:<20}  {wr:>7}  {avg:>8}  {wd:>7}  {ad:>8}")
+                        line = f"{row['removed_dimension']:<20}  {wr:>7}  {avg:>8}  {wd:>7}  {ad:>8}"
+                        if has_overlap:
+                            line += f"  {row['selection_overlap']:>7.0%}"
+                        print(line)
 
     # ── 匯出 CSV ──────────────────────────
     if getattr(args, "export", None) and report.dimension_results:

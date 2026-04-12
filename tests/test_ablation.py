@@ -266,6 +266,7 @@ class TestAblationPerformance:
         baseline = result[result["removed_dimension"] == "(none — baseline)"]
         assert len(baseline) == 1
         assert baseline.iloc[0]["win_rate_delta"] == 0.0
+        assert baseline.iloc[0]["selection_overlap"] == 1.0
 
     def test_ablation_rows_for_each_dimension(self):
         """每個維度應有一筆消融績效。"""
@@ -275,6 +276,23 @@ class TestAblationPerformance:
         result = compute_ablation_performance(records, prices, weights, holding_days=5, top_n=3)
         # baseline + 4 dimensions = 5 rows
         assert len(result) == 5
+        # 每行應有 selection_overlap 欄位
+        assert "selection_overlap" in result.columns
+        for _, row in result.iterrows():
+            assert 0.0 <= row["selection_overlap"] <= 1.0
+
+    def test_select_ratio_changes_selection(self):
+        """select_ratio < 1.0 時應實際篩選不同的股票子集。"""
+        records = self._make_records()
+        prices = self._make_prices()
+        weights = {"technical": 0.3, "chip": 0.4, "fundamental": 0.2, "news": 0.1}
+        # select_ratio=0.5 → 每日 3 支取 max(1,int(3*0.5))=1 支
+        result = compute_ablation_performance(records, prices, weights, holding_days=5, top_n=3, select_ratio=0.5)
+        assert not result.empty
+        # 消融後選股應與 baseline 有差異（overlap < 1.0）
+        ablated = result[result["removed_dimension"] != "(none — baseline)"]
+        # 至少有一個維度的 overlap 小於 1（因為分數排序改變）
+        assert (ablated["selection_overlap"] < 1.0).any()
 
     def test_empty_records_returns_empty(self):
         result = compute_ablation_performance(pd.DataFrame(), pd.DataFrame(), {"technical": 1.0})

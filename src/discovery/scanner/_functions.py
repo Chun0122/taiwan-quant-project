@@ -1988,6 +1988,142 @@ def compute_factor_ic(
     return pd.DataFrame(results)
 
 
+def compute_rolling_ic(
+    df_records: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    holding_days: int = 5,
+    window_days: int = 14,
+    step_days: int = 7,
+) -> pd.DataFrame:
+    """計算滾動 IC 時間序列，觀察因子有效性的時間趨勢。
+
+    以 step_days 為步進、window_days 為窗口，逐段計算各因子 IC。
+    每個窗口使用 compute_factor_ic() 邏輯。
+
+    Args:
+        df_records: 歷史推薦記錄（scan_date / stock_id / close / 4 scores）
+        df_prices: 日K線（stock_id / date / close）
+        holding_days: 報酬天數（預設 5）
+        window_days: 滾動窗口天數（預設 14）
+        step_days: 步進天數（預設 7）
+
+    Returns:
+        DataFrame(window_end, factor, ic, sample_count, direction)
+        按 window_end 排序，可直接繪製時間序列
+    """
+    if df_records.empty or df_prices.empty:
+        return pd.DataFrame(columns=["window_end", "factor", "ic", "sample_count", "direction"])
+
+    # 取得所有 scan_date 的時間範圍
+    scan_dates = sorted(df_records["scan_date"].apply(lambda d: d if isinstance(d, date) else None).dropna().unique())
+    if not scan_dates:
+        return pd.DataFrame(columns=["window_end", "factor", "ic", "sample_count", "direction"])
+
+    min_date = scan_dates[0]
+    max_date = scan_dates[-1]
+
+    results: list[dict] = []
+    # 從 min_date + window_days 開始，每 step_days 計算一個窗口
+    cursor = min_date + timedelta(days=window_days)
+    while cursor <= max_date + timedelta(days=1):
+        ic_df = compute_factor_ic(
+            df_records,
+            df_prices,
+            holding_days=holding_days,
+            lookback_days=window_days,
+            reference_date=cursor,
+        )
+        for _, row in ic_df.iterrows():
+            results.append(
+                {
+                    "window_end": cursor,
+                    "factor": row["factor"],
+                    "ic": row["ic"],
+                    "sample_count": int(row["evaluable_count"]),
+                    "direction": row["direction"],
+                }
+            )
+        cursor += timedelta(days=step_days)
+
+    return pd.DataFrame(results)
+
+
+def compute_regime_ic(
+    df_records: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    df_taiex: pd.DataFrame,
+    holding_days: int = 5,
+) -> pd.DataFrame:
+    """按 Regime 分組計算各因子 IC。
+
+    使用 TAIEX 收盤價透過 detect_from_series() 判定每筆推薦所在的 Regime，
+    再分組計算 Spearman IC。
+
+    Args:
+        df_records: 歷史推薦記錄
+        df_prices: 日K線
+        df_taiex: TAIEX 日K線（date / close 欄位，按 date 排序）
+        holding_days: 報酬天數
+
+    Returns:
+        DataFrame(regime, factor, ic, sample_count, direction)
+    """
+    from src.regime.detector import detect_from_series
+
+    if df_records.empty or df_prices.empty or df_taiex.empty:
+        return pd.DataFrame(columns=["regime", "factor", "ic", "sample_count", "direction"])
+
+    # 建立 date → regime 映射
+    taiex_sorted = df_taiex.sort_values("date")
+    taiex_closes = taiex_sorted["close"].reset_index(drop=True)
+    taiex_dates = taiex_sorted["date"].tolist()
+
+    date_regime: dict[date, str] = {}
+    for i, d in enumerate(taiex_dates):
+        if i < 120:  # 需要至少 sma_long=120 天才能判定
+            date_regime[d] = "unknown"
+        else:
+            partial = taiex_closes.iloc[: i + 1]
+            result = detect_from_series(partial, include_crisis=False)
+            date_regime[d] = result["regime"]
+
+    # 為每筆推薦附上 regime
+    records = df_records.copy()
+    records["regime"] = records["scan_date"].apply(
+        lambda d: date_regime.get(d, "unknown") if isinstance(d, date) else "unknown"
+    )
+    records = records[records["regime"] != "unknown"]
+
+    if records.empty:
+        return pd.DataFrame(columns=["regime", "factor", "ic", "sample_count", "direction"])
+
+    # 分組計算 IC
+    results: list[dict] = []
+    for regime, group in records.groupby("regime"):
+        if len(group) < 10:
+            continue
+
+        # 用整組推薦做 IC（不限 lookback，因為已按 regime 分組）
+        ic_df = compute_factor_ic(
+            group,
+            df_prices,
+            holding_days=holding_days,
+            lookback_days=9999,  # 不限回溯，因為已按 regime 過濾
+        )
+        for _, row in ic_df.iterrows():
+            results.append(
+                {
+                    "regime": regime,
+                    "factor": row["factor"],
+                    "ic": row["ic"],
+                    "sample_count": int(row["evaluable_count"]),
+                    "direction": row["direction"],
+                }
+            )
+
+    return pd.DataFrame(results)
+
+
 def compute_sub_factor_ic(
     sub_factor_df: pd.DataFrame,
     df_prices: pd.DataFrame,
