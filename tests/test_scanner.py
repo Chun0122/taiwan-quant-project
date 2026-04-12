@@ -7734,7 +7734,7 @@ def test_momentum_scanner_stores_sub_factors(momentum_scanner):
     assert "technical" in momentum_scanner._sub_factor_ranks
     sub = momentum_scanner._sub_factor_ranks["technical"]
     assert "tech_ret5d" in sub.columns
-    assert "tech_sharpe_proxy" in sub.columns
+    assert "tech_high20_proximity" in sub.columns
     assert len(sub) == len(sids)
 
 
@@ -7851,9 +7851,10 @@ class TestGetChipBaseWeights:
         )
         assert tier == "8F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
-        assert abs(weights["consec"] - 0.16) < 0.001
+        assert abs(weights["consec"] - 0.23) < 0.001
         assert abs(weights["smart_broker"] - 0.10) < 0.001
-        assert len(weights) == 9
+        assert "total" not in weights
+        assert len(weights) == 8
 
     def test_7f_weights(self):
         """7F（無 smart_broker）權重正確。"""
@@ -7869,7 +7870,8 @@ class TestGetChipBaseWeights:
         assert tier == "7F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
         assert "smart_broker" not in weights
-        assert len(weights) == 8
+        assert "total" not in weights
+        assert len(weights) == 7
 
     def test_3f_fallback(self):
         """3F 最低配備權重正確。"""
@@ -7884,9 +7886,10 @@ class TestGetChipBaseWeights:
         )
         assert tier == "3F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
-        assert abs(weights["consec"] - 0.37) < 0.001
-        assert abs(weights["persist"] - 0.09) < 0.001
-        assert len(weights) == 4
+        assert abs(weights["consec"] - 0.50) < 0.001
+        assert abs(weights["persist"] - 0.10) < 0.001
+        assert "total" not in weights
+        assert len(weights) == 3
 
     def test_4f_broker_only(self):
         """4F（僅 broker）。"""
@@ -7927,3 +7930,107 @@ class TestGetChipBaseWeights:
                 f"margin={has_margin} whale={has_whale} smart={has_smart_broker}: "
                 f"sum={sum(weights.values())}, tier={tier}"
             )
+
+
+# ─── 零方差因子自動排除 ──────────────────────────────────────────────
+
+
+class TestExcludeZeroVarianceFactors:
+    """零方差因子偵測與權重重分配。"""
+
+    def test_no_zero_variance_returns_unchanged(self):
+        """所有因子有方差時，返回原始映射。"""
+        from src.discovery.scanner._functions import exclude_zero_variance_factors
+
+        rank_map = {
+            "a": pd.Series([0.1, 0.5, 0.9]),
+            "b": pd.Series([0.3, 0.6, 0.8]),
+        }
+        weights = {"a": 0.6, "b": 0.4}
+        r, w = exclude_zero_variance_factors(rank_map, weights)
+        assert set(r.keys()) == {"a", "b"}
+        assert abs(w["a"] - 0.6) < 0.001
+        assert abs(w["b"] - 0.4) < 0.001
+
+    def test_one_zero_variance_excluded(self):
+        """一個零方差因子被排除，權重重分配至剩餘因子。"""
+        from src.discovery.scanner._functions import exclude_zero_variance_factors
+
+        rank_map = {
+            "a": pd.Series([0.5, 0.5, 0.5]),  # 零方差
+            "b": pd.Series([0.3, 0.6, 0.8]),
+            "c": pd.Series([0.1, 0.4, 0.9]),
+        }
+        weights = {"a": 0.3, "b": 0.4, "c": 0.3}
+        r, w = exclude_zero_variance_factors(rank_map, weights)
+        assert "a" not in r
+        assert "a" not in w
+        assert abs(sum(w.values()) - 1.0) < 0.001
+        # b 和 c 的比例保持不變 (0.4 : 0.3)
+        assert abs(w["b"] / w["c"] - 0.4 / 0.3) < 0.01
+
+    def test_all_zero_variance_returns_empty(self):
+        """全部零方差 → 空 rank_map、空 weights。"""
+        from src.discovery.scanner._functions import exclude_zero_variance_factors
+
+        rank_map = {
+            "a": pd.Series([0.5, 0.5, 0.5]),
+            "b": pd.Series([0.3, 0.3, 0.3]),
+        }
+        weights = {"a": 0.6, "b": 0.4}
+        r, w = exclude_zero_variance_factors(rank_map, weights)
+        assert len(r) == 0
+        assert len(w) == 0
+
+    def test_empty_input_returns_empty(self):
+        """空輸入不報錯。"""
+        from src.discovery.scanner._functions import exclude_zero_variance_factors
+
+        r, w = exclude_zero_variance_factors({}, {})
+        assert r == {}
+        assert w == {}
+
+    def test_weight_sum_preserved(self):
+        """權重總和保持不變（非 1.0 的情境）。"""
+        from src.discovery.scanner._functions import exclude_zero_variance_factors
+
+        rank_map = {
+            "a": pd.Series([0.5, 0.5, 0.5]),  # 零方差
+            "b": pd.Series([0.1, 0.5, 0.9]),
+        }
+        weights = {"a": 0.3, "b": 0.2}
+        _, w = exclude_zero_variance_factors(rank_map, weights)
+        # 原始總和 0.5，排除 a 後 b 應被放大至 0.5
+        assert abs(w["b"] - 0.5) < 0.001
+
+
+class TestTechScoreZeroVarianceCluster:
+    """技術面 Cluster 零方差排除測試。"""
+
+    def test_constant_cluster_excluded(self, momentum_scanner):
+        """當某個 Cluster 所有因子完全相同時，該 Cluster 被排除。"""
+        n = 5
+        sids = [f"T{i}" for i in range(n)]
+        # 所有股票的 close 完全相同 → ret_5d/ret_10d 全為 0 → Cluster A 零方差
+        dates = [date.today() - timedelta(days=30 - d) for d in range(25)]
+        rows = []
+        for sid in sids:
+            for d in dates:
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "date": d,
+                        "open": 100,
+                        "high": 100,
+                        "low": 100,
+                        "close": 100,
+                        "volume": 1_000_000,
+                    }
+                )
+        df_price = pd.DataFrame(rows)
+
+        result = momentum_scanner._compute_momentum_style_technical_scores(sids, df_price)
+        # 不該因為零方差而 crash
+        assert len(result) == n
+        assert (result["technical_score"] >= 0).all()
+        assert (result["technical_score"] <= 1).all()

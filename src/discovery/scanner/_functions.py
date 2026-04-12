@@ -2171,6 +2171,51 @@ def compute_sub_factor_weight_adjustments(
     return adjusted
 
 
+def exclude_zero_variance_factors(
+    rank_map: dict[str, "pd.Series"],  # noqa: F821
+    weights: dict[str, float],
+    eps: float = 1e-9,
+) -> tuple[dict[str, "pd.Series"], dict[str, float]]:  # noqa: F821
+    """偵測零方差因子（rank 全部相同），排除並重新分配權重。
+
+    當某子因子 rank 標準差 < eps（所有候選股得到相同排名），
+    該因子無鑑別力，自動排除並將其權重按比例分配給剩餘因子。
+
+    Args:
+        rank_map: 因子名稱 → rank Series 映射
+        weights: 因子名稱 → 權重映射（key 必須為 rank_map 的子集）
+        eps: 零方差閾值（預設 1e-9）
+
+    Returns:
+        (filtered_rank_map, adjusted_weights) — 排除零方差因子後的映射與權重
+    """
+    if not rank_map or not weights:
+        return rank_map, weights
+
+    zero_var_keys = set()
+    for key, series in rank_map.items():
+        if key not in weights:
+            continue
+        if series.std() < eps:
+            zero_var_keys.add(key)
+
+    if not zero_var_keys:
+        return rank_map, weights
+
+    # 排除零方差因子
+    filtered = {k: v for k, v in rank_map.items() if k not in zero_var_keys}
+    remaining = {k: v for k, v in weights.items() if k not in zero_var_keys}
+
+    # 重新歸一化權重至原始總和
+    original_total = sum(weights.values())
+    remaining_total = sum(remaining.values())
+    if remaining_total > 0:
+        scale = original_total / remaining_total
+        remaining = {k: v * scale for k, v in remaining.items()}
+
+    return filtered, remaining
+
+
 # ── P3-B2: 主力成本分析 ──────────────────────────────────────────────
 
 

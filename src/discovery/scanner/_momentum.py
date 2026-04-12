@@ -25,6 +25,7 @@ from src.discovery.scanner._functions import (
     compute_sub_factor_weight_adjustments,
     compute_value_weighted_inst_flow,
     compute_whale_score,
+    exclude_zero_variance_factors,
 )
 from src.discovery.universe import UniverseConfig
 
@@ -42,16 +43,17 @@ def _get_chip_base_weights(
 
     將 _compute_chip_scores() 的 15 個 if-elif 分支提取為純函數，
     回傳 (weight_dict, chip_tier)。weight_dict 的 key 對應 rank 變數名稱：
-    consec / bvr / total / persist / smr / whale / sbl / broker / smart_broker。
+    consec / bvr / persist / smr / whale / sbl / broker / smart_broker。
+
+    v2 變更：移除 total（與 bvr r=0.86 冗餘），權重重分配至 consec 與 bvr。
 
     Returns:
         (weight_dict, chip_tier) — chip_tier 如 "8F"/"7F"/"3F" 等
     """
     if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
         return {
-            "consec": 0.16,
-            "bvr": 0.14,
-            "total": 0.14,
+            "consec": 0.23,
+            "bvr": 0.21,
             "persist": 0.06,
             "smr": 0.10,
             "whale": 0.12,
@@ -61,9 +63,8 @@ def _get_chip_base_weights(
         }, "8F"
     elif has_broker and has_sbl and has_margin and has_whale:
         return {
-            "consec": 0.18,
-            "bvr": 0.16,
-            "total": 0.16,
+            "consec": 0.26,
+            "bvr": 0.24,
             "persist": 0.06,
             "smr": 0.11,
             "whale": 0.13,
@@ -72,9 +73,8 @@ def _get_chip_base_weights(
         }, "7F"
     elif has_broker and has_sbl and has_margin:
         return {
-            "consec": 0.20,
-            "bvr": 0.18,
-            "total": 0.18,
+            "consec": 0.29,
+            "bvr": 0.27,
             "persist": 0.06,
             "smr": 0.14,
             "sbl": 0.12,
@@ -82,26 +82,23 @@ def _get_chip_base_weights(
         }, "6F"
     elif has_broker and has_sbl:
         return {
-            "consec": 0.26,
-            "bvr": 0.20,
-            "total": 0.20,
+            "consec": 0.36,
+            "bvr": 0.30,
             "persist": 0.06,
             "sbl": 0.14,
             "broker": 0.14,
         }, "5F"
     elif has_broker:
         return {
-            "consec": 0.30,
-            "bvr": 0.22,
-            "total": 0.22,
+            "consec": 0.41,
+            "bvr": 0.33,
             "persist": 0.06,
             "broker": 0.20,
         }, "4F"
     elif has_sbl and has_margin and has_whale:
         return {
-            "consec": 0.20,
-            "bvr": 0.18,
-            "total": 0.18,
+            "consec": 0.29,
+            "bvr": 0.27,
             "persist": 0.06,
             "smr": 0.13,
             "whale": 0.15,
@@ -109,61 +106,54 @@ def _get_chip_base_weights(
         }, "6F"
     elif has_sbl and has_margin:
         return {
-            "consec": 0.23,
-            "bvr": 0.20,
-            "total": 0.20,
+            "consec": 0.33,
+            "bvr": 0.30,
             "persist": 0.06,
             "smr": 0.16,
             "sbl": 0.15,
         }, "5F"
     elif has_sbl and has_whale:
         return {
-            "consec": 0.26,
-            "bvr": 0.18,
-            "total": 0.18,
+            "consec": 0.35,
+            "bvr": 0.27,
             "persist": 0.06,
             "whale": 0.22,
             "sbl": 0.10,
         }, "5F"
     elif has_sbl:
         return {
-            "consec": 0.33,
-            "bvr": 0.23,
-            "total": 0.23,
+            "consec": 0.44,
+            "bvr": 0.35,
             "persist": 0.06,
             "sbl": 0.15,
         }, "4F"
     elif has_margin and has_whale:
         return {
-            "consec": 0.23,
-            "bvr": 0.20,
-            "total": 0.20,
+            "consec": 0.33,
+            "bvr": 0.30,
             "persist": 0.06,
             "smr": 0.15,
             "whale": 0.16,
         }, "5F"
     elif has_margin:
         return {
-            "consec": 0.28,
-            "bvr": 0.23,
-            "total": 0.23,
+            "consec": 0.39,
+            "bvr": 0.35,
             "persist": 0.06,
             "smr": 0.20,
         }, "4F"
     elif has_whale:
         return {
-            "consec": 0.33,
-            "bvr": 0.23,
-            "total": 0.23,
+            "consec": 0.44,
+            "bvr": 0.35,
             "persist": 0.06,
             "whale": 0.15,
         }, "4F"
     else:
         return {
-            "consec": 0.37,
-            "bvr": 0.27,
-            "total": 0.27,
-            "persist": 0.09,
+            "consec": 0.50,
+            "bvr": 0.40,
+            "persist": 0.10,
         }, "3F"
 
 
@@ -233,16 +223,13 @@ class MomentumScanner(MarketScanner):
         df_price: pd.DataFrame | None = None,
         df_margin: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 三大法人合計 + 法人連續性 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
+        """動能模式籌碼面：外資連續買超 + 買超佔量比 + 法人連續性 + 券資比 + 大戶持股 + 借券 + 分點（有資料時）。
 
-        **法人連續性因子**（persist_rank, 6%）始終啟用，衡量近 10 日法人淨買超為正的天數比例。
+        v2 變更：移除三大法人合計（total_net）因子，與 bvr r=0.86 冗餘。
+
+        **法人連續性因子**（persist_rank, 6~10%）始終啟用，衡量近 10 日法人淨買超為正的天數比例。
         連續性高 = 法人持續布局（真波段），連續性低 = 一日行情（假主力）。
         同時用於調節隔日沖扣分 — 法人連續買超越強，隔沖扣分越輕。
-
-        權重組合（由資料可用性決定，皆含連續性 6%）：
-        - 8F: 外資16%+量比14%+法人14%+連續性6%+券資比10%+大戶12%+借券7%+分點11%+智慧分點10%
-        - 7F: 外資18%+量比16%+法人16%+連續性6%+券資比11%+大戶13%+借券8%+分點12%
-        - 3F: 外資37%+量比27%+法人27%+連續性9%
 
         回傳欄位：stock_id, chip_score, chip_tier（因子層級字串，如 "8F"/"3F"/"N/A"）
         """
@@ -300,7 +287,6 @@ class MomentumScanner(MarketScanner):
 
         consec_days_rank = df["consec_foreign_days"].rank(pct=True)
         bvr_rank = df["buy_vol_ratio"].rank(pct=True)
-        total_rank = df["total_net"].rank(pct=True)
 
         # ── 法人金額加權因子（B1：衰減加權取代純天數）──────────────
         flow_df = compute_value_weighted_inst_flow(df_inst, stock_ids, window=10, decay=0.85)
@@ -424,7 +410,6 @@ class MomentumScanner(MarketScanner):
         rank_map = {
             "consec": consec_rank,
             "bvr": bvr_rank,
-            "total": total_rank,
             "persist": persist_rank,
         }
         if has_margin:
@@ -438,7 +423,10 @@ class MomentumScanner(MarketScanner):
         if has_smart_broker:
             rank_map["smart_broker"] = smart_broker_rank
 
-        df["chip_score"] = sum(rank_map[k] * w for k, w in weights.items())
+        # 零方差因子自動排除：rank 全部相同時無鑑別力，重新分配權重
+        rank_map, weights = exclude_zero_variance_factors(rank_map, weights)
+
+        df["chip_score"] = sum(rank_map[k] * w for k, w in weights.items()) if rank_map else 0.5
 
         # ── 籌碼品質修正（法人斜率 ±3% + HHI 趨勢 ±3%）───────────
         slope_df = compute_inst_net_buy_slope(df_inst, stock_ids, window=10)
@@ -452,11 +440,10 @@ class MomentumScanner(MarketScanner):
 
         df["chip_tier"] = chip_tier
 
-        # 保存子因子 rank 供 IC 診斷使用
+        # 保存子因子 rank 供 IC 診斷���用
         chip_sub = pd.DataFrame({"stock_id": df["stock_id"].tolist()})
         chip_sub["chip_consec"] = consec_rank.to_numpy()
         chip_sub["chip_bvr"] = bvr_rank.to_numpy()
-        chip_sub["chip_total_net"] = total_rank.to_numpy()
         chip_sub["chip_persist"] = persist_rank.to_numpy()
         if has_margin:
             chip_sub["chip_smr"] = smr_rank.to_numpy()
@@ -628,7 +615,7 @@ class MomentumScanner(MarketScanner):
                 return None
 
             # chip 整體弱/反向 → 標記��有子因子為同一方向，讓權重歸一化自動調整
-            all_keys = ["consec", "bvr", "total", "persist", "smr", "whale", "sbl", "broker", "smart_broker"]
+            all_keys = ["consec", "bvr", "persist", "smr", "whale", "sbl", "broker", "smart_broker"]
             results = []
             for key in all_keys:
                 results.append(

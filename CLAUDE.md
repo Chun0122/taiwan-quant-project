@@ -97,7 +97,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組 | 職責 |
 |------|------|
-| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權**（3 群：報酬動能 mean(ret5d,ret10d,sharpe_proxy) / 量能 mean(vol_ratio,vol_accel) / 突破 breakout60d，各 1/3）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；**子因子 IC 自動權重調整**（`compute_sub_factor_weight_adjustments` + `_get_chip_base_weights` 純函數，chip 層級 IC-driven 權重微調）；MFE/MAE 分析（E3） |
+| `src/discovery/scanner/` | 五模式（Momentum/Swing/Value/Dividend/Growth）；四階段漏斗；四維度評分（技術+籌碼+基本面+消息面）+ 產業/概念/週線加成；Regime 動態權重（含 crisis 保守模式）；**技術面 Cluster 等權 v2**（3 群：報酬動能 mean(ret5d,ret10d) / 量能 mean(vol_ratio,vol_accel) / 突破 high20_proximity，各 1/3；移除 sharpe_proxy+breakout60d 冗餘因子）；**籌碼因子 v2**（移除 total_net 與 bvr r=0.86 冗餘，8F→8 key / 3F→3 key）；**零方差因子自動排除**（`exclude_zero_variance_factors` 純函數，Cluster 級 + rank_map 級偵測）；**Momentum 權重 IC 校準**（bull: tech=0.40/chip=0.30/fund=0.10/news=0.20）；MomentumScanner 最高 8-factor Smart Broker；隔日沖偵測+扣分；多時框強制共振；量價背離；動態評分閾值（bull=0.45/crisis=0.60）；動量衰減；籌碼加速度；主力成本分析；勝率回饋循環（E1）；因子 IC 監控（E2）；**子因子 IC 自動權重調整**（`compute_sub_factor_weight_adjustments` + `_get_chip_base_weights` 純函數，chip 層級 IC-driven 權重微調）；MFE/MAE 分析（E3） |
 | `src/discovery/universe.py` | Universe 三層漏斗：Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援 turnover_ratio > 2x）→ Stage 3 趨勢（同樣覆蓋率檢查；trend_only/breakout_only/trend_or_breakout 三模式；Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`）；`_FEATURE_COVERAGE_MIN=0.3` |
 | `src/discovery/performance.py` | 推薦績效回測（N 日報酬率/勝率/Regime 分組/換手率/MFE-MAE）；`compute_strategy_decay()`（勝率<40% 或均報酬<0 觸發警告）；`--include-costs`（交易成本扣減）；`--entry-next-open`（T+1 開盤價進場）；向量化 `_calc_returns()` |
 | `src/discovery/ablation.py` | 因子消融測試：維度級（歸零重分配 Spearman ρ）+ 子因子級 + 歷史績效消融；CLI `ablation-test` |
@@ -298,7 +298,7 @@ pytest tests/test_factors.py -v
 pytest --cov=src --cov-report=term-missing
 ```
 
-1750 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
+1756 個測試，45 個測試檔。Fixtures 在 `tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數在 `tests/scanner_helpers.py`。
 
 | 測試檔 | 涵蓋模組 | 類型 |
 |--------|----------|------|
@@ -361,9 +361,9 @@ pytest --cov=src --cov-report=term-missing
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 
-## Completed Tasks（已完成，共 83 項）
+## Completed Tasks（已完成，共 84 項）
 
-測試數從 231 → 1750。各階段摘要：
+測試數從 231 → 1756。各階段摘要：
 
 | 階段 | Task # | 重點 |
 |------|--------|------|
@@ -385,3 +385,4 @@ pytest --cov=src --cov-report=term-missing
 | **子因子 IC 自動化** | 81 | `compute_sub_factor_weight_adjustments()`（子因子 IC 權重調整+min_samples 防護）、`_get_chip_base_weights()`（15 分支→純函數）、`_compute_chip_scores()` 重構整合 IC 調整、`_load_chip_sub_factor_ic()` DB 歷史 IC 載入+graceful degradation（+11 測試） |
 | **Discover+Rotation 效能強化** | 82 | Rotation 回測 OHLCV 預載入快取（消除 N×M 逐日查詢）、Discover 回測交易成本扣減（`--include-costs`）、T+1 開盤價進場（`--entry-next-open`）、`_calc_returns()` 向量化（iterrows→merge+join）、Rotation 回測每日持倉快照（`--export-positions` CSV）（+11 測試） |
 | **Universe 覆蓋率 fallback** | 83 | `_stage2_liquidity_filter` / `_stage3_trend_filter` DailyFeature 覆蓋率檢查（`_FEATURE_COVERAGE_MIN=0.3`），覆蓋不足時 fallback DailyPrice 全市場計算；修復 DailyFeature 僅覆蓋 watchlist 時 Universe 從 1930→6 支的瓶頸（修復後 Stage 2=745/Stage 3=469）（+1 測試） |
+| **因子結構優化** | 84 | 技術面 Cluster v2（移除 sharpe_proxy+breakout60d 冗餘，新增 high20_proximity）；籌碼面移除 total_net（與 bvr r=0.86 冗餘）權重重分配；`exclude_zero_variance_factors()` 純函數（rank_map+Cluster 級零方差偵測自動排除+權重重分配）；高相關配對 4→2 組、籌碼最高相關 0.86→0.39（+6 測試） |

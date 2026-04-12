@@ -183,7 +183,7 @@ class TestSubFactorAblation:
                 "stock_id": [f"S{i:03d}" for i in range(n)],
                 "tech_ret5d": rng.uniform(0, 1, n),
                 "tech_ret10d": rng.uniform(0, 1, n),
-                "tech_breakout60d": rng.uniform(0, 1, n),
+                "tech_high20_proximity": rng.uniform(0, 1, n),
                 "tech_vol_ratio": rng.uniform(0, 1, n),
             }
         )
@@ -194,7 +194,7 @@ class TestSubFactorAblation:
         results = run_sub_factor_ablation(df, "technical")
         assert len(results) == 4
         removed = {r.removed_factor for r in results}
-        assert removed == {"tech_ret5d", "tech_ret10d", "tech_breakout60d", "tech_vol_ratio"}
+        assert removed == {"tech_ret5d", "tech_ret10d", "tech_high20_proximity", "tech_vol_ratio"}
 
     def test_correlation_range(self):
         """分數相關性在 [-1, 1]。"""

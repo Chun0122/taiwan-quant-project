@@ -2549,13 +2549,19 @@ class MarketScanner:
             logger.warning("Stage 0.5: 全市場估值自動同步失敗，使用既有資料繼續")
 
     def _compute_momentum_style_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """動能風格技術面 6 因子（橫截面排名版）。
+        """動能風格技術面 4 因子（橫截面排名版）。
 
-        5日動能 + 10日動能 + 20日突破 + 量比（20日）+ 成交量加速 + 風險調整後動能。
-        所有因子改用橫截面 rank(pct=True)，自動適應牛熊市（Regime Adaptable），
-        消除原本 clamp(0.5 + ret×5) 在強市場天花板化的鑑別度喪失問題。
-        第 6 因子（風險調整後動能）= Return_10d / Volatility_20d（類 Sharpe），
-        偏好「上漲過程平穩」的高品質動能股，過濾暴漲暴跌的妖股。
+        4 因子分 3 Cluster 等權：
+        - Cluster A（報酬動能）：mean(ret5d, ret10d)
+        - Cluster B（量能擴張）：mean(vol_ratio, vol_accel)
+        - Cluster C（突破強度）：close / max(close, 20d)（20 日高點接近度）
+
+        v2 變更（冗餘因子精簡）：
+        - 移除 sharpe_proxy（與 ret_10d r=0.91，計算重疊）
+        - 移除 breakout_60d（需 60 日資料，多數股票不足永遠 NaN）
+        - 新增 high20_proximity（close / 20日最高，度量突破而非報酬率，降低 Cluster 間冗餘）
+
+        所有因子用橫截面 rank(pct=True)，自動適應牛熊市（Regime Adaptable）。
         資料不足或缺失的因子以中性分 0.5 填補。
         供 MomentumScanner 與 GrowthScanner 共用。
         """
@@ -2566,16 +2572,14 @@ class MarketScanner:
         g = df.groupby("stock_id", sort=False)
 
         # ── 批次取各期收盤價 ──────────────────────────────────────────
-        # 使用 apply 確保結果以 stock_id 為 index（nth() 返回的是原始整數 index，
-        # 導致後續 reindex 全部得到 NaN）
         latest_close = g["close"].last()
         close_1d_ago = g["close"].apply(
             lambda s: float(s.iloc[-2]) if len(s) >= 2 else np.nan
         )  # 前一交易日（漲停偵測用）
-        close_5d_ago = g["close"].apply(lambda s: float(s.iloc[-6]) if len(s) >= 6 else np.nan)  # 5 個交易日前
-        close_10d_ago = g["close"].apply(lambda s: float(s.iloc[-11]) if len(s) >= 11 else np.nan)  # 10 個交易日前
-        # 近 60 日最高收盤（季線突破；20日易受短期雜訊干擾，延長至 60 日延續性更強）
-        close_60d_max = g["close"].apply(lambda s: float(s.iloc[-60:].max()) if len(s) >= 60 else np.nan)
+        close_5d_ago = g["close"].apply(lambda s: float(s.iloc[-6]) if len(s) >= 6 else np.nan)
+        close_10d_ago = g["close"].apply(lambda s: float(s.iloc[-11]) if len(s) >= 11 else np.nan)
+        # 近 20 日最高收盤（突破強度：距近期高點的距離）
+        close_20d_max = g["close"].apply(lambda s: float(s.iloc[-20:].max()) if len(s) >= 20 else np.nan)
 
         # ── 批次取量能序列 ────────────────────────────────────────────
         latest_vol = g["volume"].last().astype(float)
@@ -2583,60 +2587,56 @@ class MarketScanner:
         vol_3d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-3:].mean()) if len(s) >= 3 else np.nan)
         vol_10d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-10:].mean()) if len(s) >= 10 else np.nan)
 
-        # ── 第 6 因子：20 日日報酬率標準差（Volatility_20d）────────────
-        # 計算 20 日滾動日報酬率的標準差，供風險調整後動能使用
-        vol_20d_std = g["close"].apply(
-            lambda s: float(s.pct_change().iloc[-20:].dropna().std()) if len(s) >= 21 else np.nan
-        )
-
         # ── 限縮到候選股集合，計算原始因子值 ─────────────────────────
         idx = pd.Index(stock_ids)
         c0 = latest_close.reindex(idx)
         c5 = close_5d_ago.reindex(idx).replace(0, np.nan)
         c10 = close_10d_ago.reindex(idx).replace(0, np.nan)
-        c60m = close_60d_max.reindex(idx).replace(0, np.nan)
+        c20m = close_20d_max.reindex(idx).replace(0, np.nan)
 
         ret_5d = (c0 - c5) / c5
         ret_10d = (c0 - c10) / c10
-        breakout_60d = c0 / c60m
+        high20_proximity = c0 / c20m  # 20 日高點接近度（=1 時創新高，<1 拉回整理）
 
         vol_20d = vol_20d_mean.reindex(idx).replace(0, np.nan)
         vol_ratio_raw = latest_vol.reindex(idx) / vol_20d
         vol_accel_raw = vol_3d_mean.reindex(idx) / vol_10d_mean.reindex(idx).replace(0, np.nan)
 
-        # 風險調整後動能：Return_10d / Volatility_20d（類 Sharpe ratio）
-        vv = vol_20d_std.reindex(idx).replace(0, np.nan)
-        sharpe_proxy = ret_10d / vv
-
         # ── 橫截面百分位排名（Regime Adaptive）─────────────────────────
         r5 = ret_5d.rank(pct=True)
         r10 = ret_10d.rank(pct=True)
-        rb = breakout_60d.rank(pct=True)
+        rb = high20_proximity.rank(pct=True)
         rv = vol_ratio_raw.rank(pct=True)
         ra = vol_accel_raw.rank(pct=True)
-        rs = sharpe_proxy.rank(pct=True)  # 風險調整後動能排名
 
         # ── 漲停板特殊處理（台股 10% 漲跌幅限制）────────────────────────
         # 強勢「鎖漲停」時成交量急縮屬正常現象，不應懲罰量比/量能加速因子。
-        # 偵測：當日漲幅 ≥ 9.8%（台股實際漲停幅度因計算略低於 10%）
         c1d = close_1d_ago.reindex(idx).replace(0, np.nan)
         limit_up_mask = ((c0 - c1d) / c1d) >= 0.098
         rv = rv.where(~limit_up_mask, other=1.0)
         ra = ra.where(~limit_up_mask, other=1.0)
 
         # NaN（資料不足）以中性 0.5 填補
-        scores = pd.concat([r5, r10, rb, rv, ra, rs], axis=1)
-        scores.columns = ["r5", "r10", "rb", "rv", "ra", "rs"]
+        scores = pd.concat([r5, r10, rb, rv, ra], axis=1)
+        scores.columns = ["r5", "r10", "rb", "rv", "ra"]
         scores = scores.fillna(0.5)
 
-        # Cluster 等權：將 6 因子依相關性分群，消除冗餘加權
-        # Cluster A（報酬動能）：ret5d, ret10d, sharpe_proxy（r=0.65~0.95）
-        # Cluster B（量能擴張）：vol_ratio, vol_accel（r=0.80）
-        # Cluster C（突破強度）：breakout60d（獨立）
-        cluster_a = scores[["r5", "r10", "rs"]].mean(axis=1)
+        # Cluster 等權：4 因子分 3 Cluster，消除冗餘加權
+        # Cluster A（報酬動能）：ret5d, ret10d
+        # Cluster B（量能擴張）：vol_ratio, vol_accel
+        # Cluster C（突破強度）：high20_proximity
+        cluster_a = scores[["r5", "r10"]].mean(axis=1)
         cluster_b = scores[["rv", "ra"]].mean(axis=1)
         cluster_c = scores["rb"]
-        tech_score = (cluster_a + cluster_b + cluster_c) / 3
+
+        # 零方差 Cluster 自動排除：若某 Cluster 完全無鑑別力，排除後等權剩餘
+        _eps = 1e-9
+        clusters = [("A", cluster_a), ("B", cluster_b), ("C", cluster_c)]
+        active = [(name, s) for name, s in clusters if s.std() >= _eps]
+        if active:
+            tech_score = sum(s for _, s in active) / len(active)
+        else:
+            tech_score = pd.Series(0.5, index=scores.index)
 
         # 保存子因子 rank 供 IC 診斷使用
         sub_df = scores.copy()
@@ -2645,10 +2645,9 @@ class MarketScanner:
             columns={
                 "r5": "tech_ret5d",
                 "r10": "tech_ret10d",
-                "rb": "tech_breakout60d",
+                "rb": "tech_high20_proximity",
                 "rv": "tech_vol_ratio",
                 "ra": "tech_vol_accel",
-                "rs": "tech_sharpe_proxy",
             }
         )
         self._sub_factor_ranks["technical"] = sub_df
