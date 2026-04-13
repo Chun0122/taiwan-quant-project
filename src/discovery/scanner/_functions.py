@@ -1964,6 +1964,10 @@ def compute_factor_ic(
         if len(valid) < 10:
             continue
 
+        # 常數輸入（std == 0）→ 相關係數未定義，跳過
+        if valid[factor].std() == 0 or valid["forward_return"].std() == 0:
+            continue
+
         # Spearman Rank Correlation
         ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
         if np.isnan(ic):
@@ -2181,6 +2185,9 @@ def compute_sub_factor_ic(
         valid = recent[[factor, "forward_return"]].dropna()
         if len(valid) < 10:
             continue
+        # 常數輸入（std == 0）→ 相關係數未定義，跳過
+        if valid[factor].std() == 0 or valid["forward_return"].std() == 0:
+            continue
         ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
         if np.isnan(ic):
             ic = 0.0
@@ -2207,6 +2214,8 @@ def compute_factor_correlation_matrix(
         for c in sub_factor_df.columns
         if c not in meta_cols and sub_factor_df[c].dtype in ("float64", "float32", "int64")
     ]
+    # 排除常數欄位（std == 0），避免 ConstantInputWarning
+    factor_cols = [c for c in factor_cols if sub_factor_df[c].std() > 0]
     if len(factor_cols) < 2:
         return pd.DataFrame()
     return sub_factor_df[factor_cols].corr(method="spearman")
