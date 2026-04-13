@@ -353,6 +353,97 @@ def _check_strategy_decay() -> None:
         print("  所有模式績效正常，無衰減警告。")
 
 
+def _check_factor_ic_decay() -> None:
+    """檢查各模式關鍵因子 IC 衰退（供 morning-routine 呼叫）。"""
+    from datetime import date, timedelta
+
+    import pandas as pd
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.schema import DailyPrice, DiscoveryRecord
+    from src.discovery.scanner._functions import compute_rolling_ic
+
+    key_factors = {
+        "momentum": "news_score",
+        "swing": "chip_score",
+        "value": "fundamental_score",
+        "dividend": "fundamental_score",
+        "growth": "fundamental_score",
+    }
+    mode_labels = {
+        "momentum": "Momentum",
+        "swing": "Swing",
+        "value": "Value",
+        "dividend": "Dividend",
+        "growth": "Growth",
+    }
+
+    has_decay = False
+    for mode, key_factor in key_factors.items():
+        try:
+            cutoff = date.today() - timedelta(days=35)
+            with get_session() as session:
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.technical_score,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.fundamental_score,
+                    DiscoveryRecord.news_score,
+                ).where(
+                    DiscoveryRecord.mode == mode,
+                    DiscoveryRecord.scan_date >= cutoff,
+                )
+                rows = session.execute(stmt).all()
+                if len(rows) < 20:
+                    continue
+                df_records = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "scan_date",
+                        "stock_id",
+                        "close",
+                        "technical_score",
+                        "chip_score",
+                        "fundamental_score",
+                        "news_score",
+                    ],
+                )
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_rows = session.execute(
+                    select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                        DailyPrice.stock_id.in_(stock_ids),
+                        DailyPrice.date >= cutoff,
+                    )
+                ).all()
+                if not price_rows:
+                    continue
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
+            if rolling_df.empty:
+                continue
+
+            factor_df = rolling_df[rolling_df["factor"] == key_factor].sort_values("window_end")
+            if factor_df.empty:
+                continue
+
+            latest_ic = factor_df["ic"].iloc[-1]
+            label = mode_labels.get(mode, mode)
+            if latest_ic < 0.10:
+                has_decay = True
+                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（< 0.10 門檻）")
+            else:
+                print(f"  ✓ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}")
+        except Exception:
+            continue
+
+    if not has_decay:
+        print("  所有模式關鍵因子 IC 正常。")
+
+
 def _sync_full_market() -> None:
     """同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉等非 watchlist 股票有最新價格）。"""
     from src.data.pipeline import sync_market_data
@@ -637,6 +728,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             "策略衰減監控（30/60/90 天績效趨勢）",
             {"dry_run"},
             lambda: _check_strategy_decay(),
+        ),
+        (
+            "15b",
+            "關鍵因子 IC 衰退檢查",
+            {"dry_run"},
+            lambda: _check_factor_ic_decay(),
         ),
     ]
 

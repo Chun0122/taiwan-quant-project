@@ -810,6 +810,24 @@ def cmd_factor_diagnostics(args: "argparse.Namespace") -> None:
                     trend = "↑ 改善" if series.iloc[-1] > series.iloc[0] else "↓ 衰退"
                     print(f"  {col[:20]:<20} {series.iloc[0]:>+.4f} → {series.iloc[-1]:>+.4f} ({trend})")
 
+            # IC 衰退警告
+            _KEY_FACTOR_MAP = {
+                "momentum": "news_score",
+                "swing": "chip_score",
+                "value": "fundamental_score",
+                "dividend": "fundamental_score",
+                "growth": "fundamental_score",
+            }
+            for col in pivoted.columns:
+                series = pivoted[col].dropna()
+                if len(series) >= 2 and series.iloc[-1] < 0.10:
+                    print(f"\n  {'!' * 60}")
+                    print(f"  !! 警告：{col} IC 衰退至 {series.iloc[-1]:+.4f}（< 0.10 門檻）")
+                    key_factor = _KEY_FACTOR_MAP.get(mode, "")
+                    if col == key_factor:
+                        print(f"  !!        {mode} 模式高度依賴 {col}，建議提高推薦門檻或暫停")
+                    print(f"  {'!' * 60}")
+
     # Step 6: Per-Regime IC 分析
     from src.discovery.scanner._functions import compute_regime_ic
 

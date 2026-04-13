@@ -341,22 +341,15 @@ class TestMomentumScannerSblFactor:
         return pd.DataFrame(rows)
 
     def test_six_factor_path_activated(self, momentum_scanner, monkeypatch):
-        """有 SBL + 融資融券 + 大戶持股時，啟用 6-factor，chip_score 正常計算。"""
+        """有 SBL + 融資融券時，啟用 6F，chip_score 正常計算。"""
         sids = ["1000", "1001", "1002"]
         df_inst = self._make_inst_df(sids)
         df_margin = self._make_margin_df(sids)
 
-        # 模擬 _load_sbl_data 回傳 SBL 資料
         monkeypatch.setattr(
             momentum_scanner,
             "_load_sbl_data",
             lambda stock_ids: _make_sbl_df(sids, [50000, 10000, 30000]),
-        )
-        # 模擬 _load_holding_data 回傳大戶持股資料
-        monkeypatch.setattr(
-            momentum_scanner,
-            "_load_holding_data",
-            lambda stock_ids: _make_holding_df_for_scanner(sids),
         )
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
@@ -364,20 +357,14 @@ class TestMomentumScannerSblFactor:
         assert (result["chip_score"] >= 0).all()
         assert (result["chip_score"] <= 1.0).all()
 
-    def test_no_sbl_falls_back_to_five_factor(self, momentum_scanner, monkeypatch):
-        """無 SBL 資料時，降級至 5-factor（含券資比 + 大戶持股）。"""
+    def test_no_sbl_falls_back_to_four_factor(self, momentum_scanner, monkeypatch):
+        """無 SBL 資料時，降級至 4F（margin only）。"""
         sids = ["1000", "1001"]
         df_inst = self._make_inst_df(sids)
         df_margin = self._make_margin_df(sids)
 
         # SBL 回傳空 DF → 降級
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: pd.DataFrame())
-        # 大戶持股有資料
-        monkeypatch.setattr(
-            momentum_scanner,
-            "_load_holding_data",
-            lambda stock_ids: _make_holding_df_for_scanner(sids),
-        )
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
         assert len(result) == 2
@@ -422,17 +409,6 @@ class TestMomentumScannerSblFactor:
             ]
         )
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: sbl_data)
-        # 大戶持股也相同
-        monkeypatch.setattr(
-            momentum_scanner,
-            "_load_holding_data",
-            lambda _: pd.DataFrame(
-                [
-                    {"date": dt_today, "stock_id": "low_sbl", "level": "400,001-600,000 Shares", "percent": 15.0},
-                    {"date": dt_today, "stock_id": "high_sbl", "level": "400,001-600,000 Shares", "percent": 15.0},
-                ]
-            ),
-        )
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
         scores = result.set_index("stock_id")["chip_score"]
@@ -440,7 +416,7 @@ class TestMomentumScannerSblFactor:
         assert scores["low_sbl"] > scores["high_sbl"]
 
     def test_sbl_only_uses_four_factor(self, momentum_scanner, monkeypatch):
-        """僅有 SBL（無融資融券、無大戶持股）→ 4-factor 路徑。"""
+        """僅有 SBL（無融資融券）→ 4F 路徑。"""
         sids = ["1000", "1001"]
         df_inst = self._make_inst_df(sids)
 
@@ -452,7 +428,6 @@ class TestMomentumScannerSblFactor:
             ]
         )
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: sbl_data)
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: pd.DataFrame())
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         assert len(result) == 2
@@ -460,12 +435,11 @@ class TestMomentumScannerSblFactor:
         assert (result["chip_score"] <= 1.0).all()
 
     def test_no_data_falls_to_three_factor(self, momentum_scanner, monkeypatch):
-        """無 SBL、無融資融券、無大戶持股時，使用 3-factor。"""
+        """無 SBL、無融資融券時，使用 3F。"""
         sids = ["1000"]
         df_inst = self._make_inst_df(sids)
 
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: pd.DataFrame())
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: pd.DataFrame())
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         assert len(result) == 1

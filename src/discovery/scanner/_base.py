@@ -75,6 +75,7 @@ class MarketScanner:
     _auto_sync_broker: bool = False  # 子類設為 True 以在 Stage 2.5 自動補抓分點資料
     _revenue_months: int = 1  # 子類可設為 4 以啟用「本月 YoY - 3 個月前 YoY」加速度因子
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
+    _blocked_regimes: set[str] = set()  # 子類可覆寫以阻擋特定市場狀態
 
     def __init__(
         self,
@@ -128,6 +129,21 @@ class MarketScanner:
         except Exception:
             self.regime = "sideways"
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
+
+        # Stage 0.1: Regime gate — 特定模式在指定 regime 不執行
+        if self.regime in self._blocked_regimes:
+            logger.warning(
+                "Stage 0.1: %s 模式在 %s 市場暫停掃描（歷史績效不佳）",
+                self.mode_name,
+                self.regime,
+            )
+            return DiscoveryResult(
+                rankings=pd.DataFrame(),
+                total_stocks=0,
+                after_coarse=0,
+                mode=self.mode_name,
+                audit_trail=audit,
+            )
 
         # Stage 1: 載入資料
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
@@ -2184,6 +2200,17 @@ class MarketScanner:
                 threshold,
             )
 
+        # IC 衰退回饋：關鍵因子持續失效 → 提高門檻
+        ic_decay_adj = self._compute_ic_decay_adjustment()
+        if ic_decay_adj > 0:
+            threshold += ic_decay_adj
+            logger.info(
+                "Stage 3.7 IC-Decay: %s 模式關鍵因子 IC 持續衰退，門檻 +%.2f → %.2f",
+                self.mode_name,
+                ic_decay_adj,
+                threshold,
+            )
+
         before = len(scored)
         scored = scored[scored["composite_score"] >= threshold].copy()
         removed = before - len(scored)
@@ -2244,6 +2271,88 @@ class MarketScanner:
             )
         except Exception:
             logger.debug("E1: 勝率回饋計算失敗，跳過")
+            return 0.0
+
+    # 各模式的關鍵因子（IC 衰退監控目標）
+    _KEY_FACTOR_MAP: dict[str, str] = {
+        "momentum": "news_score",
+        "swing": "chip_score",
+        "value": "fundamental_score",
+        "dividend": "fundamental_score",
+        "growth": "fundamental_score",
+    }
+
+    def _compute_ic_decay_adjustment(self) -> float:
+        """IC 衰退門檻調整：關鍵因子 IC 連續 2 窗口 < 0.05 時回傳 +0.05。"""
+        key_factor = self._KEY_FACTOR_MAP.get(self.mode_name)
+        if not key_factor:
+            return 0.0
+        try:
+            from src.discovery.scanner._functions import compute_rolling_ic
+
+            cutoff = date.today() - timedelta(days=35)
+
+            with get_session() as session:
+                stmt = select(
+                    DiscoveryRecord.scan_date,
+                    DiscoveryRecord.stock_id,
+                    DiscoveryRecord.close,
+                    DiscoveryRecord.technical_score,
+                    DiscoveryRecord.chip_score,
+                    DiscoveryRecord.fundamental_score,
+                    DiscoveryRecord.news_score,
+                ).where(
+                    DiscoveryRecord.mode == self.mode_name,
+                    DiscoveryRecord.scan_date >= cutoff,
+                )
+                rows = session.execute(stmt).all()
+                if len(rows) < 20:
+                    return 0.0
+                df_records = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "scan_date",
+                        "stock_id",
+                        "close",
+                        "technical_score",
+                        "chip_score",
+                        "fundamental_score",
+                        "news_score",
+                    ],
+                )
+
+                stock_ids = df_records["stock_id"].unique().tolist()
+                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                    DailyPrice.stock_id.in_(stock_ids),
+                    DailyPrice.date >= cutoff,
+                )
+                price_rows = session.execute(price_stmt).all()
+                if not price_rows:
+                    return 0.0
+                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+
+            rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
+            if rolling_df.empty:
+                return 0.0
+
+            # 取關鍵因子的 IC 時間序列
+            factor_df = rolling_df[rolling_df["factor"] == key_factor].sort_values("window_end")
+            if len(factor_df) < 2:
+                return 0.0
+
+            # 檢查最近 2 個窗口是否都 < 0.05
+            last_two = factor_df["ic"].tail(2).tolist()
+            if all(ic < 0.05 for ic in last_two):
+                logger.warning(
+                    "IC-Decay: %s 模式關鍵因子 %s 連續 2 窗口 IC < 0.05（%s），啟動門檻提升",
+                    self.mode_name,
+                    key_factor,
+                    [f"{v:+.4f}" for v in last_two],
+                )
+                return 0.05
+            return 0.0
+        except Exception:
+            logger.debug("IC-Decay: 計算失敗，跳過")
             return 0.0
 
     # ------------------------------------------------------------------ #

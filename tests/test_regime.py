@@ -94,24 +94,24 @@ class TestRegimeWeights:
             assert sum(w.values()) == pytest.approx(1.0)
 
     def test_get_weights_known_mode(self):
-        """get_weights 回傳正確的權重（籌碼降權、消息升權）。"""
+        """get_weights 回傳正確的權重（momentum 已移除 fundamental）。"""
         w = MarketRegimeDetector.get_weights("momentum", "bull")
-        assert w["technical"] == 0.40
-        assert w["chip"] == 0.30
-        assert w["fundamental"] == 0.10
-        assert w["news"] == 0.20
+        assert w["technical"] == 0.44
+        assert w["chip"] == 0.34
+        assert "fundamental" not in w
+        assert w["news"] == 0.22
 
     def test_momentum_sideways_chip_dominant(self):
-        """盤整時 momentum 籌碼面 0.35 > 技術面 0.30，Smart Broker 蓄積仍有參考。"""
+        """盤整時 momentum 籌碼面 0.39 > 技術面 0.33（已移除 fundamental）。"""
         w = REGIME_WEIGHTS["momentum"]["sideways"]
-        assert w["chip"] == 0.35
-        assert w["technical"] == 0.30
+        assert w["chip"] == 0.39
+        assert w["technical"] == 0.33
 
     def test_momentum_bear_news_elevated(self):
-        """空頭時 momentum 消息面提升至 35%，確保選出有事件催化劑的錯殺股。"""
+        """空頭時 momentum 消息面提升至 42%（已移除 fundamental 重新歸一）。"""
         w = REGIME_WEIGHTS["momentum"]["bear"]
-        assert w["news"] == 0.35
-        assert w["technical"] == 0.25
+        assert w["news"] == 0.42
+        assert w["technical"] == 0.29
 
     def test_get_weights_unknown_mode_returns_default(self):
         """未知模式回傳預設權重。"""
@@ -119,8 +119,8 @@ class TestRegimeWeights:
         assert sum(w.values()) == pytest.approx(1.0)
 
     def test_bear_shifts_weight_to_fundamental(self):
-        """空頭時各模式都加重基本面。"""
-        for mode in ("momentum", "swing"):
+        """空頭時 swing 加重基本面（momentum 已移除 fundamental）。"""
+        for mode in ("swing",):
             bull_w = REGIME_WEIGHTS[mode]["bull"]
             bear_w = REGIME_WEIGHTS[mode]["bear"]
             assert bear_w["fundamental"] > bull_w["fundamental"]
@@ -373,15 +373,14 @@ class TestRegimeWeightsCrisis:
             w = REGIME_WEIGHTS[mode]["crisis"]
             assert sum(w.values()) == pytest.approx(1.0), f"{mode}/crisis 權重和不為 1"
 
-    def test_momentum_crisis_chip_fundamental_dominant(self):
-        """momentum/crisis：消息面最高（崩盤時 MOPS 事件是關鍵信號），基本面防禦次之。"""
+    def test_momentum_crisis_news_dominant(self):
+        """momentum/crisis：消息面最高 0.57（已移除 fundamental，三維度歸一）。"""
         w = REGIME_WEIGHTS["momentum"]["crisis"]
-        assert w["news"] == 0.40
-        assert w["chip"] == 0.20
-        assert w["fundamental"] == 0.30
-        assert w["news"] > w["fundamental"]
-        assert w["fundamental"] > w["chip"]
-        assert w["chip"] > w["technical"]
+        assert w["news"] == 0.57
+        assert w["chip"] == 0.29
+        assert w["technical"] == 0.14
+        assert "fundamental" not in w
+        assert w["news"] > w["chip"] > w["technical"]
 
     def test_swing_crisis_fundamental_dominant(self):
         """swing/crisis：基本面（0.55）應為最高權重（品質防禦）。"""
@@ -397,10 +396,11 @@ class TestRegimeWeightsCrisis:
             assert crisis_tech <= bear_tech, f"{mode}: crisis tech {crisis_tech} > bear tech {bear_tech}"
 
     def test_get_weights_crisis_returns_correct_dict(self):
-        """get_weights('momentum', 'crisis') 回傳正確權重字典。"""
+        """get_weights('momentum', 'crisis') 回傳正確權重字典（已移除 fundamental）。"""
         w = MarketRegimeDetector.get_weights("momentum", "crisis")
-        assert w["news"] == 0.40
-        assert w["technical"] == 0.10
+        assert w["news"] == 0.57
+        assert w["technical"] == 0.14
+        assert "fundamental" not in w
         assert sum(w.values()) == pytest.approx(1.0)
 
 

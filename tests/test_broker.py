@@ -556,31 +556,29 @@ def _make_holding_df(stock_ids: list[str]) -> pd.DataFrame:
 class TestMomentumScannerBrokerFactor:
     """MomentumScanner._compute_chip_scores() 分點因子整合測試。"""
 
-    def test_seven_factor_path_activated(self, momentum_scanner, monkeypatch):
-        """有分點+借券+融資融券+大戶時，啟用 7-factor，chip_score 正常計算。"""
+    def test_six_factor_path_activated(self, momentum_scanner, monkeypatch):
+        """有分點+借券+融資融券時，啟用 6F，chip_score 正常計算。"""
         sids = ["1000", "1001", "1002"]
         df_inst = _make_inst_df(sids)
         df_margin = _make_margin_df(sids)
 
         monkeypatch.setattr(momentum_scanner, "_load_broker_data", lambda _: _make_broker_df(sids, [0.8, 0.5, 0.3]))
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: _make_sbl_df(sids))
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: _make_holding_df(sids))
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
         assert len(result) == 3
         assert (result["chip_score"] >= 0).all()
         assert (result["chip_score"] <= 1.0).all()
 
-    def test_no_broker_falls_back_to_six_factor(self, momentum_scanner, monkeypatch):
-        """無分點資料時，降級至 6-factor（借券+融資券+大戶路徑）。"""
+    def test_no_broker_falls_back_to_five_factor(self, momentum_scanner, monkeypatch):
+        """無分點資料時，降級至 5F（借券+融資券路徑）。"""
         sids = ["1000", "1001"]
         df_inst = _make_inst_df(sids)
         df_margin = _make_margin_df(sids)
 
-        # broker 回傳空 → 不走 7-factor
+        # broker 回傳空 → 不走 6F
         monkeypatch.setattr(momentum_scanner, "_load_broker_data", lambda _: pd.DataFrame())
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: _make_sbl_df(sids))
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: _make_holding_df(sids))
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, df_margin)
         assert len(result) == 2
@@ -601,9 +599,8 @@ class TestMomentumScannerBrokerFactor:
             "_load_broker_data",
             lambda _: _make_broker_df(sids, [0.95, 0.30]),
         )
-        # 其他因子相同（空 DF 或相同值）
+        # 其他因子相同（空 DF）
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: pd.DataFrame())
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: pd.DataFrame())
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         scores = result.set_index("stock_id")["chip_score"]
@@ -639,7 +636,6 @@ class TestMomentumScannerBrokerFactor:
 
         monkeypatch.setattr(momentum_scanner, "_load_broker_data", lambda _: df_broker)
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: pd.DataFrame())
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: pd.DataFrame())
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         scores = result.set_index("stock_id")["chip_score"]
@@ -647,13 +643,12 @@ class TestMomentumScannerBrokerFactor:
         assert scores["many_days"] > scores["few_days"]
 
     def test_no_all_data_falls_to_three_factor(self, momentum_scanner, monkeypatch):
-        """無分點/借券/融資融券/大戶資料時，使用 3-factor。"""
+        """無分點/借券/融資融券資料時，使用 3F。"""
         sids = ["1000"]
         df_inst = _make_inst_df(sids)
 
         monkeypatch.setattr(momentum_scanner, "_load_broker_data", lambda _: pd.DataFrame())
         monkeypatch.setattr(momentum_scanner, "_load_sbl_data", lambda _: pd.DataFrame())
-        monkeypatch.setattr(momentum_scanner, "_load_holding_data", lambda _: pd.DataFrame())
 
         result = momentum_scanner._compute_chip_scores(sids, df_inst, None, None)
         assert len(result) == 1

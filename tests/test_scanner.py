@@ -706,9 +706,10 @@ class TestChipTier:
 
 
 class TestMomentumFundamentalScores:
-    def test_yoy_positive_gets_higher(self, momentum_scanner):
-        """YoY > 0 且無加速度資料 → 基礎 Tier 3 (0.55)×80% + 加速度中性(0.5)×20% = 0.54；
-        YoY <= 0 → 基礎 Tier 4 (0.30)×80% + 加速度中性(0.5)×20% = 0.34。"""
+    """Momentum 基本面已停用（IC=0.000），一律回傳 0.5 中性分。"""
+
+    def test_always_returns_neutral(self, momentum_scanner):
+        """任何輸入都回傳 0.5。"""
         df_revenue = pd.DataFrame(
             {
                 "stock_id": ["1000", "1001"],
@@ -717,99 +718,17 @@ class TestMomentumFundamentalScores:
             }
         )
         result = momentum_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
-        scores = result.set_index("stock_id")["fundamental_score"]
-        # C2: 80% base tier + 20% acceleration (neutral=0.5 when no acceleration data)
-        assert scores["1000"] == pytest.approx(0.55 * 0.80 + 0.5 * 0.20)
-        assert scores["1001"] == pytest.approx(0.30 * 0.80 + 0.5 * 0.20)
+        assert list(result["stock_id"]) == ["1000", "1001"]
+        for score in result["fundamental_score"]:
+            assert score == pytest.approx(0.5)
 
-    def test_no_data_fallback(self, momentum_scanner):
+    def test_empty_input_returns_neutral(self, momentum_scanner):
+        """空 stock_ids 回傳空 DataFrame。"""
         result = momentum_scanner._compute_fundamental_scores(
-            ["1000"], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
+            [], pd.DataFrame(columns=["stock_id", "yoy_growth", "mom_growth"])
         )
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
-
-    def test_acceleration_bonus_positive(self, momentum_scanner):
-        """YoY > 0、MoM > 0、加速（yoy < yoy_3m_ago 的逆）→ Tier 1: 0.85。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000"],
-                "yoy_growth": [20.0],
-                "mom_growth": [5.0],
-                "yoy_3m_ago": [10.0],  # 加速：20 > 10
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # C2 混合：base 0.85 × 80% + rev_accel 0.6（accel=10>0, 單月）× 20% = 0.80
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.80)
-
-    def test_acceleration_bonus_negative(self, momentum_scanner):
-        """YoY > 0、MoM > 0 但減速（yoy < yoy_3m_ago）→ Tier 3: 0.55。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000"],
-                "yoy_growth": [10.0],
-                "mom_growth": [5.0],
-                "yoy_3m_ago": [30.0],  # 減速：10 < 30
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # C2 混合：base 0.55 × 80% + rev_accel 0.3（accel=-20≤0, 減速）× 20% = 0.50
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.50)
-
-    def test_tier2_yoy_accelerating_mom_negative(self, momentum_scanner):
-        """YoY > 0 且加速，但 MoM <= 0 → Tier 2: 0.72（非雙增故不升 Tier 1）。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000"],
-                "yoy_growth": [20.0],
-                "mom_growth": [-3.0],
-                "yoy_3m_ago": [10.0],
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # C2 混合：base 0.72 × 80% + rev_accel 0.6（accel=10>0, 單月）× 20% = 0.696
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.696)
-
-    def test_tier3_yoy_positive_no_yoy3m(self, momentum_scanner):
-        """YoY > 0 但無 yoy_3m_ago → 無法判斷加速 → Tier 3: 0.55。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000"],
-                "yoy_growth": [15.0],
-                "mom_growth": [5.0],
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # C2 混合：base 0.55 × 80% + rev_accel 0.5（無 yoy_3m, 中性）× 20% = 0.54
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.54)
-
-    def test_tier4_yoy_negative_regardless_mom(self, momentum_scanner):
-        """YoY <= 0 → Tier 4: 0.30（MoM 正也無法拉升）。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000"],
-                "yoy_growth": [-5.0],
-                "mom_growth": [10.0],
-                "yoy_3m_ago": [-8.0],
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # C2 混合：base 0.30 × 80% + rev_accel 0.6（accel=3>0, 單月）× 20% = 0.36
-        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.36)
-
-    def test_tier1_highest_tier2_second(self, momentum_scanner):
-        """四階梯排序：Tier 1 > Tier 2 > Tier 3 > Tier 4。"""
-        df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["t1", "t2", "t3", "t4"],
-                "yoy_growth": [20.0, 20.0, 15.0, -5.0],
-                "mom_growth": [5.0, -3.0, 5.0, 5.0],
-                "yoy_3m_ago": [10.0, 10.0, 30.0, -8.0],
-            }
-        )
-        result = momentum_scanner._compute_fundamental_scores(["t1", "t2", "t3", "t4"], df_revenue)
-        scores = result.set_index("stock_id")["fundamental_score"]
-        assert scores["t1"] > scores["t2"] > scores["t3"] > scores["t4"]
+        assert len(result) == 0
+        assert "fundamental_score" in result.columns
 
 
 @pytest.mark.parametrize(
@@ -858,7 +777,7 @@ def test_risk_filter_empty_returns_empty(request, scanner_name):
 
 class TestMomentumCompositeWeights:
     def test_weights_with_regime(self, momentum_scanner):
-        """確認綜合分數依 regime 權重計算（含消息面）。"""
+        """確認綜合分數依 regime 權重計算（momentum 無 fundamental）。"""
         from src.regime.detector import MarketRegimeDetector
 
         candidates = pd.DataFrame({"stock_id": ["1000"], "close": [100], "volume": [500_000]})
@@ -875,7 +794,12 @@ class TestMomentumCompositeWeights:
         news = result.iloc[0]["news_score"]
         regime = getattr(momentum_scanner, "regime", "sideways")
         w = MarketRegimeDetector.get_weights("momentum", regime)
-        expected = tech * w["technical"] + chip * w["chip"] + fund * w["fundamental"] + news * w.get("news", 0.10)
+        expected = (
+            tech * w.get("technical", 0)
+            + chip * w.get("chip", 0)
+            + fund * w.get("fundamental", 0)
+            + news * w.get("news", 0)
+        )
         assert result.iloc[0]["composite_score"] == pytest.approx(expected, abs=1e-6)
 
 
@@ -7937,42 +7861,23 @@ class TestSubFactorICWeights:
 
 
 class TestGetChipBaseWeights:
-    """P1b: 籌碼子因子權重提取純函數測試。"""
+    """P1b: 籌碼子因子權重提取純函數測試（v3：移除 whale/smart_broker）。"""
 
-    def test_8f_weights(self):
-        """8F 全資料層級權重正確。"""
+    def test_6f_weights(self):
+        """6F（broker+sbl+margin）全資料層級權重正確。"""
         from src.discovery.scanner._momentum import _get_chip_base_weights
 
         weights, tier = _get_chip_base_weights(
             has_broker=True,
             has_sbl=True,
             has_margin=True,
-            has_whale=True,
-            has_smart_broker=True,
         )
-        assert tier == "8F"
+        assert tier == "6F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
-        assert abs(weights["consec"] - 0.23) < 0.001
-        assert abs(weights["smart_broker"] - 0.10) < 0.001
-        assert "total" not in weights
-        assert len(weights) == 8
-
-    def test_7f_weights(self):
-        """7F（無 smart_broker）權重正確。"""
-        from src.discovery.scanner._momentum import _get_chip_base_weights
-
-        weights, tier = _get_chip_base_weights(
-            has_broker=True,
-            has_sbl=True,
-            has_margin=True,
-            has_whale=True,
-            has_smart_broker=False,
-        )
-        assert tier == "7F"
-        assert abs(sum(weights.values()) - 1.0) < 0.001
+        assert abs(weights["consec"] - 0.29) < 0.001
+        assert "whale" not in weights
         assert "smart_broker" not in weights
-        assert "total" not in weights
-        assert len(weights) == 7
+        assert len(weights) == 6
 
     def test_3f_fallback(self):
         """3F 最低配備權重正確。"""
@@ -7982,14 +7887,11 @@ class TestGetChipBaseWeights:
             has_broker=False,
             has_sbl=False,
             has_margin=False,
-            has_whale=False,
-            has_smart_broker=False,
         )
         assert tier == "3F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
         assert abs(weights["consec"] - 0.50) < 0.001
         assert abs(weights["persist"] - 0.10) < 0.001
-        assert "total" not in weights
         assert len(weights) == 3
 
     def test_4f_broker_only(self):
@@ -8000,8 +7902,6 @@ class TestGetChipBaseWeights:
             has_broker=True,
             has_sbl=False,
             has_margin=False,
-            has_whale=False,
-            has_smart_broker=False,
         )
         assert tier == "4F"
         assert abs(sum(weights.values()) - 1.0) < 0.001
@@ -8009,28 +7909,171 @@ class TestGetChipBaseWeights:
         assert "sbl" not in weights
 
     def test_all_tiers_sum_to_one(self):
-        """所有 15 種組合的權重總和都應為 1.0。"""
+        """所有 7 種組合的權重總和都應為 1.0。"""
         from src.discovery.scanner._momentum import _get_chip_base_weights
 
-        # 測試所有 bool 組合（2^5 = 32 種，其中多數映射到同一分支）
-        for b in range(32):
+        # 測試所有 bool 組合（2^3 = 8 種）
+        for b in range(8):
             has_broker = bool(b & 1)
             has_sbl = bool(b & 2)
             has_margin = bool(b & 4)
-            has_whale = bool(b & 8)
-            has_smart_broker = bool(b & 16)
             weights, tier = _get_chip_base_weights(
                 has_broker=has_broker,
                 has_sbl=has_sbl,
                 has_margin=has_margin,
-                has_whale=has_whale,
-                has_smart_broker=has_smart_broker,
             )
             assert abs(sum(weights.values()) - 1.0) < 0.001, (
                 f"權重總和 ≠ 1.0 for broker={has_broker} sbl={has_sbl} "
-                f"margin={has_margin} whale={has_whale} smart={has_smart_broker}: "
-                f"sum={sum(weights.values())}, tier={tier}"
+                f"margin={has_margin}: sum={sum(weights.values())}, tier={tier}"
             )
+
+    def test_no_whale_no_smart_broker_in_any_tier(self):
+        """所有 tier 不應包含 whale 或 smart_broker。"""
+        from src.discovery.scanner._momentum import _get_chip_base_weights
+
+        for b in range(8):
+            has_broker = bool(b & 1)
+            has_sbl = bool(b & 2)
+            has_margin = bool(b & 4)
+            weights, _tier = _get_chip_base_weights(has_broker, has_sbl, has_margin)
+            assert "whale" not in weights
+            assert "smart_broker" not in weights
+
+
+class TestMomentumNoFundamental:
+    """Momentum 模式各 regime 不應包含 fundamental 維度。"""
+
+    def test_momentum_no_fundamental_in_weights(self):
+        from src.regime.detector import MarketRegimeDetector
+
+        for regime in ["bull", "sideways", "bear", "crisis"]:
+            w = MarketRegimeDetector.get_weights("momentum", regime)
+            assert "fundamental" not in w, f"momentum/{regime} 不應含 fundamental"
+            assert abs(sum(w.values()) - 1.0) < 0.01, f"momentum/{regime} 權重和 ≠ 1.0"
+
+
+# ─── 技術面 3 因子精簡版 ────────────────────────────────────────────
+
+
+class TestMomentumReduced3Factors:
+    """Momentum 技術面 3 因子版本驗證。"""
+
+    def test_technical_produces_3_subfactors(self, momentum_scanner):
+        """MomentumScanner 技術面子因子應為 3 個（ret5d, vol_ratio, high20_proximity）。"""
+        df = _make_momentum_price_df(n_days=25, n_stocks=5)
+        sids = df["stock_id"].unique().tolist()
+        result = momentum_scanner._compute_technical_scores(sids, df)
+        assert "technical_score" in result.columns
+        assert len(result) == 5
+        sub = momentum_scanner._sub_factor_ranks.get("technical")
+        assert sub is not None
+        expected_cols = {"tech_ret5d", "tech_vol_ratio", "tech_high20_proximity", "stock_id"}
+        assert set(sub.columns) == expected_cols
+
+    def test_technical_score_in_range(self, momentum_scanner):
+        """技術面分數應在 [0, 1] 範圍內。"""
+        df = _make_momentum_price_df(n_days=25, n_stocks=10)
+        sids = df["stock_id"].unique().tolist()
+        result = momentum_scanner._compute_technical_scores(sids, df)
+        assert (result["technical_score"] >= 0).all()
+        assert (result["technical_score"] <= 1.0).all()
+
+    def test_empty_input_returns_empty(self, momentum_scanner):
+        """空輸入回傳空 DataFrame。"""
+        df = _make_momentum_price_df(n_days=25, n_stocks=1)
+        result = momentum_scanner._compute_technical_scores([], df)
+        assert len(result) == 0
+        assert "technical_score" in result.columns
+
+    def test_growth_still_uses_5_factors(self):
+        """GrowthScanner 技術面應仍有 5 因子（不受 momentum 精簡影響）。"""
+        from src.discovery.scanner import GrowthScanner
+
+        scanner = GrowthScanner(use_ic_adjustment=False)
+        df = _make_momentum_price_df(n_days=25, n_stocks=5)
+        sids = df["stock_id"].unique().tolist()
+        scanner._compute_technical_scores(sids, df)
+        sub = scanner._sub_factor_ranks.get("technical")
+        assert sub is not None
+        assert "tech_ret10d" in sub.columns  # 5 因子版保留 ret10d
+        assert "tech_vol_accel" in sub.columns  # 5 因子版保留 vol_accel
+
+
+# ─── Sideways Regime Gate ──────────────────────────────────────────
+
+
+class TestSidewaysRegimeGate:
+    """Sideways regime gate 測試。"""
+
+    def test_momentum_has_sideways_blocked(self):
+        """MomentumScanner._blocked_regimes 應包含 sideways。"""
+        from src.discovery.scanner import MomentumScanner
+
+        assert "sideways" in MomentumScanner._blocked_regimes
+
+    def test_swing_not_blocked_in_sideways(self):
+        """SwingScanner 不應被 sideways 阻擋。"""
+        from src.discovery.scanner import SwingScanner
+
+        assert "sideways" not in getattr(SwingScanner, "_blocked_regimes", set())
+
+    def test_base_scanner_no_blocked_regimes(self):
+        """基底 MarketScanner 預設無阻擋 regime。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        assert MarketScanner._blocked_regimes == set()
+
+    def test_regime_gate_returns_empty_when_blocked(self, momentum_scanner, monkeypatch):
+        """momentum 在 sideways 應回傳空結果（不進行資料載入）。"""
+        # 直接設定 regime 並模擬 run 流程中的 gate 檢查
+        momentum_scanner.regime = "sideways"
+        momentum_scanner.scan_date = date.today()
+        # 驗證 _blocked_regimes 生效
+        assert momentum_scanner.regime in momentum_scanner._blocked_regimes
+
+
+# ─── IC 衰退門檻調整 ────────────────────────────────────────────────
+
+
+class TestIcDecayAdjustment:
+    """IC 衰退自動門檻提升測試。"""
+
+    def test_returns_zero_with_no_data(self, momentum_scanner):
+        """無 DB 資料時回傳 0.0。"""
+        momentum_scanner.regime = "bull"
+        momentum_scanner.mode_name = "momentum"
+        assert momentum_scanner._compute_ic_decay_adjustment() == 0.0
+
+    def test_key_factor_map_has_all_modes(self):
+        """_KEY_FACTOR_MAP 應涵蓋 5 個模式。"""
+        from src.discovery.scanner._base import MarketScanner
+
+        expected_modes = {"momentum", "swing", "value", "dividend", "growth"}
+        assert set(MarketScanner._KEY_FACTOR_MAP.keys()) == expected_modes
+
+    def test_unknown_mode_returns_zero(self, momentum_scanner):
+        """未知模式回傳 0.0。"""
+        momentum_scanner.mode_name = "unknown_mode"
+        assert momentum_scanner._compute_ic_decay_adjustment() == 0.0
+
+    def test_threshold_includes_ic_decay(self, momentum_scanner, monkeypatch):
+        """IC 衰退觸發時 threshold 應增加 0.05。"""
+        momentum_scanner.regime = "bull"
+        momentum_scanner.mode_name = "momentum"
+        # Mock _compute_ic_decay_adjustment 回傳 0.05
+        monkeypatch.setattr(momentum_scanner, "_compute_ic_decay_adjustment", lambda: 0.05)
+        monkeypatch.setattr(momentum_scanner, "_compute_win_rate_adjustment", lambda: 0.0)
+
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "composite_score": [0.46],  # 介於 bull(0.45) 和 0.50 之間
+            }
+        )
+        # 無 IC decay → 0.45 門檻 → 通過
+        # 有 IC decay → 0.50 門檻 → 被剔除
+        result = momentum_scanner._apply_score_threshold(scored)
+        assert len(result) == 0  # 0.46 < 0.50 門檻，被剔除
 
 
 # ─── 零方差因子自動排除 ──────────────────────────────────────────────

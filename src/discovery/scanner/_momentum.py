@@ -8,23 +8,20 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
 from src.data.database import get_session
-from src.data.schema import HoldingDistribution
 from src.discovery.scanner._base import MarketScanner
 from src.discovery.scanner._functions import (
     compute_broker_score,
     compute_hhi_trend,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
-    compute_revenue_acceleration_score,
     compute_sbl_score,
-    compute_smart_broker_score,
     compute_sub_factor_weight_adjustments,
     compute_value_weighted_inst_flow,
-    compute_whale_score,
     exclude_zero_variance_factors,
 )
 from src.discovery.universe import UniverseConfig
@@ -36,42 +33,20 @@ def _get_chip_base_weights(
     has_broker: bool,
     has_sbl: bool,
     has_margin: bool,
-    has_whale: bool,
-    has_smart_broker: bool,
 ) -> tuple[dict[str, float], str]:
     """根據資料可用性決定籌碼子因子權重組合。
 
-    將 _compute_chip_scores() 的 15 個 if-elif 分支提取為純函數，
+    將 _compute_chip_scores() 的分支提取為純函數，
     回傳 (weight_dict, chip_tier)。weight_dict 的 key 對應 rank 變數名稱：
-    consec / bvr / persist / smr / whale / sbl / broker / smart_broker。
+    consec / bvr / persist / smr / sbl / broker。
 
-    v2 變更：移除 total（與 bvr r=0.86 冗餘），權重重分配至 consec 與 bvr。
+    v3 變更：移除 whale（消融影響低 ρ=0.972，週資料時效不匹配）
+             移除 smart_broker（消融影響最低 ρ=0.985），15 tier → 7 tier。
 
     Returns:
-        (weight_dict, chip_tier) — chip_tier 如 "8F"/"7F"/"3F" 等
+        (weight_dict, chip_tier) — chip_tier 如 "6F"/"5F"/"4F"/"3F" 等
     """
-    if has_smart_broker and has_broker and has_sbl and has_margin and has_whale:
-        return {
-            "consec": 0.23,
-            "bvr": 0.21,
-            "persist": 0.06,
-            "smr": 0.10,
-            "whale": 0.12,
-            "sbl": 0.07,
-            "broker": 0.11,
-            "smart_broker": 0.10,
-        }, "8F"
-    elif has_broker and has_sbl and has_margin and has_whale:
-        return {
-            "consec": 0.26,
-            "bvr": 0.24,
-            "persist": 0.06,
-            "smr": 0.11,
-            "whale": 0.13,
-            "sbl": 0.08,
-            "broker": 0.12,
-        }, "7F"
-    elif has_broker and has_sbl and has_margin:
+    if has_broker and has_sbl and has_margin:
         return {
             "consec": 0.29,
             "bvr": 0.27,
@@ -95,15 +70,6 @@ def _get_chip_base_weights(
             "persist": 0.06,
             "broker": 0.20,
         }, "4F"
-    elif has_sbl and has_margin and has_whale:
-        return {
-            "consec": 0.29,
-            "bvr": 0.27,
-            "persist": 0.06,
-            "smr": 0.13,
-            "whale": 0.15,
-            "sbl": 0.10,
-        }, "6F"
     elif has_sbl and has_margin:
         return {
             "consec": 0.33,
@@ -112,14 +78,6 @@ def _get_chip_base_weights(
             "smr": 0.16,
             "sbl": 0.15,
         }, "5F"
-    elif has_sbl and has_whale:
-        return {
-            "consec": 0.35,
-            "bvr": 0.27,
-            "persist": 0.06,
-            "whale": 0.22,
-            "sbl": 0.10,
-        }, "5F"
     elif has_sbl:
         return {
             "consec": 0.44,
@@ -127,27 +85,12 @@ def _get_chip_base_weights(
             "persist": 0.06,
             "sbl": 0.15,
         }, "4F"
-    elif has_margin and has_whale:
-        return {
-            "consec": 0.33,
-            "bvr": 0.30,
-            "persist": 0.06,
-            "smr": 0.15,
-            "whale": 0.16,
-        }, "5F"
     elif has_margin:
         return {
             "consec": 0.39,
             "bvr": 0.35,
             "persist": 0.06,
             "smr": 0.20,
-        }, "4F"
-    elif has_whale:
-        return {
-            "consec": 0.44,
-            "bvr": 0.35,
-            "persist": 0.06,
-            "whale": 0.15,
         }, "4F"
     else:
         return {
@@ -161,13 +104,15 @@ class MomentumScanner(MarketScanner):
     """短線動能掃描器（1~10 天）。
 
     粗篩：動能 + 流動性
-    細評：技術面 45% + 籌碼面 45% + 基本面 10%
+    細評：技術面 + 籌碼面 + 消息面（三維度，Regime 動態權重）
     風險過濾：ATR ratio > 80th percentile 剔除
+    盤整期（sideways）自動暫停掃描。
     """
 
     mode_name = "momentum"
     _auto_sync_broker = True  # Stage 2.5 自動補抓候選股分點資料
     _revenue_months = 4  # 載入 4 個月營收，啟用「本月 YoY - 3 個月前 YoY」加速度輕微加成
+    _blocked_regimes = {"sideways"}  # 盤整期歷史勝率 15%，暫停掃描
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
 
     def __init__(self, **kwargs) -> None:
@@ -213,8 +158,85 @@ class MomentumScanner(MarketScanner):
         return self._finalize_coarse(filtered)
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
-        """動能模式技術面 5 因子（委派至 base class 共用實作）。"""
-        return self._compute_momentum_style_technical_scores(stock_ids, df_price)
+        """動能模式技術面 3 因子（冗餘精簡版）。
+
+        審計結論：ret5d×ret10d r=0.74、vol_ratio×vol_accel r=0.78，
+        各 Cluster 內保留 1 個代表因子，消除共線性。
+
+        3 因子 / 3 Cluster（各 1/3）：
+        - Cluster A（報酬動能）：ret5d
+        - Cluster B（量能擴張）：vol_ratio
+        - Cluster C（突破強度）：high20_proximity
+        """
+        if not stock_ids:
+            return pd.DataFrame(columns=["stock_id", "technical_score"])
+
+        df = df_price.sort_values(["stock_id", "date"])
+        g = df.groupby("stock_id", sort=False)
+
+        # ── 批次取各期收盤價 ──────────────────────────────────────────
+        latest_close = g["close"].last()
+        close_1d_ago = g["close"].apply(lambda s: float(s.iloc[-2]) if len(s) >= 2 else np.nan)
+        close_5d_ago = g["close"].apply(lambda s: float(s.iloc[-6]) if len(s) >= 6 else np.nan)
+        close_20d_max = g["close"].apply(lambda s: float(s.iloc[-20:].max()) if len(s) >= 20 else np.nan)
+
+        # ── 批次取量能序列 ────────────────────────────────────────────
+        latest_vol = g["volume"].last().astype(float)
+        vol_20d_mean = g["volume"].apply(lambda s: float(s.astype(float).iloc[-20:].mean()) if len(s) >= 20 else np.nan)
+
+        # ── 限縮到候選股集合，計算原始因子值 ─────────────────────────
+        idx = pd.Index(stock_ids)
+        c0 = latest_close.reindex(idx)
+        c5 = close_5d_ago.reindex(idx).replace(0, np.nan)
+        c20m = close_20d_max.reindex(idx).replace(0, np.nan)
+
+        ret_5d = (c0 - c5) / c5
+        high20_proximity = c0 / c20m
+        vol_20d = vol_20d_mean.reindex(idx).replace(0, np.nan)
+        vol_ratio_raw = latest_vol.reindex(idx) / vol_20d
+
+        # ── 橫截面百分位排名（Regime Adaptive）─────────────────────────
+        r5 = ret_5d.rank(pct=True)
+        rb = high20_proximity.rank(pct=True)
+        rv = vol_ratio_raw.rank(pct=True)
+
+        # ── 漲停板特殊處理（台股 10% 漲跌幅限制）────────────────────────
+        c1d = close_1d_ago.reindex(idx).replace(0, np.nan)
+        limit_up_mask = ((c0 - c1d) / c1d) >= 0.098
+        rv = rv.where(~limit_up_mask, other=1.0)
+
+        # NaN 以中性 0.5 填補
+        scores = pd.concat([r5, rb, rv], axis=1)
+        scores.columns = ["r5", "rb", "rv"]
+        scores = scores.fillna(0.5)
+
+        # 3 Cluster 各 1 因子，等權 1/3
+        cluster_a = scores["r5"]  # 報酬動能
+        cluster_b = scores["rv"]  # 量能擴張
+        cluster_c = scores["rb"]  # 突破強度
+
+        # 零方差 Cluster 自動排除
+        _eps = 1e-9
+        clusters = [("A", cluster_a), ("B", cluster_b), ("C", cluster_c)]
+        active = [(name, s) for name, s in clusters if s.std() >= _eps]
+        if active:
+            tech_score = sum(s for _, s in active) / len(active)
+        else:
+            tech_score = pd.Series(0.5, index=scores.index)
+
+        # 保存子因子 rank 供 IC 診斷使用（3 因子版）
+        sub_df = scores.copy()
+        sub_df["stock_id"] = idx.tolist()
+        sub_df = sub_df.rename(
+            columns={
+                "r5": "tech_ret5d",
+                "rb": "tech_high20_proximity",
+                "rv": "tech_vol_ratio",
+            }
+        )
+        self._sub_factor_ranks["technical"] = sub_df
+
+        return pd.DataFrame({"stock_id": idx.tolist(), "technical_score": tech_score.to_numpy()})
 
     def _compute_chip_scores(
         self,
@@ -302,21 +324,6 @@ class MomentumScanner(MarketScanner):
         df["inst_persistence"] = df["inst_persistence"].fillna(0.5)
         persist_rank = df["inst_persistence"].rank(pct=True)
 
-        # ── 大戶持股因子（從 DB 查詢最近 2 週資料）──────────────────
-        df_whale = self._load_holding_data(stock_ids)
-        whale_df = compute_whale_score(df_whale)
-        has_whale = not whale_df.empty
-        if has_whale:
-            df = df.merge(whale_df, on="stock_id", how="left")
-            df["whale_percent"] = df["whale_percent"].fillna(
-                df["whale_percent"].median() if not df["whale_percent"].isna().all() else 0.0
-            )
-            df["whale_change"] = df["whale_change"].fillna(0.0)
-            whale_pct_rank = df["whale_percent"].rank(pct=True)
-            whale_chg_rank = df["whale_change"].rank(pct=True)
-            # 大戶持股綜合排名：持股比例 60% + 週變化 40%
-            whale_rank = whale_pct_rank * 0.60 + whale_chg_rank * 0.40
-
         # ── 借券賣出因子（空頭壓力逆向評分）────────────────────────
         df_sbl_raw = self._load_sbl_data(stock_ids)
         sbl_df = compute_sbl_score(df_sbl_raw)
@@ -341,20 +348,6 @@ class MomentumScanner(MarketScanner):
             broker_consec_rank = df["broker_consecutive_days"].rank(pct=True)
             broker_rank = broker_conc_rank * 0.60 + broker_consec_rank * 0.40
 
-        # ── 智慧分點因子（120 天歷史勝率 + 蓄積型分點，需 buy_price / sell_price）──
-        _close_map: dict[str, float] = {}
-        if df_price is not None and not df_price.empty:
-            _close_map = df_price.sort_values("date").groupby("stock_id")["close"].last().to_dict()
-        df_broker_ext = self._load_broker_data_extended(stock_ids)
-        has_smart_broker = False
-        if not df_broker_ext.empty:
-            smart_df = compute_smart_broker_score(df_broker_ext, _close_map)
-            has_smart_broker = not smart_df.empty and float(smart_df["smart_broker_factor"].sum()) > 0
-            if has_smart_broker:
-                df = df.merge(smart_df[["stock_id", "smart_broker_factor"]], on="stock_id", how="left")
-                df["smart_broker_factor"] = df["smart_broker_factor"].fillna(0.0)
-                smart_broker_rank = df["smart_broker_factor"].rank(pct=True)
-
         # ── 融資融券因子 ──────────────────────────────────────────────
         has_margin = df_margin is not None and not df_margin.empty
         if has_margin:
@@ -375,12 +368,10 @@ class MomentumScanner(MarketScanner):
 
         # ── 隔日沖扣分（broker_rank 修正）───────────────────────────
         # 使用 _load_broker_data() 已取得的 7 天資料（含 broker_name）偵測隔日沖
-        # 若有 extended 資料則用範圍更廣的歷史做行為偵測
-        _dt_broker_src = df_broker_ext if not df_broker_ext.empty else df_broker_raw
-        if has_broker and not _dt_broker_src.empty and "broker_name" in _dt_broker_src.columns:
+        if has_broker and not df_broker_raw.empty and "broker_name" in df_broker_raw.columns:
             broker_rank, self._daytrade_penalty_df = self._apply_daytrade_penalty(
                 broker_rank,
-                _dt_broker_src,
+                df_broker_raw,
                 stock_ids,
                 df_price,
                 persistence_scores=persist_df,
@@ -395,8 +386,6 @@ class MomentumScanner(MarketScanner):
             has_broker=has_broker,
             has_sbl=has_sbl,
             has_margin=has_margin,
-            has_whale=has_whale,
-            has_smart_broker=has_smart_broker,
         )
 
         # P1b: 子因子 IC 動態權重調整（use_ic_adjustment=True 且有歷史 IC 資料時啟用）
@@ -414,14 +403,10 @@ class MomentumScanner(MarketScanner):
         }
         if has_margin:
             rank_map["smr"] = smr_rank
-        if has_whale:
-            rank_map["whale"] = whale_rank
         if has_sbl:
             rank_map["sbl"] = sbl_rank
         if has_broker:
             rank_map["broker"] = broker_rank
-        if has_smart_broker:
-            rank_map["smart_broker"] = smart_broker_rank
 
         # 零方差因子自動排除：rank 全部相同時無鑑別力，重新分配權重
         rank_map, weights = exclude_zero_variance_factors(rank_map, weights)
@@ -447,101 +432,17 @@ class MomentumScanner(MarketScanner):
         chip_sub["chip_persist"] = persist_rank.to_numpy()
         if has_margin:
             chip_sub["chip_smr"] = smr_rank.to_numpy()
-        if has_whale:
-            chip_sub["chip_whale"] = whale_rank.to_numpy()
         if has_sbl:
             chip_sub["chip_sbl"] = sbl_rank.to_numpy()
         if has_broker:
             chip_sub["chip_broker"] = broker_rank.to_numpy()
-        if has_smart_broker:
-            chip_sub["chip_smart_broker"] = smart_broker_rank.to_numpy()
         self._sub_factor_ranks["chip"] = chip_sub
 
         return df[["stock_id", "chip_score", "chip_tier"]]
 
-    def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DB 載入最近 2 週的大戶持股分級資料。
-
-        若表不存在或無資料則回傳空 DataFrame，_compute_chip_scores 會自動降級。
-        """
-        cutoff = date.today() - timedelta(days=21)
-        try:
-            with get_session() as session:
-                rows = session.execute(
-                    select(
-                        HoldingDistribution.stock_id,
-                        HoldingDistribution.date,
-                        HoldingDistribution.level,
-                        HoldingDistribution.percent,
-                    ).where(
-                        HoldingDistribution.stock_id.in_(stock_ids),
-                        HoldingDistribution.date >= cutoff,
-                    )
-                ).all()
-            if not rows:
-                return pd.DataFrame()
-            return pd.DataFrame(rows, columns=["stock_id", "date", "level", "percent"])
-        except Exception:
-            return pd.DataFrame()
-
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：四階梯 + 營收加速度連續性加成。
-
-        基礎分（80%）：四階梯短線爆發濾網
-        Tier 1 (0.85)：MoM > 0 且 YoY > 0 且 YoY > yoy_3m_ago（月營收雙增 + YoY 近期創高）
-        Tier 2 (0.72)：YoY > 0 且 YoY > yoy_3m_ago（YoY 正且加速）
-        Tier 3 (0.55)：YoY > 0（YoY 正但未加速，或無加速度資料）
-        Tier 4 (0.30)：YoY <= 0（YoY 衰退）
-        無資料 fallback：0.50（中性）
-
-        加速度連續性加成（20%，C2）：連續 N 月 YoY 加速 → 可持續成長 vs 一次性暴增
-        """
-        if df_revenue.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
-
-        # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
-        rev_grouped = df_revenue.groupby("stock_id", sort=False)
-        result_rows = []
-        for sid in stock_ids:
-            if sid not in rev_grouped.groups:
-                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
-                continue
-
-            rev = rev_grouped.get_group(sid)
-            yoy = rev.iloc[0].get("yoy_growth", None)
-            if yoy is None or pd.isna(yoy):
-                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
-                continue
-
-            mom = rev.iloc[0].get("mom_growth", None)
-            yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
-
-            has_mom_pos = mom is not None and not pd.isna(mom) and float(mom) > 0
-            has_accel = yoy_3m is not None and not pd.isna(yoy_3m) and float(yoy) > float(yoy_3m)
-
-            if float(yoy) > 0 and has_mom_pos and has_accel:
-                score = 0.85  # Tier 1: 月營收雙增 + YoY 近期創高
-            elif float(yoy) > 0 and has_accel:
-                score = 0.72  # Tier 2: YoY 正且加速（MoM 未必正）
-            elif float(yoy) > 0:
-                score = 0.55  # Tier 3: YoY 正但未加速
-            else:
-                score = 0.30  # Tier 4: YoY 衰退
-
-            result_rows.append({"stock_id": sid, "fundamental_score": score})
-
-        base_df = pd.DataFrame(result_rows)
-
-        # C2: 營收加速度連續性加成（20% 權重混合）
-        accel_df = compute_revenue_acceleration_score(df_revenue, stock_ids, consecutive_threshold=3)
-        if not accel_df.empty:
-            base_df = base_df.merge(accel_df[["stock_id", "rev_accel_score"]], on="stock_id", how="left")
-            base_df["rev_accel_score"] = base_df["rev_accel_score"].fillna(0.5)
-            # 混合：基礎 Tier 80% + 加速度連續性 20%
-            base_df["fundamental_score"] = base_df["fundamental_score"] * 0.80 + base_df["rev_accel_score"] * 0.20
-            base_df = base_df.drop(columns=["rev_accel_score"])
-
-        return base_df
+        """動能模式基本面：已停用（審計結論 IC=0.000，權重=0）。"""
+        return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
 
     def _load_chip_sub_factor_ic(self) -> pd.DataFrame | None:
         """從 DB 載入歷史推薦紀錄，計算 chip 子因子 IC。
