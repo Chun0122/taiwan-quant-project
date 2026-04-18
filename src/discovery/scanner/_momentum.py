@@ -19,6 +19,7 @@ from src.discovery.scanner._functions import (
     compute_hhi_trend,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
+    compute_quality_score,
     compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_sub_factor_weight_adjustments,
@@ -442,16 +443,17 @@ class MomentumScanner(MarketScanner):
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     _FUND_TIER_ANCHOR: dict[int, float] = {1: 0.85, 2: 0.72, 3: 0.55, 4: 0.30}
-    _FUND_WEIGHT_TIER: float = 0.60
+    _FUND_WEIGHT_TIER: float = 0.55
     _FUND_WEIGHT_INTRA: float = 0.15
-    _FUND_WEIGHT_ACCEL: float = 0.25
+    _FUND_WEIGHT_ACCEL: float = 0.20
+    _FUND_WEIGHT_QUALITY: float = 0.10
     _FUND_DYNAMIC_THRESHOLD_MIN_SAMPLES: int = 10
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：Tier Anchor + 同 Tier 內 Rank + 加速度 Boost（v4）。
+        """動能模式基本面：Tier Anchor + 同 Tier 內 Rank + 加速度 Boost + 品質 Boost（v5）。
 
-        三段式公式（避免離散尺度壓縮區分度）：
-            final = 0.60 × tier_anchor + 0.15 × intra_rank + 0.25 × accel_boost
+        四段式公式（Phase F — 新增 quality 維度，含 FinancialStatement 毛利率/FCF）：
+            final = 0.55 × tier_anchor + 0.15 × intra_rank + 0.20 × accel_boost + 0.10 × quality
 
         Tier 判定（動態 percentile 門檻 + YoY > 0 絕對下限）：
             Tier 1 (anchor=0.85): YoY > p80 且 YoY > 0 且 加速度 > 0 且 MoM > 0
@@ -464,6 +466,8 @@ class MomentumScanner(MarketScanner):
 
         intra_rank 為同 tier 內 yoy_growth 的 percentile rank（0~1），不跨 tier。
         accel_boost 來自 compute_revenue_acceleration_score（4 個月連續性加速）。
+        quality 來自 compute_quality_score（毛利率 YoY 改善 0.6 + FCF 正值 0.4），
+        補足單引擎盲區 — 抓「營收成長但毛利萎縮」vs「雙引擎驅動」的區分。
         """
         default = pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
         if df_revenue.empty or len(stock_ids) == 0:
@@ -543,10 +547,17 @@ class MomentumScanner(MarketScanner):
         else:
             df["rev_accel_score"] = 0.5
 
+        # Phase F — 品質維度（毛利率 YoY + FCF 正值）
+        df_fin = self._load_financial_data(stock_ids, quarters=5)
+        quality_df = compute_quality_score(df_fin, stock_ids)
+        df = df.merge(quality_df, on="stock_id", how="left")
+        df["quality_score"] = df["quality_score"].fillna(0.5)
+
         df["fundamental_score"] = (
             self._FUND_WEIGHT_TIER * df["tier_anchor"]
             + self._FUND_WEIGHT_INTRA * df["intra_rank"]
             + self._FUND_WEIGHT_ACCEL * df["rev_accel_score"]
+            + self._FUND_WEIGHT_QUALITY * df["quality_score"]
         )
         # fallback (tier=0)：無營收資料，維持中性 0.5
         df.loc[df["tier"] == 0, "fundamental_score"] = 0.5

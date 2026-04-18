@@ -2789,6 +2789,113 @@ def compute_revenue_acceleration_score(
     return pd.DataFrame(results)
 
 
+def compute_quality_score(
+    df_financial: pd.DataFrame,
+    stock_ids: list[str],
+    gm_weight: float = 0.6,
+    fcf_weight: float = 0.4,
+) -> pd.DataFrame:
+    """基本面品質分數（Phase F）— 毛利率 YoY 改善 + FCF 正值旗標。
+
+    目標：補足單一營收引擎的盲區，抓「營收成長但毛利萎縮」vs「雙引擎驅動」的區分。
+
+    計算邏輯：
+      1. gm_yoy_change：最新季毛利率 - 一年前同季毛利率
+         （若前一年同季無資料，退回跨 4 季前的鄰近季度）
+      2. fcf_positive：最新季 free_cf > 0 → 1，否則 0（含 NaN → 0）
+      3. gm_yoy_rank：跨全池 percentile rank（0~1，無變化資料者為 0.5）
+      4. quality_score = gm_weight × gm_yoy_rank + fcf_weight × fcf_positive
+
+    Fallback：
+      - 某股無任何財報資料 → quality_score = 0.5（中性）
+      - gross_margin 全池缺失 → gm_yoy_rank = 0.5
+      - free_cf 欄位缺失 → fcf_positive = 0.5
+
+    Args:
+        df_financial: _load_financial_data 輸出，至少含 stock_id, date, year, quarter,
+                      gross_margin, free_cf 欄位（free_cf 缺失時退化）
+        stock_ids: 候選股清單
+        gm_weight: 毛利率 YoY 改善權重（預設 0.6）
+        fcf_weight: FCF 正值權重（預設 0.4）
+
+    Returns:
+        DataFrame(stock_id, quality_score) — 分數 0~1，0.5 為中性
+    """
+    default = pd.DataFrame({"stock_id": stock_ids, "quality_score": [0.5] * len(stock_ids)})
+    if df_financial is None or df_financial.empty or len(stock_ids) == 0:
+        return default
+
+    has_fcf = "free_cf" in df_financial.columns
+    has_gm = "gross_margin" in df_financial.columns
+    if not has_gm and not has_fcf:
+        return default
+
+    df = df_financial[df_financial["stock_id"].isin(stock_ids)].copy()
+    if df.empty:
+        return default
+
+    # 依 stock_id + date 排序，方便取最新季與前一年同季
+    if "date" in df.columns:
+        df = df.sort_values(["stock_id", "date"], ascending=[True, False])
+
+    # 逐股計算 gm_yoy_change 與 fcf_positive
+    rows = []
+    for sid in stock_ids:
+        grp = df[df["stock_id"] == sid]
+        if grp.empty:
+            rows.append({"stock_id": sid, "gm_yoy_change": np.nan, "fcf_positive": np.nan})
+            continue
+
+        latest = grp.iloc[0]
+        latest_gm = latest.get("gross_margin") if has_gm else None
+        latest_fcf = latest.get("free_cf") if has_fcf else None
+
+        gm_yoy_change = np.nan
+        if has_gm and latest_gm is not None and not pd.isna(latest_gm):
+            # 前一年同季：quarter 相同、year - 1
+            latest_year = latest.get("year")
+            latest_q = latest.get("quarter")
+            if latest_year is not None and latest_q is not None:
+                prior = grp[(grp["year"] == latest_year - 1) & (grp["quarter"] == latest_q)]
+                if not prior.empty:
+                    prior_gm = prior.iloc[0].get("gross_margin")
+                    if prior_gm is not None and not pd.isna(prior_gm):
+                        gm_yoy_change = float(latest_gm) - float(prior_gm)
+
+        fcf_positive = np.nan
+        if has_fcf and latest_fcf is not None and not pd.isna(latest_fcf):
+            fcf_positive = 1.0 if float(latest_fcf) > 0 else 0.0
+
+        rows.append(
+            {
+                "stock_id": sid,
+                "gm_yoy_change": gm_yoy_change,
+                "fcf_positive": fcf_positive,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    # gm YoY 跨池 percentile rank
+    valid_gm = out["gm_yoy_change"].dropna()
+    if len(valid_gm) >= 2:
+        out["gm_yoy_rank"] = out["gm_yoy_change"].rank(pct=True)
+        out["gm_yoy_rank"] = out["gm_yoy_rank"].fillna(0.5)
+    else:
+        out["gm_yoy_rank"] = 0.5
+
+    # fcf 缺失者視為 0.5
+    out["fcf_flag"] = out["fcf_positive"].fillna(0.5)
+
+    out["quality_score"] = gm_weight * out["gm_yoy_rank"] + fcf_weight * out["fcf_flag"]
+
+    # 完全無資料（gm_yoy_change 與 fcf_positive 皆 NaN）→ 0.5
+    no_data_mask = out["gm_yoy_change"].isna() & out["fcf_positive"].isna()
+    out.loc[no_data_mask, "quality_score"] = 0.5
+
+    return out[["stock_id", "quality_score"]]
+
+
 # ── P3-C3: 同業基本面排名 ────────────────────────────────────────────
 
 

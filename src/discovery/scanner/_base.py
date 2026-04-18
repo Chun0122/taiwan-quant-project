@@ -549,6 +549,7 @@ class MarketScanner:
             "revenue",
             "net_income",
             "operating_cf",
+            "free_cf",
         ]
         cutoff = date.today() - timedelta(days=quarters * 100)
         try:
@@ -566,6 +567,7 @@ class MarketScanner:
                         FinancialStatement.revenue,
                         FinancialStatement.net_income,
                         FinancialStatement.operating_cf,
+                        FinancialStatement.free_cf,
                     )
                     .where(
                         FinancialStatement.stock_id.in_(stock_ids),
@@ -641,24 +643,46 @@ class MarketScanner:
         df_ann: pd.DataFrame,
         df_ann_history: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """計算消息面分數（時間衰減 × 事件類型加權 × 異常公告率，percentile 排名）。
+        """計算消息面分數 — 拆分 catalyst / risk 雙通道（Phase E v2）。
+
+        設計目標：原 net_score 混雜正反訊號造成 IC 結構性為負；
+        改為分別衡量「正向催化」與「風險事件」，兩者獨立 rank 後合成。
+
+        分類規則：
+            catalyst：event_type ∈ NEWS_CATALYST_TYPES 且 sentiment != -1
+                     （法說會/投資人日/買回/正面營收）
+            risk：event_type ∈ NEWS_RISK_TYPES 或 sentiment == -1
+                 （董監改選/filing 或任何負面事件）
+            其他：無貢獻（避免「正面一般公告」噪音汙染）
 
         公式：
-            各公告加權值 = exp(-0.2 × days_ago) × type_weight
-            net_score = Σ(加權值 for 正面) - Σ(加權值 for 負面)
-            abnormal_multiplier：z>2 最高 +50%，z<-1 最低降至 70%，平常 1.0
-            net_score_adj = net_score × abnormal_multiplier
-            news_score = percentile_rank(net_score_adj)
-
-        Args:
-            stock_ids: 候選股代號清單
-            df_ann: 近期公告 DataFrame（須含 sentiment, event_type, date 欄位）
-            df_ann_history: 基準期公告歷史（stock_id, date），供異常率計算，None 則略過
+            weight = exp(-decay × days_ago) × type_weight × abnormal_multiplier
+            catalyst_raw[sid] = Σ weight for catalyst events
+            risk_raw[sid] = Σ weight for risk events
+            catalyst_rank = percentile_rank（僅在有催化訊號的股票間排序，無訊號者 0.5）
+            risk_rank = 同上
+            news_score = NEWS_CATALYST_WEIGHT × catalyst_rank
+                       + NEWS_RISK_WEIGHT × (1 - risk_rank)
 
         Returns:
-            DataFrame(stock_id, news_score) — 分數 0~1，0.5 為中性預設
+            DataFrame(stock_id, news_score, news_catalyst_score, news_risk_score)
+            — 三欄皆 0~1，0.5 為中性預設
         """
-        default = pd.DataFrame({"stock_id": stock_ids, "news_score": [0.5] * len(stock_ids)})
+        from src.constants import (
+            NEWS_CATALYST_TYPES,
+            NEWS_CATALYST_WEIGHT,
+            NEWS_RISK_TYPES,
+            NEWS_RISK_WEIGHT,
+        )
+
+        default = pd.DataFrame(
+            {
+                "stock_id": stock_ids,
+                "news_score": [0.5] * len(stock_ids),
+                "news_catalyst_score": [0.5] * len(stock_ids),
+                "news_risk_score": [0.5] * len(stock_ids),
+            }
+        )
 
         if df_ann.empty:
             return default
@@ -681,17 +705,20 @@ class MarketScanner:
             axis=1,
         )
 
-        pos_df = ann[ann["sentiment"] == 1].groupby("stock_id")["decay_weight"].sum().reset_index(name="pos_weighted")
-        neg_df = ann[ann["sentiment"] == -1].groupby("stock_id")["decay_weight"].sum().reset_index(name="neg_weighted")
+        # 催化 / 風險分類
+        is_risk = (ann["event_type"].isin(NEWS_RISK_TYPES)) | (ann["sentiment"] == -1)
+        is_catalyst = (ann["event_type"].isin(NEWS_CATALYST_TYPES)) & (ann["sentiment"] != -1) & (~is_risk)
+
+        catalyst_df = ann[is_catalyst].groupby("stock_id")["decay_weight"].sum().reset_index(name="catalyst_raw")
+        risk_df = ann[is_risk].groupby("stock_id")["decay_weight"].sum().reset_index(name="risk_raw")
 
         df = pd.DataFrame({"stock_id": stock_ids})
-        df = df.merge(pos_df, on="stock_id", how="left")
-        df = df.merge(neg_df, on="stock_id", how="left")
-        df["pos_weighted"] = df["pos_weighted"].fillna(0.0)
-        df["neg_weighted"] = df["neg_weighted"].fillna(0.0)
-        df["net_score"] = df["pos_weighted"] - df["neg_weighted"]
+        df = df.merge(catalyst_df, on="stock_id", how="left")
+        df = df.merge(risk_df, on="stock_id", how="left")
+        df["catalyst_raw"] = df["catalyst_raw"].fillna(0.0)
+        df["risk_raw"] = df["risk_raw"].fillna(0.0)
 
-        # 異常公告率乘數（僅在 history 有效時套用）
+        # 異常公告率乘數（僅在 history 有效時套用，同時放大兩邊）
         if df_ann_history is not None and not df_ann_history.empty:
             z_series = compute_abnormal_announcement_rate(df_ann_history, stock_ids)
 
@@ -704,17 +731,31 @@ class MarketScanner:
 
             mult_map = {sid: _to_multiplier(float(z)) for sid, z in z_series.items()}
             df["mult"] = df["stock_id"].map(mult_map).fillna(1.0)
-            df["net_score_adj"] = df["net_score"] * df["mult"]
-        else:
-            df["net_score_adj"] = df["net_score"]
+            df["catalyst_raw"] *= df["mult"]
+            df["risk_raw"] *= df["mult"]
 
-        # 無任何加權公告 → 回傳預設
-        if df["net_score_adj"].abs().sum() == 0:
-            return default
+        # 無訊號股票視為中性 0.5，只在有訊號的股票間做 rank
+        df["news_catalyst_score"] = 0.5
+        mask_c = df["catalyst_raw"] > 0
+        if mask_c.sum() >= 2:
+            df.loc[mask_c, "news_catalyst_score"] = df.loc[mask_c, "catalyst_raw"].rank(pct=True)
+        elif mask_c.sum() == 1:
+            # 單一催化訊號 → 給予正向 0.7（有優於無）
+            df.loc[mask_c, "news_catalyst_score"] = 0.7
 
-        df["news_score"] = df["net_score_adj"].rank(pct=True)
+        df["news_risk_score"] = 0.5
+        mask_r = df["risk_raw"] > 0
+        if mask_r.sum() >= 2:
+            df.loc[mask_r, "news_risk_score"] = df.loc[mask_r, "risk_raw"].rank(pct=True)
+        elif mask_r.sum() == 1:
+            df.loc[mask_r, "news_risk_score"] = 0.7
 
-        return df[["stock_id", "news_score"]]
+        # 合成 news_score：高 catalyst + 低 risk → 高分
+        df["news_score"] = NEWS_CATALYST_WEIGHT * df["news_catalyst_score"] + NEWS_RISK_WEIGHT * (
+            1.0 - df["news_risk_score"]
+        )
+
+        return df[["stock_id", "news_score", "news_catalyst_score", "news_risk_score"]]
 
     # ------------------------------------------------------------------ #
     #  Stage 3.2：前次掃描重疊加成（降低換手率）

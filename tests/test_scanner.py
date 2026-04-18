@@ -27,6 +27,7 @@ from src.discovery.scanner._functions import (
     compute_momentum_decay,
     compute_multi_timeframe_alignment,
     compute_peer_fundamental_ranking,
+    compute_quality_score,
     compute_revenue_acceleration_score,
     compute_value_weighted_inst_flow,
     compute_win_rate_threshold_adjustment,
@@ -707,10 +708,11 @@ class TestChipTier:
 
 
 class TestMomentumFundamentalScores:
-    """Momentum 基本面 v4：Tier Anchor + Intra-Tier Rank + Accel Boost。
+    """Momentum 基本面 v5：Tier Anchor + Intra-Tier Rank + Accel Boost + Quality Boost。
 
-    最終公式：final = 0.60 × tier_anchor + 0.15 × intra_rank + 0.25 × accel_boost
+    最終公式：final = 0.55 × tier_anchor + 0.15 × intra_rank + 0.20 × accel + 0.10 × quality
     小樣本（<10 支）退回絕對條件門檻；大樣本使用動態 p80/p60 percentile。
+    測試環境無 DB session → quality_score 回退 0.5 中性。
     """
 
     def test_tier1_double_positive_with_acceleration(self, momentum_scanner):
@@ -2519,15 +2521,15 @@ class TestComputeNewsScores:
         assert (result["news_score"] == 0.5).all()
 
     def test_positive_ann_beats_no_ann(self):
-        """有正面公告的股票，排名應高於無公告的股票。"""
+        """有催化型正面公告的股票，排名應高於無公告的股票（Phase E：只有 catalyst 事件算數）。"""
         scanner = self._make_scanner()
         today = date.today()
-        ann = self._make_ann([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"}])
+        ann = self._make_ann([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"}])
         result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
         assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
 
     def test_earnings_call_beats_general_positive(self):
-        """同為正面公告、相同日期：earnings_call 股票排名應高於 general 股票。"""
+        """催化型公告（earnings_call）排名應高於純 general 事件（Phase E：general 不屬 catalyst）。"""
         scanner = self._make_scanner()
         today = date.today()
         ann = self._make_ann(
@@ -2537,17 +2539,18 @@ class TestComputeNewsScores:
             ]
         )
         result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        # 1000 有催化 → news_score > 0.5；2000 無 catalyst/risk → 0.5
         assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
 
     def test_recent_beats_old_same_type(self):
-        """同類型正面公告，近期（今天）排名應高於舊公告（10 天前）。"""
+        """同類型催化公告，近期（今天）排名應高於舊公告（10 天前）。"""
         scanner = self._make_scanner()
         today = date.today()
         old_date = today - timedelta(days=10)
         ann = self._make_ann(
             [
-                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"},
-                {"stock_id": "2000", "date": old_date, "sentiment": 1, "event_type": "general"},
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+                {"stock_id": "2000", "date": old_date, "sentiment": 1, "event_type": "earnings_call"},
             ]
         )
         result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
@@ -2720,8 +2723,8 @@ class TestComputeNewsScoresV2:
     def _make_scanner(self):
         return MarketScanner(min_price=10, max_price=2000, min_volume=100_000)
 
-    def test_governance_change_beats_earnings_call(self):
-        """governance_change 正面公告排名應高於 earnings_call 正面公告。"""
+    def test_earnings_call_beats_governance_change(self):
+        """Phase E：earnings_call 是催化型，governance_change 是風險型，催化 > 風險。"""
         scanner = self._make_scanner()
         today = date.today()
         ann = pd.DataFrame(
@@ -2731,10 +2734,11 @@ class TestComputeNewsScoresV2:
             ]
         )
         result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
-        assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
+        # 2000 (catalyst) > 1000 (risk)
+        assert result.loc["2000", "news_score"] > result.loc["1000", "news_score"]
 
     def test_buyback_beats_general(self):
-        """buyback 正面公告排名應高於 general 正面公告。"""
+        """buyback（催化）排名應高於 general（非催化、非風險，中性 0.5）。"""
         scanner = self._make_scanner()
         today = date.today()
         ann = pd.DataFrame(
@@ -2747,14 +2751,14 @@ class TestComputeNewsScoresV2:
         assert result.loc["1000", "news_score"] > result.loc["2000", "news_score"]
 
     def test_abnormal_rate_boosts_score(self):
-        """有異常公告爆量（Z>2）的股票相較普通公告的股票得分更高。"""
+        """有異常公告爆量（Z>2）的股票相較普通公告的股票得分更高（改用催化型 earnings_call）。"""
         scanner = self._make_scanner()
         today = date.today()
-        # 兩股都有相同類型正面公告
+        # 兩股都有相同類型催化公告（Phase E：general 不屬 catalyst）
         ann = pd.DataFrame(
             [
-                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"},
-                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "general"},
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
             ]
         )
         # 1000 近期爆量（基準期低頻），2000 無歷史
@@ -7366,6 +7370,244 @@ class TestRevenueAccelerationScore:
         df = self._make_rev_df("2330", [30, 25, 20, 15], yoy_3m_ago=15.0)
         result = compute_revenue_acceleration_score(df, ["2330"])
         assert result.iloc[0]["consecutive_accel_months"] == 3
+
+
+class TestComputeQualityScore:
+    """Phase F — 毛利率 YoY + FCF 正值旗標的品質分數。"""
+
+    @staticmethod
+    def _make_fin(rows: list[dict]) -> pd.DataFrame:
+        return pd.DataFrame(rows)
+
+    def test_empty_returns_neutral(self):
+        """空資料 → 全部 0.5。"""
+        result = compute_quality_score(pd.DataFrame(), ["1000", "2000"])
+        assert (result["quality_score"] == 0.5).all()
+
+    def test_no_stocks_returns_empty_structure(self):
+        """無候選股時結構仍正確。"""
+        df = self._make_fin(
+            [
+                {
+                    "stock_id": "1000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 30.0,
+                    "free_cf": 100,
+                }
+            ]
+        )
+        result = compute_quality_score(df, [])
+        assert len(result) == 0
+
+    def test_missing_columns_returns_neutral(self):
+        """df_financial 無 gross_margin 與 free_cf 欄位 → 全部 0.5。"""
+        df = self._make_fin(
+            [{"stock_id": "1000", "date": date(2026, 3, 31), "year": 2026, "quarter": 1, "revenue": 100}]
+        )
+        result = compute_quality_score(df, ["1000"])
+        assert result.iloc[0]["quality_score"] == pytest.approx(0.5)
+
+    def test_positive_fcf_flag(self):
+        """FCF > 0 單股（無 YoY 比較）→ quality = 0.6×0.5 + 0.4×1.0 = 0.7。"""
+        df = self._make_fin(
+            [
+                {
+                    "stock_id": "1000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 30.0,
+                    "free_cf": 100,
+                }
+            ]
+        )
+        result = compute_quality_score(df, ["1000"])
+        # 只有 1 檔 → gm_yoy_rank = 0.5，fcf=1
+        assert result.iloc[0]["quality_score"] == pytest.approx(0.7, abs=0.01)
+
+    def test_negative_fcf_flag(self):
+        """FCF < 0 → flag 為 0；quality = 0.6×0.5 + 0.4×0 = 0.3。"""
+        df = self._make_fin(
+            [
+                {
+                    "stock_id": "1000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 30.0,
+                    "free_cf": -50,
+                }
+            ]
+        )
+        result = compute_quality_score(df, ["1000"])
+        assert result.iloc[0]["quality_score"] == pytest.approx(0.3, abs=0.01)
+
+    def test_gm_yoy_improvement_ranked_higher(self):
+        """毛利率 YoY 改善的股票 quality 應高於惡化者（需池內至少 2 檔可比較）。"""
+        df = self._make_fin(
+            [
+                # 1000: GM 從 25% → 35%（改善 +10pp）
+                {
+                    "stock_id": "1000",
+                    "date": date(2025, 3, 31),
+                    "year": 2025,
+                    "quarter": 1,
+                    "gross_margin": 25.0,
+                    "free_cf": 100,
+                },
+                {
+                    "stock_id": "1000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 35.0,
+                    "free_cf": 100,
+                },
+                # 2000: GM 從 40% → 30%（惡化 -10pp）
+                {
+                    "stock_id": "2000",
+                    "date": date(2025, 3, 31),
+                    "year": 2025,
+                    "quarter": 1,
+                    "gross_margin": 40.0,
+                    "free_cf": 100,
+                },
+                {
+                    "stock_id": "2000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 30.0,
+                    "free_cf": 100,
+                },
+            ]
+        )
+        result = compute_quality_score(df, ["1000", "2000"]).set_index("stock_id")
+        assert result.loc["1000", "quality_score"] > result.loc["2000", "quality_score"]
+
+    def test_score_bounded_0_1(self):
+        """品質分數應在 [0, 1] 區間。"""
+        rows = []
+        for i in range(5):
+            rows.append(
+                {
+                    "stock_id": f"S{i}",
+                    "date": date(2025, 3, 31),
+                    "year": 2025,
+                    "quarter": 1,
+                    "gross_margin": 20.0 + i * 3,
+                    "free_cf": -50 + i * 30,
+                }
+            )
+            rows.append(
+                {
+                    "stock_id": f"S{i}",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 25.0 + i * 2,
+                    "free_cf": 50 + i * 20,
+                }
+            )
+        df = self._make_fin(rows)
+        result = compute_quality_score(df, [f"S{i}" for i in range(5)])
+        assert result["quality_score"].between(0.0, 1.0).all()
+
+    def test_stock_missing_from_financial_gets_neutral(self):
+        """候選股不在 financial 資料中 → quality = 0.5。"""
+        df = self._make_fin(
+            [
+                {
+                    "stock_id": "1000",
+                    "date": date(2026, 3, 31),
+                    "year": 2026,
+                    "quarter": 1,
+                    "gross_margin": 30.0,
+                    "free_cf": 100,
+                }
+            ]
+        )
+        result = compute_quality_score(df, ["1000", "9999"]).set_index("stock_id")
+        assert result.loc["9999", "quality_score"] == pytest.approx(0.5)
+
+
+class TestNewsCatalystRiskSplit:
+    """Phase E — news_score 拆分 catalyst/risk 雙通道。"""
+
+    def _make_scanner(self):
+        return MarketScanner(min_price=10, max_price=2000, min_volume=100_000)
+
+    def test_output_includes_subscore_columns(self):
+        """回傳欄位應含 news_catalyst_score + news_risk_score。"""
+        scanner = self._make_scanner()
+        result = scanner._compute_news_scores(["1000"], pd.DataFrame())
+        assert "news_catalyst_score" in result.columns
+        assert "news_risk_score" in result.columns
+
+    def test_catalyst_event_raises_catalyst_score(self):
+        """earnings_call 正面事件 → catalyst_score > 0.5。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "earnings_call"}])
+        result = scanner._compute_news_scores(["1000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_catalyst_score"] > 0.5
+
+    def test_risk_event_raises_risk_score(self):
+        """governance_change 事件 → risk_score > 0.5。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "governance_change"}])
+        result = scanner._compute_news_scores(["1000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_risk_score"] > 0.5
+        # news_score 應被風險壓低
+        assert result.loc["1000", "news_score"] < 0.5
+
+    def test_negative_sentiment_routes_to_risk(self):
+        """任何 sentiment=-1 事件無論 event_type 都歸 risk bucket。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame([{"stock_id": "1000", "date": today, "sentiment": -1, "event_type": "earnings_call"}])
+        result = scanner._compute_news_scores(["1000"], ann).set_index("stock_id")
+        assert result.loc["1000", "news_risk_score"] > 0.5
+        assert result.loc["1000", "news_catalyst_score"] == pytest.approx(0.5)
+
+    def test_general_event_contributes_nothing(self):
+        """general 事件既非 catalyst 也非 risk → 兩個子分數都保持 0.5 中性。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame([{"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "general"}])
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        # 1000 與 2000 應相同（都是 0.5 中性）
+        assert result.loc["1000", "news_score"] == pytest.approx(result.loc["2000", "news_score"])
+
+    def test_catalyst_beats_risk_by_design(self):
+        """催化股 > 風險股（Phase E 核心：反轉舊的 governance > earnings_call 邏輯）。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "governance_change"},
+                {"stock_id": "2000", "date": today, "sentiment": 1, "event_type": "earnings_call"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000"], ann).set_index("stock_id")
+        assert result.loc["2000", "news_score"] > result.loc["1000", "news_score"]
+
+    def test_news_score_bounded(self):
+        """混合事件下 news_score 仍應 in [0, 1]。"""
+        scanner = self._make_scanner()
+        today = date.today()
+        ann = pd.DataFrame(
+            [
+                {"stock_id": "1000", "date": today, "sentiment": 1, "event_type": "buyback"},
+                {"stock_id": "2000", "date": today, "sentiment": -1, "event_type": "filing"},
+                {"stock_id": "3000", "date": today - timedelta(days=3), "sentiment": 1, "event_type": "investor_day"},
+            ]
+        )
+        result = scanner._compute_news_scores(["1000", "2000", "3000"], ann)
+        assert result["news_score"].between(0.0, 1.0).all()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -66,6 +66,15 @@ NEWS_TRANSIENT_TYPES: frozenset[str] = frozenset({"revenue", "general"})
 # 公告載入窗口（天）
 NEWS_LOAD_WINDOW_DAYS: int = 15
 
+# ── News Catalyst / Risk 事件分類（Phase E）───────────────────────────
+# 正向催化：forward-looking 正面訊號（法說、投資人日、買回、正面營收）
+NEWS_CATALYST_TYPES: frozenset[str] = frozenset({"earnings_call", "investor_day", "buyback", "revenue"})
+# 風險事件：容易與負報酬相關（董監改選/市場派、負面 filing）
+NEWS_RISK_TYPES: frozenset[str] = frozenset({"governance_change", "filing"})
+# News 合成權重：news_score = CATALYST × catalyst + RISK × (1 - risk)
+NEWS_CATALYST_WEIGHT: float = 0.7
+NEWS_RISK_WEIGHT: float = 0.3
+
 # ── Regime 預設值 ───────────────────────────────────────────────────────
 REGIME_FALLBACK_DEFAULT: str = "sideways"  # Regime 偵測失敗時的安全預設值
 

@@ -214,7 +214,7 @@ class TestComputeNewsScores:
         assert all(result["news_score"] == 0.5)
 
     def test_positive_announcements_boost_score(self):
-        """有正面公告的股票分數應高於無公告的股票。"""
+        """有正面催化公告的股票分數應高於無公告的股票（Phase E：需指定 catalyst event_type）。"""
         scanner = self._get_scanner()
 
         df_ann = pd.DataFrame(
@@ -224,6 +224,7 @@ class TestComputeNewsScores:
                 "seq": ["1", "2", "3"],
                 "subject": ["庫藏股買回", "營收創新高", "合併案通過"],
                 "sentiment": [1, 1, 1],
+                "event_type": ["buyback", "revenue", "general"],
             }
         )
         result = scanner._compute_news_scores(["2330", "2317"], df_ann)
@@ -233,7 +234,7 @@ class TestComputeNewsScores:
         assert score_2330 > score_2317
 
     def test_negative_announcements_reduce_score(self):
-        """有負面公告的股票分數應低於有正面公告的。"""
+        """有負面公告的股票分數應低於有正面公告的（Phase E：需 event_type 觸發 catalyst/risk）。"""
         scanner = self._get_scanner()
 
         df_ann = pd.DataFrame(
@@ -243,6 +244,7 @@ class TestComputeNewsScores:
                 "seq": ["1", "1"],
                 "subject": ["庫藏股買回", "公司終止上市"],
                 "sentiment": [1, -1],
+                "event_type": ["buyback", "filing"],
             }
         )
         result = scanner._compute_news_scores(["2330", "2317"], df_ann)
@@ -252,10 +254,10 @@ class TestComputeNewsScores:
         assert score_2330 > score_2317
 
     def test_output_columns(self):
-        """輸出 DataFrame 應只包含 stock_id 和 news_score。"""
+        """輸出 DataFrame 應含 stock_id + news_score + 雙子分數（Phase E）。"""
         scanner = self._get_scanner()
         result = scanner._compute_news_scores(["2330"], pd.DataFrame())
-        assert list(result.columns) == ["stock_id", "news_score"]
+        assert set(result.columns) == {"stock_id", "news_score", "news_catalyst_score", "news_risk_score"}
 
 
 # ------------------------------------------------------------------ #
