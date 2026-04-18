@@ -38,7 +38,7 @@ from src.discovery.scanner._functions import (
     compute_chip_macd,
     compute_daytrade_penalty,
     compute_factor_ic,
-    compute_ic_weight_adjustments,
+    compute_ic_impact_weight_adjustments,
     compute_institutional_acceleration,
     compute_key_player_cost_basis,
     compute_momentum_decay,
@@ -1334,7 +1334,7 @@ class MarketScanner:
         # E2b: Factor IC 動態權重調整（資料充足時自動啟用）
         # ≥20 筆歷史推薦即自動校準；use_ic_adjustment=False 可關閉（測試用）
         if self.use_ic_adjustment:
-            w = self._apply_ic_weight_adjustment(w)
+            w = self._apply_ic_weight_adjustment(w, scored_candidates=candidates)
 
         composite = pd.Series(0.0, index=candidates.index)
         for key, weight in w.items():
@@ -2532,11 +2532,27 @@ class MarketScanner:
     #  E2b: Factor IC 動態權重調整
     # ------------------------------------------------------------------ #
 
-    def _apply_ic_weight_adjustment(self, base_weights: dict[str, float]) -> dict[str, float]:
-        """E2b — 根據歷史 IC 自動微調四維度權重。
+    def _apply_ic_weight_adjustment(
+        self,
+        base_weights: dict[str, float],
+        scored_candidates: pd.DataFrame | None = None,
+    ) -> dict[str, float]:
+        """E2b — 根據歷史 IC + 今日影響力自動微調四維度權重（Phase C）。
 
-        需 >= 20 筆可評估推薦紀錄（~4 天 × top 5）才啟動調整。
+        雙指標軟調整：
+          - IC（離散）：方向正確性檢驗，weak/inverse 大幅衰減
+          - 影響力（軟）：1 - ρ 鑑別力檢驗，圍繞 mean 做 ±20% 軟調整
+
+        需 >= 20 筆可評估推薦紀錄（~4 天 × top 5）才啟動 IC 端調整。
+        影響力需今日候選 ≥ 10 檔 + dimension 樣本 ≥ 3 才啟用。
         調整後權重歸一化至原始總和，確保不改變評分量級。
+
+        Args:
+            base_weights: 原始 regime 權重
+            scored_candidates: 今日候選（需含 {key}_score 欄位），供 ablation 計算影響力
+
+        Returns:
+            調整後權重字典
         """
         try:
             cutoff = date.today() - timedelta(days=35)
@@ -2583,19 +2599,30 @@ class MarketScanner:
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
             ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
-            if ic_df.empty:
+
+            # 計算今日影響力（若候選資料充足）
+            impact_df = self._compute_dimension_impact(base_weights, scored_candidates)
+
+            # 若兩者皆無資料，直接返回
+            if ic_df.empty and impact_df.empty:
                 return dict(base_weights)
 
             # 將 base_weights key (如 "technical") 轉為 score 欄位名 (如 "technical_score")
             score_weights = {f"{k}_score": v for k, v in base_weights.items()}
-            adjusted_score = compute_ic_weight_adjustments(ic_df, score_weights)
+
+            # 影響力 factor 名稱亦轉為 {key}_score 對齊 ic_df
+            if not impact_df.empty:
+                impact_df = impact_df.copy()
+                impact_df["factor"] = impact_df["factor"].astype(str) + "_score"
+
+            adjusted_score = compute_ic_impact_weight_adjustments(ic_df, impact_df, score_weights)
             # 轉回原始 key
             adjusted = {k.replace("_score", ""): v for k, v in adjusted_score.items()}
 
             for key in base_weights:
-                if base_weights[key] != adjusted.get(key, base_weights[key]):
+                if abs(base_weights[key] - adjusted.get(key, base_weights[key])) > 1e-6:
                     logger.info(
-                        "E2b IC 權重調整: %s — %s %.2f → %.2f",
+                        "E2b IC×影響力權重調整: %s — %s %.3f → %.3f",
                         self.mode_name,
                         key,
                         base_weights[key],
@@ -2606,6 +2633,39 @@ class MarketScanner:
         except Exception:
             logger.debug("E2b: IC 權重調整失敗，使用原始權重")
             return dict(base_weights)
+
+    def _compute_dimension_impact(
+        self,
+        base_weights: dict[str, float],
+        scored_candidates: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """計算今日候選之維度影響力（1 - ρ）。
+
+        邏輯：用 base_weights 對 scored_candidates 執行 dimension ablation，
+        取得每個維度移除後的 Spearman ρ。ρ 越低 → 影響力越高。
+
+        最低候選數 10 檔，不足則返回空 DataFrame。
+        """
+        if scored_candidates is None or scored_candidates.empty or len(scored_candidates) < 10:
+            return pd.DataFrame()
+        try:
+            from src.discovery.ablation import run_dimension_ablation
+
+            results = run_dimension_ablation(scored_candidates, base_weights, top_n=min(20, len(scored_candidates)))
+            if not results:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                [
+                    {
+                        "factor": r.removed_dimension,
+                        "rank_correlation": r.rank_correlation,
+                    }
+                    for r in results
+                ]
+            )
+        except Exception:
+            logger.debug("E2b: 影響力計算失敗，回退純 IC 調整")
+            return pd.DataFrame()
 
     # ------------------------------------------------------------------ #
     #  Stage 4.3: 籌碼層級降級稽核

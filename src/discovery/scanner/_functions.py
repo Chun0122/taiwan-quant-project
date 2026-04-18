@@ -2266,6 +2266,101 @@ def compute_ic_weight_adjustments(
     return adjusted
 
 
+def compute_ic_impact_weight_adjustments(
+    ic_df: pd.DataFrame,
+    impact_df: pd.DataFrame,
+    base_weights: dict[str, float],
+    dampen_factor: float = 0.5,
+    impact_alpha: float = 0.2,
+    impact_clip: tuple[float, float] = (0.6, 1.4),
+    min_impact_samples: int = 3,
+) -> dict[str, float]:
+    """IC × 影響力雙指標軟調整（Phase C）。
+
+    IC 檢驗「方向正確性」，影響力（1 - ρ）檢驗「鑑別力」。
+    兩者獨立作用後歸一化，避免單一訊號主導。
+
+    規則：
+      1. IC 離散衰減（sharp）— sharp multiplier: effective=1.0 / weak=0.5 / inverse=0.25
+      2. 影響力軟調整（soft）— mult = 1 + alpha × (impact - mean_impact)，clip [0.6, 1.4]
+      3. 歸一化至原始 base_weights 總和
+
+    影響力不穩定性防護：
+      - impact_df 樣本 < min_impact_samples → 跳過影響力調整
+      - clip 範圍防止極端 impact 爆炸變異
+      - alpha 預設 0.2（保守），避免 IC × ρ 雙重放大 noise
+
+    例：某維度 IC 方向正確（effective）且 impact 顯著高於平均 → 權重略增
+         某維度 IC=inverse（方向錯）+ impact 高 → IC 端已大幅降權，impact 不再放大降權
+
+    Args:
+        ic_df: compute_factor_ic 輸出（含 factor, direction 欄位）；factor 名稱需與 base_weights key 對齊
+        impact_df: 含 "factor", "rank_correlation" 欄位；factor 名稱需與 base_weights key 對齊
+        base_weights: 原始權重字典
+        dampen_factor: IC weak/inverse 衰減因子（沿用 compute_ic_weight_adjustments）
+        impact_alpha: 影響力調整強度，0.0 = 關閉
+        impact_clip: 影響力倍率夾擠範圍
+        min_impact_samples: 啟用影響力調整的最低樣本數
+
+    Returns:
+        調整後權重字典（總和等於原始 base_weights 總和）
+    """
+    if not base_weights:
+        return dict(base_weights)
+    if (ic_df is None or ic_df.empty) and (impact_df is None or impact_df.empty):
+        return dict(base_weights)
+
+    adjusted = dict(base_weights)
+
+    # Step 1: IC 方向離散衰減
+    if ic_df is not None and not ic_df.empty:
+        ic_map = dict(zip(ic_df["factor"], ic_df["direction"]))
+        for factor in adjusted:
+            direction = ic_map.get(factor, "effective")
+            if direction == "weak":
+                adjusted[factor] *= dampen_factor
+            elif direction == "inverse":
+                adjusted[factor] *= dampen_factor**2
+
+    # Step 2: 影響力軟調整（樣本充足才啟用）
+    if impact_df is not None and not impact_df.empty and impact_alpha > 0 and len(impact_df) >= min_impact_samples:
+        impact_map: dict[str, float] = {}
+        for _, row in impact_df.iterrows():
+            factor = row.get("factor") if hasattr(row, "get") else None
+            rho = row.get("rank_correlation") if hasattr(row, "get") else None
+            if factor is None or rho is None:
+                continue
+            try:
+                rho_val = float(rho)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(rho_val):
+                continue
+            # impact = 1 - ρ（ρ 越低表示移除後排名變動越大 → 影響力越高）
+            impact_map[str(factor)] = 1.0 - rho_val
+
+        if impact_map:
+            impacts = np.array(list(impact_map.values()))
+            mean_impact = float(np.mean(impacts))
+            lo, hi = impact_clip
+            for factor in adjusted:
+                impact = impact_map.get(factor)
+                if impact is None:
+                    continue
+                mult = 1.0 + impact_alpha * (impact - mean_impact)
+                mult = max(lo, min(hi, mult))
+                adjusted[factor] *= mult
+
+    # Step 3: 歸一化至原始總和
+    original_total = sum(base_weights.values())
+    adjusted_total = sum(adjusted.values())
+    if adjusted_total > 0:
+        scale = original_total / adjusted_total
+        adjusted = {k: v * scale for k, v in adjusted.items()}
+
+    return adjusted
+
+
 def compute_sub_factor_weight_adjustments(
     sub_factor_ic_df: pd.DataFrame,
     base_weights: dict[str, float],

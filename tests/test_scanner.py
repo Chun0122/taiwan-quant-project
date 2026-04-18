@@ -19,6 +19,7 @@ from src.discovery.scanner._functions import (
     compute_chip_macd,
     compute_earnings_quality,
     compute_factor_ic,
+    compute_ic_impact_weight_adjustments,
     compute_ic_weight_adjustments,
     compute_institutional_acceleration,
     compute_key_player_cost_basis,
@@ -7001,6 +7002,142 @@ class TestComputeIcWeightAdjustments:
         base = {"technical_score": 0.40, "chip_score": 0.30, "fundamental_score": 0.30}
         result = compute_ic_weight_adjustments(ic_df, base)
         assert sum(result.values()) == pytest.approx(1.0)
+
+
+class TestComputeIcImpactWeightAdjustments:
+    """Phase C — IC × 影響力雙指標軟調整。"""
+
+    @staticmethod
+    def _make_ic(directions: dict[str, str]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "factor": list(directions.keys()),
+                "ic": [0.1] * len(directions),
+                "direction": list(directions.values()),
+            }
+        )
+
+    @staticmethod
+    def _make_impact(rho_map: dict[str, float]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "factor": list(rho_map.keys()),
+                "rank_correlation": list(rho_map.values()),
+            }
+        )
+
+    def test_both_empty_returns_base(self):
+        """IC 與 impact 皆空 → 原權重。"""
+        base = {"technical_score": 0.4, "chip_score": 0.3, "fundamental_score": 0.3}
+        result = compute_ic_impact_weight_adjustments(pd.DataFrame(), pd.DataFrame(), base)
+        assert result == base
+
+    def test_ic_only_matches_legacy(self):
+        """僅 IC 有資料時應等同 compute_ic_weight_adjustments 結果。"""
+        ic = self._make_ic({"technical_score": "effective", "chip_score": "weak", "fundamental_score": "inverse"})
+        base = {"technical_score": 0.4, "chip_score": 0.3, "fundamental_score": 0.3}
+        dual = compute_ic_impact_weight_adjustments(ic, pd.DataFrame(), base)
+        legacy = compute_ic_weight_adjustments(ic, base)
+        for k in base:
+            assert dual[k] == pytest.approx(legacy[k], abs=1e-6)
+
+    def test_impact_soft_adjusts_around_mean(self):
+        """影響力軟調整：高 impact 略增、低 impact 略減，歸一化後總和不變。"""
+        ic = self._make_ic(
+            {
+                "technical_score": "effective",
+                "chip_score": "effective",
+                "fundamental_score": "effective",
+                "news_score": "effective",
+            }
+        )
+        # technical 高影響力（ρ=0.5），fundamental 零影響力（ρ=1.0），其他中間
+        impact = self._make_impact(
+            {
+                "technical_score": 0.5,
+                "chip_score": 0.8,
+                "fundamental_score": 1.0,
+                "news_score": 0.9,
+            }
+        )
+        base = {
+            "technical_score": 0.40,
+            "chip_score": 0.32,
+            "fundamental_score": 0.28,
+            "news_score": 0.00,
+        }
+        result = compute_ic_impact_weight_adjustments(ic, impact, base, impact_alpha=0.2)
+
+        # 總和保留
+        assert sum(result.values()) == pytest.approx(sum(base.values()), abs=1e-6)
+        # 高 impact technical 權重 ≥ 原值；零 impact fundamental ≤ 原值
+        assert result["technical_score"] >= base["technical_score"] - 1e-6
+        assert result["fundamental_score"] <= base["fundamental_score"] + 1e-6
+
+    def test_impact_clip_prevents_explosion(self):
+        """極端 impact 差距被 clip 夾擠，不會產生 2x/3x 放大。"""
+        ic = self._make_ic(
+            {"technical_score": "effective", "chip_score": "effective", "fundamental_score": "effective"}
+        )
+        # technical ρ=-1（極端高 impact=2.0），其他 ρ=1（impact=0）
+        impact = self._make_impact({"technical_score": -1.0, "chip_score": 1.0, "fundamental_score": 1.0})
+        base = {"technical_score": 0.4, "chip_score": 0.3, "fundamental_score": 0.3}
+        result = compute_ic_impact_weight_adjustments(ic, impact, base, impact_alpha=0.2, impact_clip=(0.6, 1.4))
+        # clip 上限 1.4 → technical 放大倍率 ≤ 1.4，歸一化後與原值差距有限
+        ratio = result["technical_score"] / base["technical_score"]
+        assert ratio <= 1.5  # 含歸一化緩衝
+
+    def test_min_samples_guard_skips_impact(self):
+        """impact_df 樣本不足時跳過影響力調整。"""
+        ic = self._make_ic({"technical_score": "effective", "chip_score": "weak"})
+        # 只有 1 個維度，低於 min_impact_samples=3
+        impact = self._make_impact({"technical_score": 0.5})
+        base = {"technical_score": 0.5, "chip_score": 0.5}
+        result = compute_ic_impact_weight_adjustments(ic, impact, base, impact_alpha=0.2, min_impact_samples=3)
+        legacy = compute_ic_weight_adjustments(ic, base)
+        for k in base:
+            assert result[k] == pytest.approx(legacy[k], abs=1e-6)
+
+    def test_inverse_plus_high_impact_not_doubly_amplified(self):
+        """IC inverse + 高 impact 不應雙重放大降權（避免 variance 爆炸）。"""
+        ic = self._make_ic(
+            {
+                "technical_score": "effective",
+                "chip_score": "inverse",
+                "fundamental_score": "effective",
+                "news_score": "effective",
+            }
+        )
+        impact = self._make_impact(
+            {
+                "technical_score": 0.9,
+                "chip_score": 0.3,  # chip 反向 + 高 impact
+                "fundamental_score": 0.95,
+                "news_score": 0.9,
+            }
+        )
+        base = {
+            "technical_score": 0.3,
+            "chip_score": 0.3,
+            "fundamental_score": 0.2,
+            "news_score": 0.2,
+        }
+        result = compute_ic_impact_weight_adjustments(ic, impact, base, impact_alpha=0.2)
+        # chip 降幅應接近 IC 端 0.25x 衰減，而非被 impact 再放大（clip 範圍防護）
+        # 保守檢查：chip 比例未低於 IC-only 結果太多
+        ic_only = compute_ic_weight_adjustments(ic, base)
+        # 容忍 impact 讓 chip 額外降至多 25%（clip 下限 0.6 × 歸一化影響）
+        assert result["chip_score"] >= ic_only["chip_score"] * 0.7
+
+    def test_alpha_zero_disables_impact(self):
+        """impact_alpha=0 → 完全跳過影響力調整，結果等同 IC-only。"""
+        ic = self._make_ic({"technical_score": "effective", "chip_score": "weak", "fundamental_score": "effective"})
+        impact = self._make_impact({"technical_score": 0.1, "chip_score": 0.95, "fundamental_score": 0.5})
+        base = {"technical_score": 0.4, "chip_score": 0.3, "fundamental_score": 0.3}
+        dual = compute_ic_impact_weight_adjustments(ic, impact, base, impact_alpha=0.0)
+        legacy = compute_ic_weight_adjustments(ic, base)
+        for k in base:
+            assert dual[k] == pytest.approx(legacy[k], abs=1e-6)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
