@@ -19,6 +19,7 @@ from src.discovery.scanner._functions import (
     compute_hhi_trend,
     compute_inst_net_buy_slope,
     compute_institutional_persistence,
+    compute_revenue_acceleration_score,
     compute_sbl_score,
     compute_sub_factor_weight_adjustments,
     compute_value_weighted_inst_flow,
@@ -441,8 +442,62 @@ class MomentumScanner(MarketScanner):
         return df[["stock_id", "chip_score", "chip_tier"]]
 
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：已停用（審計結論 IC=0.000，權重=0）。"""
-        return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+        """動能模式基本面：四階梯短線催化劑 + 營收加速度連續性加成。
+
+        短線動能模式專用的「營收催化劑」評分，非基本面深度分析：
+        - 基礎分（80%）：四階梯短線爆發濾網
+        - 加速度連續性加成（20%）：連續 N 月 YoY 加速 → 可持續 vs 一次性
+
+        四階梯：
+        - Tier 1 (0.85)：MoM > 0 且 YoY > 0 且 YoY > yoy_3m_ago（雙增 + 創高）
+        - Tier 2 (0.72)：YoY > 0 且 YoY > yoy_3m_ago（YoY 加速）
+        - Tier 3 (0.55)：YoY > 0（正但未加速）
+        - Tier 4 (0.30)：YoY <= 0（衰退）
+        - Fallback (0.50)：無資料
+        """
+        if df_revenue.empty:
+            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+
+        rev_grouped = df_revenue.groupby("stock_id", sort=False)
+        result_rows = []
+        for sid in stock_ids:
+            if sid not in rev_grouped.groups:
+                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                continue
+
+            rev = rev_grouped.get_group(sid)
+            yoy = rev.iloc[0].get("yoy_growth", None)
+            if yoy is None or pd.isna(yoy):
+                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                continue
+
+            mom = rev.iloc[0].get("mom_growth", None)
+            yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
+
+            has_mom_pos = mom is not None and not pd.isna(mom) and float(mom) > 0
+            has_accel = yoy_3m is not None and not pd.isna(yoy_3m) and float(yoy) > float(yoy_3m)
+
+            if float(yoy) > 0 and has_mom_pos and has_accel:
+                score = 0.85
+            elif float(yoy) > 0 and has_accel:
+                score = 0.72
+            elif float(yoy) > 0:
+                score = 0.55
+            else:
+                score = 0.30
+
+            result_rows.append({"stock_id": sid, "fundamental_score": score})
+
+        base_df = pd.DataFrame(result_rows)
+
+        accel_df = compute_revenue_acceleration_score(df_revenue, stock_ids, consecutive_threshold=3)
+        if not accel_df.empty:
+            base_df = base_df.merge(accel_df[["stock_id", "rev_accel_score"]], on="stock_id", how="left")
+            base_df["rev_accel_score"] = base_df["rev_accel_score"].fillna(0.5)
+            base_df["fundamental_score"] = base_df["fundamental_score"] * 0.80 + base_df["rev_accel_score"] * 0.20
+            base_df = base_df.drop(columns=["rev_accel_score"])
+
+        return base_df
 
     def _load_chip_sub_factor_ic(self) -> pd.DataFrame | None:
         """從 DB 載入歷史推薦紀錄，計算 chip 子因子 IC。

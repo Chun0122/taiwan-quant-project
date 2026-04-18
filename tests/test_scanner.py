@@ -706,21 +706,32 @@ class TestChipTier:
 
 
 class TestMomentumFundamentalScores:
-    """Momentum 基本面已停用（IC=0.000），一律回傳 0.5 中性分。"""
+    """Momentum 基本面四階梯催化劑評分（IC=0.13 有效維度）。"""
 
-    def test_always_returns_neutral(self, momentum_scanner):
-        """任何輸入都回傳 0.5。"""
+    def test_tier1_double_positive_with_acceleration(self, momentum_scanner):
+        """MoM > 0 AND YoY > 0 AND YoY > yoy_3m_ago → 0.85（Tier 1）。"""
         df_revenue = pd.DataFrame(
-            {
-                "stock_id": ["1000", "1001"],
-                "yoy_growth": [10.0, -5.0],
-                "mom_growth": [5.0, 5.0],
-            }
+            {"stock_id": ["1000"], "yoy_growth": [20.0], "mom_growth": [5.0], "yoy_3m_ago": [10.0]}
         )
-        result = momentum_scanner._compute_fundamental_scores(["1000", "1001"], df_revenue)
-        assert list(result["stock_id"]) == ["1000", "1001"]
-        for score in result["fundamental_score"]:
-            assert score == pytest.approx(0.5)
+        result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
+        # Tier1 基礎 0.85 會與 rev_accel_score 混合（0.8 × 0.85 + 0.2 × rev_accel）
+        # rev_accel_score 資料不足預設 0.5 → 0.8 × 0.85 + 0.2 × 0.5 = 0.78
+        assert result.iloc[0]["fundamental_score"] > 0.7
+
+    def test_tier4_yoy_negative(self, momentum_scanner):
+        """YoY ≤ 0 → 0.30（Tier 4 衰退）。"""
+        df_revenue = pd.DataFrame(
+            {"stock_id": ["1001"], "yoy_growth": [-10.0], "mom_growth": [-5.0], "yoy_3m_ago": [5.0]}
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1001"], df_revenue)
+        # Tier4 基礎 0.30 + 0.2 × 0.5 = 0.34
+        assert result.iloc[0]["fundamental_score"] < 0.45
+
+    def test_fallback_for_missing_data(self, momentum_scanner):
+        """資料缺失（無 yoy_growth）→ 回傳 0.5 fallback。"""
+        df_revenue = pd.DataFrame()
+        result = momentum_scanner._compute_fundamental_scores(["1002"], df_revenue)
+        assert result.iloc[0]["fundamental_score"] == pytest.approx(0.5)
 
     def test_empty_input_returns_neutral(self, momentum_scanner):
         """空 stock_ids 回傳空 DataFrame。"""
@@ -729,6 +740,15 @@ class TestMomentumFundamentalScores:
         )
         assert len(result) == 0
         assert "fundamental_score" in result.columns
+
+    def test_tier3_yoy_positive_only(self, momentum_scanner):
+        """YoY > 0 但無加速 → 0.55（Tier 3）。"""
+        df_revenue = pd.DataFrame(
+            {"stock_id": ["1003"], "yoy_growth": [5.0], "mom_growth": [-2.0], "yoy_3m_ago": [10.0]}
+        )
+        result = momentum_scanner._compute_fundamental_scores(["1003"], df_revenue)
+        # Tier3 基礎 0.55 + 0.2 × 0.5 = 0.54
+        assert 0.45 < result.iloc[0]["fundamental_score"] < 0.65
 
 
 @pytest.mark.parametrize(
@@ -7940,15 +7960,16 @@ class TestGetChipBaseWeights:
             assert "smart_broker" not in weights
 
 
-class TestMomentumNoFundamental:
-    """Momentum 模式各 regime 不應包含 fundamental 維度。"""
+class TestMomentumFourDimensionWeights:
+    """Momentum v3：四維度權重結構（fundamental 恢復）。"""
 
-    def test_momentum_no_fundamental_in_weights(self):
+    def test_momentum_has_fundamental_in_all_regimes(self):
         from src.regime.detector import MarketRegimeDetector
 
         for regime in ["bull", "sideways", "bear", "crisis"]:
             w = MarketRegimeDetector.get_weights("momentum", regime)
-            assert "fundamental" not in w, f"momentum/{regime} 不應含 fundamental"
+            assert "fundamental" in w, f"momentum/{regime} 應含 fundamental（v3 恢復）"
+            assert 0.0 < w["fundamental"] < 1.0
             assert abs(sum(w.values()) - 1.0) < 0.01, f"momentum/{regime} 權重和 ≠ 1.0"
 
 
@@ -8178,3 +8199,177 @@ class TestTechScoreZeroVarianceCluster:
         assert len(result) == n
         assert (result["technical_score"] >= 0).all()
         assert (result["technical_score"] <= 1).all()
+
+
+# ====================================================================== #
+#  Stage 3.2：前次掃描重疊加成
+# ====================================================================== #
+
+
+class TestApplyOverlapBonus:
+    """_apply_overlap_bonus() 前次掃描重疊加成（降低換手率）。"""
+
+    def test_no_previous_scan_returns_zero_bonus(self, momentum_scanner, monkeypatch):
+        """無前次掃描記錄 → overlap_bonus 全為 0。"""
+        from unittest.mock import MagicMock
+
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        # 第一次查詢 max(scan_date) → None
+        mock_session.execute.return_value.scalar.return_value = None
+        monkeypatch.setattr("src.discovery.scanner._base.get_session", lambda: mock_session)
+
+        momentum_scanner.scan_date = date.today()
+        scored = pd.DataFrame({"stock_id": ["1000", "1001"], "composite_score": [0.6, 0.8]})
+        result = momentum_scanner._apply_overlap_bonus(scored)
+        assert (result["overlap_bonus"] == 0.0).all()
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.6)
+        assert result.iloc[1]["composite_score"] == pytest.approx(0.8)
+
+    def test_overlap_stocks_receive_bonus(self, momentum_scanner, monkeypatch):
+        """與前次推薦重疊的股票 composite_score ×1.03。"""
+        from unittest.mock import MagicMock
+
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        # 第一次 scalar() → 前次日期；第二次 scalars().all() → 前次股票
+        scalar_mock = MagicMock(return_value=date.today() - timedelta(days=1))
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = ["1000"]  # 只有 1000 重疊
+
+        call_count = {"n": 0}
+
+        def execute_side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            result_obj = MagicMock()
+            if call_count["n"] == 1:
+                result_obj.scalar = scalar_mock
+            else:
+                result_obj.scalars = MagicMock(return_value=scalars_mock)
+            return result_obj
+
+        mock_session.execute.side_effect = execute_side_effect
+        monkeypatch.setattr("src.discovery.scanner._base.get_session", lambda: mock_session)
+
+        momentum_scanner.scan_date = date.today()
+        scored = pd.DataFrame({"stock_id": ["1000", "1001"], "composite_score": [0.6, 0.8]})
+        result = momentum_scanner._apply_overlap_bonus(scored, bonus=0.03)
+        assert result.iloc[0]["overlap_bonus"] == pytest.approx(0.03)
+        assert result.iloc[1]["overlap_bonus"] == pytest.approx(0.0)
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.6 * 1.03)
+        assert result.iloc[1]["composite_score"] == pytest.approx(0.8)
+
+    def test_empty_scored_returns_empty(self, momentum_scanner):
+        """空 DataFrame 應回傳（overlap_bonus 欄位為 0 維）。"""
+        momentum_scanner.scan_date = date.today()
+        result = momentum_scanner._apply_overlap_bonus(pd.DataFrame(columns=["stock_id", "composite_score"]))
+        assert result.empty or result["overlap_bonus"].eq(0.0).all()
+
+    def test_db_exception_graceful_fallback(self, momentum_scanner, monkeypatch):
+        """DB 查詢異常應 graceful fallback（overlap_bonus=0）。"""
+
+        def raise_exc():
+            raise RuntimeError("DB boom")
+
+        monkeypatch.setattr("src.discovery.scanner._base.get_session", raise_exc)
+        momentum_scanner.scan_date = date.today()
+        scored = pd.DataFrame({"stock_id": ["1000"], "composite_score": [0.7]})
+        result = momentum_scanner._apply_overlap_bonus(scored)
+        assert (result["overlap_bonus"] == 0.0).all()
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.7)
+
+
+# ====================================================================== #
+#  Stage 3.5h：消息面負面閘門
+# ====================================================================== #
+
+
+class TestApplyNegativeNewsGate:
+    """_apply_negative_news_gate() 高負面消息股降分。"""
+
+    def test_low_news_score_penalized(self, momentum_scanner):
+        """news_score < threshold 的股票 composite_score ×(1-penalty)。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["1000", "1001", "1002"],
+                "composite_score": [0.80, 0.60, 0.70],
+                "news_score": [0.10, 0.50, 0.08],  # 1000 / 1002 低於 0.15
+            }
+        )
+        result = momentum_scanner._apply_negative_news_gate(scored, threshold=0.15, penalty=0.08)
+        # 1000 被懲罰：0.80 × 0.92 = 0.736
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.80 * 0.92, abs=1e-6)
+        # 1001 不受影響
+        assert result.iloc[1]["composite_score"] == pytest.approx(0.60, abs=1e-6)
+        # 1002 被懲罰：0.70 × 0.92 = 0.644
+        assert result.iloc[2]["composite_score"] == pytest.approx(0.70 * 0.92, abs=1e-6)
+        assert result.iloc[0]["neg_news_gate"] == pytest.approx(-0.08)
+        assert result.iloc[1]["neg_news_gate"] == pytest.approx(0.0)
+
+    def test_no_news_score_column_graceful(self, momentum_scanner):
+        """缺少 news_score 欄位時 graceful（neg_news_gate=0）。"""
+        scored = pd.DataFrame({"stock_id": ["1000"], "composite_score": [0.75]})
+        result = momentum_scanner._apply_negative_news_gate(scored)
+        assert (result["neg_news_gate"] == 0.0).all()
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.75)
+
+    def test_empty_scored_returns_empty(self, momentum_scanner):
+        """空 DataFrame 回傳（neg_news_gate 欄位初始化為 0）。"""
+        result = momentum_scanner._apply_negative_news_gate(pd.DataFrame(columns=["stock_id", "composite_score"]))
+        assert result.empty or result["neg_news_gate"].eq(0.0).all()
+
+    def test_threshold_boundary(self, momentum_scanner):
+        """news_score 恰等於 threshold 時不受懲罰（<，非 ≤）。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["1000"],
+                "composite_score": [0.7],
+                "news_score": [0.15],  # 恰好等於 threshold
+            }
+        )
+        result = momentum_scanner._apply_negative_news_gate(scored, threshold=0.15, penalty=0.08)
+        assert result.iloc[0]["composite_score"] == pytest.approx(0.7, abs=1e-6)
+        assert result.iloc[0]["neg_news_gate"] == pytest.approx(0.0)
+
+
+# ====================================================================== #
+#  Regime 權重 & IC Decay 監控目標（Phase A2/A3）
+# ====================================================================== #
+
+
+class TestMomentumRegimeWeightsV3:
+    """REGIME_WEIGHTS['momentum'] 四維度恢復（Phase A2）。"""
+
+    def test_all_regimes_have_fundamental(self):
+        """所有 regime 皆包含 fundamental 維度（回歸後的四維結構）。"""
+        from src.regime.detector import REGIME_WEIGHTS
+
+        for regime in ("bull", "sideways", "bear", "crisis"):
+            w = REGIME_WEIGHTS["momentum"][regime]
+            assert "fundamental" in w, f"momentum {regime} 應包含 fundamental"
+            assert 0.0 < w["fundamental"] < 1.0
+
+    def test_weights_sum_to_one(self):
+        """每個 regime 的四維度權重加總應為 1.0。"""
+        from src.regime.detector import REGIME_WEIGHTS
+
+        for regime in ("bull", "sideways", "bear", "crisis"):
+            w = REGIME_WEIGHTS["momentum"][regime]
+            total = sum(w.values())
+            assert abs(total - 1.0) < 1e-6, f"momentum {regime} 權重加總 {total} != 1.0"
+
+    def test_bull_fundamental_highest(self):
+        """bull regime 的 fundamental 權重 ≥ 0.15（IC=0.13 最有效維度）。"""
+        from src.regime.detector import REGIME_WEIGHTS
+
+        assert REGIME_WEIGHTS["momentum"]["bull"]["fundamental"] >= 0.15
+
+
+class TestKeyFactorMap:
+    """_KEY_FACTOR_MAP IC Decay 監控目標（Phase A3）。"""
+
+    def test_momentum_monitors_technical_score(self, momentum_scanner):
+        """momentum 模式關鍵因子應為 technical_score（非 news_score）。"""
+        assert momentum_scanner._KEY_FACTOR_MAP["momentum"] == "technical_score"

@@ -214,6 +214,11 @@ class MarketScanner:
         scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
+        # --- 軟加成：前次掃描重疊（降低換手率）---
+        scored = self._apply_overlap_bonus(scored)
+        if "overlap_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column("3.2 前次重疊", scored, "overlap_bonus", "前次掃描重疊加成")
+
         # --- 軟加成：產業 / 概念 / 同業 ---
         scored = self._apply_sector_bonus(scored)
         audit.record_score_adjustments_from_column("3.3 產業輪動", scored, "sector_bonus", "產業輪動加成")
@@ -255,6 +260,11 @@ class MarketScanner:
         scored = self._apply_key_player_cost(scored, df_price)
         if "kp_adj" in scored.columns:
             audit.record_score_adjustments_from_column("3.5g 主力成本", scored, "kp_adj", "現價vs主力成本")
+
+        # --- 軟加成：消息面負面閘門（過濾壞消息股）---
+        scored = self._apply_negative_news_gate(scored)
+        if "neg_news_gate" in scored.columns:
+            audit.record_score_adjustments_from_column("3.5h 負面消息閘門", scored, "neg_news_gate", "高負面消息股降分")
 
         # --- 軟加成：量價背離 ---
         scored = self._apply_volume_price_divergence(scored, df_price)
@@ -705,6 +715,99 @@ class MarketScanner:
         df["news_score"] = df["net_score_adj"].rank(pct=True)
 
         return df[["stock_id", "news_score"]]
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.2：前次掃描重疊加成（降低換手率）
+    # ------------------------------------------------------------------ #
+
+    def _apply_overlap_bonus(self, scored: pd.DataFrame, bonus: float = 0.03) -> pd.DataFrame:
+        """Stage 3.2 — 與前次同模式推薦重疊的股票 composite_score ×(1+bonus)。
+
+        目的：降低 scan-to-scan 換手率，鼓勵推薦持續性（邊際加成不主導排名）。
+        做法：查詢 DB 前一次同模式 DiscoveryRecord.stock_id 集合，與本次候選取交集 → 加成。
+        """
+        if scored.empty:
+            scored["overlap_bonus"] = 0.0
+            return scored
+
+        try:
+            from sqlalchemy import func
+
+            with get_session() as session:
+                prev_date = session.execute(
+                    select(func.max(DiscoveryRecord.scan_date)).where(
+                        DiscoveryRecord.mode == self.mode_name,
+                        DiscoveryRecord.scan_date < self.scan_date,
+                    )
+                ).scalar()
+                if prev_date is None:
+                    scored["overlap_bonus"] = 0.0
+                    return scored
+
+                prev_ids = set(
+                    session.execute(
+                        select(DiscoveryRecord.stock_id).where(
+                            DiscoveryRecord.mode == self.mode_name,
+                            DiscoveryRecord.scan_date == prev_date,
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+
+            if not prev_ids:
+                scored["overlap_bonus"] = 0.0
+                return scored
+
+            scored["overlap_bonus"] = scored["stock_id"].apply(lambda s: bonus if s in prev_ids else 0.0)
+            scored["composite_score"] = scored["composite_score"] * (1 + scored["overlap_bonus"])
+            n_overlap = (scored["overlap_bonus"] > 0).sum()
+            logger.info(
+                "Stage 3.2: 前次掃描重疊加成 — %d/%d 支重疊股 +%.1f%%",
+                n_overlap,
+                len(scored),
+                bonus * 100,
+            )
+            return scored
+
+        except Exception:
+            logger.debug("Stage 3.2: 重疊加成失敗，跳過")
+            scored["overlap_bonus"] = 0.0
+            return scored
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3.5h：消息面負面閘門（過濾壞消息股）
+    # ------------------------------------------------------------------ #
+
+    def _apply_negative_news_gate(
+        self,
+        scored: pd.DataFrame,
+        threshold: float = 0.15,
+        penalty: float = 0.08,
+    ) -> pd.DataFrame:
+        """Stage 3.5h — news_score < threshold 的股票 composite_score ×(1-penalty)。
+
+        理由：消融測試顯示 news 的價值來自「過濾壞消息股」，但作為連續排名 IC≈0。
+        解法：保留連續評分，額外加硬性負面閘門，僅懲罰 bottom 15% 高負面消息股。
+        """
+        if scored.empty or "news_score" not in scored.columns:
+            scored["neg_news_gate"] = 0.0
+            return scored
+
+        mask = scored["news_score"] < threshold
+        scored["neg_news_gate"] = 0.0
+        scored.loc[mask, "neg_news_gate"] = -penalty
+        scored.loc[mask, "composite_score"] = scored.loc[mask, "composite_score"] * (1 - penalty)
+
+        n_blocked = int(mask.sum())
+        if n_blocked > 0:
+            logger.info(
+                "Stage 3.5h: 負面消息閘門 — %d 支股票 news_score<%.2f 降分 -%.1f%%",
+                n_blocked,
+                threshold,
+                penalty * 100,
+            )
+        return scored
 
     # ------------------------------------------------------------------ #
     #  產業加成
@@ -2273,9 +2376,11 @@ class MarketScanner:
             logger.debug("E1: 勝率回饋計算失敗，跳過")
             return 0.0
 
-    # 各模式的關鍵因子（IC 衰退監控目標）
+    # 各模式的關鍵因子（IC 衰退監控目標）— 選擇權重最高的主導維度
+    # momentum v3：從 news_score 改為 technical_score（news IC 結構性為負，永久觸發無意義；
+    # technical 為 bull 最高權重 0.36 的核心維度，監控衰退才反映動能策略失效）
     _KEY_FACTOR_MAP: dict[str, str] = {
-        "momentum": "news_score",
+        "momentum": "technical_score",
         "swing": "chip_score",
         "value": "fundamental_score",
         "dividend": "fundamental_score",
