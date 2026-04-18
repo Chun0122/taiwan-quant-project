@@ -441,63 +441,117 @@ class MomentumScanner(MarketScanner):
 
         return df[["stock_id", "chip_score", "chip_tier"]]
 
+    _FUND_TIER_ANCHOR: dict[int, float] = {1: 0.85, 2: 0.72, 3: 0.55, 4: 0.30}
+    _FUND_WEIGHT_TIER: float = 0.60
+    _FUND_WEIGHT_INTRA: float = 0.15
+    _FUND_WEIGHT_ACCEL: float = 0.25
+    _FUND_DYNAMIC_THRESHOLD_MIN_SAMPLES: int = 10
+
     def _compute_fundamental_scores(self, stock_ids: list[str], df_revenue: pd.DataFrame) -> pd.DataFrame:
-        """動能模式基本面：四階梯短線催化劑 + 營收加速度連續性加成。
+        """動能模式基本面：Tier Anchor + 同 Tier 內 Rank + 加速度 Boost（v4）。
 
-        短線動能模式專用的「營收催化劑」評分，非基本面深度分析：
-        - 基礎分（80%）：四階梯短線爆發濾網
-        - 加速度連續性加成（20%）：連續 N 月 YoY 加速 → 可持續 vs 一次性
+        三段式公式（避免離散尺度壓縮區分度）：
+            final = 0.60 × tier_anchor + 0.15 × intra_rank + 0.25 × accel_boost
 
-        四階梯：
-        - Tier 1 (0.85)：MoM > 0 且 YoY > 0 且 YoY > yoy_3m_ago（雙增 + 創高）
-        - Tier 2 (0.72)：YoY > 0 且 YoY > yoy_3m_ago（YoY 加速）
-        - Tier 3 (0.55)：YoY > 0（正但未加速）
-        - Tier 4 (0.30)：YoY <= 0（衰退）
-        - Fallback (0.50)：無資料
+        Tier 判定（動態 percentile 門檻 + YoY > 0 絕對下限）：
+            Tier 1 (anchor=0.85): YoY > p80 且 YoY > 0 且 加速度 > 0 且 MoM > 0
+            Tier 2 (anchor=0.72): YoY > p60 且 YoY > 0 且 加速度 > 0
+            Tier 3 (anchor=0.55): YoY > 0
+            Tier 4 (anchor=0.30): YoY ≤ 0
+            Fallback (0.50):      無資料 / 候選股不足以計算 percentile
+
+        當有效樣本 < 10 時退回 2574682 的絕對條件版本（避免單股測試誤判）。
+
+        intra_rank 為同 tier 內 yoy_growth 的 percentile rank（0~1），不跨 tier。
+        accel_boost 來自 compute_revenue_acceleration_score（4 個月連續性加速）。
         """
-        if df_revenue.empty:
-            return pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+        default = pd.DataFrame({"stock_id": stock_ids, "fundamental_score": [0.5] * len(stock_ids)})
+        if df_revenue.empty or len(stock_ids) == 0:
+            return default
 
         rev_grouped = df_revenue.groupby("stock_id", sort=False)
-        result_rows = []
+        raw_rows = []
         for sid in stock_ids:
             if sid not in rev_grouped.groups:
-                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
+                raw_rows.append({"stock_id": sid, "yoy": np.nan, "mom": np.nan, "yoy_3m": np.nan})
                 continue
 
-            rev = rev_grouped.get_group(sid)
-            yoy = rev.iloc[0].get("yoy_growth", None)
-            if yoy is None or pd.isna(yoy):
-                result_rows.append({"stock_id": sid, "fundamental_score": 0.5})
-                continue
+            grp = rev_grouped.get_group(sid)
+            if "date" in grp.columns:
+                grp = grp.sort_values("date", ascending=False)
 
-            mom = rev.iloc[0].get("mom_growth", None)
-            yoy_3m = rev.iloc[0].get("yoy_3m_ago", None)
+            yoy_raw = grp.iloc[0].get("yoy_growth", None)
+            mom_raw = grp.iloc[0].get("mom_growth", None)
+            yoy3_raw = grp.iloc[0].get("yoy_3m_ago", None)
+            raw_rows.append(
+                {
+                    "stock_id": sid,
+                    "yoy": float(yoy_raw) if yoy_raw is not None and not pd.isna(yoy_raw) else np.nan,
+                    "mom": float(mom_raw) if mom_raw is not None and not pd.isna(mom_raw) else np.nan,
+                    "yoy_3m": float(yoy3_raw) if yoy3_raw is not None and not pd.isna(yoy3_raw) else np.nan,
+                }
+            )
 
-            has_mom_pos = mom is not None and not pd.isna(mom) and float(mom) > 0
-            has_accel = yoy_3m is not None and not pd.isna(yoy_3m) and float(yoy) > float(yoy_3m)
+        df = pd.DataFrame(raw_rows)
+        valid_yoy = df["yoy"].dropna()
 
-            if float(yoy) > 0 and has_mom_pos and has_accel:
-                score = 0.85
-            elif float(yoy) > 0 and has_accel:
-                score = 0.72
-            elif float(yoy) > 0:
-                score = 0.55
-            else:
-                score = 0.30
+        use_dynamic = len(valid_yoy) >= self._FUND_DYNAMIC_THRESHOLD_MIN_SAMPLES
+        if use_dynamic:
+            yoy_p80 = float(valid_yoy.quantile(0.80))
+            yoy_p60 = float(valid_yoy.quantile(0.60))
+        else:
+            yoy_p80 = yoy_p60 = np.nan
 
-            result_rows.append({"stock_id": sid, "fundamental_score": score})
+        def _assign_tier(row: pd.Series) -> int:
+            yoy = row["yoy"]
+            if pd.isna(yoy):
+                return 0  # fallback
+            has_mom_pos = not pd.isna(row["mom"]) and row["mom"] > 0
+            has_accel = not pd.isna(row["yoy_3m"]) and yoy > row["yoy_3m"]
 
-        base_df = pd.DataFrame(result_rows)
+            if use_dynamic:
+                if yoy > yoy_p80 and yoy > 0 and has_accel and has_mom_pos:
+                    return 1
+                if yoy > yoy_p60 and yoy > 0 and has_accel:
+                    return 2
+                if yoy > 0:
+                    return 3
+                return 4
+            # 小樣本：退回絕對條件
+            if yoy > 0 and has_mom_pos and has_accel:
+                return 1
+            if yoy > 0 and has_accel:
+                return 2
+            if yoy > 0:
+                return 3
+            return 4
+
+        df["tier"] = df.apply(_assign_tier, axis=1).astype(int)
+        df["tier_anchor"] = df["tier"].map(self._FUND_TIER_ANCHOR).fillna(0.5)
+
+        # 同 tier 內 percentile rank（yoy_growth），≤1 支則中性 0.5
+        df["intra_rank"] = 0.5
+        for t in (1, 2, 3, 4):
+            mask = df["tier"] == t
+            if mask.sum() >= 2:
+                df.loc[mask, "intra_rank"] = df.loc[mask, "yoy"].rank(pct=True)
 
         accel_df = compute_revenue_acceleration_score(df_revenue, stock_ids, consecutive_threshold=3)
         if not accel_df.empty:
-            base_df = base_df.merge(accel_df[["stock_id", "rev_accel_score"]], on="stock_id", how="left")
-            base_df["rev_accel_score"] = base_df["rev_accel_score"].fillna(0.5)
-            base_df["fundamental_score"] = base_df["fundamental_score"] * 0.80 + base_df["rev_accel_score"] * 0.20
-            base_df = base_df.drop(columns=["rev_accel_score"])
+            df = df.merge(accel_df[["stock_id", "rev_accel_score"]], on="stock_id", how="left")
+            df["rev_accel_score"] = df["rev_accel_score"].fillna(0.5)
+        else:
+            df["rev_accel_score"] = 0.5
 
-        return base_df
+        df["fundamental_score"] = (
+            self._FUND_WEIGHT_TIER * df["tier_anchor"]
+            + self._FUND_WEIGHT_INTRA * df["intra_rank"]
+            + self._FUND_WEIGHT_ACCEL * df["rev_accel_score"]
+        )
+        # fallback (tier=0)：無營收資料，維持中性 0.5
+        df.loc[df["tier"] == 0, "fundamental_score"] = 0.5
+
+        return df[["stock_id", "fundamental_score"]]
 
     def _load_chip_sub_factor_ic(self) -> pd.DataFrame | None:
         """從 DB 載入歷史推薦紀錄，計算 chip 子因子 IC。

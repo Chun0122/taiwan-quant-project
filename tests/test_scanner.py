@@ -706,25 +706,28 @@ class TestChipTier:
 
 
 class TestMomentumFundamentalScores:
-    """Momentum 基本面四階梯催化劑評分（IC=0.13 有效維度）。"""
+    """Momentum 基本面 v4：Tier Anchor + Intra-Tier Rank + Accel Boost。
+
+    最終公式：final = 0.60 × tier_anchor + 0.15 × intra_rank + 0.25 × accel_boost
+    小樣本（<10 支）退回絕對條件門檻；大樣本使用動態 p80/p60 percentile。
+    """
 
     def test_tier1_double_positive_with_acceleration(self, momentum_scanner):
-        """MoM > 0 AND YoY > 0 AND YoY > yoy_3m_ago → 0.85（Tier 1）。"""
+        """Tier 1 (anchor=0.85)：MoM>0 且 YoY>0 且 YoY 加速 → score 約 0.735（單股小樣本）。"""
         df_revenue = pd.DataFrame(
             {"stock_id": ["1000"], "yoy_growth": [20.0], "mom_growth": [5.0], "yoy_3m_ago": [10.0]}
         )
         result = momentum_scanner._compute_fundamental_scores(["1000"], df_revenue)
-        # Tier1 基礎 0.85 會與 rev_accel_score 混合（0.8 × 0.85 + 0.2 × rev_accel）
-        # rev_accel_score 資料不足預設 0.5 → 0.8 × 0.85 + 0.2 × 0.5 = 0.78
-        assert result.iloc[0]["fundamental_score"] > 0.7
+        # 0.60*0.85 + 0.15*0.5 + 0.25*accel(0.6) ≈ 0.735
+        assert result.iloc[0]["fundamental_score"] > 0.65
 
     def test_tier4_yoy_negative(self, momentum_scanner):
-        """YoY ≤ 0 → 0.30（Tier 4 衰退）。"""
+        """Tier 4 (anchor=0.30)：YoY ≤ 0 → score 約 0.33（單股，accel=0.3）。"""
         df_revenue = pd.DataFrame(
             {"stock_id": ["1001"], "yoy_growth": [-10.0], "mom_growth": [-5.0], "yoy_3m_ago": [5.0]}
         )
         result = momentum_scanner._compute_fundamental_scores(["1001"], df_revenue)
-        # Tier4 基礎 0.30 + 0.2 × 0.5 = 0.34
+        # 0.60*0.30 + 0.15*0.5 + 0.25*accel(0.3) ≈ 0.33
         assert result.iloc[0]["fundamental_score"] < 0.45
 
     def test_fallback_for_missing_data(self, momentum_scanner):
@@ -742,13 +745,62 @@ class TestMomentumFundamentalScores:
         assert "fundamental_score" in result.columns
 
     def test_tier3_yoy_positive_only(self, momentum_scanner):
-        """YoY > 0 但無加速 → 0.55（Tier 3）。"""
+        """Tier 3 (anchor=0.55)：YoY > 0 但無加速 → score 約 0.48（單股，accel=0.3）。"""
         df_revenue = pd.DataFrame(
             {"stock_id": ["1003"], "yoy_growth": [5.0], "mom_growth": [-2.0], "yoy_3m_ago": [10.0]}
         )
         result = momentum_scanner._compute_fundamental_scores(["1003"], df_revenue)
-        # Tier3 基礎 0.55 + 0.2 × 0.5 = 0.54
-        assert 0.45 < result.iloc[0]["fundamental_score"] < 0.65
+        # 0.60*0.55 + 0.15*0.5 + 0.25*accel(0.3) ≈ 0.48
+        assert 0.40 < result.iloc[0]["fundamental_score"] < 0.60
+
+    def test_tier_ordering_single_stock(self, momentum_scanner):
+        """Tier 1 > Tier 2 > Tier 3 > Tier 4（單股退回絕對條件門檻，驗證序列性）。"""
+        cases = [
+            ("tier1", 30.0, 5.0, 10.0),  # MoM>0 & YoY>0 & accel → tier 1
+            ("tier2", 15.0, -2.0, 10.0),  # YoY>0 & accel & MoM<=0 → tier 2
+            ("tier3", 5.0, -2.0, 10.0),  # YoY>0, no accel → tier 3
+            ("tier4", -10.0, -5.0, 5.0),  # YoY<=0 → tier 4
+        ]
+        scores = []
+        for sid, yoy, mom, y3 in cases:
+            df_rev = pd.DataFrame({"stock_id": [sid], "yoy_growth": [yoy], "mom_growth": [mom], "yoy_3m_ago": [y3]})
+            res = momentum_scanner._compute_fundamental_scores([sid], df_rev)
+            scores.append(res.iloc[0]["fundamental_score"])
+        assert scores[0] > scores[1] > scores[2] > scores[3], f"Tier 序列破壞：{scores}"
+
+    def test_dynamic_percentile_large_sample(self, momentum_scanner):
+        """樣本 >=10 時啟用動態 p80/p60：最強 20% 應被評為 Tier 1（score > 0.65）。"""
+        # 構造 10 支股票，yoy 均勻遞增：10%、12%、...、28%
+        sids = [f"d{i:03d}" for i in range(10)]
+        rows = []
+        for i, sid in enumerate(sids):
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "yoy_growth": 10.0 + i * 2.0,  # 10, 12, 14, ..., 28
+                    "mom_growth": 5.0,  # 全部 MoM>0
+                    "yoy_3m_ago": 5.0,  # 全部加速
+                }
+            )
+        df_rev = pd.DataFrame(rows)
+        result = momentum_scanner._compute_fundamental_scores(sids, df_rev)
+        result = result.set_index("stock_id")
+        # 最強 20%（yoy >= p80 = 24.4）應落 tier 1：d008 (yoy=26)、d009 (yoy=28)
+        # 單股 Tier 1 分數 ≈ 0.735（單 stock 模擬），此處 Tier 1 有 2 支 → intra_rank 變 0.5/1.0
+        top_stock = result.loc["d009", "fundamental_score"]
+        bottom_stock = result.loc["d000", "fundamental_score"]
+        assert top_stock > bottom_stock, "動態門檻下最強股應高於最弱股"
+
+    def test_fundamental_score_bounded(self, momentum_scanner):
+        """所有 fundamental_score 應落在 [0, 1] 區間（合理域）。"""
+        sids = [f"b{i:03d}" for i in range(15)]
+        rows = [
+            {"stock_id": sid, "yoy_growth": 5.0 + i * 3.0, "mom_growth": (i - 7) * 0.5, "yoy_3m_ago": 5.0}
+            for i, sid in enumerate(sids)
+        ]
+        df_rev = pd.DataFrame(rows)
+        result = momentum_scanner._compute_fundamental_scores(sids, df_rev)
+        assert result["fundamental_score"].between(0.0, 1.0).all()
 
 
 @pytest.mark.parametrize(
