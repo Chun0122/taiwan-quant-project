@@ -1001,7 +1001,7 @@ def sync_us_vix(
 def sync_market_data(
     days: int = 10,
     fetcher: FinMindFetcher | None = None,
-    max_stocks: int = 200,
+    max_stocks: int | None = 200,
 ) -> dict[str, int]:
     """同步全市場資料（日K + 三大法人 + 融資融券），用於 discover 掃描。
 
@@ -1013,7 +1013,7 @@ def sync_market_data(
     Args:
         days: 抓取最近 N 天的資料
         fetcher: 可注入 FinMind fetcher 實例（用於備案策略）
-        max_stocks: 備案策略最多抓取的股票數
+        max_stocks: 備案策略最多抓取的股票數；None 表示不限制（上游 CLI 常傳 None）
 
     Returns:
         dict: {"daily_price": N, "institutional": M, "margin": K}
@@ -1129,7 +1129,10 @@ def sync_market_data(
         return result
 
     # --- 策略 3：FinMind 逐股抓取（免費帳號備案） ---
-    logger.info("[全市場] 所有批次來源不可用，改用 FinMind 逐股抓取（上限 %d 支）", max_stocks)
+    logger.info(
+        "[全市場] 所有批次來源不可用，改用 FinMind 逐股抓取（上限 %s 支）",
+        max_stocks if max_stocks is not None else "無",
+    )
 
     with get_session() as session:
         rows = (

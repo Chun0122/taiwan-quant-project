@@ -540,9 +540,9 @@ def detect_crisis_signals(
     2. consec_decline：最後 consec_down_days 天連續收跌
     3. vol_spike：rolling-20d-std(daily_returns) / avg-rolling-20d-std(120d) > vol_ratio_threshold
     4. panic_volume：爆量長黑（TAIEX 成交量 > 20 日均量 × panic_vol_ratio 且當日下跌）
-    5. vix_spike：台灣 VIX > vix_level_threshold 或單日漲幅 > vix_change_threshold
+    5. vix_spike：台灣 VIX ≥ vix_level_threshold 或單日漲幅 ≥ vix_change_threshold
     6. single_day_drop：TAIEX 單日跌幅 > single_day_drop_threshold
-    7. us_vix_spike：美國 VIX (CBOE ^VIX) > us_vix_level_threshold 或單日漲幅 > us_vix_change_threshold
+    7. us_vix_spike：美國 VIX (CBOE ^VIX) ≥ us_vix_level_threshold 或單日漲幅 ≥ us_vix_change_threshold
 
     Args:
         closes: TAIEX 收盤價序列（pd.Series，時序由舊至新）
@@ -661,7 +661,7 @@ def detect_crisis_signals(
         vix_val = float(vix_series.iloc[-1])
         vix_prev = float(vix_series.iloc[-2])
         vix_change = (vix_val - vix_prev) / vix_prev if vix_prev > 0 else 0.0
-        sig_vix = vix_val > vix_level_threshold or vix_change > vix_change_threshold
+        sig_vix = vix_val >= vix_level_threshold or vix_change >= vix_change_threshold
 
     # Signal 6: TAIEX 單日急跌 > 2.5%
     sig_single_drop = False
@@ -676,7 +676,7 @@ def detect_crisis_signals(
         us_vix_val = float(us_vix_series.iloc[-1])
         us_vix_prev = float(us_vix_series.iloc[-2])
         us_vix_change = (us_vix_val - us_vix_prev) / us_vix_prev if us_vix_prev > 0 else 0.0
-        sig_us_vix = us_vix_val > us_vix_level_threshold or us_vix_change > us_vix_change_threshold
+        sig_us_vix = us_vix_val >= us_vix_level_threshold or us_vix_change >= us_vix_change_threshold
 
     signals = {
         "fast_return_5d": sig_return5d,

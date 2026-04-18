@@ -35,11 +35,22 @@ def setup_logging() -> None:
     )
 
 
+_db_initialized: bool = False
+
+
 def init_db() -> None:
-    """共用 DB 初始化，避免各 cmd_ 函數重複 lazy import + 呼叫。"""
+    """共用 DB 初始化，避免各 cmd_ 函數重複 lazy import + 呼叫。
+
+    多次呼叫時為 no-op（morning-routine 路徑會經過多個 cmd_ 函數，
+    每個都獨立呼叫 init_db()；透過 process-level 旗標避免重複 schema 檢查）。
+    """
+    global _db_initialized
+    if _db_initialized:
+        return
     from src.data.database import init_db as _init_db
 
     _init_db()
+    _db_initialized = True
 
 
 def ensure_sync_market_data(sync_days: int, args: argparse.Namespace) -> None:

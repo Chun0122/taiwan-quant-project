@@ -74,9 +74,11 @@ def _compute_macro_stress_check() -> dict:
                 "consec_decline_days": 0,
                 "vol_ratio": 0.0,
                 "vix_val": 0.0,
+                "us_vix_val": 0.0,
                 "signals": {},
                 "summary": "TAIEX 資料不足，跳過壓力檢查",
                 "breadth_below_ma20_pct": None,
+                "breadth_downgraded": False,
             }
 
         rows_sorted = sorted(rows, key=lambda r: r[0])

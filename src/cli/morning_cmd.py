@@ -35,11 +35,16 @@ from src.constants import (
 logger = logging.getLogger(__name__)
 
 
-def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
+def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict | None = None) -> str:
     """建立早晨例行報告的 Discord 訊息摘要。
 
     查詢今日 DiscoveryRecord、近3日 Announcement、以及 WatchEntry 狀態，
     組合成一則 Discord 推播訊息（≤ 1900 字元）。
+
+    Args:
+        today_str: 今日日期字串（YYYY-MM-DD）
+        top_n: 顯示筆數
+        freshness: _verify_data_freshness() 回傳的新鮮度 dict；為 None 時不顯示 banner
     """
     import datetime
     from collections import defaultdict
@@ -50,6 +55,11 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
     from src.data.schema import Announcement, DiscoveryRecord, WatchEntry
 
     lines: list[str] = [f"🌅 **早晨例行報告** ({today_str})", ""]
+    # ── 資料新鮮度警示（置頂顯示）──────────────────────────
+    if freshness and freshness.get("is_stale"):
+        lines.append("⚠️ **資料新鮮度警告** — 以下推薦可能使用過期數據")
+        lines.append(f"  {freshness.get('message', '')}")
+        lines.append("")
     today = datetime.date.fromisoformat(today_str)
 
     # ── Step 0: 宏觀壓力預檢警示（crash/bear 時前置顯示）───────────
@@ -121,7 +131,15 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
                     Announcement.event_type,
                     Announcement.subject,
                 )
-                .where(and_(Announcement.date >= since, Announcement.event_type != "general"))
+                # 注意：SQL 三值邏輯下 `!= "general"` 對 NULL 回傳 UNKNOWN（視為 False）
+                # 若要保留 NULL 事件為「可能重要」需加 IS NULL；此處採嚴格過濾
+                .where(
+                    and_(
+                        Announcement.date >= since,
+                        Announcement.event_type.isnot(None),
+                        Announcement.event_type != "general",
+                    )
+                )
                 .order_by(Announcement.date.desc())
                 .limit(10)
             ).all()
@@ -168,9 +186,9 @@ def _build_morning_discord_summary(today_str: str, top_n: int) -> str:
 
     # ── 4. 籌碼異動警報（快速摘要）──────────────────────────────────
     try:
-        from src.config import settings as _cfg
+        from src.data.database import get_effective_watchlist
 
-        _anomaly = _compute_anomaly_scan(_cfg.fetcher.watchlist)
+        _anomaly = _compute_anomaly_scan(get_effective_watchlist())
         _total_anomaly = sum(len(df) for df in _anomaly.values())
         if _total_anomaly > 0:
             parts_a = []
@@ -289,10 +307,10 @@ def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> l
                 name = str(r.stock_name or "")[:6]
                 industry = str(r.industry_category or "")[:8]
                 chip_tier = str(r.chip_tier or "N/A")
-                comp = f"{r.composite_score:.2f}" if r.composite_score else "  -"
-                tech = f"{r.technical_score:.2f}" if r.technical_score else "  -"
-                chip = f"{r.chip_score:.2f}" if r.chip_score else "  -"
-                fund = f"{r.fundamental_score:.2f}" if r.fundamental_score else "  -"
+                comp = f"{r.composite_score:.2f}" if r.composite_score is not None else "  -"
+                tech = f"{r.technical_score:.2f}" if r.technical_score is not None else "  -"
+                chip = f"{r.chip_score:.2f}" if r.chip_score is not None else "  -"
+                fund = f"{r.fundamental_score:.2f}" if r.fundamental_score is not None else "  -"
                 lines.append(
                     f"{r.rank:>2} {r.stock_id:>6} {name:<6} {r.close:>7.1f} {comp:>5} {tech:>5} {chip:>5} {fund:>5} {chip_tier:>3} {industry:<8}"
                 )
@@ -340,12 +358,20 @@ def _check_strategy_decay() -> None:
 
         wr = r["recent_win_rate"]
         avg = r["recent_avg_return"]
+        n = r["recent_count"]
         wr_str = f"{wr:.0%}" if wr is not None else "N/A"
         avg_str = f"{avg:+.2%}" if avg is not None else "N/A"
-        status = "⚠ 衰減" if r["is_decaying"] else "✓ 正常"
-        print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({r['recent_count']}筆) → {status}")
+        # 小樣本警示：n < 20 時統計雜訊過大，勝率/均報酬不穩定
+        MIN_SAMPLE = 20
+        if n < MIN_SAMPLE:
+            status = f"⚠ 樣本不足（n={n}）"
+        elif r["is_decaying"]:
+            status = "⚠ 衰減"
+        else:
+            status = "✓ 正常"
+        print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({n}筆) → {status}")
 
-        if r["is_decaying"]:
+        if r["is_decaying"] and n >= MIN_SAMPLE:
             has_decay = True
             print(f"    {r['warning']}")
 
@@ -364,8 +390,9 @@ def _check_factor_ic_decay() -> None:
     from src.data.schema import DailyPrice, DiscoveryRecord
     from src.discovery.scanner._functions import compute_rolling_ic
 
+    # 各模式關鍵因子 — 需與實際權重配置一致（News 於 Momentum 已歸零，改用 technical_score）
     key_factors = {
-        "momentum": "news_score",
+        "momentum": "technical_score",
         "swing": "chip_score",
         "value": "fundamental_score",
         "dividend": "fundamental_score",
@@ -432,9 +459,20 @@ def _check_factor_ic_decay() -> None:
 
             latest_ic = factor_df["ic"].iloc[-1]
             label = mode_labels.get(mode, mode)
-            if latest_ic < 0.10:
+            # IC 方向分級：
+            #   ic >= 0.10       → 正常
+            #   0.05 ≤ ic < 0.10 → ⚠ 衰減
+            #   -0.05 ≤ ic < 0.05→ ⚠ 弱（無方向性，接近隨機）
+            #   ic < -0.05       → 🔴 反向（因子方向相反，可能需重新檢視邏輯）
+            if latest_ic < -0.05:
                 has_decay = True
-                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（< 0.10 門檻）")
+                print(f"  🔴 {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（反向，因子失效）")
+            elif latest_ic < 0.05:
+                has_decay = True
+                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（弱，|IC| < 0.05）")
+            elif latest_ic < 0.10:
+                has_decay = True
+                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（衰減，< 0.10 門檻）")
             else:
                 print(f"  ✓ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}")
         except Exception:
@@ -454,11 +492,18 @@ def _sync_full_market() -> None:
     )
 
 
-def _verify_data_freshness(today_str: str) -> None:
+def _verify_data_freshness(today_str: str) -> dict:
     """驗證關鍵資料表的新鮮度（sync 完成後、discover 前執行）。
 
     檢查 DailyPrice (TAIEX) 最新日期是否為今日或昨日（考慮假日）。
-    資料過舊時發出警告但不中斷流程。
+
+    Returns:
+        dict: {
+            "is_stale": bool,      # True 表示資料過時
+            "latest": date | None, # TAIEX 最新日期
+            "gap_days": int,       # 今天與最新日期差距
+            "message": str,        # 顯示訊息
+        }
     """
     import datetime
 
@@ -469,22 +514,35 @@ def _verify_data_freshness(today_str: str) -> None:
 
     today = datetime.date.fromisoformat(today_str)
     max_stale_days = 3  # 允許最大落後天數（考慮假日/長週末）
+    result: dict = {"is_stale": False, "latest": None, "gap_days": 0, "message": ""}
 
     try:
         with get_session() as session:
             latest = session.execute(select(func.max(DailyPrice.date)).where(DailyPrice.stock_id == "TAIEX")).scalar()
 
         if latest is None:
-            print("  ⚠️ 資料新鮮度警告：DailyPrice 無 TAIEX 資料，Discover 結果可能不準確")
-            return
+            msg = "DailyPrice 無 TAIEX 資料"
+            print(f"  ⚠️ 資料新鮮度警告：{msg}，Discover 結果可能不準確")
+            result["is_stale"] = True
+            result["message"] = msg
+            return result
 
         gap = (today - latest).days
+        result["latest"] = latest
+        result["gap_days"] = gap
         if gap > max_stale_days:
-            print(f"  ⚠️ 資料新鮮度警告：TAIEX 最新資料為 {latest}（落後 {gap} 天），Discover 可能使用過期數據")
+            msg = f"TAIEX 最新資料為 {latest}（落後 {gap} 天），Discover 可能使用過期數據"
+            print(f"  ⚠️ 資料新鮮度警告：{msg}")
+            result["is_stale"] = True
+            result["message"] = msg
         else:
             print(f"  ✓ 資料新鮮度正常：TAIEX 最新 {latest}（{gap} 天前）")
+            result["message"] = f"TAIEX 最新 {latest}（{gap} 天前）"
     except Exception as e:
         logging.warning("資料新鮮度檢查失敗: %s", e)
+        result["is_stale"] = True
+        result["message"] = f"檢查失敗：{e}"
+    return result
 
 
 def cmd_morning_routine(args: argparse.Namespace) -> None:
@@ -498,9 +556,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
       Step 5  sync-revenue        同步全市場月營收（最近 1 個月）
       Step 6  sync-features       計算全市場 DailyFeature（Feature Store）
       Step 7  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
-      Step 8  sync-broker         同步 watchlist 分點資料（5日）+ 補抓 discover 推薦（累積歷史）
+      Step 8  sync-broker         同步 watchlist 分點資料（5日，歷史累積）
       Step 8b sync-market         同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉有最新價格）
       Step 9  discover all        五模式全市場掃描（--skip-sync，不重複同步）
+      Step 9b sync-broker         補抓 discover 候選股分點資料（使用今日 DiscoveryRecord）
       Step 10 alert-check         MOPS 重大事件警報（近3日）
       Step 11 watch update-status 批次更新持倉止損/止利/過期狀態
       Step 12 rotation update     輪動組合每日更新（所有 active portfolio）
@@ -534,7 +593,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 16
+    TOTAL = 17
 
     def _step(n: int | str, title: str) -> None:
         print(f"\n{'═' * 64}")
@@ -658,12 +717,9 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         ),
         (
             8,
-            "同步分點交易資料（watchlist 歷史累積 + discover 補抓）",
+            "同步分點交易資料（watchlist 歷史累積）",
             {"dry_run", "skip_sync"},
-            lambda: (
-                cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=False)),
-                cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True)),
-            ),
+            lambda: cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=False)),
         ),
         (
             "8b",
@@ -690,6 +746,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                     use_ic_adjustment=True,
                 )
             ),
+        ),
+        (
+            "9b",
+            "補抓 discover 候選股分點資料（使用今日 DiscoveryRecord）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_broker(argparse.Namespace(stocks=None, days=5, from_discover=True)),
         ),
         (
             10,
@@ -745,6 +807,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     # 步驟執行結果追蹤（原子性：單步失敗不影響後續）
     step_results: list[tuple[int | str, str, str]] = []  # (num, title, status)
+    freshness: dict = {"is_stale": False, "message": ""}
 
     for num, title, skip_on, action in _steps:
         _step(num, title)
@@ -761,8 +824,8 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                 step_results.append((num, title, "failed"))
 
         # ── 資料新鮮度檢查：在 sync 完成後、discover 前驗證 ──
-        if num == 8 and not dry_run:
-            _verify_data_freshness(today_str)
+        if num == "8b" and not dry_run:
+            freshness = _verify_data_freshness(today_str)
 
     # ── 完成提示（含失敗步驟摘要）──────────────────────────────
     failed_steps = [(n, t) for n, t, s in step_results if s == "failed"]
@@ -778,7 +841,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     # ── Discord 摘要推播（或 dry-run 預覽）────────────────────────
     if notify or dry_run:
-        msg = _build_morning_discord_summary(today_str, top_n)
+        msg = _build_morning_discord_summary(today_str, top_n, freshness=freshness)
         # 失敗步驟附加至 Discord 摘要
         if failed_steps:
             fail_lines = [f"\n⚠ **{len(failed_steps)} 個步驟失敗：**"]

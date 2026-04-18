@@ -330,6 +330,8 @@ def cmd_alert_check(args: argparse.Namespace) -> None:
         if event_types:
             conditions.append(Announcement.event_type.in_(event_types))
         else:
+            # SQL 三值邏輯：event_type != "general" 對 NULL 回傳 UNKNOWN，需顯式過濾
+            conditions.append(Announcement.event_type.isnot(None))
             conditions.append(Announcement.event_type != "general")
         if stocks:
             conditions.append(Announcement.stock_id.in_(stocks))
