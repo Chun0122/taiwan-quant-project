@@ -35,7 +35,15 @@ from src.constants import (
 logger = logging.getLogger(__name__)
 
 
-def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict | None = None) -> str:
+def _build_morning_discord_summary(
+    today_str: str,
+    top_n: int,
+    freshness: dict | None = None,
+    stress_result: dict | None = None,
+    ic_status: list[dict] | None = None,
+    disabled_modes: list[str] | None = None,
+    discover_blocked: bool = False,
+) -> str:
     """建立早晨例行報告的 Discord 訊息摘要。
 
     查詢今日 DiscoveryRecord、近3日 Announcement、以及 WatchEntry 狀態，
@@ -45,6 +53,11 @@ def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict |
         today_str: 今日日期字串（YYYY-MM-DD）
         top_n: 顯示筆數
         freshness: _verify_data_freshness() 回傳的新鮮度 dict；為 None 時不顯示 banner
+        stress_result: Step 0 已計算的 stress check 結果（M4：單一真相來源，
+            避免 Discord 區塊重新計算造成 regime 與 rotation 不一致）
+        ic_status: Step 8c IC 健康度檢查結果（M3：透明顯示因子有效性）
+        disabled_modes: IC 反向被自動停用的 discover 模式列表（M2）
+        discover_blocked: True 時表示 Step 9 因資料過期被阻擋（M1）
     """
     import datetime
     from collections import defaultdict
@@ -57,27 +70,48 @@ def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict |
     lines: list[str] = [f"🌅 **早晨例行報告** ({today_str})", ""]
     # ── 資料新鮮度警示（置頂顯示）──────────────────────────
     if freshness and freshness.get("is_stale"):
-        lines.append("⚠️ **資料新鮮度警告** — 以下推薦可能使用過期數據")
+        gap = freshness.get("gap_days", 0) or 0
+        banner = "⚠️ **資料新鮮度警告**"
+        if discover_blocked:
+            banner += f" — Discover 已阻擋（資料過期 {gap} 天 > 硬阻擋門檻 7 天）"
+        else:
+            banner += " — 以下推薦可能使用過期數據"
+        lines.append(banner)
         lines.append(f"  {freshness.get('message', '')}")
         lines.append("")
     today = datetime.date.fromisoformat(today_str)
 
-    # ── Step 0: 宏觀壓力預檢警示（crash/bear 時前置顯示）───────────
-    try:
-        stress = _compute_macro_stress_check()
-        if stress.get("breadth_downgraded"):
-            bpct = stress.get("breadth_below_ma20_pct", 0.0) or 0.0
+    # ── Step 0: 宏觀壓力預檢警示（M4：僅使用傳入的 stress_result，不重新計算）──────
+    if stress_result is not None:
+        if stress_result.get("breadth_downgraded"):
+            bpct = stress_result.get("breadth_below_ma20_pct", 0.0) or 0.0
             lines.append(f"📊 **市場廣度警示**：{bpct:.0%} 股票跌破 MA20 → regime 降級")
             lines.append("")
-        if stress.get("crisis_triggered"):
+        if stress_result.get("crisis_triggered"):
             lines.append("🚨 **CRISIS 崩盤警示已啟動**")
-            lines.append(f"  {stress.get('summary', '')}")
+            lines.append(f"  {stress_result.get('summary', '')}")
             lines.append("")
-        elif stress.get("regime") == "bear":
-            lines.append(f"⚠️ **空頭市場** {stress.get('summary', '')}")
+        elif stress_result.get("regime") == "bear":
+            lines.append(f"⚠️ **空頭市場** {stress_result.get('summary', '')}")
             lines.append("")
-    except Exception:
-        logging.debug("Discord 摘要：宏觀壓力區塊失敗", exc_info=True)
+        elif stress_result.get("regime") is None:
+            lines.append("⚠️ **Regime 未知** — Step 0 宏觀壓力預檢失敗，Rotation 以保守模式運行")
+            lines.append("")
+
+    # ── IC 健康度狀態（M3：顯示被降權/停用的子因子）────────────────
+    if ic_status:
+        failed = [s for s in ic_status if s.get("level") == "error"]
+        inverse = [s for s in ic_status if s.get("level") == "inverse"]
+        weak = [s for s in ic_status if s.get("level") in ("weak", "decay")]
+        if inverse or failed or disabled_modes:
+            lines.append("🧪 **IC 健康度**")
+            for s in inverse:
+                lines.append(f"  🔴 {s['mode']} {s['factor']} IC={s['ic']:+.4f}（反向→已暫停）")
+            for s in weak:
+                lines.append(f"  ⚠ {s['mode']} {s['factor']} IC={s['ic']:+.4f}（{s['level']}）")
+            for s in failed:
+                lines.append(f"  ⚠ {s['mode']} IC 計算失敗: {s.get('error', 'unknown')}")
+            lines.append("")
 
     # ── 1. 多模式選股（今日 DiscoveryRecord，出現 2+ 模式）──────────────
     with get_session() as session:
@@ -145,7 +179,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict |
             ).all()
     except Exception:
         # event_type 欄位可能尚未 migrate，跳過重大事件區塊
-        logging.debug("Discord 摘要：重大事件區塊失敗", exc_info=True)
+        logger.debug("Discord 摘要：重大事件區塊失敗", exc_info=True)
 
     _EVENT_SHORT = {
         "earnings_call": "📣法說",
@@ -211,7 +245,7 @@ def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict |
             lines.append(f"🚨 **籌碼異動** ({_total_anomaly}筆)  " + "  ".join(parts_a))
             lines.append("")
     except Exception:
-        logging.debug("Discord 摘要：籌碼異動區塊失敗", exc_info=True)
+        logger.debug("Discord 摘要：籌碼異動區塊失敗", exc_info=True)
 
     # ── 5. 輪動組合摘要 ──────────────────────────────────────────────
     try:
@@ -233,11 +267,11 @@ def _build_morning_discord_summary(today_str: str, top_n: int, freshness: dict |
                     )
             lines.append("")
     except Exception:
-        logging.debug("Discord 摘要：輪動組合區塊失敗", exc_info=True)
+        logger.debug("Discord 摘要：輪動組合區塊失敗", exc_info=True)
 
     msg = "\n".join(lines)
-    # Discord 單訊息上限 2000 字元，保留緩衝
-    return msg[:1900] if len(msg) > 1900 else msg
+    # Discord 單訊息上限 2000 字元，保留緩衝；截斷時附省略號避免誤以為資料完整
+    return msg[:1897] + "..." if len(msg) > 1900 else msg
 
 
 def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> list[str]:
@@ -307,12 +341,13 @@ def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> l
                 name = str(r.stock_name or "")[:6]
                 industry = str(r.industry_category or "")[:8]
                 chip_tier = str(r.chip_tier or "N/A")
+                close_str = f"{r.close:.1f}" if r.close is not None else "   -"
                 comp = f"{r.composite_score:.2f}" if r.composite_score is not None else "  -"
                 tech = f"{r.technical_score:.2f}" if r.technical_score is not None else "  -"
                 chip = f"{r.chip_score:.2f}" if r.chip_score is not None else "  -"
                 fund = f"{r.fundamental_score:.2f}" if r.fundamental_score is not None else "  -"
                 lines.append(
-                    f"{r.rank:>2} {r.stock_id:>6} {name:<6} {r.close:>7.1f} {comp:>5} {tech:>5} {chip:>5} {fund:>5} {chip_tier:>3} {industry:<8}"
+                    f"{r.rank:>2} {r.stock_id:>6} {name:<6} {close_str:>7} {comp:>5} {tech:>5} {chip:>5} {fund:>5} {chip_tier:>3} {industry:<8}"
                 )
             lines.append("```")
 
@@ -329,7 +364,7 @@ def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> l
                     )
 
             msg = "\n".join(lines)
-            messages.append(msg[:1900] if len(msg) > 1900 else msg)
+            messages.append(msg[:1897] + "..." if len(msg) > 1900 else msg)
 
     return messages
 
@@ -379,8 +414,38 @@ def _check_strategy_decay() -> None:
         print("  所有模式績效正常，無衰減警告。")
 
 
-def _check_factor_ic_decay() -> None:
-    """檢查各模式關鍵因子 IC 衰退（供 morning-routine 呼叫）。"""
+# 各模式關鍵因子 — 需與實際權重配置一致（News 於 Momentum 已歸零，改用 technical_score）
+_KEY_FACTORS: dict[str, str] = {
+    "momentum": "technical_score",
+    "swing": "chip_score",
+    "value": "fundamental_score",
+    "dividend": "fundamental_score",
+    "growth": "fundamental_score",
+}
+_MODE_LABELS: dict[str, str] = {
+    "momentum": "Momentum",
+    "swing": "Swing",
+    "value": "Value",
+    "dividend": "Dividend",
+    "growth": "Growth",
+}
+
+
+def _compute_factor_ic_status() -> list[dict]:
+    """為每個 discover 模式計算關鍵因子 rolling IC（純函數）。
+
+    回傳每個模式一筆 dict：
+    - {"mode", "factor", "ic", "level", "error"}
+    - level ∈ {"normal", "decay", "weak", "inverse", "insufficient", "error"}
+
+    level 判定（C1 修復：失敗時明確分級為 "error"，不再靜默）：
+      ic >= 0.10       → normal
+      0.05 ≤ ic < 0.10 → decay
+     -0.05 ≤ ic < 0.05 → weak
+      ic < -0.05       → inverse
+      樣本不足          → insufficient
+      例外              → error（含 error 訊息）
+    """
     from datetime import date, timedelta
 
     import pandas as pd
@@ -390,26 +455,12 @@ def _check_factor_ic_decay() -> None:
     from src.data.schema import DailyPrice, DiscoveryRecord
     from src.discovery.scanner._functions import compute_rolling_ic
 
-    # 各模式關鍵因子 — 需與實際權重配置一致（News 於 Momentum 已歸零，改用 technical_score）
-    key_factors = {
-        "momentum": "technical_score",
-        "swing": "chip_score",
-        "value": "fundamental_score",
-        "dividend": "fundamental_score",
-        "growth": "fundamental_score",
-    }
-    mode_labels = {
-        "momentum": "Momentum",
-        "swing": "Swing",
-        "value": "Value",
-        "dividend": "Dividend",
-        "growth": "Growth",
-    }
+    results: list[dict] = []
+    cutoff = date.today() - timedelta(days=35)
 
-    has_decay = False
-    for mode, key_factor in key_factors.items():
+    for mode, key_factor in _KEY_FACTORS.items():
+        entry: dict = {"mode": _MODE_LABELS.get(mode, mode), "mode_key": mode, "factor": key_factor}
         try:
-            cutoff = date.today() - timedelta(days=35)
             with get_session() as session:
                 stmt = select(
                     DiscoveryRecord.scan_date,
@@ -425,6 +476,8 @@ def _check_factor_ic_decay() -> None:
                 )
                 rows = session.execute(stmt).all()
                 if len(rows) < 20:
+                    entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
+                    results.append(entry)
                     continue
                 df_records = pd.DataFrame(
                     rows,
@@ -446,40 +499,98 @@ def _check_factor_ic_decay() -> None:
                     )
                 ).all()
                 if not price_rows:
+                    entry.update({"ic": None, "level": "insufficient", "sample_count": 0})
+                    results.append(entry)
                     continue
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
             rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
             if rolling_df.empty:
+                entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
+                results.append(entry)
                 continue
 
             factor_df = rolling_df[rolling_df["factor"] == key_factor].sort_values("window_end")
             if factor_df.empty:
+                entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
+                results.append(entry)
                 continue
 
-            latest_ic = factor_df["ic"].iloc[-1]
-            label = mode_labels.get(mode, mode)
-            # IC 方向分級：
-            #   ic >= 0.10       → 正常
-            #   0.05 ≤ ic < 0.10 → ⚠ 衰減
-            #   -0.05 ≤ ic < 0.05→ ⚠ 弱（無方向性，接近隨機）
-            #   ic < -0.05       → 🔴 反向（因子方向相反，可能需重新檢視邏輯）
+            latest_ic = float(factor_df["ic"].iloc[-1])
             if latest_ic < -0.05:
-                has_decay = True
-                print(f"  🔴 {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（反向，因子失效）")
+                level = "inverse"
             elif latest_ic < 0.05:
-                has_decay = True
-                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（弱，|IC| < 0.05）")
+                level = "weak"
             elif latest_ic < 0.10:
-                has_decay = True
-                print(f"  ⚠ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}（衰減，< 0.10 門檻）")
+                level = "decay"
             else:
-                print(f"  ✓ {label} 關鍵因子 {key_factor} IC={latest_ic:+.4f}")
-        except Exception:
-            continue
+                level = "normal"
+            entry.update({"ic": latest_ic, "level": level, "sample_count": len(rows)})
+            results.append(entry)
+        except Exception as exc:
+            # C1 修復：明確記錄失敗而非靜默 continue
+            logger.warning("IC 計算失敗 mode=%s factor=%s: %s", mode, key_factor, exc, exc_info=True)
+            entry.update({"ic": None, "level": "error", "error": str(exc)})
+            results.append(entry)
 
-    if not has_decay:
+    return results
+
+
+def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
+    """檢查各模式關鍵因子 IC 衰退（供 morning-routine 呼叫）。
+
+    C1 修復：
+    - 若未傳 ic_status 則重新計算
+    - 列印結果時明確區分「失敗」與「正常」，避免靜默誤導
+    - 回傳 ic_status 供 Discord 摘要使用
+
+    Args:
+        ic_status: 預先計算好的 IC 狀態（Step 8c 已算過時重用）
+
+    Returns:
+        list[dict]: 同 _compute_factor_ic_status 回傳格式
+    """
+    if ic_status is None:
+        ic_status = _compute_factor_ic_status()
+
+    has_decay = False
+    failed_modes: list[str] = []
+    for s in ic_status:
+        label = s.get("mode", "?")
+        factor = s.get("factor", "?")
+        level = s.get("level", "?")
+        ic = s.get("ic")
+        if level == "error":
+            failed_modes.append(label)
+            print(f"  ⚠ {label} 關鍵因子 {factor} IC 計算失敗：{s.get('error', 'unknown')}")
+            continue
+        if level == "insufficient":
+            n = s.get("sample_count", 0)
+            print(f"  {label} 關鍵因子 {factor}：樣本不足（n={n}，需 ≥20），跳過")
+            continue
+        if level == "inverse":
+            has_decay = True
+            print(f"  🔴 {label} 關鍵因子 {factor} IC={ic:+.4f}（反向，因子失效）")
+        elif level == "weak":
+            has_decay = True
+            print(f"  ⚠ {label} 關鍵因子 {factor} IC={ic:+.4f}（弱，|IC| < 0.05）")
+        elif level == "decay":
+            has_decay = True
+            print(f"  ⚠ {label} 關鍵因子 {factor} IC={ic:+.4f}（衰減，< 0.10 門檻）")
+        else:
+            print(f"  ✓ {label} 關鍵因子 {factor} IC={ic:+.4f}")
+
+    if failed_modes:
+        print(f"  ⚠ {len(failed_modes)} 個模式 IC 計算失敗：{', '.join(failed_modes)}（請檢查 log）")
+    elif not has_decay:
         print("  所有模式關鍵因子 IC 正常。")
+
+    return ic_status
+
+
+def _inverse_modes_from_ic_status(ic_status: list[dict]) -> list[str]:
+    """從 IC 狀態抽出反向模式的 mode_key 列表（M2 用）。"""
+    return [s["mode_key"] for s in ic_status if s.get("level") == "inverse"]
 
 
 def _sync_full_market() -> None:
@@ -539,7 +650,7 @@ def _verify_data_freshness(today_str: str) -> dict:
             print(f"  ✓ 資料新鮮度正常：TAIEX 最新 {latest}（{gap} 天前）")
             result["message"] = f"TAIEX 最新 {latest}（{gap} 天前）"
     except Exception as e:
-        logging.warning("資料新鮮度檢查失敗: %s", e)
+        logger.warning("資料新鮮度檢查失敗: %s", e)
         result["is_stale"] = True
         result["message"] = f"檢查失敗：{e}"
     return result
@@ -593,7 +704,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     notify: bool = getattr(args, "notify", False)
 
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    TOTAL = 17
+    TOTAL = 18
 
     def _step(n: int | str, title: str) -> None:
         print(f"\n{'═' * 64}")
@@ -622,9 +733,21 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     print("  [Step 0] 宏觀壓力預檢（Macro Stress Check）")
     print(f"{'═' * 64}")
     stress_result: dict = {}
-    regime_now: str = "sideways"  # 預設值（dry-run 或 Step 0 異常時使用）
+    # C3 修復：regime_now 預設 None，Step 0 失敗時保持 None，
+    # Rotation/Discord 皆可識別「未知 regime」並走保守 fallback，
+    # 不再假性返回 "sideways" 造成 Crisis 保護被誤略過。
+    regime_now: str | None = None
     if dry_run:
-        _skip("dry-run")
+        # dry-run 仍執行 stress check（純讀 DB，無副作用），
+        # 讓 Discord 預覽與實際執行顯示一致的 regime（M4）。
+        try:
+            stress_result = _compute_macro_stress_check()
+            regime_now = stress_result.get("regime")
+            print(f"  [dry-run] 市場狀態預覽: {(regime_now or 'unknown').upper()}")
+            print(f"  [dry-run] {stress_result.get('summary', '')}")
+        except Exception as exc:
+            logger.warning("dry-run stress check 失敗: %s", exc, exc_info=True)
+            stress_result = {}
     else:
         # 先同步 VIX（失敗不中斷流程）
         try:
@@ -634,7 +757,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             if vix_count > 0:
                 print(f"  台灣 VIX 同步：{vix_count} 筆")
         except (ConnectionError, OSError, ValueError, KeyError) as e:
-            logging.warning("台灣 VIX 同步失敗（不影響流程）: %s", e)
+            logger.warning("台灣 VIX 同步失敗（不影響流程）: %s", e)
 
         try:
             from src.data.pipeline import sync_us_vix
@@ -643,11 +766,21 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             if us_vix_count > 0:
                 print(f"  美國 VIX 同步：{us_vix_count} 筆")
         except (ConnectionError, OSError, ValueError, KeyError) as e:
-            logging.warning("美國 VIX 同步失敗（不影響流程）: %s", e)
+            logger.warning("美國 VIX 同步失敗（不影響流程）: %s", e)
 
-        stress_result = _compute_macro_stress_check()
-        regime_now = stress_result.get("regime", "sideways")
-        print(f"  市場狀態: {regime_now.upper()}")
+        # C2 修復：stress check 外層 try/except，任何例外（含 OperationalError）皆不中斷流程
+        try:
+            stress_result = _compute_macro_stress_check()
+            regime_now = stress_result.get("regime")
+        except Exception as exc:
+            logger.warning("Step 0 宏觀壓力預檢失敗: %s — Rotation 將走 regime fallback", exc, exc_info=True)
+            stress_result = {"regime": None, "summary": f"壓力預檢失敗：{exc}"}
+            regime_now = None
+
+        if regime_now:
+            print(f"  市場狀態: {regime_now.upper()}")
+        else:
+            print("  !! 市場狀態: UNKNOWN（壓力預檢失敗或資料不足，Rotation 將使用保守預設）")
         print(f"  {stress_result.get('summary', '')}")
         if stress_result.get("breadth_downgraded"):
             bpct = stress_result.get("breadth_below_ma20_pct", 0.0) or 0.0
@@ -655,9 +788,9 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         if stress_result.get("crisis_triggered"):
             print()
             print("  !! CRISIS 模式啟動 — Discover 將使用最嚴格的過濾與保守參數 !!")
-            print(f"     5日報酬: {stress_result['fast_return_5d']:+.1%}")
-            print(f"     連跌天數: {stress_result['consec_decline_days']}")
-            print(f"     波動率倍數: {stress_result['vol_ratio']:.1f}x")
+            print(f"     5日報酬: {stress_result.get('fast_return_5d', 0.0):+.1%}")
+            print(f"     連跌天數: {stress_result.get('consec_decline_days', 0)}")
+            print(f"     波動率倍數: {stress_result.get('vol_ratio', 0.0):.1f}x")
             sigs = stress_result.get("signals", {})
             if sigs.get("panic_volume"):
                 print("     爆量長黑: ✓（成交量 > 20日均量 × 1.5 且下跌）")
@@ -668,6 +801,54 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             if sigs.get("single_day_drop"):
                 print("     單日急跌: ✓（TAIEX 單日跌幅 > 2.5%）")
             print()
+
+    # M2：共用變數，供 Step 8c 寫入、Step 9 讀取
+    ic_status_state: dict = {"ic_status": [], "disabled_modes": []}
+    # M1：共用變數，Step 9 判斷資料是否過期阻擋
+    discover_blocked_state: dict = {"blocked": False, "reason": ""}
+    MAX_STALE_HARD_BLOCK_DAYS = 7  # 超過 7 天資料過期直接阻擋 Step 9（M1）
+
+    def _step_8c_ic_precheck() -> None:
+        """Step 8c：在 Step 9 discover 前檢查關鍵因子 IC，反向模式自動停用（M2）。"""
+        status = _compute_factor_ic_status()
+        ic_status_state["ic_status"] = status
+        _check_factor_ic_decay(ic_status=status)
+        disabled = _inverse_modes_from_ic_status(status)
+        ic_status_state["disabled_modes"] = disabled
+        if disabled:
+            labels = [_MODE_LABELS.get(m, m) for m in disabled]
+            print(f"  ⚠ 將於 Step 9 自動停用 {len(disabled)} 個反向模式：{', '.join(labels)}")
+        else:
+            print("  無反向模式需停用。")
+
+    def _step_9_discover() -> None:
+        """Step 9：discover all；M1 資料過期硬阻擋；M2 停用反向模式。"""
+        # M1：資料過期硬阻擋
+        gap = freshness.get("gap_days", 0) or 0
+        if freshness.get("is_stale") and gap > MAX_STALE_HARD_BLOCK_DAYS:
+            discover_blocked_state["blocked"] = True
+            discover_blocked_state["reason"] = f"資料過期 {gap} 天（> {MAX_STALE_HARD_BLOCK_DAYS} 天硬阻擋）"
+            print(f"  !! Discover 已阻擋：{discover_blocked_state['reason']}")
+            print("     請先執行完整 sync 後重跑，或確認非預期的資料斷層。")
+            return
+
+        disabled_modes = ic_status_state.get("disabled_modes", [])
+        _cmd_discover_all(
+            argparse.Namespace(
+                skip_sync=True,
+                sync_days=30,
+                top=top_n,
+                min_price=10.0,
+                max_price=2000.0,
+                min_volume=500_000,
+                max_stocks=None,
+                min_appearances=1,
+                export=None,
+                notify=False,
+                use_ic_adjustment=True,
+                disabled_modes=disabled_modes,
+            )
+        )
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
     _steps = [
@@ -728,24 +909,16 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             _sync_full_market,
         ),
         (
+            "8c",
+            "關鍵因子 IC 預檢（反向模式自動停用 discover）",
+            {"dry_run"},
+            _step_8c_ic_precheck,
+        ),
+        (
             9,
             f"五模式全市場掃描（discover all --skip-sync --top {top_n}）",
             {"dry_run"},
-            lambda: _cmd_discover_all(
-                argparse.Namespace(
-                    skip_sync=True,
-                    sync_days=30,
-                    top=top_n,
-                    min_price=10.0,
-                    max_price=2000.0,
-                    min_volume=500_000,
-                    max_stocks=None,
-                    min_appearances=1,
-                    export=None,
-                    notify=False,
-                    use_ic_adjustment=True,
-                )
-            ),
+            _step_9_discover,
         ),
         (
             "9b",
@@ -791,12 +964,6 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run"},
             lambda: _check_strategy_decay(),
         ),
-        (
-            "15b",
-            "關鍵因子 IC 衰退檢查",
-            {"dry_run"},
-            lambda: _check_factor_ic_decay(),
-        ),
     ]
 
     active_flags: set[str] = set()
@@ -823,7 +990,8 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                 print(f"  !! Step {num} 失敗，繼續執行後續步驟")
                 step_results.append((num, title, "failed"))
 
-        # ── 資料新鮮度檢查：在 sync 完成後、discover 前驗證 ──
+        # ── 資料新鮮度檢查：在 sync 位置後、discover 前驗證 ──
+        # 即使 --skip-sync 也執行（讓使用者誤用 skip-sync 在過期資料上時，M1 硬阻擋仍生效）
         if num == "8b" and not dry_run:
             freshness = _verify_data_freshness(today_str)
 
@@ -841,13 +1009,24 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     # ── Discord 摘要推播（或 dry-run 預覽）────────────────────────
     if notify or dry_run:
-        msg = _build_morning_discord_summary(today_str, top_n, freshness=freshness)
+        msg = _build_morning_discord_summary(
+            today_str,
+            top_n,
+            freshness=freshness,
+            stress_result=stress_result,
+            ic_status=ic_status_state.get("ic_status") or None,
+            disabled_modes=ic_status_state.get("disabled_modes") or None,
+            discover_blocked=discover_blocked_state.get("blocked", False),
+        )
         # 失敗步驟附加至 Discord 摘要
         if failed_steps:
             fail_lines = [f"\n⚠ **{len(failed_steps)} 個步驟失敗：**"]
             for n, t in failed_steps:
                 fail_lines.append(f"  ✗ Step {n}: {t}")
             msg += "\n".join(fail_lines) + "\n"
+        # m1 修復副作用：失敗步驟附加後再度截斷，避免 Discord 2000 字元上限
+        if len(msg) > 1900:
+            msg = msg[:1897] + "..."
         discover_msgs = _build_discover_discord_detail(today_str, top_n_per_mode=min(top_n, 10))
         if dry_run:
             # 使用 UTF-8 輸出，繞過 Windows cp950 對 emoji 的限制

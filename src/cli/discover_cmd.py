@@ -286,11 +286,18 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
         "growth": "成長",
     }
 
+    # M2：支援由上層（morning-routine Step 8c）傳入被停用的模式（IC 反向自動停用）
+    disabled_modes: list[str] = list(getattr(args, "disabled_modes", []) or [])
+
     results: dict = {}
     scan_summaries: list[str] = []
 
     for mode_key, ScannerClass in scanner_classes.items():
         label = mode_labels[mode_key]
+        if mode_key in disabled_modes:
+            print(f"  [{label}] 已停用（IC 反向）— 跳過掃描")
+            scan_summaries.append(f"  {label:<4} 已停用（IC 反向）")
+            continue
         print(f"正在掃描 [{label}]...", end="", flush=True)
         scanner = ScannerClass(
             min_price=args.min_price,
