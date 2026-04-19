@@ -13,6 +13,7 @@ from datetime import date, datetime
 import pandas as pd
 from sqlalchemy import select
 
+from src.config import settings
 from src.constants import (
     COMMISSION_RATE,
     LIQUIDITY_PARTICIPATION_LIMIT,
@@ -416,9 +417,32 @@ class RotationManager:
 
             # 載入今日排名
             rankings = resolve_rankings(portfolio.mode, today, session, top_n=portfolio.max_positions * 3)
-            if not rankings:
-                # 嘗試找最近的 scan_date
+            # 若掃描器因 regime 封鎖回傳空結果，不拉取前日排名（避免用不同 regime 的名單買入）
+            # regime 變數稍後才解析，這裡先預讀一次（若失敗視為未封鎖，由 fallback 處理）
+            _regime_for_gate = regime
+            if _regime_for_gate is None:
+                try:
+                    from src.regime.detector import RegimeStateMachine
+
+                    _regime_for_gate = RegimeStateMachine().current_regime
+                except Exception:
+                    _regime_for_gate = None
+            from src.constants import REGIME_MODE_BLOCK as _RMB
+
+            _mode_blocked_today = bool(
+                _regime_for_gate
+                and portfolio.mode != "all"
+                and portfolio.mode in _RMB.get(_regime_for_gate, frozenset())
+            )
+            if not rankings and not _mode_blocked_today:
+                # 嘗試找最近的 scan_date（未被 regime 封鎖時才 fallback）
                 rankings = self._find_latest_rankings(session, portfolio.mode, today)
+            elif not rankings and _mode_blocked_today:
+                logger.info(
+                    "Rotation: %s 模式在 %s 被封鎖 — 跳過新買入，僅處理止損/到期/風控",
+                    portfolio.mode,
+                    _regime_for_gate,
+                )
 
             # 交易日曆（前 120 天 ~ 未來 30 天）
             from datetime import timedelta
@@ -533,6 +557,27 @@ class RotationManager:
                 logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
                 return RotationActions(to_sell=[{**p, "reason": "max_drawdown_liquidation"} for p in open_positions])
 
+            # ── Rotation 成本閘門（A/B/C）參數 ──
+            cost_cfg = settings.quant.rotation_cost
+            if cost_cfg.enabled:
+                iso_year, iso_week, _ = today.isocalendar()
+                week_start = date.fromisocalendar(iso_year, iso_week, 1)
+                stmt_swaps = select(RotationPosition).where(
+                    RotationPosition.portfolio_id == portfolio.id,
+                    RotationPosition.exit_reason == "holding_expired",
+                    RotationPosition.exit_date >= week_start,
+                    RotationPosition.exit_date <= today,
+                )
+                weekly_swaps_used = len(list(session.execute(stmt_swaps).scalars()))
+                gate_min_hold = cost_cfg.min_hold_days
+                gate_score_gap = cost_cfg.score_gap_threshold
+                gate_weekly_cap = cost_cfg.weekly_swap_cap
+            else:
+                weekly_swaps_used = 0
+                gate_min_hold = 0
+                gate_score_gap = 0.0
+                gate_weekly_cap = 0
+
             # 計算 rotation
             actions = compute_rotation_actions(
                 current_positions=open_positions,
@@ -549,6 +594,10 @@ class RotationManager:
                 corr_matrix=corr_matrix,
                 vol_weights=vol_weights,
                 regime=regime,
+                min_hold_days=gate_min_hold,
+                score_gap_threshold=gate_score_gap,
+                weekly_swap_cap=gate_weekly_cap,
+                weekly_swaps_used=weekly_swaps_used,
             )
 
             # 執行賣出
@@ -738,6 +787,10 @@ class RotationManager:
             # 每日持倉快照
             daily_positions_snapshot: list[dict] = []
 
+            # 成本閘門：每 ISO 週 holding_expired 累計
+            cost_cfg = settings.quant.rotation_cost
+            weekly_swap_counter: dict[tuple[int, int], int] = {}
+
             for day in trading_cal:
                 # 取今日排名
                 if day in all_rankings:
@@ -768,6 +821,19 @@ class RotationManager:
                     if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
                         stop_losses[r["stock_id"]] = r["stop_loss"]
 
+                # 成本閘門 — 取本 ISO 週 holding_expired 用量
+                iso_y, iso_w, _ = day.isocalendar()
+                if cost_cfg.enabled:
+                    weekly_used_this_week = weekly_swap_counter.get((iso_y, iso_w), 0)
+                    gate_min_hold = cost_cfg.min_hold_days
+                    gate_score_gap = cost_cfg.score_gap_threshold
+                    gate_weekly_cap = cost_cfg.weekly_swap_cap
+                else:
+                    weekly_used_this_week = 0
+                    gate_min_hold = 0
+                    gate_score_gap = 0.0
+                    gate_weekly_cap = 0
+
                 # 計算 rotation
                 actions = compute_rotation_actions(
                     current_positions=positions,
@@ -780,7 +846,13 @@ class RotationManager:
                     current_cash=cash,
                     stop_losses=stop_losses,
                     today_prices=today_prices,
+                    min_hold_days=gate_min_hold,
+                    score_gap_threshold=gate_score_gap,
+                    weekly_swap_cap=gate_weekly_cap,
+                    weekly_swaps_used=weekly_used_this_week,
                 )
+                if cost_cfg.enabled and actions.holding_expired_sells > 0:
+                    weekly_swap_counter[(iso_y, iso_w)] = weekly_used_this_week + actions.holding_expired_sells
 
                 # ── 執行賣出 ──
                 sold_ids = set()

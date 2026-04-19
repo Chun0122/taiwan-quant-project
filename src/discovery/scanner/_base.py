@@ -38,6 +38,7 @@ from src.discovery.scanner._functions import (
     compute_chip_macd,
     compute_daytrade_penalty,
     compute_factor_ic,
+    compute_ic_aware_score_transform,
     compute_ic_impact_weight_adjustments,
     compute_institutional_acceleration,
     compute_key_player_cost_basis,
@@ -99,9 +100,28 @@ class MarketScanner:
         self.use_ic_adjustment = use_ic_adjustment
         # 子因子 rank 收集器（供 IC 診斷使用）
         self._sub_factor_ranks: dict[str, pd.DataFrame] = {}
+        # 維度 IC（E2b 設置、_score_candidates 消費做 IC-aware 分數翻轉）
+        self._dimension_ic_df: pd.DataFrame | None = None
         # Universe Filter：各子類可在 __init__ 中傳入模式專屬 config
         self._universe_config = universe_config or UniverseConfig()
         self._universe_filter = UniverseFilter(self._universe_config)
+
+    def _is_regime_blocked(self) -> bool:
+        """Stage 0.1 regime gate 判定 — 合併兩個來源。
+
+        判定規則（OR 合併）：
+          1. 子類 _blocked_regimes 集合（類級自訂）
+          2. 全域 REGIME_MODE_BLOCK 矩陣（constants.py 集中管理）
+
+        需在 self.regime 已設置後呼叫。子類覆寫 run() 時應主動呼叫此方法。
+        """
+        from src.constants import REGIME_MODE_BLOCK as _RMB
+
+        if not getattr(self, "regime", None):
+            return False
+        if self.regime in self._blocked_regimes:
+            return True
+        return self.mode_name in _RMB.get(self.regime, frozenset())
 
     def run(self) -> DiscoveryResult:
         """執行四階段漏斗掃描。
@@ -131,7 +151,7 @@ class MarketScanner:
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
 
         # Stage 0.1: Regime gate — 特定模式在指定 regime 不執行
-        if self.regime in self._blocked_regimes:
+        if self._is_regime_blocked():
             logger.warning(
                 "Stage 0.1: %s 模式在 %s 市場暫停掃描（歷史績效不佳）",
                 self.mode_name,
@@ -1394,6 +1414,17 @@ class MarketScanner:
         # ≥20 筆歷史推薦即自動校準；use_ic_adjustment=False 可關閉（測試用）
         if self.use_ic_adjustment:
             w = self._apply_ic_weight_adjustment(w, scored_candidates=candidates)
+
+        # E2c: IC 感知分數翻轉（問題 3 修正）— 對 IC 反向的維度分數做 1 - score 翻轉
+        # 與 _apply_ic_weight_adjustment 共用 self._dimension_ic_df，不另打 DB
+        if self.use_ic_adjustment and self._dimension_ic_df is not None and not self._dimension_ic_df.empty:
+            score_cols_for_ic = [f"{k}_score" for k in w]
+            df_for_flip = candidates[["stock_id", *[c for c in score_cols_for_ic if c in candidates.columns]]]
+            df_flipped, actions = compute_ic_aware_score_transform(df_for_flip, self._dimension_ic_df)
+            for col, action in actions.items():
+                if action in ("flipped", "neutralized") and col in df_flipped.columns:
+                    candidates[col] = df_flipped[col].values
+                    logger.info("E2c IC-aware 分數轉換: %s — %s → %s", self.mode_name, col, action)
 
         composite = pd.Series(0.0, index=candidates.index)
         for key, weight in w.items():
@@ -2658,6 +2689,8 @@ class MarketScanner:
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
             ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+            # 暫存供 _score_candidates 做 IC 感知分數翻轉使用（問題 3：news_score 反向修正）
+            self._dimension_ic_df = ic_df
 
             # 計算今日影響力（若候選資料充足）
             impact_df = self._compute_dimension_impact(base_weights, scored_candidates)

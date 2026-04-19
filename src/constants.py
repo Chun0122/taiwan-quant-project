@@ -99,3 +99,15 @@ REGIME_UNIVERSE_ADJUSTMENTS: dict[str, dict] = {
     "bear": {"turnover_multiplier": 1.3, "volume_ratio_override": None},  # 收緊流動性、放寬量比
     "crisis": {"turnover_multiplier": 1.5, "volume_ratio_override": None},  # 嚴格流動性、跳過量比
 }
+
+# ── Regime × Mode 封鎖矩陣 ───────────────────────────────────────────
+# 在指定 regime 下暫停特定模式的 discover 掃描（歷史績效驗證不佳）。
+# 實證依據（2026-02-27 ~ 04-19 T+1 entry 回測）：
+#   momentum × sideways：5/10/20 日全線負報酬，勝率 15~30%
+#   growth   × sideways：高 beta 特性，歷史先驗相同風險
+#   growth   × crisis：高 beta 在危機期放大虧損（保留 momentum，實測 10日 crisis +8.35%）
+# 「all」模式跨多模式平均，不封鎖（保留 value/dividend 之類防禦性配置）
+REGIME_MODE_BLOCK: dict[str, frozenset[str]] = {
+    "sideways": frozenset({"momentum", "growth"}),
+    "crisis": frozenset({"growth"}),
+}

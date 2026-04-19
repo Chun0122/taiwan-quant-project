@@ -67,6 +67,15 @@ class GrowthScanner(MarketScanner):
             self.regime = "sideways"
             logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
 
+        # Stage 0.1: Regime gate（與 MarketScanner.run() 共用邏輯）
+        if self._is_regime_blocked():
+            logger.warning(
+                "Stage 0.1: %s 模式在 %s 市場暫停掃描（歷史績效不佳）",
+                self.mode_name,
+                self.regime,
+            )
+            return DiscoveryResult(rankings=pd.DataFrame(), total_stocks=0, after_coarse=0, mode=self.mode_name)
+
         # Stage 0.5: 檢查月營收覆蓋率，不足時自動從 MOPS 補抓
         try:
             from sqlalchemy import func as sa_func

@@ -43,6 +43,8 @@ class RotationActions:
     to_buy: list[dict] = field(default_factory=list)
     to_hold: list[dict] = field(default_factory=list)
     renewed: list[dict] = field(default_factory=list)
+    # 本次呼叫產生的非止損換手次數（供 backtest 累積週預算使用）
+    holding_expired_sells: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +471,11 @@ def compute_rotation_actions(
     regime: str | None = None,
     crisis_block_new: bool = True,
     crisis_force_close: bool = False,
+    # 成本閘門（問題 1 修正：降低高頻換手拖累）
+    min_hold_days: int = 0,
+    score_gap_threshold: float = 0.0,
+    weekly_swap_cap: int = 0,
+    weekly_swaps_used: int = 0,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -541,16 +548,41 @@ def compute_rotation_actions(
     ranked_ids = {r["stock_id"] for r in new_rankings}
     ranking_map = {r["stock_id"]: r for r in new_rankings}
 
+    # ── 成本閘門 A：holding_days 安全下限（min_hold_days） ──
+    # 當 min_hold_days > holding_days 時拉高到 min_hold_days，避免極短線換手
+    effective_holding_days = max(holding_days, min_hold_days) if min_hold_days > 0 else holding_days
+
+    # ── 成本閘門 C：計算本週剩餘可換手預算 ──
+    # 僅計 holding_expired 類型（stop_loss/crisis_exit 不計入；安全優先）
+    weekly_swap_budget_remaining: int | None = None
+    if weekly_swap_cap > 0:
+        weekly_swap_budget_remaining = max(0, weekly_swap_cap - weekly_swaps_used)
+
     actions = RotationActions()
     remaining_open: list[dict] = []
     sold_today: set[str] = set()
+    weekly_swaps_this_call = 0  # 本次呼叫已產生的 holding_expired 賣出計數
+
+    # 成本閘門 B：找出「若賣出此位置將被填補」的最佳新候選分數（供比較用）
+    # 取 ranked_ids 中未持有者的 top score（即潛在替補者）
+    held_ids_initial = {p["stock_id"] for p in current_positions}
+    best_new_score: float | None = None
+    if score_gap_threshold > 0.0:
+        for r in new_rankings:
+            if r["stock_id"] in held_ids_initial:
+                continue
+            s = r.get("score")
+            if s is None:
+                continue
+            if best_new_score is None or s > best_new_score:
+                best_new_score = s
 
     for pos in current_positions:
         sid = pos["stock_id"]
         days_held = count_trading_days_held(pos["entry_date"], today, trading_calendar)
         current_price = today_prices.get(sid)
 
-        # ── 止損檢查（優先於持有期判斷）──
+        # ── 止損檢查（優先於持有期判斷，閘門豁免） ──
         sl = stop_losses.get(sid)
         if sl is not None and current_price is not None and current_price <= sl:
             actions.to_sell.append(
@@ -565,10 +597,38 @@ def compute_rotation_actions(
             sold_today.add(sid)
             continue
 
-        # ── 持有期判斷 ──
-        expired = days_held >= holding_days
+        # ── 持有期判斷（套用閘門 A：effective_holding_days）──
+        expired = days_held >= effective_holding_days
 
         if expired:
+            # ── 成本閘門 B：若新最佳候選分數與現持分差距不足，阻擋賣出 ──
+            entry_score = pos.get("entry_score") or pos.get("composite_score")
+            gate_b_block = (
+                score_gap_threshold > 0.0
+                and entry_score is not None
+                and best_new_score is not None
+                and (best_new_score - entry_score) < score_gap_threshold
+            )
+
+            # ── 成本閘門 C：本週換手預算已用盡 → 阻擋賣出 ──
+            gate_c_block = weekly_swap_budget_remaining is not None and weekly_swap_budget_remaining <= 0
+
+            # 閘門阻擋時：treat as hold（延長持有期、不觸發賣出也不新開倉）
+            if gate_b_block or gate_c_block:
+                reason = "gate_b_score_gap" if gate_b_block else "gate_c_weekly_cap"
+                rank = ranking_map[sid]["rank"] if sid in ranked_ids else None
+                actions.to_hold.append(
+                    {
+                        "stock_id": sid,
+                        "days_held": days_held,
+                        "rank": rank,
+                        "gated_by": reason,
+                        **pos,
+                    }
+                )
+                remaining_open.append(pos)
+                continue
+
             if allow_renewal and sid in ranked_ids:
                 # 續持：仍在 Top-N，延長持有期
                 new_exit = compute_planned_exit_date(today, holding_days, trading_calendar)
@@ -583,7 +643,7 @@ def compute_rotation_actions(
                 )
                 remaining_open.append(pos)
             else:
-                # 到期賣出
+                # 到期賣出（holding_expired 計入週換手預算）
                 exit_price = current_price if current_price is not None else pos["entry_price"]
                 actions.to_sell.append(
                     {
@@ -595,6 +655,9 @@ def compute_rotation_actions(
                     }
                 )
                 sold_today.add(sid)
+                weekly_swaps_this_call += 1
+                if weekly_swap_budget_remaining is not None:
+                    weekly_swap_budget_remaining = max(0, weekly_swap_budget_remaining - 1)
         else:
             # 未到期：保持持倉
             rank = ranking_map[sid]["rank"] if sid in ranked_ids else None
@@ -787,6 +850,7 @@ def compute_rotation_actions(
         # Drawdown Guard: 停止新開倉，但仍保持其餘邏輯
         pass
 
+    actions.holding_expired_sells = weekly_swaps_this_call
     return actions
 
 

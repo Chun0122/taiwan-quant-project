@@ -2361,6 +2361,76 @@ def compute_ic_impact_weight_adjustments(
     return adjusted
 
 
+def compute_ic_aware_score_transform(
+    candidates: pd.DataFrame,
+    ic_df: pd.DataFrame,
+    ic_threshold_weak: float = 0.02,
+    min_samples: int = 50,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """IC 感知維度分數轉換 — 根據歷史 IC 修正方向性錯誤的因子。
+
+    與 compute_ic_weight_adjustments()（僅衰減權重）不同，本函數直接變換 **分數值**：
+      - IC > +ic_threshold_weak  → 原樣保留（正向有效）
+      - IC < -ic_threshold_weak  → score → 1 - score（反向訊號翻轉為正向使用）
+      - |IC| ≤ ic_threshold_weak → score → 0.5（雜訊歸零為中性）
+      - evaluable_count < min_samples → 原樣保留（資料不足不翻）
+
+    設計理由：
+      原系統對 inverse IC 採權重 × 0.25 的「衰減」處理，但分數方向仍錯誤，
+      仍會以較小比例將反向訊號累加進 composite，造成 α 流失。
+      直接翻轉能保留訊息內容同時修正方向，IC 絕對值越大翻轉後貢獻越強。
+
+    安全設計：
+      - ic_df 為空時原樣回傳（cold-start 保護）
+      - 只處理 ic_df["factor"] 中且確實存在於 candidates 欄位的分數
+      - 轉換後的分數仍在 [0, 1] 區間（clip 防護）
+      - 回傳 mapping 記錄每個 factor 的動作（"kept"/"flipped"/"neutralized"），供稽核與日誌
+
+    Args:
+        candidates: 候選 DataFrame，含 *_score 欄位（例 technical_score, news_score）
+        ic_df: compute_factor_ic 輸出，需含 factor、ic、evaluable_count 欄位
+        ic_threshold_weak: IC 絕對值小於此值視為雜訊（預設 0.02）
+        min_samples: 最低有效樣本（低於則不翻轉，預設 50）
+
+    Returns:
+        (轉換後 DataFrame, {factor_name: action} mapping)
+    """
+    if candidates is None or candidates.empty:
+        return candidates, {}
+    actions: dict[str, str] = {}
+    if ic_df is None or ic_df.empty:
+        return candidates, actions
+
+    out = candidates.copy()
+    for _, row in ic_df.iterrows():
+        factor = row.get("factor")
+        if not isinstance(factor, str) or factor not in out.columns:
+            continue
+        try:
+            ic_val = float(row.get("ic", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if np.isnan(ic_val):
+            continue
+        evaluable = int(row.get("evaluable_count", 0) or 0)
+        if evaluable < min_samples:
+            actions[factor] = "kept_low_samples"
+            continue
+
+        if ic_val > ic_threshold_weak:
+            actions[factor] = "kept"
+            continue
+        if ic_val < -ic_threshold_weak:
+            out[factor] = (1.0 - out[factor]).clip(lower=0.0, upper=1.0)
+            actions[factor] = "flipped"
+            continue
+        # 雜訊區間：歸零為中性，避免雜訊污染 composite
+        out[factor] = 0.5
+        actions[factor] = "neutralized"
+
+    return out, actions
+
+
 def compute_sub_factor_weight_adjustments(
     sub_factor_ic_df: pd.DataFrame,
     base_weights: dict[str, float],

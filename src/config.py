@@ -88,6 +88,21 @@ class RiskBudgetConfig(BaseModel):
     correlation_penalty: float = 0.5  # 高相關時部位縮減比例
 
 
+class RotationCostConfig(BaseModel):
+    """Rotation 成本閘門參數（降低高頻換手帶來的成本拖累）。
+
+    三道閘門（由便宜到昂貴排序）：
+      A. min_hold_days：holding_days 的安全下限（防止極短線換手）
+      B. score_gap_threshold：expired 時需要新候選 score 贏現持倉此差距才換
+      C. weekly_swap_cap：每 ISO 週最多幾筆 holding_expired 賣出（不含 stop_loss）
+    """
+
+    enabled: bool = False  # 預設關閉以維持向後相容；明確啟用後才生效
+    min_hold_days: int = 3  # 最短持有天數（以交易日計）
+    score_gap_threshold: float = 0.05  # 切換所需 composite_score 差距
+    weekly_swap_cap: int = 4  # 每週非止損換手上限（stop_loss/crisis 不計）
+
+
 class QuantConfig(BaseModel):
     """量化參數外部化（D2）— 可在 settings.yaml 的 quant 區塊覆蓋預設值。"""
 
@@ -95,6 +110,7 @@ class QuantConfig(BaseModel):
     atr_multiplier: AtrMultiplierConfig = AtrMultiplierConfig()
     score_threshold: ScoreThresholdConfig = ScoreThresholdConfig()
     risk_budget: RiskBudgetConfig = RiskBudgetConfig()
+    rotation_cost: RotationCostConfig = RotationCostConfig()
 
 
 class Settings(BaseModel):
