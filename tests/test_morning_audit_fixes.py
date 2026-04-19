@@ -14,10 +14,7 @@ from __future__ import annotations
 import argparse
 from unittest.mock import patch
 
-import pytest
-
 from src.cli import morning_cmd
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # C1：IC 檢查 silent failure 修復
@@ -63,16 +60,29 @@ class TestCheckFactorICDecayNotSilent:
     def test_all_failures_reported_not_hidden(self, capsys):
         """全部 mode 失敗 → 不應印「IC 正常」。"""
         fake_status = [
-            {"mode": "Momentum", "mode_key": "momentum", "factor": "technical_score",
-             "level": "error", "error": "DB boom"},
-            {"mode": "Swing", "mode_key": "swing", "factor": "chip_score",
-             "level": "error", "error": "DB boom"},
-            {"mode": "Value", "mode_key": "value", "factor": "fundamental_score",
-             "level": "error", "error": "DB boom"},
-            {"mode": "Dividend", "mode_key": "dividend", "factor": "fundamental_score",
-             "level": "error", "error": "DB boom"},
-            {"mode": "Growth", "mode_key": "growth", "factor": "fundamental_score",
-             "level": "error", "error": "DB boom"},
+            {
+                "mode": "Momentum",
+                "mode_key": "momentum",
+                "factor": "technical_score",
+                "level": "error",
+                "error": "DB boom",
+            },
+            {"mode": "Swing", "mode_key": "swing", "factor": "chip_score", "level": "error", "error": "DB boom"},
+            {"mode": "Value", "mode_key": "value", "factor": "fundamental_score", "level": "error", "error": "DB boom"},
+            {
+                "mode": "Dividend",
+                "mode_key": "dividend",
+                "factor": "fundamental_score",
+                "level": "error",
+                "error": "DB boom",
+            },
+            {
+                "mode": "Growth",
+                "mode_key": "growth",
+                "factor": "fundamental_score",
+                "level": "error",
+                "error": "DB boom",
+            },
         ]
         morning_cmd._check_factor_ic_decay(ic_status=fake_status)
         out = capsys.readouterr().out
@@ -83,16 +93,17 @@ class TestCheckFactorICDecayNotSilent:
     def test_mixed_results_report_correct_levels(self, capsys):
         """混合結果 → 正常/反向/衰減各自標記。"""
         fake_status = [
-            {"mode": "Momentum", "mode_key": "momentum", "factor": "technical_score",
-             "ic": 0.15, "level": "normal"},
-            {"mode": "Swing", "mode_key": "swing", "factor": "chip_score",
-             "ic": -0.13, "level": "inverse"},
-            {"mode": "Value", "mode_key": "value", "factor": "fundamental_score",
-             "ic": 0.07, "level": "decay"},
-            {"mode": "Dividend", "mode_key": "dividend", "factor": "fundamental_score",
-             "ic": 0.01, "level": "weak"},
-            {"mode": "Growth", "mode_key": "growth", "factor": "fundamental_score",
-             "level": "insufficient", "sample_count": 5},
+            {"mode": "Momentum", "mode_key": "momentum", "factor": "technical_score", "ic": 0.15, "level": "normal"},
+            {"mode": "Swing", "mode_key": "swing", "factor": "chip_score", "ic": -0.13, "level": "inverse"},
+            {"mode": "Value", "mode_key": "value", "factor": "fundamental_score", "ic": 0.07, "level": "decay"},
+            {"mode": "Dividend", "mode_key": "dividend", "factor": "fundamental_score", "ic": 0.01, "level": "weak"},
+            {
+                "mode": "Growth",
+                "mode_key": "growth",
+                "factor": "fundamental_score",
+                "level": "insufficient",
+                "sample_count": 5,
+            },
         ]
         morning_cmd._check_factor_ic_decay(ic_status=fake_status)
         out = capsys.readouterr().out
@@ -114,18 +125,14 @@ class TestDiscordSummaryParams:
     def test_regime_none_shows_unknown_banner(self):
         """stress_result.regime=None → 顯示 regime 未知警示。"""
         stress = {"regime": None, "summary": "壓力預檢失敗"}
-        msg = morning_cmd._build_morning_discord_summary(
-            "2026-04-18", 5, stress_result=stress
-        )
+        msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, stress_result=stress)
         assert "Regime 未知" in msg
 
     def test_no_extra_stress_check_call_when_provided(self):
         """M4 修復：傳入 stress_result 後不應內部再次呼叫 _compute_macro_stress_check。"""
         with patch.object(morning_cmd, "_compute_macro_stress_check") as mock_call:
             stress = {"regime": "bull", "summary": "bull market"}
-            morning_cmd._build_morning_discord_summary(
-                "2026-04-18", 5, stress_result=stress
-            )
+            morning_cmd._build_morning_discord_summary("2026-04-18", 5, stress_result=stress)
             mock_call.assert_not_called()
 
     def test_ic_inverse_status_displayed(self):
@@ -133,9 +140,7 @@ class TestDiscordSummaryParams:
         ic_status = [
             {"mode": "Swing", "factor": "chip_score", "ic": -0.13, "level": "inverse"},
         ]
-        msg = morning_cmd._build_morning_discord_summary(
-            "2026-04-18", 5, ic_status=ic_status, disabled_modes=["swing"]
-        )
+        msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, ic_status=ic_status, disabled_modes=["swing"])
         assert "IC 健康度" in msg
         assert "Swing" in msg
         assert "已暫停" in msg
@@ -143,21 +148,16 @@ class TestDiscordSummaryParams:
     def test_ic_error_displayed_not_hidden(self):
         """C1/M3：IC 計算失敗的模式在 Discord 可見。"""
         ic_status = [
-            {"mode": "Value", "factor": "fundamental_score", "level": "error",
-             "error": "DB locked"},
+            {"mode": "Value", "factor": "fundamental_score", "level": "error", "error": "DB locked"},
         ]
-        msg = morning_cmd._build_morning_discord_summary(
-            "2026-04-18", 5, ic_status=ic_status
-        )
+        msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, ic_status=ic_status)
         assert "IC 計算失敗" in msg
         assert "Value" in msg
 
     def test_discover_blocked_banner(self):
         """M1：discover_blocked=True → 摘要顯示已阻擋。"""
         freshness = {"is_stale": True, "gap_days": 10, "message": "資料落後 10 天"}
-        msg = morning_cmd._build_morning_discord_summary(
-            "2026-04-18", 5, freshness=freshness, discover_blocked=True
-        )
+        msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, freshness=freshness, discover_blocked=True)
         assert "已阻擋" in msg
 
 
@@ -213,13 +213,15 @@ class TestDiscoverAllDisabledModes:
             disabled_modes=["swing", "growth"],
         )
 
-        with patch.object(discover_cmd, "init_db"), \
-             patch.object(discover_cmd, "ensure_sync_market_data"), \
-             patch("src.discovery.scanner.MomentumScanner", _make("momentum")), \
-             patch("src.discovery.scanner.SwingScanner", _make("swing")), \
-             patch("src.discovery.scanner.ValueScanner", _make("value")), \
-             patch("src.discovery.scanner.DividendScanner", _make("dividend")), \
-             patch("src.discovery.scanner.GrowthScanner", _make("growth")):
+        with (
+            patch.object(discover_cmd, "init_db"),
+            patch.object(discover_cmd, "ensure_sync_market_data"),
+            patch("src.discovery.scanner.MomentumScanner", _make("momentum")),
+            patch("src.discovery.scanner.SwingScanner", _make("swing")),
+            patch("src.discovery.scanner.ValueScanner", _make("value")),
+            patch("src.discovery.scanner.DividendScanner", _make("dividend")),
+            patch("src.discovery.scanner.GrowthScanner", _make("growth")),
+        ):
             discover_cmd._cmd_discover_all(ns)
 
         assert "swing" not in called_modes
