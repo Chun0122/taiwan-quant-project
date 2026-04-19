@@ -436,7 +436,7 @@ def print_performance_report(
 
     # 設定標籤
     cost_tag = " [含交易成本]" if include_costs else ""
-    entry_tag = " [T+1開��進場]" if entry_at_next_open else ""
+    entry_tag = " [T+1開盤進場]" if entry_at_next_open else ""
 
     print(f"\n{'=' * 80}")
     print(f"Discover 推薦績效回測 [{mode_label}]{cost_tag}{entry_tag}")
