@@ -66,9 +66,14 @@ def test_growth_blocked_in_crisis():
 def test_value_not_blocked_in_sideways():
     """Value 在 sideways 應繼續執行（只是可能因無資料回傳空，但會進入 Stage 1）。"""
     scanner = ValueScanner()
-    with _patch_regime("sideways"), patch.object(
-        ValueScanner, "_load_market_data", return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-    ) as mocked:
+    with (
+        _patch_regime("sideways"),
+        patch.object(
+            ValueScanner,
+            "_load_market_data",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ) as mocked,
+    ):
         scanner.run()
     # 若被封鎖則不會進到 Stage 1 的 _load_market_data
     mocked.assert_called_once()
@@ -77,11 +82,14 @@ def test_value_not_blocked_in_sideways():
 def test_dividend_not_blocked_in_crisis():
     """Dividend（防禦型）在 crisis 不封鎖。"""
     scanner = DividendScanner()
-    with _patch_regime("crisis"), patch.object(
-        DividendScanner,
-        "_load_market_data",
-        return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
-    ) as mocked:
+    with (
+        _patch_regime("crisis"),
+        patch.object(
+            DividendScanner,
+            "_load_market_data",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ) as mocked,
+    ):
         scanner.run()
     mocked.assert_called_once()
 
@@ -89,22 +97,28 @@ def test_dividend_not_blocked_in_crisis():
 def test_momentum_not_blocked_in_crisis():
     """Momentum 在 crisis 保留（實測 10 日 +8.35%）。"""
     scanner = MomentumScanner()
-    with _patch_regime("crisis"), patch.object(
-        MomentumScanner,
-        "_load_market_data",
-        return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
-    ) as mocked:
+    with (
+        _patch_regime("crisis"),
+        patch.object(
+            MomentumScanner,
+            "_load_market_data",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ) as mocked,
+    ):
         scanner.run()
     mocked.assert_called_once()
 
 
 def test_momentum_runs_in_bull():
     scanner = MomentumScanner()
-    with _patch_regime("bull"), patch.object(
-        MomentumScanner,
-        "_load_market_data",
-        return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
-    ) as mocked:
+    with (
+        _patch_regime("bull"),
+        patch.object(
+            MomentumScanner,
+            "_load_market_data",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ) as mocked,
+    ):
         scanner.run()
     mocked.assert_called_once()
 
@@ -118,12 +132,18 @@ def test_subclass_blocked_regimes_still_honored(regime):
         _blocked_regimes = {"bear", "crisis"}
 
     scanner = ExperimentalScanner()
-    with _patch_regime(regime):
-        result = scanner.run()
+    with (
+        _patch_regime(regime),
+        patch.object(
+            MomentumScanner,
+            "_load_market_data",
+            return_value=(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()),
+        ) as mocked,
+    ):
+        scanner.run()
     if regime == "crisis":
-        # 被子類自訂封鎖
-        assert result.rankings.empty
+        # 被子類自訂封鎖 → Stage 0.1 提前返回，_load_market_data 不會被呼叫
+        mocked.assert_not_called()
     else:
-        # sideways 不在子類封鎖名單 + experimental 不在矩陣 → 應能進到 Stage 1
-        # （此處會因無資料自然回傳空，但 regime gate 不觸發）
-        pass
+        # sideways 不在子類封鎖名單 + experimental 不在矩陣 → 進到 Stage 1
+        mocked.assert_called_once()
