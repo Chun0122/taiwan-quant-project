@@ -5943,7 +5943,7 @@ class TestApplySectorDiversification:
                 ("1301", 0.5, "塑膠"),
             ]
         )
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         assert len(result) == 5
 
     def test_concentration_capped(self):
@@ -5964,7 +5964,7 @@ class TestApplySectorDiversification:
                 ("D1", 0.50, "通信"),
             ]
         )
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         # 半導體最多 3 個，金融 2，塑膠 2，通信 1 → 可湊 8 個
         semi_count = (result["industry_category"] == "半導體").sum()
         assert semi_count <= 3
@@ -5984,7 +5984,7 @@ class TestApplySectorDiversification:
                 ("B2", 0.65, "金融"),
             ]
         )
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         semi_count = (result["industry_category"] == "半導體").sum()
         assert semi_count <= 3
         assert len(result) == 4
@@ -5993,7 +5993,7 @@ class TestApplySectorDiversification:
         """空排名 → 直接回傳。"""
         scanner = MarketScanner(top_n_results=10)
         rankings = pd.DataFrame(columns=["stock_id", "composite_score", "industry_category", "rank"])
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         assert result.empty
 
     def test_rank_renumbered(self):
@@ -6008,7 +6008,7 @@ class TestApplySectorDiversification:
                 ("C1", 0.75, "塑膠"),
             ]
         )
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         assert list(result["rank"]) == [1, 2, 3, 4, 5]
 
     def test_missing_industry_treated_as_unknown(self):
@@ -6024,9 +6024,41 @@ class TestApplySectorDiversification:
                 ("C1", 0.60, "塑膠"),
             ]
         )
-        result = scanner._apply_sector_diversification(rankings)
+        result, _sector_capped, _pool = scanner._apply_sector_diversification(rankings)
         unknown_count = (result["industry_category"] == "").sum() + (result["industry_category"] == "未分類").sum()
         assert unknown_count <= 3
+
+    def test_audit_separates_sector_cap_from_pool_truncation(self):
+        """Regression (Minor #1)：產業上限剔除與 Top-N*2 pool 外截斷必須分開回報。
+
+        top_n=4 → pool=top_n*2=8；輸入 10 筆、前 5 筆為同產業半導體
+        （sector_cap=3，故第 4/5 筆會被產業上限剔除）。
+        其餘 2 筆（rank 9~10）屬於 pool 外，不該計入 sector_capped_ids。
+        """
+        scanner = MarketScanner(top_n_results=4)
+        rankings = self._make_rankings(
+            [
+                ("S1", 0.95, "半導體"),
+                ("S2", 0.90, "半導體"),
+                ("S3", 0.85, "半導體"),
+                ("S4", 0.80, "半導體"),  # pool 內，因 sector_cap=3 被剔除
+                ("S5", 0.78, "半導體"),  # pool 內，因 sector_cap=3 被剔除
+                ("F1", 0.70, "金融"),
+                ("P1", 0.60, "塑膠"),
+                ("T1", 0.55, "通信"),
+                ("X1", 0.40, "其他"),  # pool 外（rank 9）
+                ("X2", 0.30, "其他"),  # pool 外（rank 10）
+            ]
+        )
+        result, sector_capped, pool_ids = scanner._apply_sector_diversification(rankings)
+        assert len(result) == 4
+        # pool_ids 僅含前 8 筆
+        assert pool_ids == {"S1", "S2", "S3", "S4", "S5", "F1", "P1", "T1"}
+        # sector_capped 僅含因產業上限剔除者，不含 pool 外的 X1/X2
+        assert "S4" in sector_capped
+        assert "S5" in sector_capped
+        assert "X1" not in sector_capped
+        assert "X2" not in sector_capped
 
 
 # ─── _apply_volume_price_divergence ──────────────────────────────────
@@ -8022,6 +8054,24 @@ def test_audit_trail_record_from_column():
     assert len(events) == 2  # 0.0 被跳過
     ids = {e["stock_id"] for e in events}
     assert ids == {"2330", "2454"}
+
+
+def test_audit_trail_stage_3_3a_uses_correct_column_name():
+    """Regression：_base.py 審計 3.3a 必須使用實際欄位名 relative_strength_bonus。
+
+    舊實作誤用 'rs_bonus'（實際欄位不存在），導致 Stage 3.3a 同業相對強度
+    調整永遠不會寫入 ScanAuditTrail。此測試保護該 wiring。
+    """
+    from pathlib import Path
+
+    base_src = Path(__file__).resolve().parent.parent / "src" / "discovery" / "scanner" / "_base.py"
+    text = base_src.read_text(encoding="utf-8")
+    # 必須使用正確欄位名；若出現 "rs_bonus" 表示回歸
+    assert "relative_strength_bonus" in text
+    # 排除錯誤舊名（允許於 comment 出現，但不得做欄位檢查）
+    for line in text.splitlines():
+        if 'if "rs_bonus"' in line or '"rs_bonus" in scored.columns' in line:
+            raise AssertionError(f"_base.py 仍引用錯誤欄位名 rs_bonus: {line!r}")
 
 
 def test_audit_trail_get_stock_trail():

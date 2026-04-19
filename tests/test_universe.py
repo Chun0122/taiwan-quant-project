@@ -395,6 +395,132 @@ class TestFilterTrendBreakout:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  TestAnomalyExclusion — 漲跌停異常排除（Critical Bug #1 回歸測試）
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestAnomalyExclusion:
+    """近 7 日內累計 3 次以上 |pct_chg| ≥ 9.5% 的股票必須被 Universe 排除。
+
+    Regression：舊實作使用 `groupby(level=0)` 對單層 RangeIndex 逐列 group，
+    導致 anomaly_ids 永遠為空，漲跌停異常股未被過濾。
+    """
+
+    @staticmethod
+    def _hist_df(stock_id: str, closes: list[float], volume: int = 2_000_000) -> pd.DataFrame:
+        n = len(closes)
+        dates = pd.date_range(end=date.today(), periods=n)
+        return pd.DataFrame(
+            {
+                "stock_id": [stock_id] * n,
+                "date": dates,
+                "close": closes,
+                "volume": [volume] * n,
+                "ma20": [closes[0]] * n,
+                "ma60": [closes[0]] * n,
+                "volume_ma20": [volume // 2] * n,
+                "momentum_20d": [5.0] * n,
+                "high_20d": [max(closes)] * n,
+            }
+        )
+
+    def test_filter_trend_excludes_consecutive_limit_up(self):
+        """連續 5 日漲停（≥9.5%）→ filter_trend 必須排除。"""
+        closes = [100.0] * 25 + [100.0 * (1.097 ** (i + 1)) for i in range(5)]
+        df = self._hist_df("9999", closes)
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        assert "9999" not in filter_trend(df, cfg)
+
+    def test_filter_trend_excludes_consecutive_limit_down(self):
+        """連續 5 日跌停 → 也要排除（絕對值 ≥9.5%）。"""
+        closes = [100.0] * 25
+        b = 100.0
+        for _ in range(5):
+            b *= 0.903
+            closes.append(b)
+        df = self._hist_df("8888", closes)
+        # 特意讓 ma20/ma60 較低，避免 close<MA 先一步剔除
+        df["ma20"] = 50.0
+        df["ma60"] = 50.0
+        df["high_20d"] = df["close"]
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        assert "8888" not in filter_trend(df, cfg)
+
+    def test_filter_trend_passes_single_limit_day(self):
+        """僅 1 日漲停（<3 次）→ 不視為異常，允許通過。"""
+        closes = [100.0] * 29 + [100.0 * 1.097]
+        df = self._hist_df("7777", closes)
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        assert "7777" in filter_trend(df, cfg)
+
+    def test_filter_trend_mixed_normal_and_anomaly(self):
+        """混合：正常股通過、漲停股被排除。"""
+        normal = self._hist_df("1234", [100.0 + i * 0.5 for i in range(30)])
+        anomaly_closes = [100.0] * 25 + [100.0 * (1.097 ** (i + 1)) for i in range(5)]
+        anomaly = self._hist_df("9999", anomaly_closes)
+        df = pd.concat([normal, anomaly], ignore_index=True)
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        result = filter_trend(df, cfg)
+        assert "1234" in result
+        assert "9999" not in result
+
+    def test_filter_trend_breakout_excludes_anomaly(self):
+        """filter_trend_breakout 同樣需排除連續漲停異常股。"""
+        closes = [100.0] * 25 + [100.0 * (1.097 ** (i + 1)) for i in range(5)]
+        df = self._hist_df("9999", closes)
+        cfg = UniverseConfig()
+        assert "9999" not in filter_trend_breakout(df, cfg)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  TestDataStaleness — 資料新鮮度告警（Minor #2 回歸測試）
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestDataStaleness:
+    """filter_trend / filter_trend_breakout 偵測到過期快照時應發出 warning。"""
+
+    @staticmethod
+    def _fresh_df(latest_offset_days: int) -> pd.DataFrame:
+        end = date.today() - timedelta(days=latest_offset_days)
+        dates = pd.date_range(end=end, periods=30)
+        return pd.DataFrame(
+            {
+                "stock_id": ["1234"] * 30,
+                "date": dates,
+                "close": [100.0 + i * 0.5 for i in range(30)],
+                "volume": [2_000_000] * 30,
+                "ma20": [100.0] * 30,
+                "ma60": [100.0] * 30,
+                "volume_ma20": [1_000_000] * 30,
+                "momentum_20d": [5.0] * 30,
+                "high_20d": [115.0] * 30,
+            }
+        )
+
+    def test_filter_trend_warns_when_stale(self, caplog):
+        df = self._fresh_df(latest_offset_days=15)  # 遠超 STALE_DATA_WARN_DAYS=5
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        with caplog.at_level("WARNING", logger="src.discovery.universe"):
+            filter_trend(df, cfg)
+        assert any("資料新鮮度告警" in rec.message for rec in caplog.records)
+
+    def test_filter_trend_silent_when_fresh(self, caplog):
+        df = self._fresh_df(latest_offset_days=0)
+        cfg = UniverseConfig(trend_ma=20, volume_ratio_min=0.5)
+        with caplog.at_level("WARNING", logger="src.discovery.universe"):
+            filter_trend(df, cfg)
+        assert not any("資料新鮮度告警" in rec.message for rec in caplog.records)
+
+    def test_filter_trend_breakout_warns_when_stale(self, caplog):
+        df = self._fresh_df(latest_offset_days=20)
+        cfg = UniverseConfig()
+        with caplog.at_level("WARNING", logger="src.discovery.universe"):
+            filter_trend_breakout(df, cfg)
+        assert any("資料新鮮度告警" in rec.message for rec in caplog.records)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  TestStage1SqlFilter — DB 整合
 # ────────────────────────────────────────────────────────────────────────────
 

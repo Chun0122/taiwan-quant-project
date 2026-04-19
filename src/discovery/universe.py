@@ -31,6 +31,10 @@ from src.data.schema import DailyFeature, DailyPrice, DiscoveryRecord, StockInfo
 # Sentinel 值：區分「未傳入」與「明確傳入 None」
 _SENTINEL = object()
 
+# Universe 資料新鮮度門檻（天數）：df_hist 最新日期與今日差距超過此值會 WARN
+# 3 個工作日足以吸收連假，但仍能捕捉上游 pipeline 停擺
+STALE_DATA_WARN_DAYS = 5
+
 # Candidate Memory 門檻衰減乘數（days_ago → 流動性門檻乘數）
 # Day 1: ×0.8（寬鬆，容易留下）→ Day 2: ×0.9 → Day 3: ×1.0（原始門檻）
 MEMORY_DECAY: dict[int, float] = {1: 0.8, 2: 0.9, 3: 1.0}
@@ -141,6 +145,28 @@ def filter_liquidity(df_5d: pd.DataFrame, config: UniverseConfig, turnover_multi
     return passed_absolute
 
 
+def _warn_if_data_stale(latest_date: object, caller: str) -> None:
+    """若 df_hist 最新日期距今超過 STALE_DATA_WARN_DAYS，記錄警告。
+
+    上游 pipeline 停擺時，discover 仍會基於舊快照產出推薦，容易導致使用者
+    誤判市況。此處僅告警、不阻擋，保留使用者覆寫能力。
+    """
+    if latest_date is None:
+        return
+    try:
+        ld = pd.Timestamp(latest_date).date()
+    except (TypeError, ValueError):
+        return
+    gap = (date.today() - ld).days
+    if gap > STALE_DATA_WARN_DAYS:
+        logger.warning(
+            "%s: 資料新鮮度告警 — 最新日期 %s 距今 %d 天，上游 pipeline 可能停擺",
+            caller,
+            ld,
+            gap,
+        )
+
+
 def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig, volume_ratio_override: object = _SENTINEL) -> list[str]:
     """Stage 3 純函數：依趨勢條件過濾，回傳通過的 stock_id 清單。
 
@@ -179,6 +205,7 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig, volume_ratio_ove
 
     # 取最新一日
     latest_date = df_hist["date"].max()
+    _warn_if_data_stale(latest_date, "filter_trend")
     latest = df_hist[df_hist["date"] == latest_date].copy()
 
     # 1. close > MA{N}
@@ -193,10 +220,14 @@ def filter_trend(df_hist: pd.DataFrame, config: UniverseConfig, volume_ratio_ove
         vol_ok = pd.Series(True, index=latest.index)
 
     # 3. 異常排除：近 7 天內出現 3 次以上漲跌停（累計，非必連續）
-    recent_5 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)]
-    pct_chg = recent_5.sort_values("date").groupby("stock_id")["close"].pct_change().abs()
+    recent_5 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)].sort_values("date")
+    pct_chg = recent_5.groupby("stock_id")["close"].pct_change().abs()
     limit_days = pct_chg >= 0.095
-    consecutive_limit = limit_days.groupby(level=0).sum() if not limit_days.empty else pd.Series(dtype=float)
+    if not limit_days.empty:
+        ids_for_group = recent_5.loc[limit_days.index, "stock_id"]
+        consecutive_limit = limit_days.groupby(ids_for_group).sum()
+    else:
+        consecutive_limit = pd.Series(dtype=float)
     anomaly_ids = set(consecutive_limit[consecutive_limit >= 3].index) if not consecutive_limit.empty else set()
     not_anomaly = ~latest["stock_id"].isin(anomaly_ids)
 
@@ -233,6 +264,7 @@ def filter_trend_breakout(df_hist: pd.DataFrame, config: UniverseConfig) -> list
 
     # 取最新一日
     latest_date = df_hist["date"].max()
+    _warn_if_data_stale(latest_date, "filter_trend_breakout")
     latest = df_hist[df_hist["date"] == latest_date].copy()
 
     # 1. close >= ma20
@@ -258,10 +290,14 @@ def filter_trend_breakout(df_hist: pd.DataFrame, config: UniverseConfig) -> list
     vol_ok = vol_ratio >= 1.5
 
     # 5. 異常排除：近 7 天內出現 3 次以上漲跌停
-    recent_7 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)]
-    pct_chg = recent_7.sort_values("date").groupby("stock_id")["close"].pct_change().abs()
+    recent_7 = df_hist[df_hist["date"] >= latest_date - timedelta(days=7)].sort_values("date")
+    pct_chg = recent_7.groupby("stock_id")["close"].pct_change().abs()
     limit_days = pct_chg >= 0.095
-    consecutive_limit = limit_days.groupby(level=0).sum() if not limit_days.empty else pd.Series(dtype=float)
+    if not limit_days.empty:
+        ids_for_group = recent_7.loc[limit_days.index, "stock_id"]
+        consecutive_limit = limit_days.groupby(ids_for_group).sum()
+    else:
+        consecutive_limit = pd.Series(dtype=float)
     anomaly_ids = set(consecutive_limit[consecutive_limit >= 3].index) if not consecutive_limit.empty else set()
     not_anomaly = ~latest["stock_id"].isin(anomaly_ids)
 

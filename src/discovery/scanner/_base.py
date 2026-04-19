@@ -224,8 +224,10 @@ class MarketScanner:
         audit.record_score_adjustments_from_column("3.3 產業輪動", scored, "sector_bonus", "產業輪動加成")
 
         scored = self._apply_sector_relative_strength(scored)
-        if "rs_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column("3.3a 同業強度", scored, "rs_bonus", "同業相對強度")
+        if "relative_strength_bonus" in scored.columns:
+            audit.record_score_adjustments_from_column(
+                "3.3a 同業強度", scored, "relative_strength_bonus", "同業相對強度"
+            )
 
         scored = self._apply_concept_bonus(scored)
         if "concept_bonus" in scored.columns:
@@ -308,10 +310,26 @@ class MarketScanner:
         # Stage 4: 排名 + 產業標籤
         rankings = self._rank_and_enrich(scored)
 
-        # 硬風控 5: 同產業分散化
+        # 硬風控 5: 同產業分散化（區分「因產業上限剔除」與「Top-N*2 pool 外截斷」）
         ids_before = set(rankings["stock_id"])
-        rankings = self._apply_sector_diversification(rankings)
-        audit.record_hard_filter("4.1 產業分散", ids_before, set(rankings["stock_id"]), "同產業超過25%上限")
+        rankings, sector_capped_ids, pool_ids = self._apply_sector_diversification(rankings)
+        ids_after = set(rankings["stock_id"])
+        # (a) 僅記錄真正因產業上限而被剔除的股票
+        audit.record_hard_filter(
+            "4.1 產業分散",
+            sector_capped_ids | ids_after,
+            ids_after,
+            "同產業超過25%上限",
+        )
+        # (b) 另記錄 Top-N*2 pool 外、排名過低未納入考量的截斷（避免與產業分散混淆）
+        pool_truncated = ids_before - pool_ids
+        if pool_truncated:
+            audit.record_hard_filter(
+                "4.1b Top-N*2 截斷",
+                ids_before,
+                pool_ids,
+                "排名超出分散化考量範圍（top_n×2）",
+            )
 
         # 硬風控 6: 回撤降頻
         effective_top_n = self._compute_drawdown_adjusted_top_n(df_price)
@@ -2778,49 +2796,58 @@ class MarketScanner:
     #  Stage 4.1: 同產業分散化
     # ------------------------------------------------------------------ #
 
-    def _apply_sector_diversification(self, rankings: pd.DataFrame) -> pd.DataFrame:
+    def _apply_sector_diversification(self, rankings: pd.DataFrame) -> tuple[pd.DataFrame, set[str], set[str]]:
         """Stage 4.1 — 限制同產業推薦數量，降低集中風險。
 
         同產業最多佔推薦總數 25%（至少 3 檔），超出部分依 composite_score
         從低到高剔除。被剔除的位置由下一順位（不同產業）遞補。
+
+        Returns:
+            (result, sector_capped_ids, pool_ids)
+              result             — 分散化後的 DataFrame
+              sector_capped_ids  — 於 pool 內被產業上限剔除的 stock_id
+              pool_ids           — 本次被納入考慮的 pool（最多 top_n*2 筆）
         """
         if rankings.empty or "industry_category" not in rankings.columns:
-            return rankings
+            return rankings, set(), set(rankings["stock_id"]) if not rankings.empty else set()
 
         top_n = self.top_n_results
         sector_cap = max(SECTOR_MIN_CAP, int(top_n * SECTOR_MAX_RATIO))
 
         # 先取比 top_n 更多的候選（讓遞補有空間）
         pool = rankings.head(top_n * 2) if len(rankings) > top_n else rankings.copy()
+        pool_ids = set(pool["stock_id"])
 
         kept: list[int] = []  # 保留的 row index
+        kept_ids: set[str] = set()
+        sector_capped_ids: set[str] = set()
         sector_counts: dict[str, int] = {}
 
         for idx, row in pool.iterrows():
-            sector = row.get("industry_category", "")
-            if not sector:
-                sector = "未分類"
+            sector = row.get("industry_category", "") or "未分類"
             count = sector_counts.get(sector, 0)
             if count < sector_cap:
                 kept.append(idx)
+                kept_ids.add(row["stock_id"])
                 sector_counts[sector] = count + 1
                 if len(kept) >= top_n:
                     break
+            else:
+                # 僅當 pool 內仍有機會填滿 top_n 時，視為真正被產業上限剔除
+                sector_capped_ids.add(row["stock_id"])
 
         result = pool.loc[kept].copy()
         result["rank"] = range(1, len(result) + 1)
 
-        displaced = len(rankings.head(top_n)) - len(result)
-        if displaced > 0 or sector_counts:
-            capped = [s for s, c in sector_counts.items() if c >= sector_cap]
-            if capped:
-                logger.info(
-                    "Stage 4.1: 同產業分散化 — 產業上限 %d，觸及上限：%s",
-                    sector_cap,
-                    ", ".join(capped),
-                )
+        capped = [s for s, c in sector_counts.items() if c >= sector_cap]
+        if capped:
+            logger.info(
+                "Stage 4.1: 同產業分散化 — 產業上限 %d，觸及上限：%s",
+                sector_cap,
+                ", ".join(capped),
+            )
 
-        return result
+        return result, sector_capped_ids, pool_ids
 
     def _reload_valuation(self, stock_ids: list[str]) -> None:
         """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
