@@ -120,22 +120,26 @@ class TestCheckFactorICDecayNotSilent:
 
 
 class TestDiscordSummaryParams:
-    """_build_morning_discord_summary 必須使用傳入的 stress_result / ic_status。"""
+    """_build_morning_discord_summary 必須使用傳入的 stress_result / ic_status。
 
-    def test_regime_none_shows_unknown_banner(self):
+    所有測試使用 db_session fixture 建立 in-memory DB（含 DiscoveryRecord/
+    Announcement/WatchEntry 空表），避免 CI 無 DB 時 OperationalError。
+    """
+
+    def test_regime_none_shows_unknown_banner(self, db_session):
         """stress_result.regime=None → 顯示 regime 未知警示。"""
         stress = {"regime": None, "summary": "壓力預檢失敗"}
         msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, stress_result=stress)
         assert "Regime 未知" in msg
 
-    def test_no_extra_stress_check_call_when_provided(self):
+    def test_no_extra_stress_check_call_when_provided(self, db_session):
         """M4 修復：傳入 stress_result 後不應內部再次呼叫 _compute_macro_stress_check。"""
         with patch.object(morning_cmd, "_compute_macro_stress_check") as mock_call:
             stress = {"regime": "bull", "summary": "bull market"}
             morning_cmd._build_morning_discord_summary("2026-04-18", 5, stress_result=stress)
             mock_call.assert_not_called()
 
-    def test_ic_inverse_status_displayed(self):
+    def test_ic_inverse_status_displayed(self, db_session):
         """M3：IC 反向模式在 Discord 訊息中可見。"""
         ic_status = [
             {"mode": "Swing", "factor": "chip_score", "ic": -0.13, "level": "inverse"},
@@ -145,7 +149,7 @@ class TestDiscordSummaryParams:
         assert "Swing" in msg
         assert "已暫停" in msg
 
-    def test_ic_error_displayed_not_hidden(self):
+    def test_ic_error_displayed_not_hidden(self, db_session):
         """C1/M3：IC 計算失敗的模式在 Discord 可見。"""
         ic_status = [
             {"mode": "Value", "factor": "fundamental_score", "level": "error", "error": "DB locked"},
@@ -154,7 +158,7 @@ class TestDiscordSummaryParams:
         assert "IC 計算失敗" in msg
         assert "Value" in msg
 
-    def test_discover_blocked_banner(self):
+    def test_discover_blocked_banner(self, db_session):
         """M1：discover_blocked=True → 摘要顯示已阻擋。"""
         freshness = {"is_stale": True, "gap_days": 10, "message": "資料落後 10 天"}
         msg = morning_cmd._build_morning_discord_summary("2026-04-18", 5, freshness=freshness, discover_blocked=True)
@@ -242,7 +246,7 @@ class TestDiscoverAllDisabledModes:
 class TestStressCheckProtection:
     """C2/C3 修復：stress check 任意例外不中斷、regime=None 明確傳達。"""
 
-    def test_regime_unknown_in_banner_when_none(self, capsys):
+    def test_regime_unknown_in_banner_when_none(self, db_session, capsys):
         """regime=None → 顯示 Regime 未知 banner（不假性 sideways）。"""
         msg = morning_cmd._build_morning_discord_summary(
             "2026-04-18",
