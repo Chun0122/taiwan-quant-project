@@ -372,6 +372,12 @@ def main() -> None:
     sp_ab.add_argument("--lookback-days", type=int, default=60, help="績效消融回溯天數（預設 60）")
     sp_ab.add_argument("--export", default=None, help="匯出消融結果 CSV")
 
+    # validate-regime-block 子命令（P3：驗證 REGIME_MODE_BLOCK 矩陣）
+    sp_vb = subparsers.add_parser("validate-regime-block", help="驗證 REGIME_MODE_BLOCK 矩陣與歷史績效是否一致")
+    sp_vb.add_argument("--holding-days", type=int, default=5, help="持有天數（預設 5）")
+    sp_vb.add_argument("--lookback-days", type=int, default=90, help="回溯天數（預設 90）")
+    sp_vb.add_argument("--min-samples", type=int, default=30, help="最低樣本數（預設 30）")
+
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
     sp_db.add_argument(
@@ -754,6 +760,15 @@ def main() -> None:
         cmd_factor_diagnostics(args)
     elif args.command == "ablation-test":
         cmd_ablation_test(args)
+    elif args.command == "validate-regime-block":
+        from src.discovery.regime_block_validator import format_validation_report, validate_regime_blocks
+
+        validations = validate_regime_blocks(
+            holding_days=args.holding_days,
+            lookback_days=args.lookback_days,
+            min_samples=args.min_samples,
+        )
+        print(format_validation_report(validations))
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":

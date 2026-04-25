@@ -9,8 +9,25 @@ import pandas as pd
 
 from src.cli.helpers import ensure_sync_market_data, init_db
 from src.cli.helpers import safe_print as print
+from src.constants import DISCOVERY_KEY_FACTOR_MAP
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_ic_decay_warning(mode: str, factor: str, latest_ic: float, ic_threshold: float = 0.10) -> None:
+    """factor-diagnostics IC 衰退警示輸出（< ic_threshold 觸發）。
+
+    若 factor 為該 mode 的關鍵因子（DISCOVERY_KEY_FACTOR_MAP），加印
+    「{mode} 模式高度依賴 {factor}」第二行強警示。
+    """
+    key_factor = DISCOVERY_KEY_FACTOR_MAP.get(mode, "")
+    is_key = factor == key_factor
+    marker = " ★關鍵因子" if is_key else ""
+    print(f"\n  {'!' * 60}")
+    print(f"  !! 警告：{factor} IC 衰退至 {latest_ic:+.4f}（< {ic_threshold:.2f} 門檻）{marker}")
+    if is_key:
+        print(f"  !!        {mode} 模式高度依賴 {factor}，建議提高推薦門檻或暫停")
+    print(f"  {'!' * 60}")
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
@@ -77,9 +94,24 @@ def cmd_discover(args: argparse.Namespace) -> None:
         f"掃描 {result.total_stocks} 支 → 粗篩 {result.after_coarse} 支 → Top {len(display)}"
     )
     print(f"{'=' * 80}")
+
+    # IC-aware 欄位狀態標記（N=neutralized, F=flipped）
+    ic_actions = getattr(result, "ic_actions", None) or {}
+
+    def _mark(score_col: str, header: str) -> str:
+        action = ic_actions.get(score_col)
+        if action == "neutralized":
+            return f"{header}(N)"
+        if action == "flipped":
+            return f"{header}(F)"
+        return header
+
     print(
         f"{'#':>3}  {'代號':>6} {'名稱':<8}  {'收盤':>8}  {'綜合':>6}  "
-        f"{'技術':>6}  {'籌碼':>6} {'層':>3}  {'基本':>6}  {'產業加成':>6}  {'產業':<10}"
+        f"{_mark('technical_score', '技術'):>7}  "
+        f"{_mark('chip_score', '籌碼'):>7} {'層':>3}  "
+        f"{_mark('fundamental_score', '基本'):>7}  "
+        f"{'產業加成':>6}  {'產業':<10}"
     )
     print(f"{'─' * 90}")
 
@@ -96,6 +128,18 @@ def cmd_discover(args: argparse.Namespace) -> None:
             f"{row['technical_score']:>6.3f}  {row['chip_score']:>6.3f} {chip_tier:>3}  "
             f"{row['fundamental_score']:>6.3f}  {sector_bonus:>+6.1%}  {industry:<10}"
         )
+
+    # IC-aware 圖例（僅顯示表格可見欄位實際出現的標記）
+    visible_cols = {"technical_score", "chip_score", "fundamental_score"}
+    visible_neutralized = any(ic_actions.get(c) == "neutralized" for c in visible_cols)
+    visible_flipped = any(ic_actions.get(c) == "flipped" for c in visible_cols)
+    if visible_neutralized or visible_flipped:
+        legend_parts = []
+        if visible_neutralized:
+            legend_parts.append("(N)=IC<0.05 中性化（不入分）")
+        if visible_flipped:
+            legend_parts.append("(F)=IC 反向已翻轉")
+        print(f"  圖例：{' | '.join(legend_parts)}")
 
     # 產業分布
     if result.sector_summary is not None and not result.sector_summary.empty:
@@ -941,22 +985,10 @@ def cmd_factor_diagnostics(args: "argparse.Namespace") -> None:
                     print(f"  {col[:20]:<20} {series.iloc[0]:>+.4f} → {series.iloc[-1]:>+.4f} ({trend})")
 
             # IC 衰退警告
-            _KEY_FACTOR_MAP = {
-                "momentum": "news_score",
-                "swing": "chip_score",
-                "value": "fundamental_score",
-                "dividend": "fundamental_score",
-                "growth": "fundamental_score",
-            }
             for col in pivoted.columns:
                 series = pivoted[col].dropna()
                 if len(series) >= 2 and series.iloc[-1] < 0.10:
-                    print(f"\n  {'!' * 60}")
-                    print(f"  !! 警告：{col} IC 衰退至 {series.iloc[-1]:+.4f}（< 0.10 門檻）")
-                    key_factor = _KEY_FACTOR_MAP.get(mode, "")
-                    if col == key_factor:
-                        print(f"  !!        {mode} 模式高度依賴 {col}，建議提高推薦門檻或暫停")
-                    print(f"  {'!' * 60}")
+                    _emit_ic_decay_warning(mode=mode, factor=col, latest_ic=float(series.iloc[-1]))
 
     # Step 6: Per-Regime IC 分析
     from src.discovery.scanner._functions import compute_regime_ic

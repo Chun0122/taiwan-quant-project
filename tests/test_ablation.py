@@ -356,3 +356,83 @@ class TestFormatAblationReport:
         text = format_ablation_report(report)
         assert "tech_ret5d" in text
         assert "子因子消融" in text
+
+
+# ──────────────────────────────────────────────────────────
+#  影響力分級（commit 後新增雙指標分級）
+# ──────────────────────────────────────────────────────────
+
+
+class TestDimensionImpactClassify:
+    """維度級分級門檻：< 0.50 極高 / < 0.85 高 / < 0.95 中 / 否則低。"""
+
+    def test_extreme_negative_rho(self):
+        """ρ < 0.50（含負值）→ 極高（今日 momentum technical ρ=-0.0481 即此情境）。"""
+        from src.discovery.ablation import _classify_dimension_impact
+
+        assert _classify_dimension_impact(-0.0481) == "極高"
+        assert _classify_dimension_impact(0.0) == "極高"
+        assert _classify_dimension_impact(0.49) == "極高"
+
+    def test_high_impact(self):
+        from src.discovery.ablation import _classify_dimension_impact
+
+        assert _classify_dimension_impact(0.50) == "高"
+        assert _classify_dimension_impact(0.65) == "高"
+        assert _classify_dimension_impact(0.84) == "高"
+
+    def test_medium_impact(self):
+        from src.discovery.ablation import _classify_dimension_impact
+
+        assert _classify_dimension_impact(0.85) == "中"
+        assert _classify_dimension_impact(0.93) == "中"
+
+    def test_low_impact(self):
+        from src.discovery.ablation import _classify_dimension_impact
+
+        assert _classify_dimension_impact(0.95) == "低"
+        assert _classify_dimension_impact(0.99) == "低"
+
+
+class TestSubFactorImpactClassify:
+    """子因子分級雙指標：rho 與 mean_shift 任一觸發即升級。"""
+
+    def test_low_rho_promotes_to_high(self):
+        from src.discovery.ablation import _classify_subfactor_impact
+
+        # rho < 0.90 → 高，無論 shift
+        assert _classify_subfactor_impact(0.85, 0.001) == "高"
+
+    def test_high_shift_promotes_to_high(self):
+        from src.discovery.ablation import _classify_subfactor_impact
+
+        # mean_shift > 0.06 → 高，即使 rho 接近 1
+        assert _classify_subfactor_impact(0.99, 0.07) == "高"
+
+    def test_dual_metric_combination_medium(self):
+        from src.discovery.ablation import _classify_subfactor_impact
+
+        # rho 普通 + shift 中等 → 中
+        assert _classify_subfactor_impact(0.93, 0.05) == "中"
+
+    def test_high_rho_low_shift_minimal(self):
+        from src.discovery.ablation import _classify_subfactor_impact
+
+        # rho 極高 + shift 極小 → 微（過去全部歸「低」是 bug）
+        assert _classify_subfactor_impact(0.99, 0.005) == "微"
+
+    def test_grading_diversity_in_real_chip_data(self):
+        """今日實跑 chip 6 個子因子（ρ 0.9175~0.9732, shift 0.0221~0.0504）應分至少 2 級。"""
+        from src.discovery.ablation import _classify_subfactor_impact
+
+        real_chip = [
+            (0.9732, 0.0221),  # consec
+            (0.9192, 0.0373),  # bvr
+            (0.9247, 0.0361),  # persist
+            (0.9175, 0.0478),  # smr
+            (0.9181, 0.0504),  # sbl
+            (0.9576, 0.0299),  # broker
+        ]
+        levels = {_classify_subfactor_impact(rho, shift) for rho, shift in real_chip}
+        # 過去全為「低/中」單級；現在應至少 2 級
+        assert len(levels) >= 2, f"分級無多樣性：{levels}"

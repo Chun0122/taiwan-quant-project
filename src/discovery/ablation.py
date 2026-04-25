@@ -431,6 +431,45 @@ def _attach_forward_returns(
 
 
 # ──────────────────────────────────────────────────────────
+#  影響力分級
+# ──────────────────────────────────────────────────────────
+
+
+def _classify_dimension_impact(rho: float) -> str:
+    """維度級消融分級。
+
+    維度 ρ 跨度大（-0.05 ~ 0.95）：移除整個維度對排名變動明顯。
+    四級門檻：< 0.50「極高」、< 0.85「高」、< 0.95「中」、其餘「低」。
+    """
+    if rho < 0.50:
+        return "極高"
+    if rho < 0.85:
+        return "高"
+    if rho < 0.95:
+        return "中"
+    return "低"
+
+
+def _classify_subfactor_impact(rho: float, mean_shift: float) -> str:
+    """子因子級消融分級（雙指標）。
+
+    子因子 ρ 跨度小（多落在 0.90~0.99），單看 ρ 易全歸「低」。
+    輔以 `mean_shift`（分數絕對偏移）加強判斷：
+      - rho < 0.90 或 mean_shift > 0.06 → 高
+      - rho < 0.95 或 mean_shift > 0.04 → 中
+      - rho < 0.98 或 mean_shift > 0.02 → 低
+      - 其餘 → 微
+    """
+    if rho < 0.90 or mean_shift > 0.06:
+        return "高"
+    if rho < 0.95 or mean_shift > 0.04:
+        return "中"
+    if rho < 0.98 or mean_shift > 0.02:
+        return "低"
+    return "微"
+
+
+# ──────────────────────────────────────────────────────────
 #  報告格式化
 # ──────────────────────────────────────────────────────────
 
@@ -463,7 +502,7 @@ def format_ablation_report(report: AblationReport) -> str:
         sorted_dims = sorted(report.dimension_results, key=lambda x: x.rank_correlation)
         lines.append("\n  影響力排序（ρ 越低 = 該維度對排名影響越大）：")
         for i, r in enumerate(sorted_dims, 1):
-            impact = "高" if r.rank_correlation < 0.85 else "中" if r.rank_correlation < 0.95 else "低"
+            impact = _classify_dimension_impact(r.rank_correlation)
             lines.append(f"    {i}. {r.removed_dimension}（ρ={r.rank_correlation:.4f}，影響 {impact}）")
 
         # 前 5 名異動明細
@@ -488,7 +527,7 @@ def format_ablation_report(report: AblationReport) -> str:
                 lines.append(f"{'─' * 70}")
                 lines.append(f"{'移除因子':<25}  {'分數 ρ':>8}  {'平均偏移':>8}  {'影響':>4}")
 
-            impact = "高" if r.score_correlation < 0.85 else "中" if r.score_correlation < 0.95 else "低"
+            impact = _classify_subfactor_impact(r.score_correlation, r.mean_score_change)
             lines.append(
                 f"{r.removed_factor:<25}  {r.score_correlation:>8.4f}  {r.mean_score_change:>8.4f}  {impact:>4}"
             )

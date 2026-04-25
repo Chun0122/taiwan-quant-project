@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
+from src.constants import DISCOVERY_KEY_FACTOR_MAP
 from src.data.database import get_session
 from src.data.schema import (
     Announcement,
@@ -103,6 +104,8 @@ class MarketScanner:
         self._sub_factor_ranks: dict[str, pd.DataFrame] = {}
         # 維度 IC（E2b 設置、_score_candidates 消費做 IC-aware 分數翻轉）
         self._dimension_ic_df: pd.DataFrame | None = None
+        # IC-aware 分數轉換動作（_score_candidates 設置，run() 寫入 DiscoveryResult）
+        self._ic_actions: dict[str, str] = {}
         # Universe Filter：各子類可在 __init__ 中傳入模式專屬 config
         self._universe_config = universe_config or UniverseConfig()
         self._universe_filter = UniverseFilter(self._universe_config)
@@ -403,6 +406,7 @@ class MarketScanner:
             mode=self.mode_name,
             audit_trail=audit,
             sub_factor_df=sub_factors if not sub_factors.empty else None,
+            ic_actions=dict(self._ic_actions),
         )
 
     # ------------------------------------------------------------------ #
@@ -943,17 +947,44 @@ class MarketScanner:
         scored: pd.DataFrame,
         threshold: float = 0.15,
         penalty: float = 0.08,
+        percentile: float = 0.15,
+        use_percentile: bool = True,
+        min_sample: int = 20,
+        abs_cutoff_safety: float = 0.30,
     ) -> pd.DataFrame:
-        """Stage 3.5h — news_score < threshold 的股票 composite_score ×(1-penalty)。
+        """Stage 3.5h — news_score 偏低的股票 composite_score ×(1-penalty)。
 
         理由：消融測試顯示 news 的價值來自「過濾壞消息股」，但作為連續排名 IC≈0。
-        解法：保留連續評分，額外加硬性負面閘門，僅懲罰 bottom 15% 高負面消息股。
+        解法：保留連續評分，額外加硬性負面閘門，僅懲罰 bottom percentile 高負面消息股。
+
+        v2 改為百分位門檻（commit ab53fb8 後 news_score 分布漂移，絕對門檻 0.15 命中率掉到 1）：
+          - 預設 use_percentile=True：cutoff = news_score 分布的 percentile 分位數
+          - 安全上限 abs_cutoff_safety：避免 bull regime 整體分布偏高時誤殺中性股
+          - 樣本 < min_sample → fallback 絕對門檻（小樣本下百分位失真）
+          - use_percentile=False：完全退化為 v1 絕對門檻行為
+
+        Args:
+            threshold: 絕對門檻 fallback（v1 行為）
+            penalty: 懲罰幅度（composite_score × (1-penalty)）
+            percentile: 百分位門檻（0~1，預設 0.15 = bottom 15%）
+            use_percentile: True=百分位模式，False=絕對門檻
+            min_sample: 啟用百分位的最低樣本數
+            abs_cutoff_safety: 百分位 cutoff 上限（防 bull regime 誤殺）
         """
         if scored.empty or "news_score" not in scored.columns:
             scored["neg_news_gate"] = 0.0
             return scored
 
-        mask = scored["news_score"] < threshold
+        news = scored["news_score"].dropna()
+        if use_percentile and len(news) >= min_sample:
+            cutoff = float(news.quantile(percentile))
+            cutoff = min(cutoff, abs_cutoff_safety)
+            gate_mode = f"p{int(percentile * 100)}={cutoff:.3f}"
+        else:
+            cutoff = threshold
+            gate_mode = f"abs={cutoff:.3f}"
+
+        mask = scored["news_score"] < cutoff
         scored["neg_news_gate"] = 0.0
         scored.loc[mask, "neg_news_gate"] = -penalty
         scored.loc[mask, "composite_score"] = scored.loc[mask, "composite_score"] * (1 - penalty)
@@ -961,9 +992,9 @@ class MarketScanner:
         n_blocked = int(mask.sum())
         if n_blocked > 0:
             logger.info(
-                "Stage 3.5h: 負面消息閘門 — %d 支股票 news_score<%.2f 降分 -%.1f%%",
+                "Stage 3.5h: 負面消息閘門 — %d 支股票（門檻 %s）降分 -%.1f%%",
                 n_blocked,
-                threshold,
+                gate_mode,
                 penalty * 100,
             )
         return scored
@@ -1505,6 +1536,8 @@ class MarketScanner:
                 if action in ("flipped", "neutralized") and col in df_flipped.columns:
                     candidates[col] = df_flipped[col].values
                     logger.info("E2c IC-aware 分數轉換: %s — %s → %s", self.mode_name, col, action)
+            # 持久化 actions 供 CLI 表格標記欄位狀態（N/F）
+            self._ic_actions = dict(actions)
 
         composite = pd.Series(0.0, index=candidates.index)
         for key, weight in w.items():
@@ -2546,16 +2579,9 @@ class MarketScanner:
             logger.debug("E1: 勝率回饋計算失敗，跳過")
             return 0.0
 
-    # 各模式的關鍵因子（IC 衰退監控目標）— 選擇權重最高的主導維度
-    # momentum v3：從 news_score 改為 technical_score（news IC 結構性為負，永久觸發無意義；
-    # technical 為 bull 最高權重 0.36 的核心維度，監控衰退才反映動能策略失效）
-    _KEY_FACTOR_MAP: dict[str, str] = {
-        "momentum": "technical_score",
-        "swing": "chip_score",
-        "value": "fundamental_score",
-        "dividend": "fundamental_score",
-        "growth": "fundamental_score",
-    }
+    # 關鍵因子 mapping 集中於 src/constants.py（DISCOVERY_KEY_FACTOR_MAP）
+    # 此處保留類屬性別名供子類覆寫；變更請改 constants.py 單一真相來源
+    _KEY_FACTOR_MAP = DISCOVERY_KEY_FACTOR_MAP
 
     def _compute_ic_decay_adjustment(self) -> float:
         """IC 衰退門檻調整：關鍵因子 IC 連續 2 窗口 < 0.05 時回傳 +0.05。"""

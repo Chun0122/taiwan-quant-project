@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -8813,6 +8814,127 @@ class TestApplyNegativeNewsGate:
         result = momentum_scanner._apply_negative_news_gate(scored, threshold=0.15, penalty=0.08)
         assert result.iloc[0]["composite_score"] == pytest.approx(0.7, abs=1e-6)
         assert result.iloc[0]["neg_news_gate"] == pytest.approx(0.0)
+
+
+class TestNegativeNewsGatePercentile:
+    """v2 百分位門檻：commit ab53fb8 後 news_score 分布漂移，絕對門檻命中率掉到 1。"""
+
+    def test_percentile_cuts_bottom_when_abs_misses(self, momentum_scanner):
+        """100 支股票分布 0.20~0.95（無一支 < 0.15 絕對門檻）→ 百分位仍命中數支。
+
+        關鍵對比：v1 絕對門檻 0.15 對此分布命中 0 支；v2 百分位機制能正常運作。
+        實際命中數受 abs_cutoff_safety 上限約束（cutoff=min(p15, 0.30)）。
+        """
+        scored = pd.DataFrame(
+            {
+                "stock_id": [f"{i:04d}" for i in range(100)],
+                "news_score": np.linspace(0.20, 0.95, 100),
+                "composite_score": [1.0] * 100,
+            }
+        )
+        result_pct = momentum_scanner._apply_negative_news_gate(
+            scored.copy(), percentile=0.15, use_percentile=True, abs_cutoff_safety=0.30
+        )
+        n_blocked_pct = int((result_pct["neg_news_gate"] < 0).sum())
+        # 百分位模式應命中 10~20 支（落在 bottom 15% 附近）
+        assert 10 <= n_blocked_pct <= 20, f"百分位命中數異常：{n_blocked_pct}"
+
+        # 對照組：絕對門檻 0.15 → 0 命中（無一支 < 0.15）
+        result_abs = momentum_scanner._apply_negative_news_gate(scored.copy(), threshold=0.15, use_percentile=False)
+        n_blocked_abs = int((result_abs["neg_news_gate"] < 0).sum())
+        assert n_blocked_abs == 0, "v1 絕對門檻在此分布下應 0 命中（用以對比驗證百分位修正）"
+
+    def test_percentile_falls_back_to_abs_when_small_sample(self, momentum_scanner):
+        """樣本 < min_sample 時走絕對門檻（小樣本下百分位失真）。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": ["A", "B", "C"],
+                "news_score": [0.10, 0.40, 0.90],
+                "composite_score": [1.0, 1.0, 1.0],
+            }
+        )
+        # 樣本 3 < min_sample 10 → fallback 絕對門檻 0.15
+        result = momentum_scanner._apply_negative_news_gate(
+            scored,
+            threshold=0.15,
+            percentile=0.15,
+            use_percentile=True,
+            min_sample=10,
+        )
+        n_blocked = int((result["neg_news_gate"] < 0).sum())
+        # 絕對門檻只命中 0.10 那支
+        assert n_blocked == 1
+        assert result.loc[result["stock_id"] == "A", "neg_news_gate"].iloc[0] == pytest.approx(-0.08)
+
+    def test_abs_cutoff_safety_caps_high_distribution(self, momentum_scanner):
+        """bull regime 整體分布偏高（全 > 0.40）時，cutoff 被夾到 abs_cutoff_safety。"""
+        # 50 支股票分布 0.40~0.95，p15 ≈ 0.48 → 被夾到 0.30 → 0 命中
+        scored = pd.DataFrame(
+            {
+                "stock_id": [f"{i:04d}" for i in range(50)],
+                "news_score": np.linspace(0.40, 0.95, 50),
+                "composite_score": [1.0] * 50,
+            }
+        )
+        result = momentum_scanner._apply_negative_news_gate(
+            scored, percentile=0.15, use_percentile=True, abs_cutoff_safety=0.30
+        )
+        # 無人 < 0.30（safety cap）→ 0 命中（避免誤殺中性股）
+        n_blocked = int((result["neg_news_gate"] < 0).sum())
+        assert n_blocked == 0
+
+    def test_use_percentile_false_keeps_v1_behavior(self, momentum_scanner):
+        """use_percentile=False 完全退化為 v1 絕對門檻。"""
+        scored = pd.DataFrame(
+            {
+                "stock_id": [f"{i:04d}" for i in range(50)],
+                "news_score": np.linspace(0.05, 0.95, 50),  # 5 支 < 0.15
+                "composite_score": [1.0] * 50,
+            }
+        )
+        result = momentum_scanner._apply_negative_news_gate(
+            scored, threshold=0.15, percentile=0.15, use_percentile=False
+        )
+        n_blocked = int((result["neg_news_gate"] < 0).sum())
+        # 走絕對門檻 0.15：news_score [0.05, 0.07, 0.09, 0.11, 0.13] 共 5 支
+        # （linspace(0.05, 0.95, 50) 的 step ≈ 0.0184，前 6 個分別為 0.0500, 0.0684, 0.0867, 0.1051, 0.1235, 0.1418）
+        # 實際 < 0.15 共 6 支
+        assert n_blocked == 6
+
+    def test_percentile_uses_distribution_quantile(self, momentum_scanner):
+        """cutoff 應為實際分布的 percentile 分位數，而非固定值。"""
+        # 50 支股票，前 10 支 news_score=0.05、後 40 支=0.50
+        # p15 應落在第 7~8 名附近（0.05 區段），cutoff ≈ 0.05
+        scored = pd.DataFrame(
+            {
+                "stock_id": [f"{i:04d}" for i in range(50)],
+                "news_score": [0.05] * 10 + [0.50] * 40,
+                "composite_score": [1.0] * 50,
+            }
+        )
+        result = momentum_scanner._apply_negative_news_gate(
+            scored, percentile=0.15, use_percentile=True, abs_cutoff_safety=0.30
+        )
+        # p15 = 第 7.35 個分位數 = 0.05（因為前 10 個都是 0.05）
+        # mask: news_score < 0.05 → 0 命中（嚴格 <）
+        n_blocked = int((result["neg_news_gate"] < 0).sum())
+        assert n_blocked == 0  # 邊界精確（實際 cutoff = 0.05，無人 < 0.05）
+
+    def test_log_message_indicates_mode(self, momentum_scanner, caplog):
+        """log 應標明使用的是百分位 (p15) 或絕對 (abs) 模式。"""
+        import logging
+
+        scored = pd.DataFrame(
+            {
+                "stock_id": [f"{i:04d}" for i in range(50)],
+                "news_score": np.linspace(0.05, 0.95, 50),
+                "composite_score": [1.0] * 50,
+            }
+        )
+        with caplog.at_level(logging.INFO, logger="src.discovery.scanner._base"):
+            momentum_scanner._apply_negative_news_gate(scored, percentile=0.15, use_percentile=True)
+        # 至少有一條 log 含 p15 標識
+        assert any("p15=" in rec.message for rec in caplog.records)
 
 
 # ====================================================================== #

@@ -3335,3 +3335,6 @@ class DiscoveryResult:
     mode: str = "momentum"
     audit_trail: ScanAuditTrail | None = None
     sub_factor_df: pd.DataFrame | None = None
+    # IC-aware 分數轉換動作 mapping（{factor_col: "kept"/"flipped"/"neutralized"}）
+    # 供 CLI Top N 表格標記欄位狀態（N=neutralized, F=flipped）
+    ic_actions: dict[str, str] = field(default_factory=dict)
