@@ -54,8 +54,17 @@ class GrowthScanner(MarketScanner):
         )
         super().__init__(**kwargs)
 
-    def run(self) -> DiscoveryResult:
-        """覆寫 run()：粗篩前自動同步 MOPS 全市場月營收。"""
+    def run(self, shared=None, precomputed_ic=None) -> DiscoveryResult:
+        """覆寫 run()：粗篩前自動同步 MOPS 全市場月營收。
+
+        Args:
+            shared: 項目 B — 由 `_cmd_discover_all` 預載入的全市場資料；
+                傳入時 `_load_market_data` 以 in-memory 過濾取代 DB 查詢。
+            precomputed_ic: 項目 E — Step 8c 預算的 static IC DataFrame，
+                供 `_apply_ic_weight_adjustment` / `_log_factor_effectiveness` 短路。
+        """
+        self._shared = shared
+        self._precomputed_ic = precomputed_ic
         # Stage 0: Regime 偵測
         try:
             from src.regime.detector import MarketRegimeDetector
@@ -175,8 +184,17 @@ class GrowthScanner(MarketScanner):
         )
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：growth 模式載入 2 個月營收資料（算加速度）。"""
+        """覆寫：growth 模式載入 4 個月營收資料（算加速度）。
+
+        項目 B：若 `self._shared` 已由 `run(shared=...)` 注入，則以 in-memory 過濾
+        取代 DB 查詢，month=4 透過 `revenue_months` 參數顯式對齊原行為。
+        """
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+
+        shared = getattr(self, "_shared", None)
+        if shared is not None:
+            # Growth 不做 UniverseFilter（全市場掃）→ universe_ids 傳空清單
+            return self._slice_shared_market_data(shared, [], cutoff, revenue_months=4)
 
         with get_session() as session:
             rows = session.execute(

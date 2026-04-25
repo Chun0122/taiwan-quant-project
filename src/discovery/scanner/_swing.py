@@ -55,9 +55,17 @@ class SwingScanner(MarketScanner):
         super().__init__(**kwargs)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：swing 模式載入 2 個月營收資料（算加速度）。含 UniverseFilter Stage 0.5。"""
+        """覆寫：swing 模式載入 2 個月營收資料（算加速度）。含 UniverseFilter Stage 0.5。
+
+        項目 B：若 `self._shared` 已由 `run(shared=...)` 注入，則以 in-memory 過濾
+        取代 DB 查詢，month=2 透過 `revenue_months` 參數顯式對齊原行為。
+        """
         universe_ids = self._get_universe_ids()
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+
+        shared = getattr(self, "_shared", None)
+        if shared is not None:
+            return self._slice_shared_market_data(shared, universe_ids, cutoff, revenue_months=2)
 
         with get_session() as session:
             price_query = select(

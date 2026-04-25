@@ -537,6 +537,10 @@ def sync_broker_trades(
     每次 API 呼叫取得 start~end 期間彙整，date 欄位統一為 end（今日）。
     速率控制由 fetch_dj_broker_trades() 內部處理（3 秒間隔）。
 
+    項目 C：以 `ThreadPoolExecutor(max_workers=3)` 並行化（與 `sync_broker_bootstrap`
+    一致），等效請求速率 ≈ 1 req/s，對 DJ 端點仍溫和。cache 篩選與 `_batch_get_last_dates`
+    保留於主 thread，僅 HTTP + upsert 進入 worker。
+
     Args:
         stock_ids: 指定股票代號清單，預設使用 watchlist
         days:      查詢最近幾個交易日的彙整範圍（預設 5）
@@ -544,6 +548,8 @@ def sync_broker_trades(
     Returns:
         新增的分點交易筆數
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     from src.data.twse_fetcher import fetch_dj_broker_trades
 
     if stock_ids is None:
@@ -553,21 +559,50 @@ def sync_broker_trades(
     end_date = date.today()
     start_date = end_date - timedelta(days=days + 3)
 
-    total = 0
+    # 主 thread：批次查 last_date，篩出 pending（跳過 cache < 2 天的股票）
     last_dates = _batch_get_last_dates(BrokerTrade, stock_ids)
+    pending: list[str] = []
+    skipped: list[tuple[str, date]] = []
     for sid in stock_ids:
         latest_str = last_dates.get(sid)
         latest = date.fromisoformat(latest_str) if latest_str else None
         if latest and (date.today() - latest).days < 2:
-            logger.info("[分點] %s 已有最新資料（%s），跳過", sid, latest)
-            continue
+            skipped.append((sid, latest))
+        else:
+            pending.append(sid)
 
-        df = fetch_dj_broker_trades(sid, start_date, end_date)
+    for sid, latest in skipped:
+        logger.info("[分點] %s 已有最新資料（%s），跳過", sid, latest)
 
-        if not df.empty:
+    if not pending:
+        logger.info("[分點] 全部 %d 支快取新鮮，無需同步", len(stock_ids))
+        return 0
+
+    logger.info("[分點] 待抓 %d 支（跳過 %d 支快取新鮮）", len(pending), len(skipped))
+
+    def _fetch_and_upsert(sid: str) -> int:
+        """Worker：抓一支股票 → 寫 DB；失敗降級為 0，不中止其他 worker。"""
+        try:
+            df = fetch_dj_broker_trades(sid, start_date, end_date)
+        except Exception:
+            logger.warning("[分點] %s 抓取失敗，跳過", sid, exc_info=True)
+            return 0
+        if df.empty:
+            return 0
+        try:
             n = _upsert_broker_trade(df)
-            total += n
+        except Exception:
+            logger.warning("[分點] %s 寫入失敗，跳過", sid, exc_info=True)
+            return 0
+        if n > 0:
             logger.info("[分點] %s 寫入 %d 筆", sid, n)
+        return n
+
+    total = 0
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="broker_sync") as pool:
+        # pool.map 會保留 pending 的順序、iteration 時 raise 也會被 _fetch_and_upsert 的 try 吞掉
+        for n in pool.map(_fetch_and_upsert, pending):
+            total += n
 
     return total
 

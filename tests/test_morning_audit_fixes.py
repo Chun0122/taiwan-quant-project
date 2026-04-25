@@ -31,7 +31,8 @@ class TestICStatusComputation:
             "src.discovery.scanner._functions.compute_rolling_ic",
             side_effect=RuntimeError("模擬崩壞"),
         ):
-            status = morning_cmd._compute_factor_ic_status()
+            # 項目 E：_compute_factor_ic_status 改為回傳 (status, ic_df_by_mode)
+            status, _ic_df_by_mode = morning_cmd._compute_factor_ic_status()
 
         # 每個模式只要有進入 compute_rolling_ic 都應回 level='error'
         # （若樣本不足才會是 insufficient；此處無法控制 DB，
@@ -195,7 +196,7 @@ class TestDiscoverAllDisabledModes:
             def __init__(self, mode_key, **kwargs):
                 self._mode_key = mode_key
 
-            def run(self):
+            def run(self, shared=None, precomputed_ic=None):  # 項目 B + E
                 called_modes.append(self._mode_key)
                 return _FakeResult()
 
@@ -217,9 +218,31 @@ class TestDiscoverAllDisabledModes:
             disabled_modes=["swing", "growth"],
         )
 
+        # 項目 A/B：避免 _cmd_discover_all 觸碰真實 DB / FinMind（shared 載入與預熱）
+        from datetime import date, timedelta
+
+        import pandas as pd
+
+        from src.discovery.scanner._shared_load import SharedMarketData
+
+        empty_shared = SharedMarketData(
+            df_price=pd.DataFrame(columns=["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]),
+            df_inst=pd.DataFrame(columns=["stock_id", "date", "name", "net"]),
+            df_margin=pd.DataFrame(columns=["stock_id", "date", "margin_balance", "short_balance"]),
+            df_revenue=pd.DataFrame(columns=["stock_id", "date", "yoy_growth", "mom_growth"]),
+            price_cutoff=date.today() - timedelta(days=90),
+            revenue_cutoff=date.today() - timedelta(days=180),
+            loaded_at=pd.Timestamp.utcnow().to_pydatetime(),
+        )
+
         with (
             patch.object(discover_cmd, "init_db"),
             patch.object(discover_cmd, "ensure_sync_market_data"),
+            patch.object(discover_cmd, "_prewarm_stage_25"),
+            patch(
+                "src.discovery.scanner._shared_load.load_shared_market_data",
+                lambda **kw: empty_shared,
+            ),
             patch("src.discovery.scanner.MomentumScanner", _make("momentum")),
             patch("src.discovery.scanner.SwingScanner", _make("swing")),
             patch("src.discovery.scanner.ValueScanner", _make("value")),

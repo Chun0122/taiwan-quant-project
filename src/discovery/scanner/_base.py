@@ -52,6 +52,7 @@ from src.discovery.scanner._functions import (
     detect_chip_tier_changes,
     score_key_player_cost,
 )
+from src.discovery.scanner._shared_load import SharedMarketData, slice_revenue_raw
 from src.discovery.universe import UniverseConfig, UniverseFilter
 from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
 
@@ -123,14 +124,29 @@ class MarketScanner:
             return True
         return self.mode_name in _RMB.get(self.regime, frozenset())
 
-    def run(self) -> DiscoveryResult:
+    def run(
+        self,
+        shared: SharedMarketData | None = None,
+        precomputed_ic: pd.DataFrame | None = None,
+    ) -> DiscoveryResult:
         """執行四階段漏斗掃描。
 
         流程清楚分為三大區塊：
         1. 資料準備（Stage 0~2.7）
         2. 評分 + 軟加成（Stage 3~3.6）— 調整 composite_score，不剔除
         3. 硬風控（Stage 3.5/3.5b/3.5e/3.7/4.1/4.2）— 通過或剔除
+
+        Args:
+            shared: 由 `_cmd_discover_all` 預載入的全市場資料（項目 B）；
+                傳入時 `_load_market_data` 以 in-memory 過濾取代 DB 查詢，
+                省下 4 次重複 I/O。未傳入時維持原行為（各 scanner 自行查 DB）。
+            precomputed_ic: 由 morning-routine Step 8c 預算的 static IC DataFrame
+                （項目 E）；傳入時 `_apply_ic_weight_adjustment` 與
+                `_log_factor_effectiveness` 直接使用，跳過 DB 查詢 + 重算 IC。
+                未傳入時維持原 DB 路徑。
         """
+        self._shared = shared
+        self._precomputed_ic = precomputed_ic
         self.scan_date = date.today()
         audit = ScanAuditTrail()
         self._audit_trail = audit
@@ -417,11 +433,19 @@ class MarketScanner:
         Stage 0.5（Universe Filter）：先執行三層 SQL/Pandas 過濾，取得 ~150-1500 支候選 stock_id，
         再以 IN 子句限定 DailyPrice/InstitutionalInvestor/MarginTrading 查詢範圍，
         避免全量載入 ~6000 支股票，節省約 75% I/O。
+
+        項目 B 增強：若 `self._shared` 已由 `run(shared=...)` 注入，則以 in-memory 過濾
+        取代 DB 查詢，避免 5 個 scanner 重複相同的全市場讀取。
         """
         # Stage 0.5: Universe Filter — SQL 硬過濾 + 流動性 + 趨勢
         universe_ids = self._get_universe_ids()
 
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+
+        # 項目 B：共用資料注入路徑（避免重複 DB 讀取）
+        shared = getattr(self, "_shared", None)
+        if shared is not None:
+            return self._slice_shared_market_data(shared, universe_ids, cutoff)
 
         with get_session() as session:
             # 日K線（含 turnover，供流動性評分使用）
@@ -476,6 +500,62 @@ class MarketScanner:
         # 月營收（限候選股）
         df_revenue = self._load_revenue_data(
             stock_ids=universe_ids if universe_ids else None, months=self._revenue_months
+        )
+
+        return df_price, df_inst, df_margin, df_revenue
+
+    def _slice_shared_market_data(
+        self,
+        shared: SharedMarketData,
+        universe_ids: list[str],
+        cutoff: date,
+        *,
+        revenue_months: int | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """項目 B：由 SharedMarketData 以 in-memory 過濾產生 scanner 所需的 4 張 DataFrame。
+
+        語意與原 `_load_market_data` DB 路徑一致：
+          - 以 `cutoff = today - (lookback_days + 10)` 過濾日期
+          - 若有 `universe_ids` 則以 `.isin()` 過濾股票
+          - revenue 依 `revenue_months`（未傳入時用 `self._revenue_months`）pivot
+
+        共用資料不可 mutate；回傳前 `.copy()` 確保 scanner 可安全改欄位。
+
+        Args:
+            revenue_months: Swing 等覆寫 `_load_market_data` 的子類可在此顯式傳遞
+                `months=2` 對齊原行為，不依賴 `_revenue_months` 類別屬性。
+        """
+        # 防呆：shared 的 price_cutoff 需早於或等於本 scanner 所需 cutoff
+        if shared.price_cutoff > cutoff:
+            logger.warning(
+                "Shared price_cutoff=%s 晚於 scanner cutoff=%s，資料覆蓋不足；退回 DB 路徑",
+                shared.price_cutoff,
+                cutoff,
+            )
+            self._shared = None  # 避免下方遞迴
+            try:
+                return self._load_market_data()
+            finally:
+                self._shared = shared
+
+        def _filter(df: pd.DataFrame) -> pd.DataFrame:
+            """按 date + universe 過濾共用 DF，並回傳 copy。"""
+            if df.empty:
+                return df.copy()
+            mask = df["date"] >= cutoff
+            if universe_ids:
+                mask &= df["stock_id"].isin(universe_ids)
+            return df.loc[mask].copy()
+
+        df_price = _filter(shared.df_price)
+        df_inst = _filter(shared.df_inst)
+        df_margin = _filter(shared.df_margin)
+
+        months = revenue_months if revenue_months is not None else self._revenue_months
+        df_revenue = slice_revenue_raw(
+            shared.df_revenue,
+            stock_ids=universe_ids if universe_ids else None,
+            months=months,
         )
 
         return df_price, df_inst, df_margin, df_revenue
@@ -2559,7 +2639,24 @@ class MarketScanner:
 
         不影響當前評分流程，僅提供因子有效性資訊供後續人工調參。
         若 DB 無足夠資料（<10 筆推薦）則靜默跳過。
+
+        項目 E：若 `self._precomputed_ic` 已由 `run(precomputed_ic=...)` 注入，直接使用，
+        跳過 DB 查詢 + `compute_factor_ic` 呼叫。
         """
+        # 項目 E 短路：使用 morning-routine Step 8c 預算的 IC
+        precomputed = getattr(self, "_precomputed_ic", None)
+        if precomputed is not None and not precomputed.empty:
+            for _, row in precomputed.iterrows():
+                logger.info(
+                    "E2 因子IC: %s — %s IC=%.4f (%s, n=%d) [precomputed]",
+                    self.mode_name,
+                    row["factor"],
+                    row["ic"],
+                    row["direction"],
+                    row["evaluable_count"],
+                )
+            return
+
         try:
             cutoff = date.today() - timedelta(days=35)
 
@@ -2643,54 +2740,63 @@ class MarketScanner:
 
         Returns:
             調整後權重字典
+
+        項目 E：若 `self._precomputed_ic` 非空，跳過 DB 查詢與 `compute_factor_ic` 呼叫，
+        直接使用預算結果（與 morning-routine Step 8c 一致的 holding_days=5/lookback_days=30）。
         """
         try:
-            cutoff = date.today() - timedelta(days=35)
+            # 項目 E 短路：使用預算 IC，跳過 DB 查詢與重算
+            precomputed = getattr(self, "_precomputed_ic", None)
+            if precomputed is not None and not precomputed.empty:
+                ic_df = precomputed
+                self._dimension_ic_df = ic_df
+            else:
+                cutoff = date.today() - timedelta(days=35)
 
-            with get_session() as session:
-                stmt = select(
-                    DiscoveryRecord.scan_date,
-                    DiscoveryRecord.stock_id,
-                    DiscoveryRecord.close,
-                    DiscoveryRecord.technical_score,
-                    DiscoveryRecord.chip_score,
-                    DiscoveryRecord.fundamental_score,
-                    DiscoveryRecord.news_score,
-                ).where(
-                    DiscoveryRecord.mode == self.mode_name,
-                    DiscoveryRecord.scan_date >= cutoff,
-                )
-                rows = session.execute(stmt).all()
-                if len(rows) < 20:
-                    logger.info("E2b: 歷史推薦不足 20 筆（%d），跳過 IC 權重調整", len(rows))
-                    return dict(base_weights)
+                with get_session() as session:
+                    stmt = select(
+                        DiscoveryRecord.scan_date,
+                        DiscoveryRecord.stock_id,
+                        DiscoveryRecord.close,
+                        DiscoveryRecord.technical_score,
+                        DiscoveryRecord.chip_score,
+                        DiscoveryRecord.fundamental_score,
+                        DiscoveryRecord.news_score,
+                    ).where(
+                        DiscoveryRecord.mode == self.mode_name,
+                        DiscoveryRecord.scan_date >= cutoff,
+                    )
+                    rows = session.execute(stmt).all()
+                    if len(rows) < 20:
+                        logger.info("E2b: 歷史推薦不足 20 筆（%d），跳過 IC 權重調整", len(rows))
+                        return dict(base_weights)
 
-                df_records = pd.DataFrame(
-                    rows,
-                    columns=[
-                        "scan_date",
-                        "stock_id",
-                        "close",
-                        "technical_score",
-                        "chip_score",
-                        "fundamental_score",
-                        "news_score",
-                    ],
-                )
+                    df_records = pd.DataFrame(
+                        rows,
+                        columns=[
+                            "scan_date",
+                            "stock_id",
+                            "close",
+                            "technical_score",
+                            "chip_score",
+                            "fundamental_score",
+                            "news_score",
+                        ],
+                    )
 
-                stock_ids = df_records["stock_id"].unique().tolist()
-                price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
-                    DailyPrice.stock_id.in_(stock_ids),
-                    DailyPrice.date >= cutoff,
-                )
-                price_rows = session.execute(price_stmt).all()
-                if not price_rows:
-                    return dict(base_weights)
-                df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
+                    stock_ids = df_records["stock_id"].unique().tolist()
+                    price_stmt = select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                        DailyPrice.stock_id.in_(stock_ids),
+                        DailyPrice.date >= cutoff,
+                    )
+                    price_rows = session.execute(price_stmt).all()
+                    if not price_rows:
+                        return dict(base_weights)
+                    df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
-            ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
-            # 暫存供 _score_candidates 做 IC 感知分數翻轉使用（問題 3：news_score 反向修正）
-            self._dimension_ic_df = ic_df
+                ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+                # 暫存供 _score_candidates 做 IC 感知分數翻轉使用（問題 3：news_score 反向修正）
+                self._dimension_ic_df = ic_df
 
             # 計算今日影響力（若候選資料充足）
             impact_df = self._compute_dimension_impact(base_weights, scored_candidates)

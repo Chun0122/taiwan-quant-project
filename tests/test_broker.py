@@ -1634,3 +1634,163 @@ class TestLoadBrokerDataExtendedCloseProxy:
         smart_result = compute_smart_broker_score(result, close_map)
         # 評分可能為空（需達門檻），但函數執行不應拋例外
         assert isinstance(smart_result, pd.DataFrame)
+
+
+# ------------------------------------------------------------------ #
+#  TestSyncBrokerTradesConcurrency — 項目 C：ThreadPoolExecutor 併發
+# ------------------------------------------------------------------ #
+
+
+class TestSyncBrokerTradesConcurrency:
+    """項目 C：`sync_broker_trades` 併發化（max_workers=3）後的語意保證。
+
+    本測試只聚焦於「ThreadPoolExecutor 編排」的新增行為；
+    `_upsert_broker_trade` 與 `_batch_get_last_dates` 的 DB 互動由其他測試覆蓋，
+    此處 mock 以避免 SQLAlchemy 單連線 session 在多 thread 下的 ResourceClosedError
+    （`db_session` fixture 預設 single-connection，與 ThreadPool 本質不相容）。
+
+    關鍵驗證：
+      1. 每支股票被 fetch 一次、總數彙總正確
+      2. 同時 in-flight worker 數 ≤ 3（不超過 DJ 端點可容忍併發度）且 ≥ 2（確實併發）
+      3. 單支股票例外不中止其他股票
+      4. 快取新鮮（< 2 天）股票被主 thread 過濾，不進入 worker
+      5. 對外 API 簽名相容（回歸保護）
+    """
+
+    @staticmethod
+    def _non_empty_df() -> pd.DataFrame:
+        """建立非空 DataFrame（觸發 `_upsert_broker_trade` 路徑）。"""
+        return pd.DataFrame([{"stock_id": "X", "date": date.today(), "broker_id": "9999"}])
+
+    def test_all_stocks_fetched_and_upsert_count_aggregated(self, monkeypatch):
+        """4 支股票各 fetch 一次，每次 upsert 回傳 1 → 總計 4。"""
+        from src.data import pipeline
+
+        called: list[str] = []
+
+        def fake_fetch(sid, start, end):
+            called.append(sid)
+            return self._non_empty_df()
+
+        monkeypatch.setattr("src.data.twse_fetcher.fetch_dj_broker_trades", fake_fetch)
+        monkeypatch.setattr(pipeline, "init_db", lambda: None)
+        monkeypatch.setattr(pipeline, "_batch_get_last_dates", lambda *a, **kw: {})
+        monkeypatch.setattr(pipeline, "_upsert_broker_trade", lambda df: 1)
+
+        total = pipeline.sync_broker_trades(stock_ids=["2330", "2317", "2454", "2308"], days=5)
+
+        assert total == 4
+        assert sorted(called) == ["2308", "2317", "2330", "2454"]
+
+    def test_max_workers_is_three(self, monkeypatch):
+        """同時 in-flight 的 worker 數應 ≥ 2（證實併發）且 ≤ 3（不超過 DJ 端點容忍）。"""
+        import threading
+        import time
+
+        from src.data import pipeline
+
+        lock = threading.Lock()
+        inflight = [0]
+        peak = [0]
+
+        def slow_fetch(sid, start, end):
+            with lock:
+                inflight[0] += 1
+                peak[0] = max(peak[0], inflight[0])
+            time.sleep(0.05)
+            with lock:
+                inflight[0] -= 1
+            return pd.DataFrame()  # 空 df，不觸發 upsert
+
+        monkeypatch.setattr("src.data.twse_fetcher.fetch_dj_broker_trades", slow_fetch)
+        monkeypatch.setattr(pipeline, "init_db", lambda: None)
+        monkeypatch.setattr(pipeline, "_batch_get_last_dates", lambda *a, **kw: {})
+
+        pipeline.sync_broker_trades(stock_ids=[f"{1000 + i}" for i in range(10)], days=5)
+        assert peak[0] <= 3, f"peak inflight={peak[0]}，應 ≤ 3"
+        assert peak[0] >= 2, f"peak inflight={peak[0]}，應 ≥ 2 表示確實併發"
+
+    def test_exception_in_one_stock_does_not_abort_others(self, monkeypatch):
+        """單支股票 fetch 例外應被吸收，其他股票仍被抓取且不影響總計。"""
+        from src.data import pipeline
+
+        called: list[str] = []
+
+        def flaky_fetch(sid, start, end):
+            called.append(sid)
+            if sid == "BAD":
+                raise ConnectionError("boom")
+            return self._non_empty_df()
+
+        monkeypatch.setattr("src.data.twse_fetcher.fetch_dj_broker_trades", flaky_fetch)
+        monkeypatch.setattr(pipeline, "init_db", lambda: None)
+        monkeypatch.setattr(pipeline, "_batch_get_last_dates", lambda *a, **kw: {})
+        monkeypatch.setattr(pipeline, "_upsert_broker_trade", lambda df: 1)
+
+        total = pipeline.sync_broker_trades(stock_ids=["2330", "BAD", "2317"], days=5)
+
+        assert total == 2  # BAD raise → 0；其他兩支各 1
+        assert sorted(called) == ["2330", "2317", "BAD"] or sorted(called) == sorted(
+            ["2330", "BAD", "2317"]
+        )  # 所有股票仍被嘗試
+        assert set(called) == {"2330", "2317", "BAD"}
+
+    def test_fresh_cache_stocks_skipped_before_pool(self, monkeypatch):
+        """last_date 在 2 天內（含今日）的股票應被主 thread 過濾，不進入 ThreadPool。"""
+        from src.data import pipeline
+
+        # 模擬 _batch_get_last_dates：2330 昨天有資料（快取新鮮），2317 無資料
+        yesterday_iso = (date.today() - timedelta(days=1)).isoformat()
+        monkeypatch.setattr(
+            pipeline,
+            "_batch_get_last_dates",
+            lambda *a, **kw: {"2330": yesterday_iso},
+        )
+
+        fetched: list[str] = []
+
+        def fake_fetch(sid, start, end):
+            fetched.append(sid)
+            return self._non_empty_df()
+
+        monkeypatch.setattr("src.data.twse_fetcher.fetch_dj_broker_trades", fake_fetch)
+        monkeypatch.setattr(pipeline, "init_db", lambda: None)
+        monkeypatch.setattr(pipeline, "_upsert_broker_trade", lambda df: 1)
+
+        total = pipeline.sync_broker_trades(stock_ids=["2330", "2317"], days=5)
+
+        assert fetched == ["2317"], "2330 快取新鮮應被主 thread 跳過，不進 pool"
+        assert total == 1
+
+    def test_all_cache_fresh_returns_zero_without_pool(self, monkeypatch):
+        """全部股票快取新鮮 → 直接回 0，連 ThreadPool 都不建立。"""
+        from src.data import pipeline
+
+        yesterday_iso = (date.today() - timedelta(days=1)).isoformat()
+        monkeypatch.setattr(
+            pipeline,
+            "_batch_get_last_dates",
+            lambda *a, **kw: {"2330": yesterday_iso, "2317": yesterday_iso},
+        )
+
+        called: list[str] = []
+        monkeypatch.setattr(
+            "src.data.twse_fetcher.fetch_dj_broker_trades",
+            lambda sid, s, e: called.append(sid) or pd.DataFrame(),
+        )
+        monkeypatch.setattr(pipeline, "init_db", lambda: None)
+
+        total = pipeline.sync_broker_trades(stock_ids=["2330", "2317"], days=5)
+        assert total == 0
+        assert called == []
+
+    def test_signature_unchanged_for_backwards_compat(self):
+        """併發改造後保持對外 API 相容：(stock_ids, days) + 回傳 int。"""
+        import inspect
+
+        from src.data.pipeline import sync_broker_trades
+
+        sig = inspect.signature(sync_broker_trades)
+        assert list(sig.parameters.keys()) == ["stock_ids", "days"]
+        assert sig.parameters["days"].default == 5
+        assert sig.parameters["stock_ids"].default is None

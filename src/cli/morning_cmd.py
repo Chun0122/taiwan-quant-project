@@ -431,20 +431,23 @@ _MODE_LABELS: dict[str, str] = {
 }
 
 
-def _compute_factor_ic_status() -> list[dict]:
-    """為每個 discover 模式計算關鍵因子 rolling IC（純函數）。
+def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
+    """為每個 discover 模式計算 IC：rolling IC（level 判定）+ scanner 用 IC（項目 E）。
 
-    回傳每個模式一筆 dict：
-    - {"mode", "factor", "ic", "level", "error"}
-    - level ∈ {"normal", "decay", "weak", "inverse", "insufficient", "error"}
+    為每個 mode 跑兩次 IC 計算，**共用同一次 DB 查詢**：
+      1. `compute_rolling_ic(window_days=14, step_days=7)` — 用於 level 判定（rolling 窗口）
+      2. `compute_factor_ic(holding_days=5, lookback_days=30)` — 用於 scanner
+         `_apply_ic_weight_adjustment` / `_log_factor_effectiveness`（單次靜態 IC）
 
-    level 判定（C1 修復：失敗時明確分級為 "error"，不再靜默）：
-      ic >= 0.10       → normal
-      0.05 ≤ ic < 0.10 → decay
-     -0.05 ≤ ic < 0.05 → weak
-      ic < -0.05       → inverse
-      樣本不足          → insufficient
-      例外              → error（含 error 訊息）
+    兩者語意不同（rolling vs static），不可混用。本函式同時產出，避免 scanner
+    內重複查 DiscoveryRecord + DailyPrice + 重算 IC（每 mode 省 ~2-5 秒）。
+
+    Returns:
+        tuple:
+          - status_list: 每模式一筆 dict（mode/mode_key/factor/ic/level/sample_count/error）
+            level ∈ {"normal", "decay", "weak", "inverse", "insufficient", "error"}
+          - ic_df_by_mode: {mode_key: ic_df}，ic_df 為 `compute_factor_ic` 輸出
+            （factor / ic / evaluable_count / direction），失敗或樣本不足時為空 DataFrame
     """
     from datetime import date, timedelta
 
@@ -453,13 +456,15 @@ def _compute_factor_ic_status() -> list[dict]:
 
     from src.data.database import get_session
     from src.data.schema import DailyPrice, DiscoveryRecord
-    from src.discovery.scanner._functions import compute_rolling_ic
+    from src.discovery.scanner._functions import compute_factor_ic, compute_rolling_ic
 
     results: list[dict] = []
+    ic_df_by_mode: dict[str, pd.DataFrame] = {}
     cutoff = date.today() - timedelta(days=35)
 
     for mode, key_factor in _KEY_FACTORS.items():
         entry: dict = {"mode": _MODE_LABELS.get(mode, mode), "mode_key": mode, "factor": key_factor}
+        ic_df_by_mode[mode] = pd.DataFrame()  # 預設空，失敗或樣本不足時保持
         try:
             with get_session() as session:
                 stmt = select(
@@ -504,7 +509,18 @@ def _compute_factor_ic_status() -> list[dict]:
                     continue
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
+            # 路徑 1：rolling IC，用於 level 判定（保留原行為）
             rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
+
+            # 路徑 2：scanner 端用的 static IC（holding_days=5, lookback_days=30）
+            # — 與 _apply_ic_weight_adjustment / _log_factor_effectiveness 內部呼叫的參數一致
+            try:
+                static_ic = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+                if not static_ic.empty:
+                    ic_df_by_mode[mode] = static_ic
+            except Exception:
+                logger.warning("scanner 用 static IC 計算失敗 mode=%s（不影響 level 判定）", mode, exc_info=True)
+
             if rolling_df.empty:
                 entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
                 results.append(entry)
@@ -533,7 +549,7 @@ def _compute_factor_ic_status() -> list[dict]:
             entry.update({"ic": None, "level": "error", "error": str(exc)})
             results.append(entry)
 
-    return results
+    return results, ic_df_by_mode
 
 
 def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
@@ -548,10 +564,10 @@ def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
         ic_status: 預先計算好的 IC 狀態（Step 8c 已算過時重用）
 
     Returns:
-        list[dict]: 同 _compute_factor_ic_status 回傳格式
+        list[dict]: 同 _compute_factor_ic_status 回傳格式（status_list 部分）
     """
     if ic_status is None:
-        ic_status = _compute_factor_ic_status()
+        ic_status, _ = _compute_factor_ic_status()
 
     has_decay = False
     failed_modes: list[str] = []
@@ -802,16 +818,22 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                 print("     單日急跌: ✓（TAIEX 單日跌幅 > 2.5%）")
             print()
 
-    # M2：共用變數，供 Step 8c 寫入、Step 9 讀取
-    ic_status_state: dict = {"ic_status": [], "disabled_modes": []}
+    # M2 + 項目 E：共用變數，Step 8c 寫入 status / disabled_modes / ic_df_by_mode；Step 9 讀取
+    ic_status_state: dict = {"ic_status": [], "disabled_modes": [], "ic_df_by_mode": {}}
     # M1：共用變數，Step 9 判斷資料是否過期阻擋
     discover_blocked_state: dict = {"blocked": False, "reason": ""}
     MAX_STALE_HARD_BLOCK_DAYS = 7  # 超過 7 天資料過期直接阻擋 Step 9（M1）
 
     def _step_8c_ic_precheck() -> None:
-        """Step 8c：在 Step 9 discover 前檢查關鍵因子 IC，反向模式自動停用（M2）。"""
-        status = _compute_factor_ic_status()
+        """Step 8c：在 Step 9 discover 前檢查關鍵因子 IC，反向模式自動停用（M2）。
+
+        項目 E：同時計算 scanner `_apply_ic_weight_adjustment` / `_log_factor_effectiveness`
+        所需的 static IC，存入 ic_status_state["ic_df_by_mode"]，避免 5 個 scanner
+        在並行掃描時各自重複查 DB + 重算 IC。
+        """
+        status, ic_df_by_mode = _compute_factor_ic_status()
         ic_status_state["ic_status"] = status
+        ic_status_state["ic_df_by_mode"] = ic_df_by_mode
         _check_factor_ic_decay(ic_status=status)
         disabled = _inverse_modes_from_ic_status(status)
         ic_status_state["disabled_modes"] = disabled
@@ -833,6 +855,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             return
 
         disabled_modes = ic_status_state.get("disabled_modes", [])
+        ic_df_by_mode = ic_status_state.get("ic_df_by_mode", {}) or {}
         _cmd_discover_all(
             argparse.Namespace(
                 skip_sync=True,
@@ -847,6 +870,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
                 notify=False,
                 use_ic_adjustment=True,
                 disabled_modes=disabled_modes,
+                precomputed_ic_by_mode=ic_df_by_mode,  # 項目 E
             )
         )
 

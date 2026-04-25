@@ -578,13 +578,43 @@ def fetch_tpex_margin(target_date: date | None = None) -> pd.DataFrame:
     return df
 
 
+def _fetch_twse_tpex_parallel(
+    twse_fn,
+    tpex_fn,
+    target_date: date | None,
+    label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """併發抓取 TWSE + TPEX（不同 host）同一指標，降低單日 wall-clock（項目 D）。
+
+    為何只做內層 TWSE/TPEX 並行（非跨指標）：
+      - TWSE 與 TPEX 是不同 host，併發不共享速率限制。
+      - 跨指標（price/inst/margin）屬同一 host，若併發會破壞各 fetcher 內的
+        `time.sleep(_REQUEST_DELAY)` 同 host 3 秒間隔 → 被端點限流。
+
+    單 fetcher 例外時該側回傳空 DataFrame，不阻斷另一邊結果。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _safe(fn):
+        try:
+            return fn(target_date)
+        except Exception:
+            logger.warning("[%s] 抓取失敗，降級為空 DataFrame", label, exc_info=True)
+            return pd.DataFrame()
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"mkt_{label}") as pool:
+        fut_twse = pool.submit(_safe, twse_fn)
+        fut_tpex = pool.submit(_safe, tpex_fn)
+        return fut_twse.result(), fut_tpex.result()
+
+
 def fetch_market_margin(target_date: date | None = None) -> pd.DataFrame:
     """抓取全市場（上市 + 上櫃）融資融券。
 
     合併 TWSE + TPEX 資料，回傳統一欄位的 DataFrame。
+    項目 D：TWSE + TPEX 以 2 worker 並行（不同 host，各自保留 3 秒速率限制）。
     """
-    df_twse = fetch_twse_margin(target_date)
-    df_tpex = fetch_tpex_margin(target_date)
+    df_twse, df_tpex = _fetch_twse_tpex_parallel(fetch_twse_margin, fetch_tpex_margin, target_date, "margin")
 
     dfs = [df for df in [df_twse, df_tpex] if not df.empty]
     if not dfs:
@@ -695,10 +725,9 @@ def fetch_market_daily_prices(target_date: date | None = None) -> pd.DataFrame:
     """抓取全市場（上市 + 上櫃）日收盤行情。
 
     合併 TWSE + TPEX 資料，回傳統一欄位的 DataFrame。
-    僅需 2 次 API 呼叫。
+    項目 D：TWSE + TPEX 以 2 worker 並行（不同 host，各自保留 3 秒速率限制）。
     """
-    df_twse = fetch_twse_daily_prices(target_date)
-    df_tpex = fetch_tpex_daily_prices(target_date)
+    df_twse, df_tpex = _fetch_twse_tpex_parallel(fetch_twse_daily_prices, fetch_tpex_daily_prices, target_date, "daily")
 
     dfs = [df for df in [df_twse, df_tpex] if not df.empty]
     if not dfs:
@@ -713,10 +742,11 @@ def fetch_market_institutional(target_date: date | None = None) -> pd.DataFrame:
     """抓取全市場（上市 + 上櫃）三大法人買賣超。
 
     合併 TWSE + TPEX 資料，回傳統一欄位的 DataFrame。
-    僅需 2 次 API 呼叫。
+    項目 D：TWSE + TPEX 以 2 worker 並行（不同 host，各自保留 3 秒速率限制）。
     """
-    df_twse = fetch_twse_institutional(target_date)
-    df_tpex = fetch_tpex_institutional(target_date)
+    df_twse, df_tpex = _fetch_twse_tpex_parallel(
+        fetch_twse_institutional, fetch_tpex_institutional, target_date, "inst"
+    )
 
     dfs = [df for df in [df_twse, df_tpex] if not df.empty]
     if not dfs:

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 import pandas as pd
 
 from src.cli.helpers import ensure_sync_market_data, init_db
 from src.cli.helpers import safe_print as print
+
+logger = logging.getLogger(__name__)
 
 
 def cmd_discover(args: argparse.Namespace) -> None:
@@ -259,11 +262,105 @@ def _build_cross_comparison(results: dict, top_n: int) -> "pd.DataFrame":
     return df
 
 
+def _prewarm_stage_25(shared, top_n: int = 200) -> None:
+    """項目 A：在 5 scanner 並行前，於主 thread 預熱 Stage 2.5 所需的 FinMind 資料。
+
+    動機：5 scanner 並行時若各自呼叫 `sync_revenue_for_stocks` / `sync_broker_for_stocks`，
+    會同時對 FinMind 0.5s/req 速率限制造成 5x 衝擊。預熱以 5 日 turnover 取前 N 名做
+    超集合預抓，待 scanner Stage 2.5 觸發時 cache_days=30(營收) / 2 天(分點) 多半 cache-hit。
+
+    失敗不影響 scanner 流程（已記 log）。
+    """
+    if shared.df_price.empty:
+        logger.info("[預熱] 跳過：shared.df_price 為空")
+        return
+    try:
+        # 取每股最近 5 天 turnover 加總
+        recent = shared.df_price.sort_values("date").groupby("stock_id").tail(5)
+        turnover_5d = recent.groupby("stock_id")["turnover"].sum().sort_values(ascending=False)
+        top_ids = turnover_5d.head(top_n).index.tolist()
+    except Exception:
+        logger.warning("[預熱] 計算 top turnover 失敗，跳過預熱", exc_info=True)
+        return
+
+    if not top_ids:
+        logger.info("[預熱] 無候選 top_ids，跳過")
+        return
+
+    print(f"預熱 Stage 2.5（top {len(top_ids)} by turnover）...", end="", flush=True)
+    rev_count = 0
+    broker_count = 0
+    try:
+        from src.data.pipeline import sync_broker_for_stocks, sync_revenue_for_stocks
+
+        rev_count = sync_revenue_for_stocks(top_ids)
+        broker_count = sync_broker_for_stocks(top_ids)
+    except Exception:
+        logger.warning("[預熱] Stage 2.5 預熱失敗（不影響 scanner 流程）", exc_info=True)
+    print(f" 月營收 {rev_count} 筆 | 分點 {broker_count} 筆")
+
+
+def _resolve_max_workers(default: int = 5) -> int:
+    """讀取 `CONCURRENCY_DISABLE=1` 環境變數退化為序列模式（回滾保險）。"""
+    import os
+
+    if os.environ.get("CONCURRENCY_DISABLE", "0") == "1":
+        return 1
+    return default
+
+
+def _run_scanner_worker(
+    mode_key: str,
+    label: str,
+    ScannerClass,
+    args: argparse.Namespace,
+    shared,
+    precomputed_ic=None,
+) -> tuple[str, object, str, Exception | None]:
+    """單一 scanner 的 worker 函式。
+
+    回傳 `(mode_key, result, summary_line, error)` — error=None 表示成功。
+    內層 try/except 確保任一 scanner 失敗不會中止整個 ThreadPoolExecutor 批次。
+
+    Args:
+        precomputed_ic: 項目 E — Step 8c 預算好的 static IC DataFrame（單一模式）；
+            scanner 內部 `_apply_ic_weight_adjustment` 與 `_log_factor_effectiveness`
+            可直接使用，跳過 DB 查詢與重複 IC 計算。
+    """
+    try:
+        scanner = ScannerClass(
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_volume=args.min_volume,
+            top_n_results=args.top,
+            weekly_confirm=getattr(args, "weekly_confirm", False),
+            use_ic_adjustment=getattr(args, "use_ic_adjustment", False),
+        )
+        result = scanner.run(shared=shared, precomputed_ic=precomputed_ic)
+    except Exception as exc:
+        logger.exception("Scanner [%s] 執行失敗", mode_key)
+        return mode_key, None, f"  {label:<4} 失敗：{exc}", exc
+
+    # _save_discovery_records 內各模式 (scan_date, mode) 不衝突；SQLite WAL 寫鎖序列化即安全
+    if not result.rankings.empty:
+        actual = len(result.rankings.head(args.top))
+        try:
+            _save_discovery_records(result, mode_key, scanner)
+        except Exception:
+            logger.warning("[%s] _save_discovery_records 失敗，繼續", mode_key, exc_info=True)
+        summary = f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → Top {actual}"
+    else:
+        summary = f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → 0 筆"
+    return mode_key, result, summary, None
+
+
 def _cmd_discover_all(args: argparse.Namespace) -> None:
     """執行五個 Scanner 並輸出多模式綜合比較表。"""
     import datetime
+    from concurrent.futures import ThreadPoolExecutor
 
     from src.discovery.scanner import DividendScanner, GrowthScanner, MomentumScanner, SwingScanner, ValueScanner
+    from src.discovery.scanner._shared_load import load_shared_market_data
 
     init_db()
 
@@ -289,39 +386,65 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     # M2：支援由上層（morning-routine Step 8c）傳入被停用的模式（IC 反向自動停用）
     disabled_modes: list[str] = list(getattr(args, "disabled_modes", []) or [])
 
+    # 項目 B：一次性載入全市場資料（80 天價量 + 180 天營收），由 5 個 scanner 共用，
+    # 取代原本每個 scanner 各自 SELECT DailyPrice/Inst/Margin/Revenue 造成的 4 次重複 I/O。
+    print("載入全市場共用資料（80 天價量 + 180 天營收）...", end="", flush=True)
+    shared = load_shared_market_data(price_lookback_days=80, revenue_days=180)
+    print(
+        f" 日K {len(shared.df_price):,} | 法人 {len(shared.df_inst):,} | "
+        f"融資融券 {len(shared.df_margin):,} | 營收 {len(shared.df_revenue):,}"
+    )
+
+    # 項目 A 預熱：避免 5 scanner 同時對 FinMind 0.5s/req 速率打擊
+    _prewarm_stage_25(shared, top_n=200)
+
+    # 篩出實際要跑的 mode（依 disabled_modes 過濾），保留原順序供結果渲染
+    active_modes = [m for m in scanner_classes if m not in disabled_modes]
+    skipped_summaries = [f"  {mode_labels[m]:<4} 已停用（IC 反向）" for m in disabled_modes if m in scanner_classes]
+    for m in disabled_modes:
+        if m in scanner_classes:
+            print(f"  [{mode_labels[m]}] 已停用（IC 反向）— 跳過掃描")
+
+    # 項目 A：5 scanner 並行（依賴項目 B 的 shared 資料注入避免重複 DB I/O）
+    max_workers = _resolve_max_workers(default=min(5, len(active_modes) or 1))
+    print(f"並行掃描 {len(active_modes)} 個模式（max_workers={max_workers}）...")
+
+    # 項目 E：morning-routine Step 8c 預算的 IC DataFrame（依 mode 切片）
+    precomputed_ic_by_mode: dict = getattr(args, "precomputed_ic_by_mode", None) or {}
+
     results: dict = {}
+    summary_by_mode: dict[str, str] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="discover") as pool:
+        futures = {
+            pool.submit(
+                _run_scanner_worker,
+                mode_key,
+                mode_labels[mode_key],
+                scanner_classes[mode_key],
+                args,
+                shared,
+                precomputed_ic_by_mode.get(mode_key),
+            ): mode_key
+            for mode_key in active_modes
+        }
+        for fut in futures:
+            mode_key, result, summary, _err = fut.result()
+            results[mode_key] = result
+            summary_by_mode[mode_key] = summary
+
+    # 結果渲染依原 mode 順序，讓輸出穩定可預期
     scan_summaries: list[str] = []
-
-    for mode_key, ScannerClass in scanner_classes.items():
-        label = mode_labels[mode_key]
-        if mode_key in disabled_modes:
-            print(f"  [{label}] 已停用（IC 反向）— 跳過掃描")
-            scan_summaries.append(f"  {label:<4} 已停用（IC 反向）")
-            continue
-        print(f"正在掃描 [{label}]...", end="", flush=True)
-        scanner = ScannerClass(
-            min_price=args.min_price,
-            max_price=args.max_price,
-            min_volume=args.min_volume,
-            top_n_results=args.top,
-            weekly_confirm=getattr(args, "weekly_confirm", False),
-            use_ic_adjustment=getattr(args, "use_ic_adjustment", False),
-        )
-        result = scanner.run()
-        results[mode_key] = result
-
-        if result.rankings.empty:
-            print(" (無符合條件的股票)")
-            scan_summaries.append(
-                f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → 0 筆"
-            )
-        else:
-            actual = len(result.rankings.head(args.top))
-            print(f" -> Top {actual}")
-            scan_summaries.append(
-                f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → Top {actual}"
-            )
-            _save_discovery_records(result, mode_key, scanner)
+    for mode_key in scanner_classes:
+        if mode_key in summary_by_mode:
+            scan_summaries.append(summary_by_mode[mode_key])
+            r = results.get(mode_key)
+            if r is None or r.rankings.empty:
+                print(f"  [{mode_labels[mode_key]}] 完成 (無符合條件的股票)")
+            else:
+                actual = len(r.rankings.head(args.top))
+                print(f"  [{mode_labels[mode_key]}] 完成 → Top {actual}")
+    scan_summaries.extend(skipped_summaries)
 
     # 建立比較表
     df = _build_cross_comparison(results, args.top)

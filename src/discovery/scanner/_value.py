@@ -55,9 +55,44 @@ class ValueScanner(MarketScanner):
         return self._compute_value_style_technical_scores(stock_ids, df_price)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """覆寫：value 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。"""
+        """覆寫：value 模式額外載入估值資料 + 2 個月營收。含 UniverseFilter Stage 0.5。
+
+        項目 B：若 `self._shared` 已由 `run(shared=...)` 注入，則以 in-memory 過濾
+        取代 DB 查詢 4 張共用表；估值與 stock_info 仍走 DB 查詢（未在 shared 中）。
+        """
         universe_ids = self._get_universe_ids()
         cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+
+        shared = getattr(self, "_shared", None)
+        if shared is not None:
+            df_price, df_inst, df_margin, df_revenue = self._slice_shared_market_data(
+                shared, universe_ids, cutoff, revenue_months=2
+            )
+            # 估值 + stock_info 不在 shared 中，仍走 DB
+            with get_session() as session:
+                val_query = select(
+                    StockValuation.stock_id,
+                    StockValuation.date,
+                    StockValuation.pe_ratio,
+                    StockValuation.pb_ratio,
+                    StockValuation.dividend_yield,
+                ).where(StockValuation.date >= cutoff)
+                if universe_ids:
+                    val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
+                rows = session.execute(val_query).all()
+                self._df_valuation = pd.DataFrame(
+                    rows,
+                    columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
+                )
+
+                info_query = select(StockInfo.stock_id, StockInfo.industry_category)
+                if universe_ids:
+                    info_query = info_query.where(StockInfo.stock_id.in_(universe_ids))
+                info_rows = session.execute(info_query).all()
+                df_info = pd.DataFrame(info_rows, columns=["stock_id", "industry_category"])
+                df_info["industry_category"] = df_info["industry_category"].fillna("未分類")
+                self._df_stock_info = df_info
+            return df_price, df_inst, df_margin, df_revenue
 
         with get_session() as session:
             price_query = select(
@@ -130,8 +165,16 @@ class ValueScanner(MarketScanner):
 
         return df_price, df_inst, df_margin, df_revenue
 
-    def run(self) -> DiscoveryResult:
-        """覆寫 run()：在 Stage 0.5 自動補抓估值、Stage 2.5 補抓候選股估值。"""
+    def run(self, shared=None, precomputed_ic=None) -> DiscoveryResult:
+        """覆寫 run()：在 Stage 0.5 自動補抓估值、Stage 2.5 補抓候選股估值。
+
+        Args:
+            shared: 項目 B — 由 `_cmd_discover_all` 預載入的全市場資料；
+                `_load_market_data` 會優先以此過濾產生 4 張共用 DataFrame。
+            precomputed_ic: 項目 E — Step 8c 預算的 static IC DataFrame。
+        """
+        self._shared = shared
+        self._precomputed_ic = precomputed_ic
         # Stage 0: Regime 偵測
         try:
             from src.regime.detector import MarketRegimeDetector
