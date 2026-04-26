@@ -60,8 +60,10 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting morning-routine..."
 
 cd "{PROJECT_ROOT}"
 
-# 啟用虛擬環境（如存在）
-if [ -f "venv/bin/activate" ]; then
+# 啟用虛擬環境（優先 .venv，fallback venv）
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+elif [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
@@ -95,6 +97,21 @@ def _generate_plist(output: Path, sh_path: Path) -> None:
         <key>Minute</key>
         <integer>0</integer>
     </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LANG</key>
+        <string>zh_TW.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>zh_TW.UTF-8</string>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
     <key>StandardOutPath</key>
     <string>{PROJECT_ROOT}/logs/launchd_daily.log</string>
     <key>StandardErrorPath</key>
@@ -124,8 +141,10 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting weekly holding sync..."
 
 cd "{PROJECT_ROOT}"
 
-# 啟用虛擬環境（如存在）
-if [ -f "venv/bin/activate" ]; then
+# 啟用虛擬環境（優先 .venv，fallback venv）
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+elif [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
@@ -161,6 +180,21 @@ def _generate_weekly_plist(output: Path, sh_path: Path) -> None:
         <key>Minute</key>
         <integer>0</integer>
     </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LANG</key>
+        <string>zh_TW.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>zh_TW.UTF-8</string>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
     <key>StandardOutPath</key>
     <string>{PROJECT_ROOT}/logs/launchd_weekly.log</string>
     <key>StandardErrorPath</key>
