@@ -152,6 +152,7 @@ class TestTopTableMarking:
 
         monkeypatch.setattr(discover_cmd, "init_db", lambda: None)
         monkeypatch.setattr(discover_cmd, "ensure_sync_market_data", lambda *a, **kw: None)
+        monkeypatch.setattr(discover_cmd, "_save_discovery_records", lambda *a, **kw: None)
         from src.discovery import scanner as scanner_pkg
 
         monkeypatch.setattr(scanner_pkg, "MomentumScanner", _StubScanner)
@@ -168,11 +169,9 @@ class TestTopTableMarking:
             compare=False,
             verbose=False,
             export=None,
+            notify=False,
         )
-        try:
-            discover_cmd.cmd_discover(args)
-        except AttributeError:
-            pass  # cmd_discover 後段會用到我們未模擬的屬性，但表格已輸出
+        discover_cmd.cmd_discover(args)
         out = capsys.readouterr().out
 
         assert "技術(N)" in out
@@ -195,6 +194,7 @@ class TestTopTableMarking:
 
         monkeypatch.setattr(discover_cmd, "init_db", lambda: None)
         monkeypatch.setattr(discover_cmd, "ensure_sync_market_data", lambda *a, **kw: None)
+        monkeypatch.setattr(discover_cmd, "_save_discovery_records", lambda *a, **kw: None)
         from src.discovery import scanner as scanner_pkg
 
         monkeypatch.setattr(scanner_pkg, "MomentumScanner", _StubScanner)
@@ -211,11 +211,9 @@ class TestTopTableMarking:
             compare=False,
             verbose=False,
             export=None,
+            notify=False,
         )
-        try:
-            discover_cmd.cmd_discover(args)
-        except AttributeError:
-            pass  # cmd_discover 後段會用到我們未模擬的屬性，但表格已輸出
+        discover_cmd.cmd_discover(args)
         out = capsys.readouterr().out
 
         assert "技術(F)" in out
@@ -236,6 +234,7 @@ class TestTopTableMarking:
 
         monkeypatch.setattr(discover_cmd, "init_db", lambda: None)
         monkeypatch.setattr(discover_cmd, "ensure_sync_market_data", lambda *a, **kw: None)
+        monkeypatch.setattr(discover_cmd, "_save_discovery_records", lambda *a, **kw: None)
         from src.discovery import scanner as scanner_pkg
 
         monkeypatch.setattr(scanner_pkg, "MomentumScanner", _StubScanner)
@@ -252,11 +251,9 @@ class TestTopTableMarking:
             compare=False,
             verbose=False,
             export=None,
+            notify=False,
         )
-        try:
-            discover_cmd.cmd_discover(args)
-        except AttributeError:
-            pass  # cmd_discover 後段會用到我們未模擬的屬性，但表格已輸出
+        discover_cmd.cmd_discover(args)
         out = capsys.readouterr().out
 
         assert "(N)" not in out and "(F)" not in out
@@ -279,6 +276,7 @@ class TestTopTableMarking:
 
         monkeypatch.setattr(discover_cmd, "init_db", lambda: None)
         monkeypatch.setattr(discover_cmd, "ensure_sync_market_data", lambda *a, **kw: None)
+        monkeypatch.setattr(discover_cmd, "_save_discovery_records", lambda *a, **kw: None)
         from src.discovery import scanner as scanner_pkg
 
         monkeypatch.setattr(scanner_pkg, "MomentumScanner", _StubScanner)
@@ -295,11 +293,9 @@ class TestTopTableMarking:
             compare=False,
             verbose=False,
             export=None,
+            notify=False,
         )
-        try:
-            discover_cmd.cmd_discover(args)
-        except AttributeError:
-            pass
+        discover_cmd.cmd_discover(args)
         out = capsys.readouterr().out
 
         # news 欄不在表格中 → 不應顯示 (F) 圖例
