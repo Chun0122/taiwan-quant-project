@@ -805,7 +805,7 @@ class TestComputeAndStoreDailyFeatures:
         from src.data.pipeline import compute_and_store_daily_features
 
         self._seed_prices(db_session, "2330", days=65)
-        count = compute_and_store_daily_features(lookback_days=65)
+        count = compute_and_store_daily_features(lookback_days=65, min_stocks_per_day=1)
         assert count >= 1
         rows = db_session.execute(select(DailyFeature).where(DailyFeature.stock_id == "2330")).all()
         assert len(rows) >= 1
@@ -818,7 +818,7 @@ class TestComputeAndStoreDailyFeatures:
         from src.data.pipeline import compute_and_store_daily_features
 
         self._seed_prices(db_session, "2317", days=65)
-        compute_and_store_daily_features(lookback_days=65)
+        compute_and_store_daily_features(lookback_days=65, min_stocks_per_day=1)
         row = db_session.execute(select(DailyFeature).where(DailyFeature.stock_id == "2317")).first()
         assert row is not None
         feat = row[0]
@@ -832,7 +832,7 @@ class TestComputeAndStoreDailyFeatures:
         from src.data.pipeline import compute_and_store_daily_features
 
         self._seed_prices(db_session, "2454", days=65)
-        compute_and_store_daily_features(lookback_days=65)
+        compute_and_store_daily_features(lookback_days=65, min_stocks_per_day=1)
         row = db_session.execute(select(DailyFeature).where(DailyFeature.stock_id == "2454")).first()
         feat = row[0]
         assert feat.turnover_ma5 is not None and feat.turnover_ma5 > 0
@@ -845,11 +845,68 @@ class TestComputeAndStoreDailyFeatures:
         from src.data.pipeline import compute_and_store_daily_features
 
         self._seed_prices(db_session, "3008", days=65)
-        compute_and_store_daily_features(lookback_days=65)
-        compute_and_store_daily_features(lookback_days=65)
+        compute_and_store_daily_features(lookback_days=65, min_stocks_per_day=1)
+        compute_and_store_daily_features(lookback_days=65, min_stocks_per_day=1)
         count = db_session.execute(select(func.count()).where(DailyFeature.stock_id == "3008")).scalar()
         # 每支股票在最新一日只應有 1 筆記錄
         assert count == 1
+
+    @pytest.mark.usefixtures("_patch_pipeline_session")
+    def test_partial_latest_day_falls_back_to_full_day(self, db_session, monkeypatch):
+        """覆蓋率守門：最新日僅有少數股票時，fallback 至前一個全市場日。
+
+        模擬：D-1 灌入 1500 支全市場股票；D 只有 5 支（watchlist 子集）。
+        預期：sync-features 跳過 D（< MIN_STOCKS_PER_DAY=1000），改寫 D-1 的 1500 筆。
+        """
+        from sqlalchemy import func, select
+
+        from src.data.pipeline import compute_and_store_daily_features
+
+        d = date.today()
+        d_minus_1 = d - timedelta(days=1)
+
+        # D-1 灌入 1500 支
+        for i in range(1500):
+            sid = f"{i:04d}"
+            for j in range(60):
+                dt = d_minus_1 - timedelta(days=60 - j)
+                db_session.add(_make_dp(sid, dt, close=100 + j * 0.1))
+            db_session.add(_make_dp(sid, d_minus_1, close=120))
+        # D 只灌 5 支（watchlist 子集）
+        for sid in ["0001", "0002", "0003", "0004", "0005"]:
+            db_session.add(_make_dp(sid, d, close=121))
+        db_session.flush()
+
+        compute_and_store_daily_features(lookback_days=80)
+
+        # 應寫入 D-1 的 1500 筆，而非 D 的 5 筆
+        d_count = db_session.execute(
+            select(func.count()).select_from(DailyFeature).where(DailyFeature.date == d)
+        ).scalar()
+        d_minus_1_count = db_session.execute(
+            select(func.count()).select_from(DailyFeature).where(DailyFeature.date == d_minus_1)
+        ).scalar()
+        assert d_count == 0, f"D 僅 5 支應被守門擋下，實際寫入 {d_count}"
+        assert d_minus_1_count == 1500, f"應 fallback 至 D-1 的 1500 筆，實際 {d_minus_1_count}"
+
+    @pytest.mark.usefixtures("_patch_pipeline_session")
+    def test_no_valid_day_writes_zero(self, db_session):
+        """覆蓋率守門：所有日期都低於 MIN_STOCKS_PER_DAY 時，回傳 0、不寫 DB。"""
+        from sqlalchemy import func, select
+
+        from src.data.pipeline import compute_and_store_daily_features
+
+        # 全部日期都只有 8 支（污染情境）
+        for sid in [f"{i:04d}" for i in range(8)]:
+            for j in range(65):
+                dt = date.today() - timedelta(days=65 - j)
+                db_session.add(_make_dp(sid, dt, close=100 + j * 0.1))
+        db_session.flush()
+
+        written = compute_and_store_daily_features(lookback_days=65)
+        assert written == 0
+        feature_count = db_session.execute(select(func.count()).select_from(DailyFeature)).scalar()
+        assert feature_count == 0
 
 
 # ────────────────────────────────────────────────────────────────────────────

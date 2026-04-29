@@ -95,7 +95,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
     )
     print(f"{'=' * 80}")
 
-    # IC-aware 欄位狀態標記（N=neutralized, F=flipped）
+    # IC-aware 欄位狀態標記（N=neutralized, F=flipped, D=dampened）
     ic_actions = getattr(result, "ic_actions", None) or {}
 
     def _mark(score_col: str, header: str) -> str:
@@ -104,6 +104,8 @@ def cmd_discover(args: argparse.Namespace) -> None:
             return f"{header}(N)"
         if action == "flipped":
             return f"{header}(F)"
+        if action == "dampen":
+            return f"{header}(D)"
         return header
 
     print(
@@ -133,12 +135,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
     visible_cols = {"technical_score", "chip_score", "fundamental_score"}
     visible_neutralized = any(ic_actions.get(c) == "neutralized" for c in visible_cols)
     visible_flipped = any(ic_actions.get(c) == "flipped" for c in visible_cols)
-    if visible_neutralized or visible_flipped:
+    visible_dampen = any(ic_actions.get(c) == "dampen" for c in visible_cols)
+    if visible_neutralized or visible_flipped or visible_dampen:
         legend_parts = []
         if visible_neutralized:
             legend_parts.append("(N)=IC<0.05 中性化（不入分）")
         if visible_flipped:
             legend_parts.append("(F)=IC 反向已翻轉")
+        if visible_dampen:
+            legend_parts.append("(D)=IC<0.05 降權至 25%（保留排序）")
         print(f"  圖例：{' | '.join(legend_parts)}")
 
     # 產業分布

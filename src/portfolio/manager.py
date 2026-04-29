@@ -336,6 +336,45 @@ def _get_ohlcv_on_date(session, stock_ids: list[str], target_date: date) -> dict
     return result
 
 
+def compute_cost_metrics(
+    commission: float,
+    tax: float,
+    slippage: float,
+    turnover_value: float,
+    capital: float,
+) -> dict:
+    """計算成本拆解指標（純函式，可獨立單元測試）。
+
+    回傳欄位：
+      total_commission / total_tax / total_slippage_cost: 各項累計金額
+      total_cost: 三項加總
+      cost_drag_pct: 總成本佔初始資金 % （手續費+稅+滑價 / capital × 100）
+      commission_pct / tax_pct / slippage_pct: 各項佔初始資金 %（總和 == cost_drag_pct）
+      turnover_value: 累計名目交易額（買賣雙邊計入）
+      turnover_ratio: turnover / capital
+      cost_per_turnover_bps: 每元周轉成本（bps），跨期間/策略可比較指標
+
+    不變式：
+      total_cost == total_commission + total_tax + total_slippage_cost
+      cost_drag_pct ≈ commission_pct + tax_pct + slippage_pct（rounding 誤差 < 0.001%）
+      turnover_value == 0 → cost_per_turnover_bps == 0（避免除零）
+    """
+    total_cost = commission + tax + slippage
+    return {
+        "total_commission": round(commission, 2),
+        "total_tax": round(tax, 2),
+        "total_slippage_cost": round(slippage, 2),
+        "total_cost": round(total_cost, 2),
+        "cost_drag_pct": round(total_cost / capital * 100, 4) if capital > 0 else 0,
+        "commission_pct": round(commission / capital * 100, 4) if capital > 0 else 0,
+        "tax_pct": round(tax / capital * 100, 4) if capital > 0 else 0,
+        "slippage_pct": round(slippage / capital * 100, 4) if capital > 0 else 0,
+        "turnover_value": round(turnover_value, 2),
+        "turnover_ratio": round(turnover_value / capital, 4) if capital > 0 else 0,
+        "cost_per_turnover_bps": round(total_cost / turnover_value * 10000, 2) if turnover_value > 0 else 0,
+    }
+
+
 def _get_taiex_prices(session, start: date, end: date) -> dict[date, float]:
     """取得 TAIEX 收盤價序列，用於 benchmark 計算。"""
     stmt = select(DailyPrice.date, DailyPrice.close).where(
@@ -1100,6 +1139,7 @@ class RotationManager:
                     total_commission += costs.commission
                     total_tax += costs.tax
                     total_slippage_cost += costs.slippage_cost
+                    turnover_value += exit_p * pos["shares"]
 
                     all_trades.append(
                         {
@@ -1163,17 +1203,19 @@ class RotationManager:
                 "avg_loss": round(sum(losses) / len(losses), 4) if losses else 0,
                 "final_capital": round(equities[-1], 2) if equities else capital,
                 "trading_days": len(equity_curve),
-                # 成本歸因
-                "total_commission": round(total_commission, 2),
-                "total_tax": round(total_tax, 2),
-                "total_slippage_cost": round(total_slippage_cost, 2),
-                "total_cost": round(total_commission + total_tax + total_slippage_cost, 2),
-                "cost_drag_pct": round((total_commission + total_tax + total_slippage_cost) / capital * 100, 4)
-                if capital > 0
-                else 0,
                 # TAIEX Benchmark
                 "benchmark_return": benchmark_return,
             }
+            # 成本歸因 + 拆解（合併進 metrics）
+            metrics.update(
+                compute_cost_metrics(
+                    commission=total_commission,
+                    tax=total_tax,
+                    slippage=total_slippage_cost,
+                    turnover_value=turnover_value,
+                    capital=capital,
+                )
+            )
 
             result = RotationBacktestResult(
                 equity_curve=equity_curve,

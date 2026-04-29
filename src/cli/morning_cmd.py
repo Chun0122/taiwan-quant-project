@@ -30,6 +30,7 @@ from src.constants import (
     DEFAULT_INST_THRESHOLD,
     DEFAULT_SBL_SIGMA,
     DEFAULT_VOL_MULT,
+    DISCOVERY_KEY_FACTOR_MAP,
 )
 
 logger = logging.getLogger(__name__)
@@ -414,14 +415,9 @@ def _check_strategy_decay() -> None:
         print("  所有模式績效正常，無衰減警告。")
 
 
-# 各模式關鍵因子 — 需與實際權重配置一致（News 於 Momentum 已歸零，改用 technical_score）
-_KEY_FACTORS: dict[str, str] = {
-    "momentum": "technical_score",
-    "swing": "chip_score",
-    "value": "fundamental_score",
-    "dividend": "fundamental_score",
-    "growth": "fundamental_score",
-}
+# 各模式關鍵因子 — 共用 SSOT（src/constants.py:DISCOVERY_KEY_FACTOR_MAP）
+# 避免本地副本與全域定義失同步（先前 swing 因副本錯設 chip_score 被誤殺）
+_KEY_FACTORS: dict[str, str] = DISCOVERY_KEY_FACTOR_MAP
 _MODE_LABELS: dict[str, str] = {
     "momentum": "Momentum",
     "swing": "Swing",
@@ -681,10 +677,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
       Step 3  compute             計算技術指標（watchlist）
       Step 4  sync-mops           同步 MOPS 重大訊息公告
       Step 5  sync-revenue        同步全市場月營收（最近 1 個月）
-      Step 6  sync-features       計算全市場 DailyFeature（Feature Store）
       Step 7  sync-sbl            同步全市場借券賣出（TWSE TWT96U，3日）
       Step 8  sync-broker         同步 watchlist 分點資料（5日，歷史累積）
       Step 8b sync-market         同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉有最新價格）
+      Step 8d sync-features       計算全市場 DailyFeature（Feature Store，須在 8b 之後）
       Step 9  discover all        五模式全市場掃描（--skip-sync，不重複同步）
       Step 9b sync-broker         補抓 discover 候選股分點資料（使用今日 DiscoveryRecord）
       Step 10 alert-check         MOPS 重大事件警報（近3日）
@@ -907,12 +903,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run", "skip_sync"},
             lambda: cmd_sync_revenue(argparse.Namespace(months=1)),
         ),
-        (
-            6,
-            "計算 DailyFeature（sync-features --days 90）",
-            {"dry_run", "skip_sync"},
-            lambda: cmd_sync_features(argparse.Namespace(days=90)),
-        ),
+        # ── Step 6 (sync-features) 已搬到 8d，改在全市場 sync (8b) 完成後計算 ──
         # ── 原有步驟（重新編號 7~15）──────────────────────────────
         (
             7,
@@ -931,6 +922,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             "同步全市場 TWSE/TPEX 日K線（rotation 持倉 + discover 候選）",
             {"dry_run", "skip_sync"},
             _sync_full_market,
+        ),
+        (
+            "8d",
+            "計算 DailyFeature（sync-features --days 90，全市場資料就緒後）",
+            {"dry_run", "skip_sync"},
+            lambda: cmd_sync_features(argparse.Namespace(days=90)),
         ),
         (
             "8c",

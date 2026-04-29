@@ -29,6 +29,24 @@ class TestKeyFactorMapSsot:
             assert mode in DISCOVERY_KEY_FACTOR_MAP
             assert DISCOVERY_KEY_FACTOR_MAP[mode].endswith("_score")
 
+    def test_key_factor_is_max_weight_dimension_in_bull(self) -> None:
+        """KEY_FACTOR 應為各模式 bull regime 中最大權重的維度（避免誤判）。
+
+        防止 swing 之前的 bug：fundamental 0.40 是最大權重，但 KEY_FACTOR
+        錯設為 chip_score (0.20，第三大)，導致 IC 預檢用第三大維度判斷停用。
+        """
+        from src.regime.detector import REGIME_WEIGHTS
+
+        for mode, key_factor_score in DISCOVERY_KEY_FACTOR_MAP.items():
+            weights = REGIME_WEIGHTS[mode]["bull"]
+            max_dim = max(weights, key=weights.get)
+            expected_key = f"{max_dim}_score"
+            assert key_factor_score == expected_key, (
+                f"{mode}: KEY_FACTOR={key_factor_score} 應為 bull 最大權重維度 "
+                f"{expected_key}（權重 {weights[max_dim]:.2f}），實際權重 "
+                f"{weights[key_factor_score.replace('_score', '')]:.2f}"
+            )
+
 
 class TestEmitIcDecayWarning:
     def test_non_key_factor_no_dependency_message(self, capsys) -> None:
@@ -48,11 +66,15 @@ class TestEmitIcDecayWarning:
         assert "★關鍵因子" in out
         assert "momentum 模式高度依賴 technical_score" in out
 
-    def test_swing_key_factor_chip_score(self, capsys) -> None:
-        """swing 關鍵因子為 chip_score。"""
-        _emit_ic_decay_warning(mode="swing", factor="chip_score", latest_ic=0.02)
+    def test_swing_key_factor_fundamental_score(self, capsys) -> None:
+        """swing 關鍵因子為 fundamental_score（bull regime 0.40，最大權重維度）。
+
+        歷史 bug：曾誤設為 chip_score（0.20，第三大），造成 Step 8c IC 預檢
+        以 chip IC 反向誤殺 swing 模式停用。詳見 src/constants.py 註解。
+        """
+        _emit_ic_decay_warning(mode="swing", factor="fundamental_score", latest_ic=0.02)
         out = capsys.readouterr().out
-        assert "swing 模式高度依賴 chip_score" in out
+        assert "swing 模式高度依賴 fundamental_score" in out
 
     def test_value_key_factor_fundamental(self, capsys) -> None:
         """value/dividend/growth 關鍵因子皆為 fundamental_score。"""

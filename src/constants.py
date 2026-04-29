@@ -117,12 +117,15 @@ REGIME_MODE_BLOCK: dict[str, frozenset[str]] = {
 # 使用方：
 #   1. BaseScanner._KEY_FACTOR_MAP（IC-Decay 動態門檻提升）
 #   2. factor-diagnostics 警示文案「{mode} 模式高度依賴 {factor}」
+#   3. cli/morning_cmd._step_8c_ic_precheck（反向模式自動停用 discover）
 # momentum v3：bull 權重 tech 0.40 為最高權重維度，故為關鍵因子
 #   （不再用 news_score；news IC 結構性為負永久觸發無意義，已由 12d1623-A
 #    將 bull news 權重歸零，改由 Stage 3.5h 負面閘門承接純濾網角色）
+# swing 修正：bull 權重 fundamental 0.40 為最高維度，先前誤設為 chip_score
+#   (0.20，第三大)，造成 swing 在 Step 8c 被 chip IC 反向誤殺停用。
 DISCOVERY_KEY_FACTOR_MAP: dict[str, str] = {
     "momentum": "technical_score",
-    "swing": "chip_score",
+    "swing": "fundamental_score",
     "value": "fundamental_score",
     "dividend": "fundamental_score",
     "growth": "fundamental_score",

@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from src.constants import COMMISSION_RATE, REGIME_FALLBACK_DEFAULT, SLIPPAGE_RATE, TAX_RATE
 from src.data.schema import (  # noqa: F401 — 確保 ORM 註冊
@@ -2285,3 +2286,108 @@ class TestBacktestResultDailyPositions:
         assert len(df) == 2
         assert list(df.columns) == ["date", "stock_id", "shares", "weight"]
         assert df.iloc[1]["weight"] == 0.48
+
+
+# ===========================================================================
+# P0-#2: 成本拆解 metrics 不變式（compute_cost_metrics 純函式）
+# ===========================================================================
+
+
+class TestCostBreakdownMetrics:
+    """compute_cost_metrics() 純函式：成本拆解 + turnover bps 計算。"""
+
+    def test_total_cost_equals_three_components(self):
+        """合計 == 手續費 + 交易稅 + 滑價（rounding 後仍成立）。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        m = compute_cost_metrics(
+            commission=22_563.0,
+            tax=24_056.0,
+            slippage=143_340.0,
+            turnover_value=15_833_697.0,
+            capital=1_000_000.0,
+        )
+        assert m["total_cost"] == round(22_563.0 + 24_056.0 + 143_340.0, 2)
+
+    def test_pct_components_sum_to_drag(self):
+        """commission_pct + tax_pct + slippage_pct ≈ cost_drag_pct（rounding 容差）。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        m = compute_cost_metrics(
+            commission=22_563.0,
+            tax=24_056.0,
+            slippage=143_340.0,
+            turnover_value=15_833_697.0,
+            capital=1_000_000.0,
+        )
+        components_sum = m["commission_pct"] + m["tax_pct"] + m["slippage_pct"]
+        assert abs(components_sum - m["cost_drag_pct"]) < 0.001
+
+    def test_real_audit_values_match(self):
+        """以實測 mom5_3d 數據驗證指標一致性。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        # 來自 logs/audit_20260426/07_rotation_backtest_breakdown.log
+        m = compute_cost_metrics(
+            commission=22_563.0,
+            tax=24_056.0,
+            slippage=143_340.0,
+            turnover_value=15_833_697.0,
+            capital=1_000_000.0,
+        )
+        assert m["cost_drag_pct"] == pytest.approx(19.00, abs=0.01)
+        assert m["slippage_pct"] == pytest.approx(14.33, abs=0.01)
+        assert m["turnover_ratio"] == pytest.approx(15.83, abs=0.01)
+        # 每元周轉成本 = 19% / 15.83 倍 ≈ 1.20% = 120 bps
+        assert m["cost_per_turnover_bps"] == pytest.approx(120.0, abs=1.0)
+
+    def test_zero_turnover_avoids_division_error(self):
+        """周轉量為 0 時，cost_per_turnover_bps 應回 0 而非除零。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        m = compute_cost_metrics(
+            commission=100.0,
+            tax=50.0,
+            slippage=200.0,
+            turnover_value=0.0,
+            capital=1_000_000.0,
+        )
+        assert m["cost_per_turnover_bps"] == 0
+        assert m["turnover_ratio"] == 0
+
+    def test_zero_capital_returns_zero_pcts(self):
+        """capital=0 時，所有 pct 欄位回 0 不爆炸。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        m = compute_cost_metrics(
+            commission=100.0,
+            tax=50.0,
+            slippage=200.0,
+            turnover_value=10_000.0,
+            capital=0.0,
+        )
+        assert m["cost_drag_pct"] == 0
+        assert m["commission_pct"] == 0
+        assert m["tax_pct"] == 0
+        assert m["slippage_pct"] == 0
+        assert m["turnover_ratio"] == 0
+
+    def test_all_required_keys_present(self):
+        """欄位齊全（CLI 與 DB 序列化都依賴這些 key）。"""
+        from src.portfolio.manager import compute_cost_metrics
+
+        m = compute_cost_metrics(commission=1.0, tax=1.0, slippage=1.0, turnover_value=100.0, capital=1000.0)
+        required = {
+            "total_commission",
+            "total_tax",
+            "total_slippage_cost",
+            "total_cost",
+            "cost_drag_pct",
+            "commission_pct",
+            "tax_pct",
+            "slippage_pct",
+            "turnover_value",
+            "turnover_ratio",
+            "cost_per_turnover_bps",
+        }
+        assert required.issubset(m.keys())

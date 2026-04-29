@@ -1433,7 +1433,7 @@ def save_rotation_backtest(result) -> int:
 # ────────────────────────────────────────────────────────────────
 
 
-def compute_and_store_daily_features(lookback_days: int = 90) -> int:
+def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day: int = 1000) -> int:
     """計算並儲存全市場每日特徵到 DailyFeature 表（Feature Store）。
 
     從 DailyPrice 讀取最近 lookback_days 天資料，以 Pandas 向量化 rolling
@@ -1503,8 +1503,29 @@ def compute_and_store_daily_features(lookback_days: int = 90) -> int:
     g_high = df.groupby("stock_id")["high"]
     df["high_20d"] = g_high.transform(lambda s: s.rolling(20, min_periods=10).max())
 
-    # 只取最新一日（增量更新策略）
-    latest_date = df["date"].max()
+    # 只取最新一日（增量更新策略），並加最低覆蓋率守門
+    # 防止「watchlist 子集先寫 DailyPrice → sync-features 抓到部分日期當 latest」的污染
+    date_counts = df.groupby("date").size().sort_index(ascending=False)
+    valid_dates = date_counts[date_counts >= min_stocks_per_day].index
+
+    if len(valid_dates) == 0:
+        logger.warning(
+            "[DailyFeature] 無任何日期達最低覆蓋（≥%d 支），跳過寫入。請先執行全市場 sync 再 sync-features。",
+            min_stocks_per_day,
+        )
+        return 0
+
+    latest_date = max(valid_dates)
+    raw_latest = df["date"].max()
+    if latest_date != raw_latest:
+        logger.warning(
+            "[DailyFeature] %s 僅 %d 支（低於門檻 %d），fallback 至 %s（%d 支）",
+            raw_latest,
+            int(date_counts.iloc[0]),
+            min_stocks_per_day,
+            latest_date,
+            int(date_counts[latest_date]),
+        )
     df_latest = df[df["date"] == latest_date].copy()
     df_latest["computed_at"] = pd.Timestamp.utcnow()
 

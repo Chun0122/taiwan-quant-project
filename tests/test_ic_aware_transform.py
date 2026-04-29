@@ -13,7 +13,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.discovery.scanner._functions import compute_ic_aware_score_transform
+from src.discovery.scanner._functions import (
+    IC_DAMPEN_WEIGHT_MULT,
+    compute_ic_aware_score_transform,
+)
 
 
 def _candidates(**score_cols: list[float]) -> pd.DataFrame:
@@ -132,3 +135,50 @@ def test_threshold_boundary():
     ic_df_neg = pd.DataFrame([_ic_row("news_score", -0.02)])
     out_neg, actions_neg = compute_ic_aware_score_transform(cands, ic_df_neg)
     assert actions_neg["news_score"] == "neutralized"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dampen 模式測試（IC_DAMPEN=1 啟用，弱 IC 改為降權而非歸 0.5）
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_dampen_mode_weak_ic_keeps_scores():
+    """dampen_mode=True：|IC|<threshold 時，分數保留原值，action='dampen'。"""
+    cands = _candidates(news_score=[0.2, 0.5, 0.8])
+    ic_df = pd.DataFrame([_ic_row("news_score", 0.01)])
+    out, actions = compute_ic_aware_score_transform(cands, ic_df, dampen_mode=True)
+    assert actions["news_score"] == "dampen"
+    # 與 baseline 模式對照：分數保留原值，不歸 0.5
+    assert list(out["news_score"]) == [0.2, 0.5, 0.8]
+
+
+def test_dampen_mode_does_not_affect_strong_positive_ic():
+    """dampen_mode=True：IC > threshold 時行為與 baseline 一致（kept）。"""
+    cands = _candidates(news_score=[0.2, 0.5, 0.8])
+    ic_df = pd.DataFrame([_ic_row("news_score", 0.10)])
+    out, actions = compute_ic_aware_score_transform(cands, ic_df, dampen_mode=True)
+    assert actions["news_score"] == "kept"
+    assert list(out["news_score"]) == [0.2, 0.5, 0.8]
+
+
+def test_dampen_mode_does_not_affect_negative_ic_flip():
+    """dampen_mode=True：IC < -threshold 時行為與 baseline 一致（flipped）。"""
+    cands = _candidates(news_score=[0.2, 0.5, 0.8])
+    ic_df = pd.DataFrame([_ic_row("news_score", -0.10)])
+    out, actions = compute_ic_aware_score_transform(cands, ic_df, dampen_mode=True)
+    assert actions["news_score"] == "flipped"
+    assert np.allclose(out["news_score"].tolist(), [0.8, 0.5, 0.2])
+
+
+def test_dampen_mode_low_samples_still_kept():
+    """dampen_mode=True：樣本不足時仍是 kept_low_samples，不誤觸發 dampen。"""
+    cands = _candidates(news_score=[0.2, 0.5, 0.8])
+    ic_df = pd.DataFrame([_ic_row("news_score", 0.01, n=10)])
+    out, actions = compute_ic_aware_score_transform(cands, ic_df, dampen_mode=True)
+    assert actions["news_score"] == "kept_low_samples"
+    assert list(out["news_score"]) == [0.2, 0.5, 0.8]
+
+
+def test_ic_dampen_weight_mult_constant():
+    """常數應為 0.25，與 _base.py 套用 weight×0.25 邏輯一致。"""
+    assert IC_DAMPEN_WEIGHT_MULT == 0.25

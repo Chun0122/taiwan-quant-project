@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date, timedelta
 
 import numpy as np
@@ -28,6 +29,7 @@ from src.data.schema import (
     StockValuation,
 )
 from src.discovery.scanner._functions import (
+    IC_DAMPEN_WEIGHT_MULT,
     MIN_SCORE_THRESHOLDS,
     SECTOR_MAX_RATIO,
     SECTOR_MIN_CAP,
@@ -1528,22 +1530,44 @@ class MarketScanner:
 
         # E2c: IC 感知分數翻轉（問題 3 修正）— 對 IC 反向的維度分數做 1 - score 翻轉
         # 與 _apply_ic_weight_adjustment 共用 self._dimension_ic_df，不另打 DB
+        # IC_DAMPEN=1（環境變數）啟用降權模式：弱 IC 因子保留分數但 weight×0.25，
+        # 取代既有的「歸 0.5 中性化」策略。詳見 IC_DAMPEN_WEIGHT_MULT 註解。
+        dampen_mode = os.getenv("IC_DAMPEN", "0") == "1"
+        weight_mults: dict[str, float] = {f"{k}_score": 1.0 for k in w}
         if self.use_ic_adjustment and self._dimension_ic_df is not None and not self._dimension_ic_df.empty:
             score_cols_for_ic = [f"{k}_score" for k in w]
             df_for_flip = candidates[["stock_id", *[c for c in score_cols_for_ic if c in candidates.columns]]]
-            df_flipped, actions = compute_ic_aware_score_transform(df_for_flip, self._dimension_ic_df)
+            df_flipped, actions = compute_ic_aware_score_transform(
+                df_for_flip, self._dimension_ic_df, dampen_mode=dampen_mode
+            )
             for col, action in actions.items():
                 if action in ("flipped", "neutralized") and col in df_flipped.columns:
                     candidates[col] = df_flipped[col].values
                     logger.info("E2c IC-aware 分數轉換: %s — %s → %s", self.mode_name, col, action)
-            # 持久化 actions 供 CLI 表格標記欄位狀態（N/F）
+                elif action == "dampen":
+                    weight_mults[col] = IC_DAMPEN_WEIGHT_MULT
+                    logger.info(
+                        "E2c IC-aware 分數轉換: %s — %s → dampen (weight×%.2f)",
+                        self.mode_name,
+                        col,
+                        IC_DAMPEN_WEIGHT_MULT,
+                    )
+            # 持久化 actions 供 CLI 表格標記欄位狀態（N/F/D）
             self._ic_actions = dict(actions)
 
+        # composite 加權：套 weight_mult，再歸一化回原始總和，避免 dampen 後量級下移
+        # 觸發 Stage 3.7 動態門檻誤殺
         composite = pd.Series(0.0, index=candidates.index)
+        original_total_weight = sum(w.values())
+        effective_total_weight = 0.0
         for key, weight in w.items():
             col = f"{key}_score"
             if col in candidates.columns:
-                composite += candidates[col] * weight
+                eff_w = weight * weight_mults.get(col, 1.0)
+                composite += candidates[col] * eff_w
+                effective_total_weight += eff_w
+        if effective_total_weight > 0 and effective_total_weight != original_total_weight:
+            composite = composite * (original_total_weight / effective_total_weight)
         candidates["composite_score"] = composite
 
         # hook：子類可在加權後做額外處理

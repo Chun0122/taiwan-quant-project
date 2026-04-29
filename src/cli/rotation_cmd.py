@@ -298,7 +298,21 @@ def _print_rotation_backtest(result) -> None:
         alpha = metrics.get("total_return", 0) * 100 - bm
         print(f"  TAIEX 同期: {bm:>+8.2f}%")
         print(f"  Alpha:      {alpha:>+8.2f}%")
-    # 成本歸因
+    # 成本歸因（拆解：手續費 / 交易稅 / 滑價，並印每元周轉成本 bps）
     if metrics.get("total_cost") is not None:
-        print(f"  交易成本:   {metrics['total_cost']:>14,.0f}")
-        print(f"  成本拖累:   {metrics.get('cost_drag_pct', 0):>8.4f}%")
+        print()
+        print("  ── 成本拆解 ──")
+        print(
+            f"  手續費:       {metrics.get('total_commission', 0):>14,.0f}  ({metrics.get('commission_pct', 0):>5.2f}%)"
+        )
+        print(f"  交易稅:       {metrics.get('total_tax', 0):>14,.0f}  ({metrics.get('tax_pct', 0):>5.2f}%)")
+        print(
+            f"  滑價成本:     {metrics.get('total_slippage_cost', 0):>14,.0f}  "
+            f"({metrics.get('slippage_pct', 0):>5.2f}%)"
+        )
+        print(f"  合計:         {metrics.get('total_cost', 0):>14,.0f}  ({metrics.get('cost_drag_pct', 0):>5.2f}%)")
+        print(
+            f"  累計周轉:     {metrics.get('turnover_value', 0):>14,.0f}  "
+            f"(×{metrics.get('turnover_ratio', 0):>4.2f} 初始資金)"
+        )
+        print(f"  每元周轉成本: {metrics.get('cost_per_turnover_bps', 0):>14.2f} bps")

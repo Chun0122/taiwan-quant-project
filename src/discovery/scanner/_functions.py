@@ -2361,18 +2361,28 @@ def compute_ic_impact_weight_adjustments(
     return adjusted
 
 
+# IC dampen 模式下，|IC| < ic_threshold_weak 時的權重衰減倍率
+# 設計理由：保留分數排序資訊但壓抑該維度對 composite 的貢獻，避免直接歸 0.5 造成
+# 該維度權重全送給常數值（top 名單失去區分度）
+IC_DAMPEN_WEIGHT_MULT: float = 0.25
+
+
 def compute_ic_aware_score_transform(
     candidates: pd.DataFrame,
     ic_df: pd.DataFrame,
     ic_threshold_weak: float = 0.02,
     min_samples: int = 50,
+    dampen_mode: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     """IC 感知維度分數轉換 — 根據歷史 IC 修正方向性錯誤的因子。
 
     與 compute_ic_weight_adjustments()（僅衰減權重）不同，本函數直接變換 **分數值**：
       - IC > +ic_threshold_weak  → 原樣保留（正向有效）
       - IC < -ic_threshold_weak  → score → 1 - score（反向訊號翻轉為正向使用）
-      - |IC| ≤ ic_threshold_weak → score → 0.5（雜訊歸零為中性）
+      - |IC| ≤ ic_threshold_weak（雜訊區間）：
+          * dampen_mode=False（預設）→ score → 0.5（中性化，向後相容）
+          * dampen_mode=True          → score 保留原值（action="dampen"，由
+            caller 在 composite 加權階段以 IC_DAMPEN_WEIGHT_MULT 倍率衰減）
       - evaluable_count < min_samples → 原樣保留（資料不足不翻）
 
     設計理由：
@@ -2424,9 +2434,12 @@ def compute_ic_aware_score_transform(
             out[factor] = (1.0 - out[factor]).clip(lower=0.0, upper=1.0)
             actions[factor] = "flipped"
             continue
-        # 雜訊區間：歸零為中性，避免雜訊污染 composite
-        out[factor] = 0.5
-        actions[factor] = "neutralized"
+        # 雜訊區間：dampen 模式保留分數讓 caller 衰減權重，否則歸 0.5 中性化
+        if dampen_mode:
+            actions[factor] = "dampen"
+        else:
+            out[factor] = 0.5
+            actions[factor] = "neutralized"
 
     return out, actions
 
