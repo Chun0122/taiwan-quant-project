@@ -119,10 +119,15 @@ class MomentumScanner(MarketScanner):
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)  # F3 季線突破需 60 交易日（80 曆日）
+        # 2026-04-30 歸因實驗：min_close 5→30、volume_ratio_min None→1.0
+        # 移除 thin 池（avg_turnover<50M 或 close<NT$30）佔 26.6%；clean 子集 +3.1pp 勝率 / +1.4pp 報酬
         kwargs.setdefault(
             "universe_config",
             UniverseConfig(
-                min_close=5.0, min_available_days=30, volume_ratio_min=None, trend_filter_mode="trend_or_breakout"
+                min_close=30.0,
+                min_available_days=30,
+                volume_ratio_min=1.0,
+                trend_filter_mode="trend_or_breakout",
             ),
         )
         super().__init__(**kwargs)
