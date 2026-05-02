@@ -111,6 +111,7 @@ import sys
 from src.cli.anomaly_cmd import cmd_anomaly_scan, cmd_revenue_scan
 from src.cli.backtest_cmd import cmd_backtest, cmd_walk_forward
 from src.cli.discover_cmd import cmd_ablation_test, cmd_discover, cmd_discover_backtest, cmd_factor_diagnostics
+from src.cli.export_dashboard_cmd import cmd_export_dashboard
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
     cmd_dashboard,
@@ -724,6 +725,26 @@ def main() -> None:
     sp_rd = rot_sub.add_parser("delete", help="刪除組合及所有持倉")
     sp_rd.add_argument("--name", required=True, help="組合名稱")
 
+    # export-dashboard 子命令（iOS App / 下游消費者用的單一日報 JSON）
+    sp_ed = subparsers.add_parser(
+        "export-dashboard",
+        help="匯出每日 dashboard JSON（regime/discover/rotation/watch/signals/strategy_events）",
+    )
+    sp_ed.add_argument("--date", default=None, help="報告日期 (YYYY-MM-DD)，預設今日")
+    sp_ed.add_argument("--top", type=int, default=20, help="每模式 Top N（預設 20）")
+    sp_ed.add_argument("--event-days", type=int, default=30, help="策略事件回溯天數（預設 30）")
+    sp_ed.add_argument(
+        "--out",
+        default=None,
+        help="輸出目錄（預設 ~/Library/Mobile Documents/com~apple~CloudDocs/QuantDashboard/）",
+    )
+    sp_ed.add_argument(
+        "--regenerate-ai-summary",
+        action="store_true",
+        default=False,
+        help="重新呼叫 Claude API 產生 AI 摘要（預設不呼叫，避免每次燒 token）",
+    )
+
     args = parser.parse_args()
 
     if args.command == "sync":
@@ -823,6 +844,8 @@ def main() -> None:
             sp_rot.print_help()
         else:
             cmd_rotation(args)
+    elif args.command == "export-dashboard":
+        cmd_export_dashboard(args)
     else:
         parser.print_help()
         sys.exit(1)

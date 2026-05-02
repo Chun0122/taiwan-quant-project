@@ -370,6 +370,26 @@ def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> l
     return messages
 
 
+def _export_dashboard_step(top_n: int = 20) -> None:
+    """morning-routine Step 16：匯出 Dashboard JSON。
+
+    失敗不阻擋例行流程（外層 Step loop 已 try/except）。
+    """
+    import argparse as _argparse
+
+    from src.cli.export_dashboard_cmd import cmd_export_dashboard
+
+    cmd_export_dashboard(
+        _argparse.Namespace(
+            date=None,
+            top=top_n,
+            event_days=30,
+            out=None,
+            regenerate_ai_summary=False,
+        )
+    )
+
+
 def _check_strategy_decay() -> None:
     """檢查所有 Discover 模式的策略衰減（供 morning-routine Step 9 呼叫）。"""
     from src.discovery.performance import check_all_modes_decay
@@ -984,6 +1004,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             "策略衰減監控（30/60/90 天績效趨勢）",
             {"dry_run"},
             lambda: _check_strategy_decay(),
+        ),
+        (
+            16,
+            "匯出 Dashboard JSON（iOS App / 下游消費者）",
+            {"dry_run"},
+            lambda: _export_dashboard_step(top_n=top_n),
         ),
     ]
 

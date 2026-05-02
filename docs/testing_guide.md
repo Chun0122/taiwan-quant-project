@@ -10,7 +10,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 
 ## 測試統計
 
-- **1761 個測試**，45 個測試檔
+- **1784 個測試**，47 個測試檔
 - Fixtures：`tests/conftest.py`（`in_memory_engine` / `db_session` / `sample_ohlcv`）
 - 共用建構函數：`tests/scanner_helpers.py`
 
@@ -69,6 +69,8 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_morning_atomicity.py` | `cli/morning_cmd.py` 原子性 | mock |
 | `test_ablation.py` | `discovery/ablation.py` 因子消融 | 純函數 |
 | `test_scheduler.py` | `scheduler/` launchd + windows + auto 偵測 | 純函數+mock |
+| `test_export_dashboard.py` | `cli/export_dashboard_cmd.py` Dashboard JSON 匯出 | 純函數+SQLite (fresh_db) |
+| `test_strategy_events.py` | `discovery/strategy_events.py` git log + settings diff | 純函數+tmp git repo |
 
 ## 新增測試注意事項
 

@@ -186,10 +186,27 @@ python main.py anomaly-scan --notify
 ## 每日例行
 
 ```bash
-python main.py morning-routine --notify              # 完整流程（Step 0~15+8b）
+python main.py morning-routine --notify              # 完整流程（Step 0~16+8b）
 python main.py morning-routine --skip-sync --notify  # 跳過 Step 1~8b
 python main.py morning-routine --dry-run
 ```
+
+Step 16 會自動把當日狀態寫成 `daily_dashboard.json`，供 iOS 監控 App 與其他下游消費者使用。
+
+---
+
+## Dashboard JSON 匯出
+
+每日狀態統一輸出檔，schema 與欄位對照表見 [`docs/dashboard_schema.md`](dashboard_schema.md)。
+
+```bash
+python main.py export-dashboard                                   # 今日，寫到 iCloud Drive 預設路徑
+python main.py export-dashboard --date 2026-04-30 --top 30        # 補產歷史日期
+python main.py export-dashboard --out /tmp/dashboard              # 自訂輸出目錄
+python main.py export-dashboard --regenerate-ai-summary           # 重呼 Claude API 產 AI 摘要（會燒 token）
+```
+
+預設輸出兩個檔：`<out_dir>/<YYYY-MM-DD>.json` + `<out_dir>/latest.json`（後者為 App 固定入口）。
 
 ---
 

@@ -89,6 +89,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/universe.py` | Universe 三層漏斗（SQL→流動性→趨勢）+ Candidate Memory |
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告 |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
+| `discovery/strategy_events.py` | 策略調整事件抽取（git log + settings.yaml diff，供 dashboard 事件流） |
 | `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機 |
 | `industry/analyzer.py` | 產業輪動、同業相對強度（±3%） |
 | `industry/concept_analyzer.py` | 概念股輪動、Percentile Rank（±5% 加成） |
@@ -106,8 +107,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組 | 職責 |
 |------|------|
-| `main.py` | CLI 調度器（argparse，38 子命令 + dispatch table） |
-| `cli/*.py` | 各子命令實作（sync/discover/backtest/watch/rotation/anomaly/morning 等） |
+| `main.py` | CLI 調度器（argparse，39 子命令 + dispatch table） |
+| `cli/*.py` | 各子命令實作（sync/discover/backtest/watch/rotation/anomaly/morning/export-dashboard 等） |
 | `report/` | 每日報告 + Discord 格式化（2000 字元限制）+ AI 摘要（`claude-sonnet-4-6`） |
 | `notification/line_notify.py` | Discord Webhook（檔名歷史遺留） |
 | `visualization/` | Streamlit 儀表板（12 分頁）+ Plotly 圖表 |
@@ -146,7 +147,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 ### CLI 設計原則
 
-- 入口：`python main.py <子命令>`（38 子命令，dispatch table 在 `main.py`）
+- 入口：`python main.py <子命令>`（39 子命令，dispatch table 在 `main.py`）
 - 每日例行：`morning-routine`（Step 0~15+8b，含全市場同步 + discover + 風控 + 通知）
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`
 - 完整指令參考見 [`docs/cli_commands.md`](docs/cli_commands.md)
@@ -157,7 +158,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（1761 測試 / 45 檔）
+- **執行**：`pytest -v`（1784 測試 / 47 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 
