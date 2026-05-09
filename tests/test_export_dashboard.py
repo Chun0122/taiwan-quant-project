@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from src.cli import export_dashboard_cmd as ed
@@ -28,6 +28,7 @@ from src.data.database import Base
 from src.data.schema import (
     DailyPrice,
     DiscoveryRecord,
+    RotationDailySnapshot,
     RotationPortfolio,
     RotationPosition,
     WatchEntry,
@@ -489,5 +490,215 @@ class TestPayloadAndCli:
         # 字串 JSON 序列化中文不亂碼
         assert "台積電" in latest.read_text(encoding="utf-8")
 
+        # v1.1 新區塊存在於 top-level
+        assert "portfolio_review" in data
+        assert "position_timeseries" in data
+
         # 無錯誤
         assert data["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.1 新區塊：portfolio_review
+# ---------------------------------------------------------------------------
+
+
+def _seed_snapshot_history(
+    db_session,
+    portfolio_name: str,
+    end_date: _dt.date,
+    n_days: int,
+    initial: float = 1_000_000.0,
+    daily_drift: float = 0.001,
+) -> None:
+    """為指定 portfolio 注入連續 n_days 個 daily snapshot（end_date 為最後一天）。
+
+    capital 走勢採線性微幅成長：capital_i = initial * (1 + i * daily_drift)
+    其中第一筆 daily_return_pct=None；後續為 (capital_i - capital_{i-1}) / capital_{i-1}.
+    """
+    prev_cap: float | None = None
+    for i in range(n_days):
+        d = end_date - _dt.timedelta(days=(n_days - 1 - i))
+        cap = initial * (1 + i * daily_drift)
+        daily_ret = None if prev_cap is None or prev_cap <= 0 else (cap - prev_cap) / prev_cap
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name=portfolio_name,
+                snapshot_date=d,
+                total_capital=cap,
+                total_market_value=cap * 0.7,
+                total_cash=cap * 0.3,
+                unrealized_pnl=cap - initial,
+                daily_return_pct=daily_ret,
+                n_holdings=3,
+                regime_state="bull",
+            )
+        )
+        prev_cap = cap
+    db_session.commit()
+
+
+class TestBuildPortfolioReview:
+    def test_no_rotation_returns_none(self):
+        assert ed._build_portfolio_review(None, lookback_days=30) is None
+
+    def test_empty_snapshots_returns_skeleton(self, fresh_db):
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+
+        rot = ed._build_rotation()
+        review = ed._build_portfolio_review(rot, lookback_days=30)
+        assert review is not None
+        assert review["snapshots_count"] == 0
+        assert review["sharpe_ratio"] is None
+        assert review["max_drawdown_pct"] is None
+        assert review["wtd_return_pct"] is None
+        assert review["mtd_return_pct"] is None
+        # total_return_pct 從 rotation_block 取，仍應有值
+        assert review["total_return_pct"] is not None
+
+    def test_full_metrics_with_30d(self, fresh_db):
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history(session, "default", today, n_days=30)
+
+        rot = ed._build_rotation()
+        review = ed._build_portfolio_review(rot, lookback_days=90)
+        assert review["snapshots_count"] == 30
+        # 30 天 >> 10，sharpe 必有值
+        assert review["sharpe_ratio"] is not None
+        # 平滑上漲 → MDD 接近 0
+        assert review["max_drawdown_pct"] == 0.0
+        # equity_curve asc by date
+        assert len(review["equity_curve"]) == 30
+        assert review["equity_curve"][0]["date"] < review["equity_curve"][-1]["date"]
+        # today_pnl_pct 等於最後一筆 daily_return_pct
+        assert review["today_pnl_pct"] is not None
+        # win_rate 在線性上漲下接近 100%（首筆 None 排除）
+        assert review["win_rate_pct"] >= 95.0
+
+    def test_min_samples_threshold(self, fresh_db):
+        """N=5 時 sharpe 強制 null，但 mdd/win_rate 仍計算（N>=3）。"""
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history(session, "default", today, n_days=5)
+
+        rot = ed._build_rotation()
+        review = ed._build_portfolio_review(rot, lookback_days=90)
+        assert review["snapshots_count"] == 5
+        assert review["sharpe_ratio"] is None  # N<10
+        assert review["max_drawdown_pct"] is not None  # N>=3
+        assert review["win_rate_pct"] is not None
+
+
+# ---------------------------------------------------------------------------
+# v1.1 新區塊：position_timeseries
+# ---------------------------------------------------------------------------
+
+
+def _seed_price_history(db_session, stock_id: str, end_date: _dt.date, days: int) -> None:
+    """注入 stock_id 自 end_date 倒推 days 個交易日（跳過週末）的 DailyPrice。
+
+    遇到既有資料（同 stock_id+date）會 skip，避免與 _seed_dataset 重複觸發 UniqueConstraint。
+    """
+    existing = {r[0] for r in db_session.execute(select(DailyPrice.date).where(DailyPrice.stock_id == stock_id)).all()}
+    d = end_date
+    inserted = 0
+    while inserted < days:
+        if d.weekday() < 5:  # 週一至週五
+            if d not in existing:
+                db_session.add(
+                    DailyPrice(
+                        stock_id=stock_id,
+                        date=d,
+                        open=100,
+                        high=102,
+                        low=99,
+                        close=100 + inserted * 0.5,
+                        volume=1_000_000,
+                        turnover=1.0,
+                    )
+                )
+            inserted += 1
+        d -= _dt.timedelta(days=1)
+    db_session.commit()
+
+
+class TestBuildPositionTimeseries:
+    def test_no_holdings_returns_none(self, fresh_db):
+        with fresh_db() as session:
+            _seed_dataset(session, _dt.date(2026, 5, 1))
+        ts = ed._build_position_timeseries(
+            rotation_block=None, watch_block=[], days=14, target_date=_dt.date(2026, 5, 1)
+        )
+        assert ts is None
+
+    def test_full_history_first_idx_zero(self, fresh_db):
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_price_history(session, "2330", today, days=20)
+
+        rot = ed._build_rotation()
+        watch = ed._build_watch_entries()
+        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        assert ts is not None
+        assert len(ts["trading_days"]) == 14
+        assert "2330" in ts["series"]
+        assert ts["series"]["2330"]["first_idx"] == 0
+        assert len(ts["series"]["2330"]["close"]) == 14
+
+    def test_short_history_first_idx_offset(self, fresh_db):
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            # 只塞 5 個交易日
+            _seed_price_history(session, "2330", today, days=5)
+            # 額外塞另一檔有完整 14+ 天的股票，讓 trading_days 長到 14
+            _seed_price_history(session, "9999", today, days=20)
+            # 把 9999 加入 rotation 持倉以加入 sids
+            primary = session.execute(select(RotationPortfolio).where(RotationPortfolio.name == "default")).scalar_one()
+            session.add(
+                RotationPosition(
+                    portfolio_id=primary.id,
+                    stock_id="9999",
+                    stock_name="影武者",
+                    entry_date=today - _dt.timedelta(days=2),
+                    entry_price=100.0,
+                    entry_rank=2,
+                    holding_days_count=2,
+                    planned_exit_date=today + _dt.timedelta(days=8),
+                    shares=100,
+                    allocated_capital=10_000,
+                    status="open",
+                )
+            )
+            session.commit()
+
+        rot = ed._build_rotation()
+        watch = ed._build_watch_entries()
+        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        assert ts is not None
+        # 9999 完整 14 天
+        assert ts["series"]["9999"]["first_idx"] == 0
+        assert len(ts["series"]["9999"]["close"]) == 14
+        # 2330 只有 5 天 → first_idx = 14 - 5 = 9
+        assert ts["series"]["2330"]["first_idx"] == 14 - 5
+        assert len(ts["series"]["2330"]["close"]) == 5
+
+    def test_excludes_weekends(self, fresh_db):
+        today = _dt.date(2026, 5, 1)  # Friday
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_price_history(session, "2330", today, days=14)
+
+        rot = ed._build_rotation()
+        watch = ed._build_watch_entries()
+        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        # trading_days 應全為平日
+        for d_str in ts["trading_days"]:
+            d = _dt.date.fromisoformat(d_str)
+            assert d.weekday() < 5

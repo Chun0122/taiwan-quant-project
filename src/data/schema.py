@@ -782,3 +782,32 @@ class RotationBacktestTrade(Base):
 
     def __repr__(self) -> str:
         return f"<RotationBacktestTrade {self.stock_id} {self.entry_date}~{self.exit_date} pnl={self.pnl}>"
+
+
+class RotationDailySnapshot(Base):
+    """輪動組合每日權益快照 — 為 dashboard portfolio_review 區塊提供時序資料。
+
+    每次 RotationManager.update() 結尾寫入一筆。後續 export-dashboard 撈最近 N 天
+    計算 today/wtd/mtd 報酬、Sharpe、MDD、勝率，並可作為 equity curve 來源。
+    """
+
+    __tablename__ = "rotation_daily_snapshot"
+    __table_args__ = (
+        UniqueConstraint("portfolio_name", "snapshot_date", name="uq_rotation_daily_snapshot"),
+        Index("ix_rotation_daily_snapshot_name_date", "portfolio_name", "snapshot_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    total_capital: Mapped[float] = mapped_column(Float, nullable=False)  # 現金 + 持倉市值
+    total_market_value: Mapped[float] = mapped_column(Float, nullable=False)
+    total_cash: Mapped[float] = mapped_column(Float, nullable=False)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    daily_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # vs 前一筆 snapshot
+    n_holdings: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    regime_state: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RotationDailySnapshot {self.portfolio_name} {self.snapshot_date} capital={self.total_capital:.0f}>"

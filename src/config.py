@@ -113,6 +113,13 @@ class QuantConfig(BaseModel):
     rotation_cost: RotationCostConfig = RotationCostConfig()
 
 
+class DashboardConfig(BaseModel):
+    """iOS 監控 App 日報 JSON（export-dashboard）相關設定。"""
+
+    position_timeseries_days: int = 14  # 持倉/Watch 個股小走勢圖窗口天數
+    portfolio_review_lookback_days: int = 90  # portfolio_review 撈最近 N 天 snapshot 計算指標
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
@@ -121,6 +128,7 @@ class Settings(BaseModel):
     discord: DiscordWebhookConfig = DiscordWebhookConfig()
     anthropic: AnthropicConfig = AnthropicConfig()
     quant: QuantConfig = QuantConfig()
+    dashboard: DashboardConfig = DashboardConfig()
 
     @model_validator(mode="after")
     def _validate_critical_settings(self) -> "Settings":

@@ -25,6 +25,7 @@ from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
     DiscoveryRecord,
+    RotationDailySnapshot,
     RotationPortfolio,
     RotationPosition,
 )
@@ -686,6 +687,19 @@ class RotationManager:
                             var_result["var_pct"],
                         )
 
+            # ── Daily Snapshot：dashboard portfolio_review 與 equity curve 來源 ──
+            try:
+                self._write_daily_snapshot(
+                    session,
+                    portfolio=portfolio,
+                    snapshot_date=today,
+                    market_value=market_value,
+                    n_holdings=len(open_after),
+                    regime=regime,
+                )
+            except Exception as exc:
+                logger.warning("[%s] 寫入 daily snapshot 失敗：%s", self.portfolio_name, exc)
+
             logger.info(
                 "[%s] 更新完成: 賣出=%d, 續持=%d, 買入=%d, 保持=%d | 現金=%.0f, 總資產=%.0f",
                 self.portfolio_name,
@@ -697,6 +711,96 @@ class RotationManager:
                 portfolio.current_capital,
             )
             return actions
+
+    # ── Daily Snapshot ──
+
+    def _write_daily_snapshot(
+        self,
+        session,
+        *,
+        portfolio: RotationPortfolio,
+        snapshot_date: date,
+        market_value: float,
+        n_holdings: int,
+        regime: str | None,
+    ) -> None:
+        """寫入單日權益快照（同日重複呼叫採 update 而非新增，避免 UniqueConstraint 衝突）。"""
+        unrealized_pnl = market_value + portfolio.current_cash - portfolio.initial_capital
+
+        existing = session.execute(
+            select(RotationDailySnapshot).where(
+                RotationDailySnapshot.portfolio_name == portfolio.name,
+                RotationDailySnapshot.snapshot_date == snapshot_date,
+            )
+        ).scalar_one_or_none()
+
+        prev = session.execute(
+            select(RotationDailySnapshot)
+            .where(
+                RotationDailySnapshot.portfolio_name == portfolio.name,
+                RotationDailySnapshot.snapshot_date < snapshot_date,
+            )
+            .order_by(RotationDailySnapshot.snapshot_date.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+        daily_return_pct: float | None
+        if prev is not None and prev.total_capital > 0:
+            daily_return_pct = (portfolio.current_capital - prev.total_capital) / prev.total_capital
+        else:
+            daily_return_pct = None
+
+        if existing is not None:
+            existing.total_capital = portfolio.current_capital
+            existing.total_market_value = market_value
+            existing.total_cash = portfolio.current_cash
+            existing.unrealized_pnl = unrealized_pnl
+            existing.daily_return_pct = daily_return_pct
+            existing.n_holdings = n_holdings
+            existing.regime_state = regime
+        else:
+            session.add(
+                RotationDailySnapshot(
+                    portfolio_name=portfolio.name,
+                    snapshot_date=snapshot_date,
+                    total_capital=portfolio.current_capital,
+                    total_market_value=market_value,
+                    total_cash=portfolio.current_cash,
+                    unrealized_pnl=unrealized_pnl,
+                    daily_return_pct=daily_return_pct,
+                    n_holdings=n_holdings,
+                    regime_state=regime,
+                )
+            )
+        session.commit()
+
+    def get_recent_snapshots(self, n_days: int = 90) -> list[dict]:
+        """回傳本組合最近 n_days 個 snapshot（asc by snapshot_date）。
+
+        注意：rotation 改名後與舊 snapshot 名稱不一致時會斷鏈，僅撈當前 portfolio_name。
+        """
+        with get_session() as session:
+            stmt = (
+                select(RotationDailySnapshot)
+                .where(RotationDailySnapshot.portfolio_name == self.portfolio_name)
+                .order_by(RotationDailySnapshot.snapshot_date.desc())
+                .limit(n_days)
+            )
+            rows = session.execute(stmt).scalars().all()
+            rows_asc = list(reversed(rows))
+            return [
+                {
+                    "snapshot_date": r.snapshot_date,
+                    "total_capital": r.total_capital,
+                    "total_market_value": r.total_market_value,
+                    "total_cash": r.total_cash,
+                    "unrealized_pnl": r.unrealized_pnl,
+                    "daily_return_pct": r.daily_return_pct,
+                    "n_holdings": r.n_holdings,
+                    "regime_state": r.regime_state,
+                }
+                for r in rows_asc
+            ]
 
     # ── 回測 ──
 

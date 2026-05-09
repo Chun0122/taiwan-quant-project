@@ -23,8 +23,9 @@ from sqlalchemy import select
 
 from src.cli.helpers import init_db
 from src.cli.helpers import safe_print as print
+from src.config import settings
 from src.data.database import get_session
-from src.data.schema import DiscoveryRecord, WatchEntry
+from src.data.schema import DailyPrice, DiscoveryRecord, WatchEntry
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +290,6 @@ def _build_data_freshness_signal(target_date: _dt.date) -> dict | None:
     """產出 data_stale 訊號（若有）。"""
     from sqlalchemy import func
 
-    from src.data.schema import DailyPrice
-
     try:
         with get_session() as session:
             latest = session.execute(select(func.max(DailyPrice.date)).where(DailyPrice.stock_id == "TAIEX")).scalar()
@@ -373,6 +372,215 @@ def _build_ai_summary(target_date: _dt.date, regenerate: bool) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Portfolio Review（每日績效摘要）
+# ---------------------------------------------------------------------------
+
+
+# 樣本門檻 — 統計指標的最低樣本數（少於此值強制 null，避免無意義數值）
+_MIN_SAMPLES_FOR_SHARPE = 10
+_MIN_SAMPLES_FOR_MDD = 3
+
+
+def _build_portfolio_review(rotation_block: dict | None, lookback_days: int) -> dict | None:
+    """以 RotationDailySnapshot 計算 portfolio_review 區塊。
+
+    回傳 keys：today_pnl_pct / wtd_return_pct / mtd_return_pct / total_return_pct
+            / sharpe_ratio / max_drawdown_pct / win_rate_pct
+            / equity_curve / snapshots_count
+
+    資料不足策略：N<10 → sharpe=null；N<3 → mdd/win_rate 也 null；
+    snapshot 表為空時除 total_return_pct（從 rotation_block 取）外其餘 null。
+
+    注意：rotation 改名後新舊 snapshot 名稱不一致會斷鏈，這裡只撈當下 primary portfolio。
+    """
+    if rotation_block is None:
+        return None
+
+    portfolio_name = rotation_block.get("name")
+    if not portfolio_name:
+        return None
+
+    from src.portfolio.manager import RotationManager
+
+    mgr = RotationManager(portfolio_name)
+    snapshots = mgr.get_recent_snapshots(n_days=lookback_days)
+
+    total_return_pct = rotation_block.get("total_return_pct")
+
+    review: dict = {
+        "today_pnl_pct": None,
+        "wtd_return_pct": None,
+        "mtd_return_pct": None,
+        "total_return_pct": total_return_pct,
+        "sharpe_ratio": None,
+        "max_drawdown_pct": None,
+        "win_rate_pct": None,
+        "equity_curve": [],
+        "snapshots_count": len(snapshots),
+    }
+
+    if not snapshots:
+        return review
+
+    # equity_curve（asc by date，給 v1.2 預留）
+    review["equity_curve"] = [
+        {"date": s["snapshot_date"].isoformat(), "capital": float(s["total_capital"])} for s in snapshots
+    ]
+
+    # today / wtd / mtd
+    today_snap = snapshots[-1]
+    today_date = today_snap["snapshot_date"]
+    if today_snap.get("daily_return_pct") is not None:
+        review["today_pnl_pct"] = float(today_snap["daily_return_pct"])
+
+    week_start = today_date - _dt.timedelta(days=today_date.weekday())  # 週一=0
+    month_start = today_date.replace(day=1)
+
+    def _pct_from(start_date) -> float | None:
+        # 取 snapshot_date >= start_date 的第一筆作為基準點
+        for s in snapshots:
+            if s["snapshot_date"] >= start_date:
+                base = s["total_capital"]
+                if base and base > 0:
+                    return (today_snap["total_capital"] - base) / base
+                return None
+        return None
+
+    review["wtd_return_pct"] = _pct_from(week_start)
+    review["mtd_return_pct"] = _pct_from(month_start)
+
+    # Sharpe（年化）— N>=10 才算
+    daily_returns = [s["daily_return_pct"] for s in snapshots if s.get("daily_return_pct") is not None]
+    if len(daily_returns) >= _MIN_SAMPLES_FOR_SHARPE:
+        import math
+        import statistics
+
+        mean = statistics.fmean(daily_returns)
+        try:
+            stdev = statistics.stdev(daily_returns)
+        except statistics.StatisticsError:
+            stdev = 0.0
+        if stdev > 1e-8:
+            review["sharpe_ratio"] = round(mean / stdev * math.sqrt(252), 4)
+
+    # MDD（百分比）+ Win rate（百分比，按日勝率）— N>=3 才算
+    if len(snapshots) >= _MIN_SAMPLES_FOR_MDD:
+        peak = snapshots[0]["total_capital"]
+        max_dd = 0.0
+        for s in snapshots:
+            cap = s["total_capital"]
+            if cap > peak:
+                peak = cap
+            if peak > 0:
+                dd = (peak - cap) / peak
+                if dd > max_dd:
+                    max_dd = dd
+        review["max_drawdown_pct"] = round(max_dd * 100, 2)
+
+        if daily_returns:
+            wins = sum(1 for r in daily_returns if r > 0)
+            review["win_rate_pct"] = round(wins / len(daily_returns) * 100, 2)
+
+    return review
+
+
+# ---------------------------------------------------------------------------
+# Position Timeseries（持倉/Watch 個股小走勢圖）
+# ---------------------------------------------------------------------------
+
+
+def _build_position_timeseries(
+    rotation_block: dict | None,
+    watch_block: list[dict],
+    days: int,
+    target_date: _dt.date,
+) -> dict | None:
+    """從 DailyPrice 撈 rotation.holdings ∪ watch_entries 的最近 N 個交易日 close。
+
+    結構：
+        {
+          "trading_days": ["2026-04-15", ...],
+          "series": {
+            "2330": {"close": [...], "first_idx": 0},
+            ...
+          }
+        }
+
+    `first_idx` 處理上市未滿 N 日 / 中段停牌的股票（只給連續最末段）。
+    """
+    sids: set[str] = set()
+    if rotation_block:
+        for h in rotation_block.get("holdings", []) or []:
+            sid = h.get("stock_id")
+            if sid:
+                sids.add(sid)
+    for w in watch_block or []:
+        sid = w.get("stock_id")
+        if sid:
+            sids.add(sid)
+
+    if not sids:
+        return None
+
+    # 多撈一些緩衝避免假日不夠（1.5 倍）
+    earliest = target_date - _dt.timedelta(days=int(days * 1.5) + 14)
+
+    with get_session() as session:
+        rows = session.execute(
+            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close).where(
+                DailyPrice.stock_id.in_(list(sids)),
+                DailyPrice.date >= earliest,
+                DailyPrice.date <= target_date,
+            )
+        ).all()
+
+    if not rows:
+        return None
+
+    # 收集所有出現過的交易日（asc）— 以「實際有資料的日期」為交易日來源
+    all_dates = sorted({r[1] for r in rows})
+    trading_days = all_dates[-days:]
+    if not trading_days:
+        return None
+    td_index = {d: i for i, d in enumerate(trading_days)}
+
+    by_stock: dict[str, list[tuple[_dt.date, float]]] = {}
+    for sid, d, close in rows:
+        if d in td_index and close is not None:
+            by_stock.setdefault(sid, []).append((d, float(close)))
+
+    series: dict[str, dict] = {}
+    for sid in sids:
+        pairs = sorted(by_stock.get(sid, []), key=lambda p: p[0])
+        if not pairs:
+            continue
+        # 只取連續最末段（從最新一筆向前找連續）
+        # 我們用 trading_days 作為基準逐日比對
+        # 找出最早有資料且後續連續的起點：從尾向前掃，遇到「該交易日無資料」即斷
+        sid_dates = {p[0] for p in pairs}
+        first_idx = len(trading_days)
+        for i in range(len(trading_days) - 1, -1, -1):
+            if trading_days[i] in sid_dates:
+                first_idx = i
+            else:
+                break
+        if first_idx >= len(trading_days):
+            continue
+        closes = [c for d, c in pairs if d in trading_days[first_idx:]]
+        if not closes:
+            continue
+        series[sid] = {"close": closes, "first_idx": first_idx}
+
+    if not series:
+        return None
+
+    return {
+        "trading_days": [d.isoformat() for d in trading_days],
+        "series": series,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 組裝 + 寫檔
 # ---------------------------------------------------------------------------
 
@@ -449,6 +657,28 @@ def _build_payload(
     except Exception as exc:
         bundle.record_error("ai_summary", exc)
 
+    # portfolio_review（每日績效摘要 — 依賴 RotationDailySnapshot 表）
+    portfolio_review = None
+    try:
+        portfolio_review = _build_portfolio_review(
+            rotation_block,
+            lookback_days=settings.dashboard.portfolio_review_lookback_days,
+        )
+    except Exception as exc:
+        bundle.record_error("portfolio_review", exc)
+
+    # position_timeseries（持倉/Watch 個股小走勢圖）
+    position_timeseries = None
+    try:
+        position_timeseries = _build_position_timeseries(
+            rotation_block,
+            watch_block,
+            days=settings.dashboard.position_timeseries_days,
+            target_date=target_date,
+        )
+    except Exception as exc:
+        bundle.record_error("position_timeseries", exc)
+
     # 移除 regime 內部欄位
     regime_clean = {k: v for k, v in regime_block.items() if not k.startswith("_")}
 
@@ -463,6 +693,8 @@ def _build_payload(
         "signals": signals,
         "strategy_events": events,
         "ai_summary": ai_summary,
+        "portfolio_review": portfolio_review,
+        "position_timeseries": position_timeseries,
         "errors": bundle.errors,
     }
     return bundle.payload
@@ -516,6 +748,8 @@ def cmd_export_dashboard(args: argparse.Namespace) -> None:
     n_signals = len(payload["signals"])
     n_events = len(payload["strategy_events"])
     n_errors = len(payload["errors"])
+    n_snapshots = (payload.get("portfolio_review") or {}).get("snapshots_count", 0)
+    n_pts_series = len((payload.get("position_timeseries") or {}).get("series", {}) or {})
 
     print(f"Dashboard JSON 已寫出：{dated}")
     print(f"  latest 同步：{latest}")
@@ -523,5 +757,6 @@ def cmd_export_dashboard(args: argparse.Namespace) -> None:
         f"  discover={n_disc} | rotation_holdings={n_holdings} | "
         f"watch={n_watch} | signals={n_signals} | events={n_events} | errors={n_errors}"
     )
+    print(f"  portfolio_review.snapshots={n_snapshots} | position_timeseries.series={n_pts_series}")
     if n_errors:
         print(f"  ⚠ {n_errors} 個區塊產出失敗（payload.errors[] 內含詳情）")
