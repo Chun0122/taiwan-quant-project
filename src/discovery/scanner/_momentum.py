@@ -1,6 +1,9 @@
-"""MomentumScanner — 短線動能掃描模式。
+"""MomentumScanner — 動能模式（v5：籌碼/基本面主導）。
 
-突破 + 資金流 + 量能擴張，適合 1~10 天短線操作。
+2026-05-09 audit 後：technical_score 維度權重歸零（IC=-0.13 持續為負），
+轉以 chip（最高 0.55）+ fundamental（0.45）為核心評分維度。
+technical 子因子仍計算並寫入 DiscoveryRecord（供 IC 監控），但不入 composite。
+建議搭配 holding_days ≥ 10 使用（短期持有踩到 reversal 風險）。
 """
 
 from __future__ import annotations
@@ -103,12 +106,13 @@ def _get_chip_base_weights(
 
 
 class MomentumScanner(MarketScanner):
-    """短線動能掃描器（1~10 天）。
+    """動能模式 v5（建議持有 10~20 天）。
 
-    粗篩：動能 + 流動性
-    細評：技術面 + 籌碼面 + 消息面（三維度，Regime 動態權重）
+    粗篩：動能 + 流動性（保留動能因子作為候選池過濾）
+    細評：籌碼面（0.55）+ 基本面（0.45），technical 權重歸零
     風險過濾：ATR ratio > 80th percentile 剔除
-    盤整期（sideways）自動暫停掃描。
+    盤整期（sideways）自動暫停掃描；
+    搭配 rotation 時建議 holding_days ≥ 10 + min_hold_days ≥ 7。
     """
 
     mode_name = "momentum"

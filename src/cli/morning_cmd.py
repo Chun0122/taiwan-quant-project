@@ -30,6 +30,7 @@ from src.constants import (
     DEFAULT_INST_THRESHOLD,
     DEFAULT_SBL_SIGMA,
     DEFAULT_VOL_MULT,
+    DISCOVERY_IC_HOLDING_DAYS_MAP,
     DISCOVERY_KEY_FACTOR_MAP,
 )
 
@@ -452,15 +453,20 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
 
     為每個 mode 跑兩次 IC 計算，**共用同一次 DB 查詢**：
       1. `compute_rolling_ic(window_days=14, step_days=7)` — 用於 level 判定（rolling 窗口）
-      2. `compute_factor_ic(holding_days=5, lookback_days=30)` — 用於 scanner
+      2. `compute_factor_ic(lookback_days=30)` — 用於 scanner
          `_apply_ic_weight_adjustment` / `_log_factor_effectiveness`（單次靜態 IC）
 
-    兩者語意不同（rolling vs static），不可混用。本函式同時產出，避免 scanner
-    內重複查 DiscoveryRecord + DailyPrice + 重算 IC（每 mode 省 ~2-5 秒）。
+    Holding days 由 `DISCOVERY_IC_HOLDING_DAYS_MAP` 決定（mode-aware）：
+      - momentum: 5（chip_score 短期敏感）
+      - swing: 10（中期波段）
+      - value/dividend/growth: 20（fundamental_score 中長期兌現）
+    避免 fundamental 因子在 5 天 holding 下被誤判 inverse 而誤殺整個模式。
+
+    cutoff 動態擴大為 35 + max(holding_days)，確保 holding=20 模式仍有足夠 forward 樣本。
 
     Returns:
         tuple:
-          - status_list: 每模式一筆 dict（mode/mode_key/factor/ic/level/sample_count/error）
+          - status_list: 每模式一筆 dict（mode/mode_key/factor/ic/level/sample_count/holding_days/error）
             level ∈ {"normal", "decay", "weak", "inverse", "insufficient", "error"}
           - ic_df_by_mode: {mode_key: ic_df}，ic_df 為 `compute_factor_ic` 輸出
             （factor / ic / evaluable_count / direction），失敗或樣本不足時為空 DataFrame
@@ -476,10 +482,18 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
 
     results: list[dict] = []
     ic_df_by_mode: dict[str, pd.DataFrame] = {}
-    cutoff = date.today() - timedelta(days=35)
+    # 動態 cutoff：base 35 天 + 最大 holding（如 holding=20 需要 records 在 55 天前才有 forward 報酬）
+    max_holding = max(DISCOVERY_IC_HOLDING_DAYS_MAP.values(), default=5)
+    cutoff = date.today() - timedelta(days=35 + max_holding)
 
     for mode, key_factor in _KEY_FACTORS.items():
-        entry: dict = {"mode": _MODE_LABELS.get(mode, mode), "mode_key": mode, "factor": key_factor}
+        holding_days = DISCOVERY_IC_HOLDING_DAYS_MAP.get(mode, 5)
+        entry: dict = {
+            "mode": _MODE_LABELS.get(mode, mode),
+            "mode_key": mode,
+            "factor": key_factor,
+            "holding_days": holding_days,
+        }
         ic_df_by_mode[mode] = pd.DataFrame()  # 預設空，失敗或樣本不足時保持
         try:
             with get_session() as session:
@@ -525,13 +539,18 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
                     continue
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
-            # 路徑 1：rolling IC，用於 level 判定（保留原行為）
-            rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
+            # 路徑 1：rolling IC，用於 level 判定（mode-aware holding）
+            rolling_df = compute_rolling_ic(
+                df_records, df_prices, holding_days=holding_days, window_days=14, step_days=7
+            )
 
-            # 路徑 2：scanner 端用的 static IC（holding_days=5, lookback_days=30）
-            # — 與 _apply_ic_weight_adjustment / _log_factor_effectiveness 內部呼叫的參數一致
+            # 路徑 2：scanner 端用的 static IC（mode-aware holding, lookback_days=30）
+            # TODO: scanner 端 _apply_ic_weight_adjustment / _check_ic_decay 仍硬編碼 holding=5，
+            #       下次 audit 統一改用 DISCOVERY_IC_HOLDING_DAYS_MAP，避免 fundamental 在 scanner
+            #       內被誤 flip/dampen。本函式產出的 static_ic 已 mode-aware，但 scanner 內部會
+            #       再自行查 DB 重算（暫接受 morning-routine 與 scanner 的 IC 短期不一致）。
             try:
-                static_ic = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+                static_ic = compute_factor_ic(df_records, df_prices, holding_days=holding_days, lookback_days=30)
                 if not static_ic.empty:
                     ic_df_by_mode[mode] = static_ic
             except Exception:

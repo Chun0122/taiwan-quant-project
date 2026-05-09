@@ -1,15 +1,63 @@
-"""factor-diagnostics IC 衰退警示文案測試（commit 2574682-A3 修正驗證）。
+"""factor-diagnostics IC 衰退警示文案測試。
 
 驗證項目：
   1. SSOT — DISCOVERY_KEY_FACTOR_MAP 為單一真相來源，BaseScanner 與 CLI 共用
-  2. momentum 關鍵因子為 technical_score（不再是 news_score）
-  3. 警示文案正確綁定關鍵因子（避免「momentum 高度依賴 news_score」這類 stale text）
+  2. momentum 關鍵因子為 chip_score（v5：technical 權重歸零後改為 chip_score）
+  3. 警示文案正確綁定關鍵因子（避免「momentum 高度依賴 X」這類 stale text）
+  4. SSOT — DISCOVERY_IC_HOLDING_DAYS_MAP 與 KEY_FACTOR 對齊：
+     fundamental 主導模式用 20 天 holding（防止 5 天視角誤判 inverse）
 """
 
 from __future__ import annotations
 
 from src.cli.discover_cmd import _emit_ic_decay_warning
-from src.constants import DISCOVERY_KEY_FACTOR_MAP
+from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP, DISCOVERY_KEY_FACTOR_MAP
+
+
+class TestIcHoldingDaysMapSsot:
+    """DISCOVERY_IC_HOLDING_DAYS_MAP（2026-05-09 audit）：
+    morning-routine Step 8c 預檢用 mode-aware holding，避免 fundamental 因子被 5 天視角誤判 inverse。"""
+
+    def test_all_modes_have_holding_days(self) -> None:
+        """五個模式都應有對應的 IC holding days。"""
+        for mode in ("momentum", "swing", "value", "dividend", "growth"):
+            assert mode in DISCOVERY_IC_HOLDING_DAYS_MAP
+            assert DISCOVERY_IC_HOLDING_DAYS_MAP[mode] >= 1
+
+    def test_chip_factor_uses_short_horizon(self) -> None:
+        """chip_score 主導模式（momentum）用短週期（≤10 天）— 資金流訊號短期兌現。"""
+        for mode, factor in DISCOVERY_KEY_FACTOR_MAP.items():
+            if factor == "chip_score":
+                assert DISCOVERY_IC_HOLDING_DAYS_MAP[mode] <= 10, f"{mode}: chip_score 應用短週期 holding"
+
+    def test_fundamental_factor_uses_long_horizon(self) -> None:
+        """fundamental_score 主導模式（value/dividend/growth/swing）用 ≥10 天 holding —
+        YoY 營收/獲利週期 30+ 天兌現，5 天 holding 視角會誤判 inverse。"""
+        for mode, factor in DISCOVERY_KEY_FACTOR_MAP.items():
+            if factor == "fundamental_score":
+                assert DISCOVERY_IC_HOLDING_DAYS_MAP[mode] >= 10, (
+                    f"{mode}: fundamental_score 至少需 10 天 holding，實際 {DISCOVERY_IC_HOLDING_DAYS_MAP[mode]} 天"
+                )
+
+
+class TestStep8cModeAwareHolding:
+    """Step 8c (_compute_factor_ic_status) 確實使用 mode-aware holding（SSOT 共用驗證）。"""
+
+    def test_morning_cmd_imports_holding_map(self) -> None:
+        """morning_cmd 應 import 並共用同一 DISCOVERY_IC_HOLDING_DAYS_MAP（SSOT）。"""
+        from src.cli import morning_cmd
+
+        assert hasattr(morning_cmd, "DISCOVERY_IC_HOLDING_DAYS_MAP"), (
+            "morning_cmd 未匯入 DISCOVERY_IC_HOLDING_DAYS_MAP，Step 8c 無法 mode-aware"
+        )
+        assert morning_cmd.DISCOVERY_IC_HOLDING_DAYS_MAP is DISCOVERY_IC_HOLDING_DAYS_MAP, (
+            "morning_cmd 應與 constants 共用同一物件（SSOT）"
+        )
+
+    def test_all_key_factor_modes_have_holding(self) -> None:
+        """每個 KEY_FACTOR_MAP 的模式都需有對應的 holding_days，避免 KeyError 漏網。"""
+        for mode in DISCOVERY_KEY_FACTOR_MAP:
+            assert mode in DISCOVERY_IC_HOLDING_DAYS_MAP, f"{mode} 缺少 holding_days 設定"
 
 
 class TestKeyFactorMapSsot:
@@ -19,9 +67,10 @@ class TestKeyFactorMapSsot:
 
         assert MarketScanner._KEY_FACTOR_MAP is DISCOVERY_KEY_FACTOR_MAP
 
-    def test_momentum_key_is_technical_score(self) -> None:
-        """commit 2574682-A3：momentum 關鍵因子改為 technical_score（非 news_score）。"""
-        assert DISCOVERY_KEY_FACTOR_MAP["momentum"] == "technical_score"
+    def test_momentum_key_is_chip_score(self) -> None:
+        """v5（2026-05-09 audit）：technical 權重歸零後，chip_score（0.55）成為最高權重維度，
+        故 momentum 關鍵因子由 technical_score 改為 chip_score。"""
+        assert DISCOVERY_KEY_FACTOR_MAP["momentum"] == "chip_score"
 
     def test_all_modes_have_mapping(self) -> None:
         """五個模式都應有對應的關鍵因子。"""
@@ -50,9 +99,8 @@ class TestKeyFactorMapSsot:
 
 class TestEmitIcDecayWarning:
     def test_non_key_factor_no_dependency_message(self, capsys) -> None:
-        """非關鍵因子衰退不應觸發『高度依賴』訊息（過去 stale text bug）。"""
-        # 過去的 bug：news_score 衰退會印「momentum 模式高度依賴 news_score」
-        # 但 momentum 關鍵因子已改為 technical_score，news_score 不該觸發此訊息
+        """非關鍵因子衰退不應觸發『高度依賴』訊息。"""
+        # v5：momentum 關鍵因子為 chip_score，news_score / technical_score 不應觸發強警示
         _emit_ic_decay_warning(mode="momentum", factor="news_score", latest_ic=-0.05)
         out = capsys.readouterr().out
         assert "高度依賴" not in out
@@ -60,11 +108,11 @@ class TestEmitIcDecayWarning:
         assert "news_score IC 衰退至 -0.0500" in out  # 但基本警示仍應出現
 
     def test_key_factor_emits_dependency_message(self, capsys) -> None:
-        """關鍵因子衰退應強警示。"""
-        _emit_ic_decay_warning(mode="momentum", factor="technical_score", latest_ic=-0.05)
+        """關鍵因子衰退應強警示（v5：momentum 關鍵因子改為 chip_score）。"""
+        _emit_ic_decay_warning(mode="momentum", factor="chip_score", latest_ic=-0.05)
         out = capsys.readouterr().out
         assert "★關鍵因子" in out
-        assert "momentum 模式高度依賴 technical_score" in out
+        assert "momentum 模式高度依賴 chip_score" in out
 
     def test_swing_key_factor_fundamental_score(self, capsys) -> None:
         """swing 關鍵因子為 fundamental_score（bull regime 0.40，最大權重維度）。

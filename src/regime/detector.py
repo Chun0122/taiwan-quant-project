@@ -74,16 +74,21 @@ _BREADTH_BELOW_MA20_THRESHOLD: float = 0.60  # >60% 股票跌破 MA20 → regime
 # 新聞/基本面（品質防禦）提升至最高，只留有真實催化劑的防禦股
 REGIME_WEIGHTS: dict[str, dict[str, dict[str, float]]] = {
     "momentum": {
-        # v4 修正（Phase A）：news 於 bull 期歸零（IC 結構性為負 -0.03，Rolling 降至 -0.13）
-        # 保留 Stage 3.5h 負面閘門作為純濾網，不再作為正面評分維度
-        # Bull：純技術/籌碼/基本面三維度（news=0，權重轉給 technical/chip/fundamental）
-        "bull": {"technical": 0.40, "chip": 0.32, "fundamental": 0.28, "news": 0.00},
+        # v5 修正（2026-05-09 audit）：technical 權重歸零
+        # 證據鏈：(1) E2 IC: technical_score = -0.1330（持續為負，rolling -0.05 ~ -0.14）
+        #         (2) ablation --with-performance: 移除 technical → 勝率 53.4%→56.6% (+3.2pp)
+        #         (3) 維度級消融 ρ=0.3293 主導排名，但方向錯誤
+        # 政策：直接刪除 technical 訊號（不再依賴 IC-aware flip 治標）；
+        #       權重重新分配到 chip（最高 IC 0.18）/ fundamental（0.15）。
+        # v4 註解（保留）：news 於 bull 期歸零（IC 結構性為負，Stage 3.5h 負面閘門承接濾網角色）
+        # Bull：chip 主導 + fundamental 輔助
+        "bull": {"technical": 0.00, "chip": 0.55, "fundamental": 0.45, "news": 0.00},
         # Sideways：blocked（_blocked_regimes），此權重不會被使用，維護正確性
-        "sideways": {"technical": 0.30, "chip": 0.32, "fundamental": 0.28, "news": 0.10},
-        # Bear：消息面降權（事件催化劑仍存在，但從 0.35 → 0.15）
-        "bear": {"technical": 0.28, "chip": 0.30, "fundamental": 0.27, "news": 0.15},
-        # Crisis：消息面降權（從 0.52 → 0.30），提升 chip/fundamental 防禦
-        "crisis": {"technical": 0.15, "chip": 0.30, "fundamental": 0.25, "news": 0.30},
+        "sideways": {"technical": 0.00, "chip": 0.45, "fundamental": 0.40, "news": 0.15},
+        # Bear：基本面防禦提升
+        "bear": {"technical": 0.00, "chip": 0.42, "fundamental": 0.38, "news": 0.20},
+        # Crisis：消息面催化（防禦股事件驅動）+ 籌碼/基本面平衡
+        "crisis": {"technical": 0.00, "chip": 0.35, "fundamental": 0.30, "news": 0.35},
     },
     "swing": {
         "bull": {"technical": 0.30, "chip": 0.20, "fundamental": 0.40, "news": 0.10},

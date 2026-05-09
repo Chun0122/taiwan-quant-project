@@ -118,15 +118,34 @@ REGIME_MODE_BLOCK: dict[str, frozenset[str]] = {
 #   1. BaseScanner._KEY_FACTOR_MAP（IC-Decay 動態門檻提升）
 #   2. factor-diagnostics 警示文案「{mode} 模式高度依賴 {factor}」
 #   3. cli/morning_cmd._step_8c_ic_precheck（反向模式自動停用 discover）
-# momentum v3：bull 權重 tech 0.40 為最高權重維度，故為關鍵因子
-#   （不再用 news_score；news IC 結構性為負永久觸發無意義，已由 12d1623-A
-#    將 bull news 權重歸零，改由 Stage 3.5h 負面閘門承接純濾網角色）
+# momentum v5（2026-05-09 audit）：technical 權重歸零後，chip 0.55 為最高維度
+#   （參見 src/regime/detector.py:REGIME_WEIGHTS["momentum"]["bull"]）。
+#   technical_score IC=-0.13 持續為負，已從評分維度移除，不再作為關鍵因子。
 # swing 修正：bull 權重 fundamental 0.40 為最高維度，先前誤設為 chip_score
 #   (0.20，第三大)，造成 swing 在 Step 8c 被 chip IC 反向誤殺停用。
 DISCOVERY_KEY_FACTOR_MAP: dict[str, str] = {
-    "momentum": "technical_score",
+    "momentum": "chip_score",
     "swing": "fundamental_score",
     "value": "fundamental_score",
     "dividend": "fundamental_score",
     "growth": "fundamental_score",
+}
+
+# ── 各模式 IC 預檢的合適 holding_days（與因子本質週期對齊） ────────────
+# 2026-05-09 audit 發現：morning-routine Step 8c 一律用 holding=5 計算 rolling IC，
+# 對 fundamental_score 主導的模式（value/dividend/growth）天然不適用，
+# 造成全部誤判為 inverse、被自動停用。
+# 設計原則：holding_days 應接近該模式 KEY_FACTOR 的兌現週期。
+#   - chip_score 短期敏感（資金流訊號 1~10 天兌現）→ 5 天
+#   - fundamental_score 中長期（YoY 營收/獲利週期 30+ 天）→ 20 天
+#   - swing 介於兩者，取中間值 10 天
+# 使用方：morning_cmd._compute_factor_ic_status / factor-diagnostics（未來）
+# TODO: scanner 端 _apply_ic_weight_adjustment / _check_ic_decay 仍使用 holding=5，
+#       下次 audit 一併統一以避免 fundamental 因子在 scanner 內被誤 flip/dampen。
+DISCOVERY_IC_HOLDING_DAYS_MAP: dict[str, int] = {
+    "momentum": 5,
+    "swing": 10,
+    "value": 20,
+    "dividend": 20,
+    "growth": 20,
 }

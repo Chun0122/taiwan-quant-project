@@ -94,7 +94,7 @@ class TestCheckFactorICDecayNotSilent:
     def test_mixed_results_report_correct_levels(self, capsys):
         """混合結果 → 正常/反向/衰減各自標記。"""
         fake_status = [
-            {"mode": "Momentum", "mode_key": "momentum", "factor": "technical_score", "ic": 0.15, "level": "normal"},
+            {"mode": "Momentum", "mode_key": "momentum", "factor": "chip_score", "ic": 0.15, "level": "normal"},
             {"mode": "Swing", "mode_key": "swing", "factor": "chip_score", "ic": -0.13, "level": "inverse"},
             {"mode": "Value", "mode_key": "value", "factor": "fundamental_score", "ic": 0.07, "level": "decay"},
             {"mode": "Dividend", "mode_key": "dividend", "factor": "fundamental_score", "ic": 0.01, "level": "weak"},

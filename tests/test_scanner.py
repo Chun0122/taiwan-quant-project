@@ -8971,8 +8971,8 @@ class TestMomentumRegimeWeightsV3:
 
 
 class TestKeyFactorMap:
-    """_KEY_FACTOR_MAP IC Decay 監控目標（Phase A3）。"""
+    """_KEY_FACTOR_MAP IC Decay 監控目標。"""
 
-    def test_momentum_monitors_technical_score(self, momentum_scanner):
-        """momentum 模式關鍵因子應為 technical_score（非 news_score）。"""
-        assert momentum_scanner._KEY_FACTOR_MAP["momentum"] == "technical_score"
+    def test_momentum_monitors_chip_score(self, momentum_scanner):
+        """v5 audit：technical 權重歸零後，momentum 關鍵因子改為 chip_score（最高權重 0.55）。"""
+        assert momentum_scanner._KEY_FACTOR_MAP["momentum"] == "chip_score"
