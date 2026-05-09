@@ -29,7 +29,7 @@ from src.data.schema import DailyPrice, DiscoveryRecord, WatchEntry
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_TOP_N = 20
 DEFAULT_EVENT_DAYS = 30
 
@@ -126,55 +126,75 @@ def _build_discover(target_date: _dt.date, top_n: int) -> dict[str, list[dict]]:
     return out
 
 
-def _build_rotation() -> dict | None:
-    """取主要（current_capital 最大的 active）輪動組合的快照。"""
+def _build_rotations() -> list[dict]:
+    """取所有 active 輪動組合的快照（依 current_capital 降冪排序，第一筆為 primary）。"""
     from src.portfolio.manager import RotationManager
 
     portfolios = RotationManager.list_portfolios()
     actives = [p for p in portfolios if p.get("status") == "active"]
     if not actives:
-        return None
+        return []
 
-    primary = max(actives, key=lambda p: p.get("current_capital", 0.0) or 0.0)
-    mgr = RotationManager(primary["name"])
-    status = mgr.get_status()
-    if status is None:
-        return None
+    actives_sorted = sorted(
+        actives,
+        key=lambda p: p.get("current_capital", 0.0) or 0.0,
+        reverse=True,
+    )
 
-    holdings = []
-    for h in status.get("holdings", []) or []:
-        entry_date = h.get("entry_date")
-        holdings.append(
+    out: list[dict] = []
+    for p in actives_sorted:
+        mgr = RotationManager(p["name"])
+        status = mgr.get_status()
+        if status is None:
+            continue
+
+        holdings = []
+        for h in status.get("holdings", []) or []:
+            entry_date = h.get("entry_date")
+            holdings.append(
+                {
+                    "stock_id": h.get("stock_id"),
+                    "stock_name": h.get("stock_name"),
+                    "entry_date": entry_date.isoformat() if isinstance(entry_date, _dt.date) else entry_date,
+                    "entry_price": h.get("entry_price"),
+                    "current_price": h.get("current_price"),
+                    "shares": h.get("shares"),
+                    "market_value": h.get("market_value"),
+                    "unrealized_pnl": h.get("unrealized_pnl"),
+                    "unrealized_pct": h.get("unrealized_pct"),
+                    "entry_rank": h.get("entry_rank"),
+                }
+            )
+
+        out.append(
             {
-                "stock_id": h.get("stock_id"),
-                "stock_name": h.get("stock_name"),
-                "entry_date": entry_date.isoformat() if isinstance(entry_date, _dt.date) else entry_date,
-                "entry_price": h.get("entry_price"),
-                "current_price": h.get("current_price"),
-                "shares": h.get("shares"),
-                "market_value": h.get("market_value"),
-                "unrealized_pnl": h.get("unrealized_pnl"),
-                "unrealized_pct": h.get("unrealized_pct"),
-                "entry_rank": h.get("entry_rank"),
+                "name": status["name"],
+                "mode": status["mode"],
+                "max_positions": status["max_positions"],
+                "holding_days": status["holding_days"],
+                "allow_renewal": status["allow_renewal"],
+                "initial_capital": status["initial_capital"],
+                "current_capital": status["current_capital"],
+                "current_cash": status["current_cash"],
+                "total_market_value": status.get("total_market_value", 0.0),
+                "total_unrealized_pnl": status.get("total_unrealized_pnl", 0.0),
+                "total_return_pct": status.get("total_return_pct", 0.0),
+                "status": status["status"],
+                "updated_at": status.get("updated_at"),
+                "holdings": holdings,
             }
         )
 
-    return {
-        "name": status["name"],
-        "mode": status["mode"],
-        "max_positions": status["max_positions"],
-        "holding_days": status["holding_days"],
-        "allow_renewal": status["allow_renewal"],
-        "initial_capital": status["initial_capital"],
-        "current_capital": status["current_capital"],
-        "current_cash": status["current_cash"],
-        "total_market_value": status.get("total_market_value", 0.0),
-        "total_unrealized_pnl": status.get("total_unrealized_pnl", 0.0),
-        "total_return_pct": status.get("total_return_pct", 0.0),
-        "status": status["status"],
-        "updated_at": status.get("updated_at"),
-        "holdings": holdings,
-    }
+    return out
+
+
+def _build_rotation() -> dict | None:
+    """取主要（current_capital 最大的 active）輪動組合的快照。
+
+    保留為 v1 backward-compat alias；內部委派 `_build_rotations()[0]`。
+    """
+    rotations = _build_rotations()
+    return rotations[0] if rotations else None
 
 
 def _build_watch_entries() -> list[dict]:
@@ -490,12 +510,12 @@ def _build_portfolio_review(rotation_block: dict | None, lookback_days: int) -> 
 
 
 def _build_position_timeseries(
-    rotation_block: dict | None,
+    rotations: list[dict] | None,
     watch_block: list[dict],
     days: int,
     target_date: _dt.date,
 ) -> dict | None:
-    """從 DailyPrice 撈 rotation.holdings ∪ watch_entries 的最近 N 個交易日 close。
+    """從 DailyPrice 撈所有 rotations.holdings ∪ watch_entries 的最近 N 個交易日 close。
 
     結構：
         {
@@ -509,8 +529,8 @@ def _build_position_timeseries(
     `first_idx` 處理上市未滿 N 日 / 中段停牌的股票（只給連續最末段）。
     """
     sids: set[str] = set()
-    if rotation_block:
-        for h in rotation_block.get("holdings", []) or []:
+    for rot in rotations or []:
+        for h in rot.get("holdings", []) or []:
             sid = h.get("stock_id")
             if sid:
                 sids.add(sid)
@@ -609,10 +629,12 @@ def _build_payload(
     except Exception as exc:
         bundle.record_error("discover", exc)
 
-    # rotation
-    rotation_block = None
+    # rotations（多組 active 輪動）+ rotation（v1 backward-compat alias = primary）
+    rotations_list: list[dict] = []
+    rotation_block: dict | None = None
     try:
-        rotation_block = _build_rotation()
+        rotations_list = _build_rotations()
+        rotation_block = rotations_list[0] if rotations_list else None
     except Exception as exc:
         bundle.record_error("rotation", exc)
 
@@ -667,11 +689,11 @@ def _build_payload(
     except Exception as exc:
         bundle.record_error("portfolio_review", exc)
 
-    # position_timeseries（持倉/Watch 個股小走勢圖）
+    # position_timeseries（持倉/Watch 個股小走勢圖；聚合所有 rotations）
     position_timeseries = None
     try:
         position_timeseries = _build_position_timeseries(
-            rotation_block,
+            rotations_list,
             watch_block,
             days=settings.dashboard.position_timeseries_days,
             target_date=target_date,
@@ -689,6 +711,7 @@ def _build_payload(
         "regime": regime_clean,
         "discover": discover_block,
         "rotation": rotation_block,
+        "rotations": rotations_list,
         "watch_entries": watch_block,
         "signals": signals,
         "strategy_events": events,
@@ -743,7 +766,10 @@ def cmd_export_dashboard(args: argparse.Namespace) -> None:
     dated, latest = _write_payload(payload, out_dir, target_date)
 
     n_disc = sum(len(v) for v in payload["discover"].values())
-    n_holdings = len((payload.get("rotation") or {}).get("holdings", []))
+    rotations_payload = payload.get("rotations") or []
+    n_rotations = len(rotations_payload)
+    n_holdings_total = sum(len(r.get("holdings", []) or []) for r in rotations_payload)
+    primary_name = rotations_payload[0].get("name") if rotations_payload else None
     n_watch = len(payload["watch_entries"])
     n_signals = len(payload["signals"])
     n_events = len(payload["strategy_events"])
@@ -753,8 +779,13 @@ def cmd_export_dashboard(args: argparse.Namespace) -> None:
 
     print(f"Dashboard JSON 已寫出：{dated}")
     print(f"  latest 同步：{latest}")
+    rotations_summary = (
+        f"rotations={n_rotations}（primary={primary_name}, holdings_total={n_holdings_total}）"
+        if n_rotations
+        else "rotations=0"
+    )
     print(
-        f"  discover={n_disc} | rotation_holdings={n_holdings} | "
+        f"  discover={n_disc} | {rotations_summary} | "
         f"watch={n_watch} | signals={n_signals} | events={n_events} | errors={n_errors}"
     )
     print(f"  portfolio_review.snapshots={n_snapshots} | position_timeseries.series={n_pts_series}")

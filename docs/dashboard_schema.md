@@ -12,21 +12,28 @@
 
 | 欄位 | 型別 | 必填 | 說明 |
 |-----|-----|------|-----|
-| `version` | int | ✓ | Schema 版本，現為 `1`；breaking change 時遞增。 |
+| `version` | int | ✓ | Schema 版本，現為 `2`；breaking change 時遞增。 |
 | `generated_at` | string (ISO 8601) | ✓ | 產出時間（含時區）。 |
 | `date` | string (YYYY-MM-DD) | ✓ | 報告對應日期。 |
 | `regime` | object | ✓ | 市場狀態。 |
 | `discover` | object | ✓ | 五模式推薦（每模式可為空陣列）。 |
-| `rotation` | object \| null | ✓ | 主要輪動組合狀態；無 active 組合時為 `null`。 |
+| `rotation` | object \| null | ✓ | **v1 backward-compat 別名** = `rotations[0]`（即 primary）；無 active 時為 `null`。 |
+| `rotations` | array | ✓ | 全部 active 輪動組合（依 `current_capital` 降冪；v2 新增）。 |
 | `watch_entries` | array | ✓ | 持倉監控（status=active）。 |
 | `signals` | array | ✓ | 異常 / 警告訊號（可為空）。 |
 | `strategy_events` | array | ✓ | 策略調整事件（可為空）。 |
 | `ai_summary` | string \| null | ✓ | AI 摘要文字；未啟用 / 無快取時為 `null`。 |
-| `portfolio_review` | object \| null | ✓ | 主要組合每日績效摘要；無 active rotation 時為 `null`（v1.1 新增）。 |
-| `position_timeseries` | object \| null | ✓ | 持倉/Watch 個股最近 N 個交易日 close（v1.1 新增）；無持倉時為 `null`。 |
+| `portfolio_review` | object \| null | ✓ | **primary 組合**每日績效摘要；無 active rotation 時為 `null`（v1.1 新增）。 |
+| `position_timeseries` | object \| null | ✓ | **聚合所有 rotations 的持倉 ∪ Watch** 最近 N 個交易日 close（v1.1 新增；v2 改為跨組合聚合）；無持倉時為 `null`。 |
 | `errors` | array of string | ✓ | 子區塊產出失敗訊息（空陣列代表全部成功）。 |
 
-> v1.1 為向下相容增量：`SCHEMA_VERSION` 仍為 `1`，舊版下游若以嚴格 Codable 解析，新欄位請設為 optional。
+> **v2 schema 變更**（2026-05）：
+> - `SCHEMA_VERSION` 從 `1` 升至 `2`。
+> - 新增 `rotations: [RotationBlock]`，承載**全部** active 輪動組合（先前 `rotation` 只挑 capital 最大者，導致多組同時跑時無法在下游全部呈現）。
+> - 保留 `rotation` 欄位作為 v1 backward-compat alias，內容等同 `rotations[0]`。新下游請改用 `rotations`。
+> - `position_timeseries` 的 `series` keys 來源從「primary 持倉 ∪ watch」擴大為「所有 rotations 持倉 ∪ watch」。
+>
+> v1.1 為向下相容增量（不升版號）：`portfolio_review` / `position_timeseries` 為新增欄位，舊版下游若以嚴格 Codable 解析，新欄位請設為 optional。
 
 ---
 
@@ -91,7 +98,23 @@
 
 ---
 
-## `rotation`（來自 `RotationManager.list_portfolios()` + `get_status()`）
+## `rotation` / `rotations`（來自 `RotationManager.list_portfolios()` + `get_status()`）
+
+`rotations` 為全部 active 組合的陣列（v2 新增），依 `current_capital` 降冪排序，`rotations[0]` 即 primary。
+`rotation` 為 v1 backward-compat alias = `rotations[0]`；無 active 組合時 `rotation=null` 且 `rotations=[]`。
+
+```json
+{
+  "rotation": {RotationBlock},
+  "rotations": [
+    {RotationBlock},  // primary（current_capital 最大）
+    {RotationBlock},  // 次要
+    ...
+  ]
+}
+```
+
+每個 `RotationBlock`：
 
 ```json
 {
@@ -111,8 +134,6 @@
   "holdings": [ {RotationHolding}, ... ]
 }
 ```
-
-若有多個 active 組合，輸出 **`current_capital` 最大** 的一個（單一主要組合）。未來如需多組合，可改為 `rotations: [...]`（v2）。
 
 ### `RotationHolding`
 

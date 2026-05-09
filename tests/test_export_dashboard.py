@@ -397,6 +397,31 @@ class TestBuildRotation:
         assert isinstance(h["entry_date"], str)
 
 
+class TestBuildRotations:
+    """需要 fresh_db（每次 get_session 開新 Session），因 _build_rotations
+    迭代多個 portfolio 時會多次 with get_session()。"""
+
+    def test_returns_all_actives_sorted_desc(self, fresh_db):
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+
+        rots = ed._build_rotations()
+        # _seed_dataset 注入兩個 active：default(1.05M) + small(0.5M)
+        assert len(rots) == 2
+        assert [r["name"] for r in rots] == ["default", "small"]
+        # primary（[0]）應與 _build_rotation() 結果同名（持倉數據透過獨立 session 取，但語意一致）
+        primary = ed._build_rotation()
+        assert primary is not None
+        assert rots[0]["name"] == primary["name"]
+        assert len(rots[0]["holdings"]) == len(primary["holdings"])
+
+    def test_empty_when_no_actives(self, fresh_db):
+        # 無種子資料 → 應回傳空 list（而非 None）
+        rots = ed._build_rotations()
+        assert rots == []
+
+
 class TestBuildDataFreshnessSignal:
     def test_levels(self, db_session):
         today = _dt.date(2026, 5, 1)
@@ -454,6 +479,7 @@ class TestPayloadAndCli:
             "regime",
             "discover",
             "rotation",
+            "rotations",
             "watch_entries",
             "signals",
             "strategy_events",
@@ -473,9 +499,15 @@ class TestPayloadAndCli:
             assert isinstance(data["discover"][m], list)
         assert len(data["discover"]["momentum"]) == 5
 
-        # rotation 主組合
+        # rotation 主組合（v1 backward compat）
         assert data["rotation"]["name"] == "default"
         assert len(data["rotation"]["holdings"]) == 1
+        # rotations 多組陣列（v2）— 兩組 active：default + small
+        assert isinstance(data["rotations"], list)
+        assert len(data["rotations"]) == 2
+        assert [r["name"] for r in data["rotations"]] == ["default", "small"]
+        # primary 與 rotation 同步
+        assert data["rotations"][0]["name"] == data["rotation"]["name"]
 
         # watch_entries 只取 active
         assert len(data["watch_entries"]) == 1
@@ -631,9 +663,7 @@ class TestBuildPositionTimeseries:
     def test_no_holdings_returns_none(self, fresh_db):
         with fresh_db() as session:
             _seed_dataset(session, _dt.date(2026, 5, 1))
-        ts = ed._build_position_timeseries(
-            rotation_block=None, watch_block=[], days=14, target_date=_dt.date(2026, 5, 1)
-        )
+        ts = ed._build_position_timeseries(rotations=None, watch_block=[], days=14, target_date=_dt.date(2026, 5, 1))
         assert ts is None
 
     def test_full_history_first_idx_zero(self, fresh_db):
@@ -642,9 +672,9 @@ class TestBuildPositionTimeseries:
             _seed_dataset(session, today)
             _seed_price_history(session, "2330", today, days=20)
 
-        rot = ed._build_rotation()
+        rots = ed._build_rotations()
         watch = ed._build_watch_entries()
-        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        ts = ed._build_position_timeseries(rots, watch, days=14, target_date=today)
         assert ts is not None
         assert len(ts["trading_days"]) == 14
         assert "2330" in ts["series"]
@@ -678,9 +708,9 @@ class TestBuildPositionTimeseries:
             )
             session.commit()
 
-        rot = ed._build_rotation()
+        rots = ed._build_rotations()
         watch = ed._build_watch_entries()
-        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        ts = ed._build_position_timeseries(rots, watch, days=14, target_date=today)
         assert ts is not None
         # 9999 完整 14 天
         assert ts["series"]["9999"]["first_idx"] == 0
@@ -695,9 +725,9 @@ class TestBuildPositionTimeseries:
             _seed_dataset(session, today)
             _seed_price_history(session, "2330", today, days=14)
 
-        rot = ed._build_rotation()
+        rots = ed._build_rotations()
         watch = ed._build_watch_entries()
-        ts = ed._build_position_timeseries(rot, watch, days=14, target_date=today)
+        ts = ed._build_position_timeseries(rots, watch, days=14, target_date=today)
         # trading_days 應全為平日
         for d_str in ts["trading_days"]:
             d = _dt.date.fromisoformat(d_str)
