@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
-from src.constants import DISCOVERY_KEY_FACTOR_MAP
+from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP, DISCOVERY_KEY_FACTOR_MAP
 from src.data.database import get_session
 from src.data.schema import (
     Announcement,
@@ -2606,16 +2606,39 @@ class MarketScanner:
     # 關鍵因子 mapping 集中於 src/constants.py（DISCOVERY_KEY_FACTOR_MAP）
     # 此處保留類屬性別名供子類覆寫；變更請改 constants.py 單一真相來源
     _KEY_FACTOR_MAP = DISCOVERY_KEY_FACTOR_MAP
+    _IC_HOLDING_MAP = DISCOVERY_IC_HOLDING_DAYS_MAP
+
+    def _get_ic_holding_days(self) -> int:
+        """回傳本模式 IC 計算用的 forward holding days（與 morning_cmd Step 8c 一致）。
+
+        SSOT: src/constants.py:DISCOVERY_IC_HOLDING_DAYS_MAP
+        - momentum: 5（chip_score 短期敏感）
+        - swing: 10（中期波段）
+        - value/dividend/growth: 20（fundamental_score 中長期兌現）
+        """
+        return self._IC_HOLDING_MAP.get(self.mode_name, 5)
+
+    def _get_ic_cutoff_days(self) -> int:
+        """IC 計算需擷取的歷史天數 = 35 + holding_days。
+
+        對 holding=20 的模式（value/dividend/growth）需要 records 在 55 天前才能算 forward 20d，
+        否則樣本嚴重不足。"""
+        return 35 + self._get_ic_holding_days()
 
     def _compute_ic_decay_adjustment(self) -> float:
-        """IC 衰退門檻調整：關鍵因子 IC 連續 2 窗口 < 0.05 時回傳 +0.05。"""
+        """IC 衰退門檻調整：關鍵因子 IC 連續 2 窗口 < 0.05 時回傳 +0.05。
+
+        holding_days 由 mode 對應的 KEY_FACTOR 兌現週期決定（DISCOVERY_IC_HOLDING_DAYS_MAP）。
+        例：value/dividend/growth 用 20 天（fundamental 中長期），momentum 用 5 天（chip 短期）。
+        """
         key_factor = self._KEY_FACTOR_MAP.get(self.mode_name)
         if not key_factor:
             return 0.0
         try:
             from src.discovery.scanner._functions import compute_rolling_ic
 
-            cutoff = date.today() - timedelta(days=35)
+            holding_days = self._get_ic_holding_days()
+            cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -2656,7 +2679,9 @@ class MarketScanner:
                     return 0.0
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
-            rolling_df = compute_rolling_ic(df_records, df_prices, holding_days=5, window_days=14, step_days=7)
+            rolling_df = compute_rolling_ic(
+                df_records, df_prices, holding_days=holding_days, window_days=14, step_days=7
+            )
             if rolling_df.empty:
                 return 0.0
 
@@ -2708,7 +2733,8 @@ class MarketScanner:
             return
 
         try:
-            cutoff = date.today() - timedelta(days=35)
+            holding_days = self._get_ic_holding_days()
+            cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -2749,7 +2775,7 @@ class MarketScanner:
                     return
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
-            ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+            ic_df = compute_factor_ic(df_records, df_prices, holding_days=holding_days, lookback_days=30)
             if ic_df.empty:
                 return
 
@@ -2792,7 +2818,10 @@ class MarketScanner:
             調整後權重字典
 
         項目 E：若 `self._precomputed_ic` 非空，跳過 DB 查詢與 `compute_factor_ic` 呼叫，
-        直接使用預算結果（與 morning-routine Step 8c 一致的 holding_days=5/lookback_days=30）。
+        直接使用預算結果（與 morning-routine Step 8c 一致的 mode-aware holding_days/lookback_days=30）。
+
+        Fallback 路徑（直接跑 `discover` 未走 morning-routine）使用 mode 對應 holding_days，
+        避免 fundamental 因子在 5 天視角被誤判 inverse、觸發誤 flip/dampen。
         """
         try:
             # 項目 E 短路：使用預算 IC，跳過 DB 查詢與重算
@@ -2801,7 +2830,8 @@ class MarketScanner:
                 ic_df = precomputed
                 self._dimension_ic_df = ic_df
             else:
-                cutoff = date.today() - timedelta(days=35)
+                holding_days = self._get_ic_holding_days()
+                cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
 
                 with get_session() as session:
                     stmt = select(
@@ -2844,7 +2874,7 @@ class MarketScanner:
                         return dict(base_weights)
                     df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
 
-                ic_df = compute_factor_ic(df_records, df_prices, holding_days=5, lookback_days=30)
+                ic_df = compute_factor_ic(df_records, df_prices, holding_days=holding_days, lookback_days=30)
                 # 暫存供 _score_candidates 做 IC 感知分數翻轉使用（問題 3：news_score 反向修正）
                 self._dimension_ic_df = ic_df
 

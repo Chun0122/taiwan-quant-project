@@ -545,10 +545,8 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
             )
 
             # 路徑 2：scanner 端用的 static IC（mode-aware holding, lookback_days=30）
-            # TODO: scanner 端 _apply_ic_weight_adjustment / _check_ic_decay 仍硬編碼 holding=5，
-            #       下次 audit 統一改用 DISCOVERY_IC_HOLDING_DAYS_MAP，避免 fundamental 在 scanner
-            #       內被誤 flip/dampen。本函式產出的 static_ic 已 mode-aware，但 scanner 內部會
-            #       再自行查 DB 重算（暫接受 morning-routine 與 scanner 的 IC 短期不一致）。
+            # scanner 端 _apply_ic_weight_adjustment / _compute_ic_decay_adjustment 也已改用
+            # DISCOVERY_IC_HOLDING_DAYS_MAP（fallback 路徑）；short-circuit 路徑直接消費此處 ic_df。
             try:
                 static_ic = compute_factor_ic(df_records, df_prices, holding_days=holding_days, lookback_days=30)
                 if not static_ic.empty:

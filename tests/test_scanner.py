@@ -8976,3 +8976,27 @@ class TestKeyFactorMap:
     def test_momentum_monitors_chip_score(self, momentum_scanner):
         """v5 audit：technical 權重歸零後，momentum 關鍵因子改為 chip_score（最高權重 0.55）。"""
         assert momentum_scanner._KEY_FACTOR_MAP["momentum"] == "chip_score"
+
+
+class TestIcHoldingMapMethods:
+    """BaseScanner mode-aware IC holding helpers（與 morning_cmd Step 8c 對齊）。"""
+
+    def test_momentum_holding_5d(self, momentum_scanner):
+        """momentum mode 用 5 天 holding（chip_score 短期敏感）。"""
+        assert momentum_scanner._get_ic_holding_days() == 5
+
+    def test_momentum_cutoff_includes_holding_buffer(self, momentum_scanner):
+        """cutoff_days 應 = 35 + holding，確保 forward N 天 return 樣本充足。"""
+        assert momentum_scanner._get_ic_cutoff_days() == 40  # 35 + 5
+
+    def test_ic_holding_map_is_ssot(self, momentum_scanner):
+        """類屬性 _IC_HOLDING_MAP 應與 constants 共用同一物件（避免本地副本失同步）。"""
+        from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP
+
+        assert momentum_scanner._IC_HOLDING_MAP is DISCOVERY_IC_HOLDING_DAYS_MAP
+
+    def test_unknown_mode_falls_back_to_5(self, momentum_scanner, monkeypatch):
+        """未在 map 內的模式 fallback 為 holding=5（防呆）。"""
+        monkeypatch.setattr(momentum_scanner, "mode_name", "nonexistent")
+        assert momentum_scanner._get_ic_holding_days() == 5
+        assert momentum_scanner._get_ic_cutoff_days() == 40

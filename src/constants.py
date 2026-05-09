@@ -139,9 +139,10 @@ DISCOVERY_KEY_FACTOR_MAP: dict[str, str] = {
 #   - chip_score 短期敏感（資金流訊號 1~10 天兌現）→ 5 天
 #   - fundamental_score 中長期（YoY 營收/獲利週期 30+ 天）→ 20 天
 #   - swing 介於兩者，取中間值 10 天
-# 使用方：morning_cmd._compute_factor_ic_status / factor-diagnostics（未來）
-# TODO: scanner 端 _apply_ic_weight_adjustment / _check_ic_decay 仍使用 holding=5，
-#       下次 audit 一併統一以避免 fundamental 因子在 scanner 內被誤 flip/dampen。
+# 使用方：
+#   1. morning_cmd._compute_factor_ic_status（Step 8c 預檢）
+#   2. BaseScanner._compute_ic_decay_adjustment / _log_factor_effectiveness /
+#      _apply_ic_weight_adjustment（fallback 路徑：未走 morning-routine 直跑 discover 時）
 DISCOVERY_IC_HOLDING_DAYS_MAP: dict[str, int] = {
     "momentum": 5,
     "swing": 10,
