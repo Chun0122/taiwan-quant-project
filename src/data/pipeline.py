@@ -1510,7 +1510,18 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
     df = pd.DataFrame(rows, columns=["stock_id", "date", "high", "close", "volume", "turnover"])
     df = df.sort_values(["stock_id", "date"])
 
-    logger.info("[DailyFeature] 共 %d 筆原始資料，開始向量化計算...", len(df))
+    # W6 修復（2026-05-09 audit）：排除盤前/未開盤暫定資料（volume<=0 或 close 缺失），
+    # 避免污染 momentum_20d / volatility_20d 的 rolling 視窗
+    n_before = len(df)
+    df = df[(df["volume"] > 0) & df["close"].notna() & (df["close"] > 0)]
+    n_filtered = n_before - len(df)
+    if n_filtered > 0:
+        logger.info(
+            "[DailyFeature] 過濾 %d 筆 volume<=0 / close 無效資料（W6 pre-market guard）",
+            n_filtered,
+        )
+
+    logger.info("[DailyFeature] 共 %d 筆有效資料，開始向量化計算...", len(df))
 
     # 向量化 rolling 計算（groupby + transform，無 Python for-loop）
     g_close = df.groupby("stock_id")["close"]

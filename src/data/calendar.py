@@ -52,7 +52,29 @@ _TWSE_HOLIDAYS: dict[int, frozenset[date]] = {
             date(2026, 10, 9),  # 國慶日（調整）
         ]
     ),
+    # 2027：W3 audit fix（2026-05-09）— 預先排入暫定假日表，待 TWSE 官方公告後校對。
+    # 春節依農曆推算（2027 農曆新年=2027-02-06 週六），補休與彈性放假以行政院往例估算。
+    # 重要：每年 12 月底 TWSE 公告次年正式交易日後，務必對照 https://www.twse.com.tw 校對。
+    2027: frozenset(
+        [
+            date(2027, 1, 1),  # 元旦
+            date(2027, 2, 5),  # 除夕（農曆 12/29，週五）
+            date(2027, 2, 8),  # 春節（初二補休 — 2/6 週六、2/7 週日）
+            date(2027, 2, 9),  # 春節（初三）
+            date(2027, 2, 10),  # 春節（初四）
+            date(2027, 2, 11),  # 春節（初五，可能彈性放假，待確認）
+            date(2027, 3, 1),  # 和平紀念日（2/28 週日 → 補休）
+            date(2027, 4, 5),  # 清明節（兒童節合併，週一）
+            # 5/1 勞動節為週六（金融業放假，但證券業視往例多有放假）
+            date(2027, 6, 8),  # 端午節（農曆 5/5，2027 對應 6/8 週二）
+            date(2027, 9, 15),  # 中秋節（農曆 8/15，2027 對應 9/15 週三）
+            date(2027, 10, 11),  # 國慶日補休（10/10 週日 → 10/11 週一補休）
+        ]
+    ),
 }
+
+# W3 audit fix：缺資料的年份只 log 一次（避免 morning-routine 全程刷屏）
+_LOGGED_MISSING_YEARS: set[int] = set()
 
 
 def is_weekend(d: date) -> bool:
@@ -63,10 +85,18 @@ def is_weekend(d: date) -> bool:
 def is_twse_holiday(d: date) -> bool:
     """判斷是否為 TWSE 公告休市日（不含週末）。
 
-    若該年度未列入 _TWSE_HOLIDAYS，回傳 False（僅依週末判斷）。
+    若該年度未列入 _TWSE_HOLIDAYS，回傳 False（僅依週末判斷），
+    並 log warning 提示需手動更新（W3 audit fix，每年 once）。
     """
     year_holidays = _TWSE_HOLIDAYS.get(d.year)
     if year_holidays is None:
+        if d.year not in _LOGGED_MISSING_YEARS:
+            logger.warning(
+                "[Calendar] %d 年 TWSE 假日資料尚未建立 — 僅依週末判斷可能誤判元旦/春節為交易日。"
+                "請更新 src/data/calendar.py:_TWSE_HOLIDAYS",
+                d.year,
+            )
+            _LOGGED_MISSING_YEARS.add(d.year)
         return False
     return d in year_holidays
 

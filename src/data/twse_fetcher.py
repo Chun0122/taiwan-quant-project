@@ -57,11 +57,19 @@ def _to_roc_date(d: date) -> str:
     return f"{roc_year}/{d.month:02d}/{d.day:02d}"
 
 
-def _find_last_trading_day(target: date, max_lookback: int = 7) -> date:
-    """從 target 往前找最近的交易日（跳過週末）。"""
+def _find_last_trading_day(target: date, max_lookback: int = 14) -> date:
+    """從 target 往前找最近的交易日。
+
+    W2 修復（2026-05-09 audit）：
+      - 改用 calendar.is_trading_day（含 TWSE 公告假日），原僅判斷週末；春節連假 5 工作日
+        + 兩個週末 = 9 天 > 舊 max_lookback=7，回溯失敗會抓不到最後交易日
+      - max_lookback 預設提升至 14，覆蓋連假 + 緩衝
+    """
+    from src.data.calendar import is_trading_day
+
     d = target
     for _ in range(max_lookback):
-        if d.weekday() < 5:  # 週一~週五
+        if is_trading_day(d):
             return d
         d -= timedelta(days=1)
     return target

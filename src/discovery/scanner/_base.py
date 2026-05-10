@@ -1496,9 +1496,35 @@ class MarketScanner:
             candidates = candidates.merge(df, on="stock_id", how="left")
 
         # 所有 *_score 欄位 fillna(0.5)
+        # W4 修復（2026-05-09 audit）：fillna(0.5) 中性化造成 ranking ties；
+        # 統計每維度被 imputed 的股票數，寫入 audit_trail 供事後追蹤
         score_cols = [c for c in candidates.columns if c.endswith("_score") and c != "composite_score"]
+        imputation_stats: dict[str, int] = {}
         for col in score_cols:
+            n_missing = int(candidates[col].isna().sum())
+            if n_missing > 0:
+                imputation_stats[col] = n_missing
             candidates[col] = candidates[col].fillna(0.5)
+        if imputation_stats:
+            audit = getattr(self, "_audit_trail", None)
+            total = len(candidates)
+            for col, n in imputation_stats.items():
+                pct = (n / total * 100) if total > 0 else 0
+                logger.info(
+                    "[%s] W4 fillna(0.5) imputed: %s missing %d/%d (%.1f%%)",
+                    self.mode_name,
+                    col,
+                    n,
+                    total,
+                    pct,
+                )
+                if audit is not None and hasattr(audit, "record_event"):
+                    try:
+                        audit.record_event(
+                            f"W4 imputation: {col} 中性化 {n}/{total} ({pct:.1f}%)",
+                        )
+                    except Exception:
+                        pass
 
         # chip_tier 字串欄位 fillna
         if "chip_tier" in candidates.columns:

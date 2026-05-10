@@ -58,24 +58,34 @@ class TestToRocDate:
 
 
 class TestFindLastTradingDay:
+    """W2 修復後：函數使用 calendar.is_trading_day（含 TWSE 公告假日），
+    測試改用非假日日期。原 2026-02-16~20 為春節假日，2/21~22 週末，會被視為連假。"""
+
     def test_weekday_returns_same(self):
-        # 2026-02-18 is Wednesday
-        result = _find_last_trading_day(date(2026, 2, 18))
-        assert result == date(2026, 2, 18)
+        # 2026-03-18 is Wednesday (非假日)
+        result = _find_last_trading_day(date(2026, 3, 18))
+        assert result == date(2026, 3, 18)
 
     def test_saturday_returns_friday(self):
-        # 2026-02-21 is Saturday
-        result = _find_last_trading_day(date(2026, 2, 21))
-        assert result == date(2026, 2, 20)  # Friday
+        # 2026-03-21 is Saturday
+        result = _find_last_trading_day(date(2026, 3, 21))
+        assert result == date(2026, 3, 20)  # Friday (非假日)
 
     def test_sunday_returns_friday(self):
-        # 2026-02-22 is Sunday
-        result = _find_last_trading_day(date(2026, 2, 22))
-        assert result == date(2026, 2, 20)  # Friday
+        # 2026-03-22 is Sunday
+        result = _find_last_trading_day(date(2026, 3, 22))
+        assert result == date(2026, 3, 20)  # Friday
 
     def test_monday_returns_same(self):
-        result = _find_last_trading_day(date(2026, 2, 16))
-        assert result == date(2026, 2, 16)
+        # 2026-03-16 is Monday (非假日)
+        result = _find_last_trading_day(date(2026, 3, 16))
+        assert result == date(2026, 3, 16)
+
+    def test_skips_lunar_new_year_holiday_period(self):
+        """W2：跨春節 (2/16~2/20 + 週末) 應回溯至 2/13 週五。"""
+        # 2026-02-22 is Sunday → 應該跳過 2/16~2/20 (春節) 抓到 2/13 (Fri)
+        result = _find_last_trading_day(date(2026, 2, 22))
+        assert result == date(2026, 2, 13)
 
 
 class TestFetchTwseValuationAll:

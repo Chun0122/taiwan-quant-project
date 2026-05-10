@@ -607,13 +607,38 @@ class UniverseFilter:
 
         return filter_liquidity(df_5d, self.config, turnover_multiplier=t_mult)
 
+    # W5 修復（2026-05-09 audit）：DailyFeature 過時超過 N 個交易日視為 stale
+    _FEATURE_STALENESS_TRADING_DAYS = 1
+
     def _load_feature_turnover(self, stock_ids: list[str]) -> pd.DataFrame:
-        """從 DailyFeature 讀取最新一日的 turnover_ma5、turnover_ma20、turnover_ratio_5d_20d。"""
+        """從 DailyFeature 讀取最新一日的 turnover_ma5、turnover_ma20、turnover_ratio_5d_20d。
+
+        W5 修復：取得 latest_date 後檢查是否過時（與今日交易日比對），
+        gap > _FEATURE_STALENESS_TRADING_DAYS 時 log warning，讓上層 fallback DailyPrice。
+        """
         try:
             with get_session() as session:
-                latest_date_subq = (
-                    select(func.max(DailyFeature.date)).where(DailyFeature.stock_id.in_(stock_ids)).scalar_subquery()
-                )
+                latest_date_row = session.execute(
+                    select(func.max(DailyFeature.date)).where(DailyFeature.stock_id.in_(stock_ids))
+                ).scalar()
+                if latest_date_row is None:
+                    return pd.DataFrame()
+
+                # W5：staleness check
+                from src.data.calendar import get_trading_days, is_trading_day
+
+                today = date.today()
+                # 計算 latest_date → today 之間的交易日數（不含 today 自己若非交易日）
+                gap_trading_days = max(0, len(get_trading_days(latest_date_row, today)) - 1)
+                if is_trading_day(today) and gap_trading_days > self._FEATURE_STALENESS_TRADING_DAYS:
+                    logger.warning(
+                        "[Universe Stage 2] DailyFeature 最新日期 %s 距今 %d 個交易日（> %d）"
+                        " — 結果可能為 stale；上層應 fallback DailyPrice 即時計算",
+                        latest_date_row,
+                        gap_trading_days,
+                        self._FEATURE_STALENESS_TRADING_DAYS,
+                    )
+
                 rows = session.execute(
                     select(
                         DailyFeature.stock_id,
@@ -622,7 +647,7 @@ class UniverseFilter:
                         DailyFeature.turnover_ratio_5d_20d,
                     )
                     .where(DailyFeature.stock_id.in_(stock_ids))
-                    .where(DailyFeature.date == latest_date_subq)
+                    .where(DailyFeature.date == latest_date_row)
                 ).all()
                 return pd.DataFrame(
                     rows, columns=["stock_id", "turnover_ma5", "turnover_ma20", "turnover_ratio_5d_20d"]
@@ -762,16 +787,29 @@ class UniverseFilter:
     # ------------------------------------------------------------------ #
 
     def _load_candidate_memory(self, mode: str, stage1_ids: list[str]) -> dict[str, int]:
-        """讀取前 N 天同模式的 DiscoveryRecord，回傳 {stock_id: days_ago} 字典。
+        """讀取前 N 天同模式的 DiscoveryRecord，回傳 {stock_id: trading_days_ago} 字典。
 
         只回傳仍通過 Stage 1 的 stock_ids（確保 close > 10 等基本條件）。
-        多日出現的股票取最近的 days_ago（最小值）。
+        多日出現的股票取最近的 trading_days_ago（最小值）。
+
+        W1 修復（2026-05-09 audit）：days_ago 改用「交易日距離」而非自然日。
+        原本週五 scan_date 對週一執行的 days_ago=3（自然日），但實際只 1 個交易日；
+        memory bonus 用 days_ago 索引（Day 1 ×0.8 / Day 2 ×0.9 / Day 3 ×1.0），
+        週一/連假後第一日的 memory bonus 失效，universe 結果波動 ±5~10 檔。
+
+        計算方式：days_ago = scan_date 之後到 today 之間的交易日數。
+        - 例：scan=週五、today=週一 → 1（只有今天本身是交易日）
+        - 例：scan=週四、today=週一 → 2（週五 + 週一）
+        - today 為非交易日（測試常見）：仍用自然天差為 fallback，避免測試 flaky
         """
         if self.config.candidate_memory_days <= 0:
             return {}
 
-        cutoff = date.today() - timedelta(days=self.config.candidate_memory_days)
+        from src.data.calendar import get_trading_days, is_trading_day
+
         today = date.today()
+        # 寬鬆 cutoff（自然日 × 2），後續用交易日過濾
+        cutoff = today - timedelta(days=self.config.candidate_memory_days * 2 + 14)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -782,22 +820,34 @@ class UniverseFilter:
         except Exception:
             return {}
 
-        # 計算 days_ago，多日出現取最近的
         stage1_set = set(stage1_ids)
         memory_map: dict[str, int] = {}
+        # today 為非交易日（週末/假日測試）→ fallback 自然日；正常 production 用交易日
+        today_is_trading = is_trading_day(today)
+
         for stock_id, scan_date in rows:
             if stock_id not in stage1_set:
                 continue
-            days_ago = (today - scan_date).days
+            if scan_date >= today:
+                continue  # 今天或未來的記錄不算記憶
+            if today_is_trading:
+                # 交易日：scan_date 之後到 today 之間的交易日數
+                days_ago = len(get_trading_days(scan_date + timedelta(days=1), today))
+            else:
+                # 非交易日（測試/週末）：fallback 自然日，保留向後相容
+                days_ago = (today - scan_date).days
             if days_ago <= 0:
-                continue  # 今天的記錄不算記憶
+                continue
+            if days_ago > self.config.candidate_memory_days:
+                continue
             if stock_id not in memory_map or days_ago < memory_map[stock_id]:
                 memory_map[stock_id] = days_ago
 
         if memory_map:
             logger.debug(
-                "UniverseFilter Memory: 找到 %d 支候選（有效 %d 支）",
+                "UniverseFilter Memory: 找到 %d 支候選（有效 %d 支，%s）",
                 len(rows),
                 len(memory_map),
+                "trading_days_ago" if today_is_trading else "natural_days_ago(today=non-trading)",
             )
         return memory_map
