@@ -63,10 +63,30 @@ def _batch_get_last_dates(model, stock_ids: list[str]) -> dict[str, str | None]:
     return {sid: last_map.get(sid) for sid in stock_ids}
 
 
-def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size: int = UPSERT_BATCH_SIZE) -> int:
-    """將 DataFrame 分批寫入指定表（衝突時略過）。
+def _upsert_batch(
+    model,
+    df: pd.DataFrame,
+    conflict_keys: list[str],
+    batch_size: int = UPSERT_BATCH_SIZE,
+    update_cols: list[str] | None = None,
+) -> int:
+    """將 DataFrame 分批寫入指定表（衝突解決可選）。
 
     SQLite 有 SQL 變數上限，必須分批 INSERT。
+
+    Args:
+        model: ORM model class
+        df: 要寫入的資料
+        conflict_keys: 衝突判定欄位（通常為 unique constraint 的欄位組合）
+        batch_size: 每批筆數（預設 UPSERT_BATCH_SIZE=80）
+        update_cols: 衝突時要更新的欄位列表。
+            - None（預設）：on_conflict_do_nothing，舊值保留（不可變歷史紀錄場景）
+            - list[str]：on_conflict_do_update，覆蓋指定欄位
+              （重算指標 / DailyFeature 等場景，避免 stale value 殘留）
+
+    C2 修復（2026-05-09 audit）：原始實作硬編碼 do_nothing，導致 TechnicalIndicator /
+    DailyFeature 同日重算的舊值永不覆蓋（除權息回溯 ~2% 偏差、universe 雜訊 +5~10%）。
+    新增 update_cols 參數讓 caller 顯式選擇覆蓋語意。
     """
     if df.empty:
         return 0
@@ -82,7 +102,13 @@ def _upsert_batch(model, df: pd.DataFrame, conflict_keys: list[str], batch_size:
         for i in range(0, len(records), batch_size):
             batch = records[i : i + batch_size]
             stmt = sqlite_upsert(model).values(batch)
-            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_keys)
+            if update_cols:
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=conflict_keys,
+                    set_={c: stmt.excluded[c] for c in update_cols},
+                )
+            else:
+                stmt = stmt.on_conflict_do_nothing(index_elements=conflict_keys)
             session.execute(stmt)
         session.commit()
     return len(records)
@@ -1218,8 +1244,17 @@ def sync_market_data(
 
 
 def _upsert_indicators(df: pd.DataFrame) -> int:
-    """將技術指標 DataFrame 寫入 technical_indicator 表。"""
-    return _upsert_batch(TechnicalIndicator, df, ["stock_id", "date", "name"])
+    """將技術指標 DataFrame 寫入 technical_indicator 表。
+
+    C2 修復：用 update_cols=["value"]，同日重算指標（如除權息回溯、--adjust-dividend）
+    時可正確覆蓋舊值，避免 EAV 寬表載入時拿到 stale value。
+    """
+    return _upsert_batch(
+        TechnicalIndicator,
+        df,
+        ["stock_id", "date", "name"],
+        update_cols=["value"],
+    )
 
 
 def sync_indicators(
@@ -1548,7 +1583,15 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
     ]
     df_out = df_latest[keep_cols].reset_index(drop=True)
 
-    written = _upsert_batch(DailyFeature, df_out, ["stock_id", "date"])
+    # C2 修復：update_cols 涵蓋所有計算欄位，避免重算後舊特徵殘留
+    # （e.g., 同日盤中 + 盤後分別跑 sync-features 時）
+    feature_update_cols = [c for c in keep_cols if c not in ("stock_id", "date")]
+    written = _upsert_batch(
+        DailyFeature,
+        df_out,
+        ["stock_id", "date"],
+        update_cols=feature_update_cols,
+    )
     logger.info("[DailyFeature] 已寫入 %d 筆（日期 %s）", written, latest_date)
     return written
 

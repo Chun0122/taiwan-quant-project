@@ -1893,6 +1893,10 @@ FACTOR_COLUMNS: list[str] = [
 ]
 
 
+_PER_DATE_MIN_STOCKS = 3  # 每日 cross-section 至少 N 檔才計算當日 IC
+_PER_DATE_MIN_DATES = 3  # 至少 N 個有效日期才用 per-date 平均；否則 fallback pooled
+
+
 def compute_factor_ic(
     df_records: pd.DataFrame,
     df_prices: pd.DataFrame,
@@ -1902,7 +1906,17 @@ def compute_factor_ic(
 ) -> pd.DataFrame:
     """計算各評分因子與後續報酬率的 IC（Information Coefficient）。
 
-    IC = Spearman Rank Correlation(factor_score, N-day return)
+    IC 定義（標準 cross-sectional）：
+        IC = mean_t( spearman_corr(factor_t, ret_{t→t+h}) )
+    即每日先做 cross-section corr，再對日期平均。
+
+    C4 修復（2026-05-09 audit）：原本對全樣本（跨日 pool）做 spearman corr，
+    當 factor 跨日均值漂移時（如 momentum 在 bull/bear 不同 mean）會把 time-series
+    訊號混進 IC，造成 momentum IC 高估 0.05~0.10。改為標準 per-date 平均。
+
+    Backward compat：當 per-date 資料稀疏（每日 < 3 檔 或 有效日期 < 3 天）時，
+    fallback 至 pooled corr（保留舊行為，主要支援既有合成測試資料）。
+
     高 IC（> 0.05）= 因子有效；低 IC（< -0.05）= 因子反向。
 
     Args:
@@ -1960,18 +1974,35 @@ def compute_factor_ic(
         if factor not in recent.columns:
             continue
 
-        valid = recent[[factor, "forward_return"]].dropna()
+        # valid 含 scan_date + factor + forward_return，後續 groupby 用
+        valid = recent[["scan_date", factor, "forward_return"]].dropna()
         if len(valid) < 10:
             continue
 
-        # 常數輸入（std == 0）→ 相關係數未定義，跳過
-        if valid[factor].std() == 0 or valid["forward_return"].std() == 0:
-            continue
+        # ── C4 主路徑：per-date cross-sectional IC ─────────────
+        per_date_ics: list[float] = []
+        used_samples = 0
+        for _scan_d, grp in valid.groupby("scan_date"):
+            if len(grp) < _PER_DATE_MIN_STOCKS:
+                continue
+            if grp[factor].std() == 0 or grp["forward_return"].std() == 0:
+                continue
+            ic_d = grp[factor].corr(grp["forward_return"], method="spearman")
+            if not np.isnan(ic_d):
+                per_date_ics.append(float(ic_d))
+                used_samples += len(grp)
 
-        # Spearman Rank Correlation
-        ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
-        if np.isnan(ic):
-            ic = 0.0
+        if len(per_date_ics) >= _PER_DATE_MIN_DATES:
+            ic = float(np.mean(per_date_ics))
+            evaluable = used_samples
+        else:
+            # ── Fallback：per-date 資料稀疏時用 pooled corr（保留舊語意） ──
+            if valid[factor].std() == 0 or valid["forward_return"].std() == 0:
+                continue
+            ic = float(valid[factor].corr(valid["forward_return"], method="spearman"))
+            if np.isnan(ic):
+                ic = 0.0
+            evaluable = len(valid)
 
         if ic > 0.05:
             direction = "effective"
@@ -1984,7 +2015,7 @@ def compute_factor_ic(
             {
                 "factor": factor,
                 "ic": round(ic, 4),
-                "evaluable_count": len(valid),
+                "evaluable_count": evaluable,
                 "direction": direction,
             }
         )

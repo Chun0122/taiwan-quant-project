@@ -571,7 +571,15 @@ class RotationManager:
                     logger.info("波動率反比權重：%s", vol_weights)
 
             # ── Max Drawdown Kill Switch：回撤超過閾值強制平倉 ──
-            equity_history = self._compute_equity_history(session, portfolio)
+            # C1 修復（2026-05-09）：傳入 open_positions + today_prices，
+            # 讓 equity_history 反映當日盤中浮動損益（含 gap-down），
+            # 否則用過時 portfolio.current_capital 會在真實回撤時不觸發熔斷。
+            equity_history = self._compute_equity_history(
+                session,
+                portfolio,
+                open_positions=open_positions,
+                today_prices=today_prices,
+            )
             if check_drawdown_kill_switch(equity_history):
                 dd_pct = compute_portfolio_drawdown(equity_history)
                 logger.error(
@@ -1508,8 +1516,37 @@ class RotationManager:
         stmt = select(RotationPortfolio).where(RotationPortfolio.name == self.portfolio_name)
         return session.execute(stmt).scalar_one_or_none()
 
-    def _compute_equity_history(self, session, portfolio: RotationPortfolio) -> list[float]:
-        """從已平倉記錄重建淨值序列（用於回撤計算）。"""
+    def _compute_equity_history(
+        self,
+        session,
+        portfolio: RotationPortfolio,
+        open_positions: list[dict] | None = None,
+        today_prices: dict[str, float] | None = None,
+    ) -> list[float]:
+        """從已平倉記錄 + 當前持倉即時 MtM 重建淨值序列（用於回撤計算）。
+
+        C1 修復（2026-05-09 audit）：原實作 append `portfolio.current_capital`，
+        該欄位於 update() 結束時才寫入（line 663），呼叫端在交易**前**讀取會拿到
+        上一輪結束值，不含今日盤中浮動損益。在 gap-down 情境下會導致 drawdown
+        kill switch 不觸發（真實回撤 25% 但 realized pnl 僅 -10% 時系統判定 dd=10%）。
+
+        新行為：
+          - 若提供 open_positions + today_prices → 最後淨值 = cash + Σ(MtM)，
+            正確反映當日浮動損益。
+          - 兩者皆未提供 → fallback 至 portfolio.current_capital（向後相容，
+            主要用於既有測試或無價格資訊的情境）。
+
+        Args:
+            session: SQLAlchemy session
+            portfolio: 組合 ORM
+            open_positions: 由 _load_open_positions 取得的當前持倉 list；
+                每筆需含 stock_id / shares / entry_price
+            today_prices: 今日收盤價 dict {stock_id: close}；缺價的個股
+                fallback 至 entry_price（保守估值）
+
+        Returns:
+            equity 序列 [initial, after_pos1_close, ..., latest_with_mtm]
+        """
         equity = [portfolio.initial_capital]
         stmt = (
             select(RotationPosition)
@@ -1525,8 +1562,14 @@ class RotationManager:
         for pos in closed:
             running += pos.pnl or 0.0
             equity.append(running)
-        # 最後加上當前資本
-        equity.append(portfolio.current_capital)
+
+        # 最後加上「即時 MtM」（C1 修復）：
+        if open_positions is not None and today_prices is not None:
+            mtm = sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in open_positions)
+            equity.append(portfolio.current_cash + mtm)
+        else:
+            # Fallback：滯後 1 輪，僅供無價格資訊的場景
+            equity.append(portfolio.current_capital)
         return equity
 
     def _load_open_positions(self, session, portfolio_id: int) -> list[dict]:

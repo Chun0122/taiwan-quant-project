@@ -446,7 +446,7 @@ class MarketScanner:
         # Stage 0.5: Universe Filter — SQL 硬過濾 + 流動性 + 趨勢
         universe_ids = self._get_universe_ids()
 
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self.lookback_days + 10)
 
         # 項目 B：共用資料注入路徑（避免重複 DB 讀取）
         shared = getattr(self, "_shared", None)
@@ -575,7 +575,7 @@ class MarketScanner:
         """
         from sqlalchemy import func
 
-        revenue_cutoff = date.today() - timedelta(days=180)
+        revenue_cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=180)
 
         with get_session() as session:
             base_filter = MonthlyRevenue.date >= revenue_cutoff
@@ -675,7 +675,7 @@ class MarketScanner:
             "operating_cf",
             "free_cf",
         ]
-        cutoff = date.today() - timedelta(days=quarters * 100)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=quarters * 100)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -728,7 +728,7 @@ class MarketScanner:
 
         if days is None:
             days = NEWS_LOAD_WINDOW_DAYS
-        today = date.today()
+        today = getattr(self, "scan_date", None) or date.today()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
         recent_cutoff = today - timedelta(days=days)
         baseline_cutoff = today - timedelta(days=baseline_days)
 
@@ -815,7 +815,7 @@ class MarketScanner:
         if ann.empty:
             return default
 
-        today = date.today()
+        today = getattr(self, "scan_date", None) or date.today()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
         ann["days_ago"] = ann["date"].apply(lambda d: max(0, (today - d).days))
 
         # event_type 欄位相容（舊資料無此欄則預設 general）
@@ -1067,7 +1067,7 @@ class MarketScanner:
         default = pd.DataFrame({"stock_id": stock_ids, "weekly_bonus": [0.0] * len(stock_ids)})
 
         try:
-            cutoff = date.today() - timedelta(days=90)
+            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=90)
 
             with get_session() as session:
                 rows = (
@@ -1184,7 +1184,7 @@ class MarketScanner:
         default = pd.DataFrame({"stock_id": stock_ids, "relative_strength_bonus": [0.0] * len(stock_ids)})
 
         try:
-            cutoff = date.today() - timedelta(days=30)
+            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=30)
 
             with get_session() as session:
                 price_rows = session.execute(
@@ -2564,7 +2564,7 @@ class MarketScanner:
             cfg = WIN_RATE_FEEDBACK_CONFIG
             lookback = cfg["lookback_days"]
             holding = cfg["holding_days"]
-            cutoff = date.today() - timedelta(days=lookback + holding + 5)
+            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=lookback + holding + 5)
 
             with get_session() as session:
                 # 載入推薦記錄
@@ -2638,7 +2638,7 @@ class MarketScanner:
             from src.discovery.scanner._functions import compute_rolling_ic
 
             holding_days = self._get_ic_holding_days()
-            cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
+            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -2734,7 +2734,7 @@ class MarketScanner:
 
         try:
             holding_days = self._get_ic_holding_days()
-            cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
+            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -2831,7 +2831,7 @@ class MarketScanner:
                 self._dimension_ic_df = ic_df
             else:
                 holding_days = self._get_ic_holding_days()
-                cutoff = date.today() - timedelta(days=self._get_ic_cutoff_days())
+                cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
 
                 with get_session() as session:
                     stmt = select(
@@ -3070,7 +3070,7 @@ class MarketScanner:
 
     def _reload_valuation(self, stock_ids: list[str]) -> None:
         """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self.lookback_days + 10)
         with get_session() as session:
             rows = session.execute(
                 select(
@@ -3363,7 +3363,7 @@ class MarketScanner:
         ValueScanner / GrowthScanner 的 _compute_chip_scores() 呼叫。
         若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
         """
-        cutoff = date.today() - timedelta(days=7)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=7)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -3392,7 +3392,7 @@ class MarketScanner:
         _compute_chip_scores() 呼叫。
         若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
         """
-        cutoff = date.today() - timedelta(days=5)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=5)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -3430,7 +3430,7 @@ class MarketScanner:
           - 本函數自動以 DailyPrice.close 填補 NULL 均價（同日收盤價）
           - win_rate / PF 的意義：衡量分點「是否在漲前買、跌前賣」的擇時能力
         """
-        cutoff = date.today() - timedelta(days=days)
+        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=days)
         try:
             with get_session() as session:
                 rows = session.execute(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import date
 
 import pandas as pd
 
@@ -371,10 +372,14 @@ def _build_discover_discord_detail(today_str: str, top_n_per_mode: int = 5) -> l
     return messages
 
 
-def _export_dashboard_step(top_n: int = 20) -> None:
+def _export_dashboard_step(top_n: int = 20, target_date: date | None = None) -> None:
     """morning-routine Step 16：匯出 Dashboard JSON。
 
     失敗不阻擋例行流程（外層 Step loop 已 try/except）。
+
+    C3 修復（2026-05-09 audit）：接受 target_date 參數並 plumb 至 cmd_export_dashboard，
+    避免 morning-routine 跨午夜執行時 cmd_export_dashboard 重新呼叫 date.today() 取到隔日，
+    導致 _build_discover 查詢 scan_date 對不到當日 DiscoveryRecord（May 8 discover=0 根因之一）。
     """
     import argparse as _argparse
 
@@ -382,7 +387,7 @@ def _export_dashboard_step(top_n: int = 20) -> None:
 
     cmd_export_dashboard(
         _argparse.Namespace(
-            date=None,
+            date=target_date.isoformat() if target_date else None,
             top=top_n,
             event_days=30,
             out=None,
@@ -448,7 +453,7 @@ _MODE_LABELS: dict[str, str] = {
 }
 
 
-def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
+def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
     """為每個 discover 模式計算 IC：rolling IC（level 判定）+ scanner 用 IC（項目 E）。
 
     為每個 mode 跑兩次 IC 計算，**共用同一次 DB 查詢**：
@@ -464,6 +469,12 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
 
     cutoff 動態擴大為 35 + max(holding_days)，確保 holding=20 模式仍有足夠 forward 樣本。
 
+    C3 修復（2026-05-09 audit）：接受 today 參數，避免在 morning-routine 跨午夜時與
+    cmd_morning_routine 開頭設定的 today_str 不一致（推薦由呼叫端傳入）。
+
+    Args:
+        today: 基準日期；None 時 fallback 至 date.today()（向後相容）。
+
     Returns:
         tuple:
           - status_list: 每模式一筆 dict（mode/mode_key/factor/ic/level/sample_count/holding_days/error）
@@ -471,7 +482,8 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
           - ic_df_by_mode: {mode_key: ic_df}，ic_df 為 `compute_factor_ic` 輸出
             （factor / ic / evaluable_count / direction），失敗或樣本不足時為空 DataFrame
     """
-    from datetime import date, timedelta
+    from datetime import date as _date
+    from datetime import timedelta
 
     import pandas as pd
     from sqlalchemy import select
@@ -480,11 +492,14 @@ def _compute_factor_ic_status() -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
     from src.data.schema import DailyPrice, DiscoveryRecord
     from src.discovery.scanner._functions import compute_factor_ic, compute_rolling_ic
 
+    if today is None:
+        today = _date.today()
+
     results: list[dict] = []
     ic_df_by_mode: dict[str, pd.DataFrame] = {}
     # 動態 cutoff：base 35 天 + 最大 holding（如 holding=20 需要 records 在 55 天前才有 forward 報酬）
     max_holding = max(DISCOVERY_IC_HOLDING_DAYS_MAP.values(), default=5)
-    cutoff = date.today() - timedelta(days=35 + max_holding)
+    cutoff = today - timedelta(days=35 + max_holding)
 
     for mode, key_factor in _KEY_FACTORS.items():
         holding_days = DISCOVERY_IC_HOLDING_DAYS_MAP.get(mode, 5)
@@ -752,7 +767,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     top_n: int = getattr(args, "top", 20)
     notify: bool = getattr(args, "notify", False)
 
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    # C3 修復（2026-05-09 audit）：建立單一 today 物件貫穿全流程，避免跨午夜執行時
+    # 各 step 各自呼叫 date.today() 拿到不同日期（observed: 23:13 啟動跑到 02:17 隔日）。
+    # 此 today 會被傳遞給 Step 8c IC 預檢與 Step 16 export-dashboard，
+    # 確保 scan_date / target_date 與此處 today_str 完全對齊。
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
     TOTAL = 18
 
     def _step(n: int | str, title: str) -> None:
@@ -764,16 +784,15 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         print(f"  >> 跳過（{reason}）")
 
     # ── 交易日檢查：非交易日跳過全部流程 ──
-    import datetime as _dt
+    import datetime as _dt  # noqa: F401  保留以備後續使用
 
     from src.data.calendar import has_calendar_data, is_trading_day
 
-    _today_dt = _dt.date.today()
-    if not dry_run and not is_trading_day(_today_dt):
+    if not dry_run and not is_trading_day(today):
         print(f"\n{'═' * 64}")
         print(f"  今日 {today_str} 非交易日（休市），跳過早晨例行流程。")
-        if not has_calendar_data(_today_dt.year):
-            print(f"  （注意：{_today_dt.year} 年假日資料尚未建立，僅依週末判斷）")
+        if not has_calendar_data(today.year):
+            print(f"  （注意：{today.year} 年假日資料尚未建立，僅依週末判斷）")
         print(f"{'═' * 64}\n")
         return
 
@@ -863,8 +882,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         項目 E：同時計算 scanner `_apply_ic_weight_adjustment` / `_log_factor_effectiveness`
         所需的 static IC，存入 ic_status_state["ic_df_by_mode"]，避免 5 個 scanner
         在並行掃描時各自重複查 DB + 重算 IC。
+
+        C3 修復：傳入 outer scope 的 today，與 cmd_morning_routine 開始時的 today_str 對齊。
         """
-        status, ic_df_by_mode = _compute_factor_ic_status()
+        status, ic_df_by_mode = _compute_factor_ic_status(today=today)
         ic_status_state["ic_status"] = status
         ic_status_state["ic_df_by_mode"] = ic_df_by_mode
         _check_factor_ic_decay(ic_status=status)
@@ -1026,7 +1047,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             16,
             "匯出 Dashboard JSON（iOS App / 下游消費者）",
             {"dry_run"},
-            lambda: _export_dashboard_step(top_n=top_n),
+            lambda: _export_dashboard_step(top_n=top_n, target_date=today),
         ),
     ]
 
