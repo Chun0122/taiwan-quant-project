@@ -1116,3 +1116,34 @@ def check_drawdown_kill_switch(
     """
     dd = compute_portfolio_drawdown(equity_history)
     return dd >= threshold_pct
+
+
+def build_equity_history(
+    initial_capital: float,
+    closed_pnls: list[float],
+    final_equity: float,
+) -> list[float]:
+    """從初始資金、已平倉 pnl 序列、與最終淨值組裝權益歷史序列（純函數）。
+
+    S4 audit fix（2026-05-09）：原 _compute_equity_history 在 manager 中需 session，
+    難以獨立單元測試。重構為純函數，與 DB 解耦；manager 負責 IO + 此函數負責計算。
+
+    序列：[initial, after_pos1_close, after_pos2_close, ..., final_equity]
+
+    Args:
+        initial_capital: 組合初始資金
+        closed_pnls: 已平倉部位的 pnl 序列（按 exit_date 升序）；None 視為 0
+        final_equity: 最新淨值；建議 = cash + Σ(MtM)，無即時價格時 fallback 至
+            portfolio.current_capital（C1 audit 已修復 manager 端傳入正確值）
+
+    Returns:
+        equity 序列：至少包含 [initial_capital, final_equity]，
+        中間插入每筆 closed pnl 累積後的 running balance
+    """
+    equity: list[float] = [initial_capital]
+    running = initial_capital
+    for pnl in closed_pnls:
+        running += pnl or 0.0
+        equity.append(running)
+    equity.append(final_equity)
+    return equity

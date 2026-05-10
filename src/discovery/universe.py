@@ -615,6 +615,10 @@ class UniverseFilter:
 
         W5 修復：取得 latest_date 後檢查是否過時（與今日交易日比對），
         gap > _FEATURE_STALENESS_TRADING_DAYS 時 log warning，讓上層 fallback DailyPrice。
+
+        S5 audit fix（2026-05-09）：將 latest_date 與 staleness_days 寫入 instance
+        attribute（_feature_latest_date, _feature_staleness_days），供呼叫端
+        （scanner 等）寫入 audit_trail 或 dashboard 追蹤。
         """
         try:
             with get_session() as session:
@@ -622,6 +626,8 @@ class UniverseFilter:
                     select(func.max(DailyFeature.date)).where(DailyFeature.stock_id.in_(stock_ids))
                 ).scalar()
                 if latest_date_row is None:
+                    self._feature_latest_date = None
+                    self._feature_staleness_days = None
                     return pd.DataFrame()
 
                 # W5：staleness check
@@ -630,6 +636,9 @@ class UniverseFilter:
                 today = date.today()
                 # 計算 latest_date → today 之間的交易日數（不含 today 自己若非交易日）
                 gap_trading_days = max(0, len(get_trading_days(latest_date_row, today)) - 1)
+                # S5：暴露為 instance 屬性，便於上層審計
+                self._feature_latest_date = latest_date_row
+                self._feature_staleness_days = gap_trading_days
                 if is_trading_day(today) and gap_trading_days > self._FEATURE_STALENESS_TRADING_DAYS:
                     logger.warning(
                         "[Universe Stage 2] DailyFeature 最新日期 %s 距今 %d 個交易日（> %d）"

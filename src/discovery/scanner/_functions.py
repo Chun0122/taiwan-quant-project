@@ -1893,7 +1893,7 @@ FACTOR_COLUMNS: list[str] = [
 ]
 
 
-_PER_DATE_MIN_STOCKS = 3  # 每日 cross-section 至少 N 檔才計算當日 IC
+_PER_DATE_MIN_STOCKS = 3  # 每日 cross-section 至少 N 檔才計算當日 IC（預設）
 _PER_DATE_MIN_DATES = 3  # 至少 N 個有效日期才用 per-date 平均；否則 fallback pooled
 
 
@@ -1903,6 +1903,7 @@ def compute_factor_ic(
     holding_days: int = 5,
     lookback_days: int = 30,
     reference_date: date | None = None,
+    min_per_date_count: int | None = None,
 ) -> pd.DataFrame:
     """計算各評分因子與後續報酬率的 IC（Information Coefficient）。
 
@@ -1927,6 +1928,9 @@ def compute_factor_ic(
         holding_days: 報酬天數（預設 5）
         lookback_days: 回溯天數（預設 30）
         reference_date: 基準日期（預設 today）
+        min_per_date_count: 每日 cross-section 最少股票數，少於此值該日 IC 不計入
+            （預設 None → 套用模組常數 _PER_DATE_MIN_STOCKS=3）。S2 audit fix：
+            可由 caller 調整（如測試或低樣本場景），保持向後相容。
 
     Returns:
         DataFrame(factor, ic, evaluable_count, direction)
@@ -1935,6 +1939,7 @@ def compute_factor_ic(
     if df_records.empty or df_prices.empty:
         return pd.DataFrame(columns=["factor", "ic", "evaluable_count", "direction"])
 
+    min_per_date = min_per_date_count if min_per_date_count is not None else _PER_DATE_MIN_STOCKS
     ref_date = reference_date or date.today()
     cutoff = ref_date - timedelta(days=lookback_days)
 
@@ -1983,7 +1988,7 @@ def compute_factor_ic(
         per_date_ics: list[float] = []
         used_samples = 0
         for _scan_d, grp in valid.groupby("scan_date"):
-            if len(grp) < _PER_DATE_MIN_STOCKS:
+            if len(grp) < min_per_date:
                 continue
             if grp[factor].std() == 0 or grp["forward_return"].std() == 0:
                 continue

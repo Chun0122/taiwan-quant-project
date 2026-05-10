@@ -2923,14 +2923,29 @@ class MarketScanner:
             # 轉回原始 key
             adjusted = {k.replace("_score", ""): v for k, v in adjusted_score.items()}
 
+            # S1 audit fix（2026-05-09）：log 加印 IC value + impact ρ，提升調權回溯能力
+            ic_lookup: dict[str, float] = {}
+            if not ic_df.empty:
+                ic_lookup = {row["factor"]: row["ic"] for _, row in ic_df.iterrows()}
+            impact_lookup: dict[str, float] = {}
+            if not impact_df.empty and "rho" in impact_df.columns:
+                impact_lookup = {row["factor"]: row["rho"] for _, row in impact_df.iterrows()}
+
             for key in base_weights:
                 if abs(base_weights[key] - adjusted.get(key, base_weights[key])) > 1e-6:
+                    score_col = f"{key}_score"
+                    ic_val = ic_lookup.get(score_col)
+                    impact_rho = impact_lookup.get(score_col)
+                    ic_str = f"IC={ic_val:+.4f}" if ic_val is not None else "IC=N/A"
+                    impact_str = f"ρ={impact_rho:.3f}" if impact_rho is not None else "ρ=N/A"
                     logger.info(
-                        "E2b IC×影響力權重調整: %s — %s %.3f → %.3f",
+                        "E2b IC×影響力權重調整: %s — %s %.3f → %.3f (%s, %s)",
                         self.mode_name,
                         key,
                         base_weights[key],
                         adjusted[key],
+                        ic_str,
+                        impact_str,
                     )
             return adjusted
 
