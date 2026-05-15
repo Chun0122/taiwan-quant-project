@@ -572,8 +572,9 @@ class SwingScanner(MarketScanner):
         return result
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
-        """波段模式風險過濾：近 60 日年化波動率 > 85th percentile 剔除。"""
-        return self._apply_vol_risk_filter(scored, df_price, percentile=85, window=60, annualize=True)
+        """波段模式風險過濾：近 60 日年化波動率 > 85th percentile + 過熱反轉懲罰。"""
+        scored = self._apply_vol_risk_filter(scored, df_price, percentile=85, window=60, annualize=True)
+        return self._apply_overheating_filter(scored, df_price)
 
     def _score_candidates(
         self,

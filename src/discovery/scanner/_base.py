@@ -2265,6 +2265,99 @@ class MarketScanner:
         return scored
 
     # ------------------------------------------------------------------ #
+    #  Stage 3.5: 過熱反轉懲罰（硬剔除 + 軟降分）
+    # ------------------------------------------------------------------ #
+
+    def _apply_overheating_filter(
+        self,
+        scored: pd.DataFrame,
+        df_price: pd.DataFrame,
+        *,
+        exclude_ret5d: float | None = None,
+        exclude_ret10d: float | None = None,
+        dampen_ret5d: float | None = None,
+        dampen_ret10d: float | None = None,
+        dampen_composite_factor: float | None = None,
+    ) -> pd.DataFrame:
+        """過熱反轉懲罰：對短期已大漲個股做硬剔除 + composite_score 軟降分。
+
+        2026-05-15 audit：5/7-5/8 三連停損案例（6224/6108/5864）顯示 swing/momentum
+        scanner 在 buying climax 期間系統性推薦剛衝高的股票，根因為 technical_score
+        完全是「動能延續」邏輯，無過熱反轉懲罰。
+
+        - ret_5d > exclude_ret5d 或 ret_10d > exclude_ret10d → 從候選池剔除
+        - dampen_ret5d < ret_5d ≤ exclude_ret5d 或 dampen_ret10d < ret_10d ≤ exclude_ret10d
+          → composite_score × dampen_composite_factor（保留候選資格但降低排名）
+
+        Args:
+            scored: 已含 composite_score 的 candidates DataFrame
+            df_price: 完整日K資料（用於計算 ret_5d, ret_10d）
+            exclude_ret5d / exclude_ret10d: 硬剔除門檻（None 取 constants 預設）
+            dampen_ret5d / dampen_ret10d: 軟降分門檻（None 取 constants 預設）
+            dampen_composite_factor: 軟降分區間 composite_score 折扣係數
+        """
+        from src.constants import (
+            DISCOVERY_OVERHEATING_DAMPEN_FACTOR,
+            DISCOVERY_OVERHEATING_DAMPEN_RET5D,
+            DISCOVERY_OVERHEATING_DAMPEN_RET10D,
+            DISCOVERY_OVERHEATING_EXCLUDE_RET5D,
+            DISCOVERY_OVERHEATING_EXCLUDE_RET10D,
+        )
+
+        if scored.empty or df_price.empty:
+            return scored
+
+        exclude_5d = exclude_ret5d if exclude_ret5d is not None else DISCOVERY_OVERHEATING_EXCLUDE_RET5D
+        exclude_10d = exclude_ret10d if exclude_ret10d is not None else DISCOVERY_OVERHEATING_EXCLUDE_RET10D
+        dampen_5d = dampen_ret5d if dampen_ret5d is not None else DISCOVERY_OVERHEATING_DAMPEN_RET5D
+        dampen_10d = dampen_ret10d if dampen_ret10d is not None else DISCOVERY_OVERHEATING_DAMPEN_RET10D
+        dampen_k = (
+            dampen_composite_factor if dampen_composite_factor is not None else DISCOVERY_OVERHEATING_DAMPEN_FACTOR
+        )
+
+        grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
+        rows = []
+        for sid in scored["stock_id"].tolist():
+            if sid not in grouped.groups:
+                rows.append({"stock_id": sid, "ret_5d": 0.0, "ret_10d": 0.0})
+                continue
+            closes = grouped.get_group(sid)["close"].values
+            ret5 = float((closes[-1] - closes[-6]) / closes[-6]) if len(closes) >= 6 and closes[-6] > 0 else 0.0
+            ret10 = float((closes[-1] - closes[-11]) / closes[-11]) if len(closes) >= 11 and closes[-11] > 0 else 0.0
+            rows.append({"stock_id": sid, "ret_5d": ret5, "ret_10d": ret10})
+        df_ret = pd.DataFrame(rows)
+
+        # 硬剔除
+        exclude_mask = (df_ret["ret_5d"] > exclude_5d) | (df_ret["ret_10d"] > exclude_10d)
+        excluded_ids = df_ret[exclude_mask]["stock_id"].tolist()
+        if excluded_ids:
+            scored = scored[~scored["stock_id"].isin(excluded_ids)].copy()
+            logger.info(
+                "Stage 3.5: 過熱反轉硬剔除 %d 支（ret_5d>%.0f%% 或 ret_10d>%.0f%%）: %s",
+                len(excluded_ids),
+                exclude_5d * 100,
+                exclude_10d * 100,
+                ",".join(excluded_ids[:5]) + ("..." if len(excluded_ids) > 5 else ""),
+            )
+        if scored.empty:
+            return scored
+
+        # 軟降分
+        df_ret_remain = df_ret[~df_ret["stock_id"].isin(excluded_ids)]
+        dampen_mask = (df_ret_remain["ret_5d"] > dampen_5d) | (df_ret_remain["ret_10d"] > dampen_10d)
+        dampen_ids = df_ret_remain[dampen_mask]["stock_id"].tolist()
+        if dampen_ids and "composite_score" in scored.columns:
+            mask = scored["stock_id"].isin(set(dampen_ids))
+            scored.loc[mask, "composite_score"] = scored.loc[mask, "composite_score"] * dampen_k
+            logger.info(
+                "Stage 3.5: 過熱反轉軟降分 %d 支（composite *= %.2f）: %s",
+                len(dampen_ids),
+                dampen_k,
+                ",".join(dampen_ids[:5]) + ("..." if len(dampen_ids) > 5 else ""),
+            )
+        return scored
+
+    # ------------------------------------------------------------------ #
     #  Stage 3.5c: 動量衰減偵測
     # ------------------------------------------------------------------ #
 

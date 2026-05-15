@@ -663,5 +663,6 @@ class MomentumScanner(MarketScanner):
             return None
 
     def _apply_risk_filter(self, scored: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
-        """動能模式風險過濾：ATR(14)/close > 80th percentile 剔除。"""
-        return self._apply_atr_risk_filter(scored, df_price, percentile=80)
+        """動能模式風險過濾：ATR(14)/close > 80th percentile + 過熱反轉懲罰。"""
+        scored = self._apply_atr_risk_filter(scored, df_price, percentile=80)
+        return self._apply_overheating_filter(scored, df_price)

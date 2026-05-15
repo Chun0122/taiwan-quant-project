@@ -90,6 +90,7 @@ def resolve_rankings(
     scan_date: date,
     session,
     top_n: int = 50,
+    per_mode_max: int | None = None,
 ) -> list[dict]:
     """從 DiscoveryRecord 解析指定日期的排名。
 
@@ -102,15 +103,19 @@ def resolve_rankings(
     session : SQLAlchemy Session
     top_n : int
         最大取用筆數。
+    per_mode_max : int | None
+        僅對 mode='all' 生效；每個 primary_mode 最多 N 檔（避免單 mode 集中爆雷）。
+        None = 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設；0 或負值 = 不限制。
 
     Returns
     -------
     list[dict]
         按排名排序的清單，每筆含：
         {stock_id, stock_name, rank, score, close, stop_loss}
+        （mode='all' 時額外含 primary_mode）
     """
     if mode == "all":
-        return _resolve_all_mode_rankings(scan_date, session, top_n)
+        return _resolve_all_mode_rankings(scan_date, session, top_n, per_mode_max=per_mode_max)
 
     stmt = (
         select(DiscoveryRecord)
@@ -136,12 +141,29 @@ def _resolve_all_mode_rankings(
     scan_date: date,
     session,
     top_n: int,
+    per_mode_max: int | None = None,
 ) -> list[dict]:
-    """解析 'all' 模式排名 — 所有模式取 avg_score 排序。"""
+    """解析 'all' 模式排名 — 所有模式取 avg_score 排序，可選 primary_mode 配額。
+
+    Parameters
+    ----------
+    per_mode_max : int | None
+        每個 primary_mode 最多 N 檔。primary_mode 定義：該股票在各模式
+        discovery_record 中 composite_score 最高的 mode。
+        None = 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設；0 或負值 = 不限制。
+
+        2026-05-15 audit：all10_5d 5/7-5/8 從 swing 模式同時進 4 檔導致集中爆雷，
+        加入此配額避免單一 mode 因子失效時整組合受重傷。
+    """
+    from src.constants import ROTATION_ALL_MODE_PER_MODE_MAX
+
+    if per_mode_max is None:
+        per_mode_max = ROTATION_ALL_MODE_PER_MODE_MAX
+
     stmt = select(DiscoveryRecord).where(DiscoveryRecord.scan_date == scan_date)
     records = session.execute(stmt).scalars().all()
 
-    # 按 stock_id 分組，計算 avg_score
+    # 按 stock_id 分組，計算 avg_score + 紀錄各 mode 分數
     stock_data: dict[str, dict] = {}
     for r in records:
         sid = r.stock_id
@@ -152,8 +174,13 @@ def _resolve_all_mode_rankings(
                 "close": r.close,
                 "stop_loss": r.stop_loss,
                 "scores": [],
+                "mode_scores": {},
             }
         stock_data[sid]["scores"].append(r.composite_score)
+        # 同一 mode 若多筆紀錄，取最高分（防禦性，正常 unique(scan_date, mode, stock_id)）
+        prev = stock_data[sid]["mode_scores"].get(r.mode, float("-inf"))
+        if r.composite_score > prev:
+            stock_data[sid]["mode_scores"][r.mode] = r.composite_score
         # 保留最嚴格的 stop_loss（最高的）
         existing_sl = stock_data[sid]["stop_loss"]
         if r.stop_loss is not None:
@@ -164,6 +191,7 @@ def _resolve_all_mode_rankings(
     ranked = []
     for sid, data in stock_data.items():
         avg_score = sum(data["scores"]) / len(data["scores"])
+        primary_mode = max(data["mode_scores"].items(), key=lambda kv: kv[1])[0] if data["mode_scores"] else "unknown"
         ranked.append(
             {
                 "stock_id": sid,
@@ -171,9 +199,23 @@ def _resolve_all_mode_rankings(
                 "score": avg_score,
                 "close": data["close"],
                 "stop_loss": data["stop_loss"],
+                "primary_mode": primary_mode,
             }
         )
     ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    # mode 配額（per_mode_max > 0 啟用）
+    if per_mode_max is not None and per_mode_max > 0:
+        mode_count: dict[str, int] = {}
+        filtered: list[dict] = []
+        for r in ranked:
+            m = r.get("primary_mode", "unknown")
+            if mode_count.get(m, 0) < per_mode_max:
+                filtered.append(r)
+                mode_count[m] = mode_count.get(m, 0) + 1
+            if len(filtered) >= top_n:
+                break
+        ranked = filtered
 
     # 加上排名
     for i, r in enumerate(ranked[:top_n], 1):

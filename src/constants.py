@@ -150,3 +150,25 @@ DISCOVERY_IC_HOLDING_DAYS_MAP: dict[str, int] = {
     "dividend": 20,
     "growth": 20,
 }
+
+# ── 過熱反轉懲罰閘門（2026-05-15 audit：5/7-5/8 三連停損根因修復） ────────
+# 證據：6224 (+30%/5d, +45%/10d)、6108 (+21%/5d, +33%/10d)、5864 (+25%/5d, +36%/10d)
+#       均為進場後 1-2 日跳空崩跌的追高型；
+#       根因為 swing/momentum scanner technical_score 完全是「動能延續」邏輯，
+#       無過熱反轉懲罰，在 buying climax 時系統性推薦頂部股票。
+# 使用方：BaseScanner._apply_overheating_filter（由 _swing/_momentum _apply_risk_filter 呼叫）
+# 設計：硬剔除（超過 EXCLUDE 門檻）+ 軟降分（DAMPEN ~ EXCLUDE 區間 composite_score×factor）
+DISCOVERY_OVERHEATING_EXCLUDE_RET5D: float = 0.35
+DISCOVERY_OVERHEATING_EXCLUDE_RET10D: float = 0.50
+DISCOVERY_OVERHEATING_DAMPEN_RET5D: float = 0.25
+DISCOVERY_OVERHEATING_DAMPEN_RET10D: float = 0.35
+# 軟降分區間 composite_score 折扣係數
+# 推導：swing technical 權重 ≈ 0.30，technical 折半（×0.5）即 composite×(1 - 0.15) = ×0.85
+DISCOVERY_OVERHEATING_DAMPEN_FACTOR: float = 0.85
+
+# ── Rotation 'all' 模式 mode 配額（2026-05-15 audit：避免單 mode 集中爆雷） ─
+# 證據：all10_5d 5/7-5/8 同時從 swing 模式進 4 檔（6224/6108/5864/3094），
+#       整 mode 同時爆雷無分散。改用「每個 primary_mode 最多 N 檔」即可避免。
+# primary_mode 定義：該股票在各模式 discovery_record 中 composite_score 最高的 mode
+# 使用方：portfolio.manager._resolve_all_mode_rankings
+ROTATION_ALL_MODE_PER_MODE_MAX: int = 3
