@@ -454,6 +454,33 @@ def _get_benchmark_close_on_or_before(session, target_date: date, lookback_days:
     return float(row[0]) if row else None
 
 
+def compute_benchmark_alpha_fields(
+    today_bm_close: float | None,
+    prev_bm_close: float | None,
+    base_bm_close: float | None,
+    portfolio_cum_return: float | None,
+) -> tuple[float | None, float | None, float | None]:
+    """純函數：回傳 (benchmark_return_pct, benchmark_cum_return_pct, alpha_cum_pct)。
+
+    供 `_write_daily_snapshot` 與 `backfill_snapshot_benchmark_alpha` 共用，
+    確保兩條路徑的計算邏輯一致（audit S4 純函數化建議）。
+    任一輸入為 None / 0 / 非正值即回傳 None，不擲例外。
+    """
+    benchmark_return_pct: float | None = None
+    if today_bm_close is not None and prev_bm_close is not None and prev_bm_close > 0:
+        benchmark_return_pct = (today_bm_close - prev_bm_close) / prev_bm_close
+
+    benchmark_cum_return_pct: float | None = None
+    if today_bm_close is not None and base_bm_close is not None and base_bm_close > 0:
+        benchmark_cum_return_pct = (today_bm_close - base_bm_close) / base_bm_close
+
+    alpha_cum_pct: float | None = None
+    if benchmark_cum_return_pct is not None and portfolio_cum_return is not None:
+        alpha_cum_pct = portfolio_cum_return - benchmark_cum_return_pct
+
+    return benchmark_return_pct, benchmark_cum_return_pct, alpha_cum_pct
+
+
 # ---------------------------------------------------------------------------
 # RotationManager
 # ---------------------------------------------------------------------------
@@ -843,24 +870,22 @@ class RotationManager:
         else:
             daily_return_pct = None
 
-        # ── Benchmark / alpha 計算 ──
+        # ── Benchmark / alpha 計算（純函數）──
         today_bm_close = _get_benchmark_close_on_or_before(session, snapshot_date)
         prev_bm_close = _get_benchmark_close_on_or_before(session, prev.snapshot_date) if prev is not None else None
         base_date = first_snapshot.snapshot_date if first_snapshot is not None else snapshot_date
         base_bm_close = _get_benchmark_close_on_or_before(session, base_date)
 
-        benchmark_return_pct: float | None = None
-        if today_bm_close is not None and prev_bm_close is not None and prev_bm_close > 0:
-            benchmark_return_pct = (today_bm_close - prev_bm_close) / prev_bm_close
-
-        benchmark_cum_return_pct: float | None = None
-        if today_bm_close is not None and base_bm_close is not None and base_bm_close > 0:
-            benchmark_cum_return_pct = (today_bm_close - base_bm_close) / base_bm_close
-
-        alpha_cum_pct: float | None = None
-        if benchmark_cum_return_pct is not None and portfolio.initial_capital > 0:
+        portfolio_cum_return: float | None = None
+        if portfolio.initial_capital > 0:
             portfolio_cum_return = (portfolio.current_capital - portfolio.initial_capital) / portfolio.initial_capital
-            alpha_cum_pct = portfolio_cum_return - benchmark_cum_return_pct
+
+        benchmark_return_pct, benchmark_cum_return_pct, alpha_cum_pct = compute_benchmark_alpha_fields(
+            today_bm_close=today_bm_close,
+            prev_bm_close=prev_bm_close,
+            base_bm_close=base_bm_close,
+            portfolio_cum_return=portfolio_cum_return,
+        )
 
         if existing is not None:
             existing.total_capital = portfolio.current_capital
@@ -892,6 +917,92 @@ class RotationManager:
             )
         session.commit()
 
+    @staticmethod
+    def backfill_snapshot_benchmark_alpha(
+        session,
+        *,
+        portfolio_name: str | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, int]:
+        """重算歷史 snapshot 的 benchmark/alpha 三欄位。
+
+        2026-05-16：commit 7f13f08 加欄位前的 33 筆 snapshot 全為 NULL，需一次性補齊。
+
+        Args:
+            portfolio_name: 限制單一 portfolio；None=全部
+            overwrite: True 時連已有值的列也重算；False（預設）只補 NULL
+
+        Returns:
+            {"updated": N, "skipped_no_initial_capital": K, "skipped_no_benchmark": M}
+        """
+        # 依 (name, date asc) 排序，逐筆計算（需 base = 該 portfolio 最早 snapshot）
+        stmt = select(RotationDailySnapshot)
+        if portfolio_name is not None:
+            stmt = stmt.where(RotationDailySnapshot.portfolio_name == portfolio_name)
+        stmt = stmt.order_by(RotationDailySnapshot.portfolio_name, RotationDailySnapshot.snapshot_date)
+        rows = session.execute(stmt).scalars().all()
+
+        # 預先載每個 portfolio 的 initial_capital 與最早 snapshot_date（base）
+        portfolio_names = {r.portfolio_name for r in rows}
+        portfolios = (
+            session.execute(select(RotationPortfolio).where(RotationPortfolio.name.in_(portfolio_names)))
+            .scalars()
+            .all()
+        )
+        initial_cap_map = {p.name: p.initial_capital for p in portfolios}
+
+        base_date_map: dict[str, date] = {}
+        for r in rows:
+            base_date_map.setdefault(r.portfolio_name, r.snapshot_date)
+
+        # 預先取每個 base_date 的 0050 close（reuse helper）
+        base_bm_map: dict[str, float | None] = {
+            name: _get_benchmark_close_on_or_before(session, d) for name, d in base_date_map.items()
+        }
+
+        # 群組 prev close 查詢：對每筆 row 依該 portfolio 上一筆 snapshot_date 找 0050
+        prev_date_by_row: dict[int, date | None] = {}
+        last_seen: dict[str, date] = {}
+        for r in rows:
+            prev_date_by_row[r.id] = last_seen.get(r.portfolio_name)
+            last_seen[r.portfolio_name] = r.snapshot_date
+
+        stats = {"updated": 0, "skipped_no_initial_capital": 0, "skipped_no_benchmark": 0}
+
+        for r in rows:
+            already_filled = r.alpha_cum_pct is not None
+            if already_filled and not overwrite:
+                continue
+
+            initial_capital = initial_cap_map.get(r.portfolio_name, 0.0) or 0.0
+            if initial_capital <= 0:
+                stats["skipped_no_initial_capital"] += 1
+                continue
+
+            today_bm = _get_benchmark_close_on_or_before(session, r.snapshot_date)
+            prev_date = prev_date_by_row.get(r.id)
+            prev_bm = _get_benchmark_close_on_or_before(session, prev_date) if prev_date is not None else None
+            base_bm = base_bm_map.get(r.portfolio_name)
+
+            if today_bm is None or base_bm is None:
+                stats["skipped_no_benchmark"] += 1
+                continue
+
+            portfolio_cum_return = (r.total_capital - initial_capital) / initial_capital
+            bm_ret, bm_cum, alpha_cum = compute_benchmark_alpha_fields(
+                today_bm_close=today_bm,
+                prev_bm_close=prev_bm,
+                base_bm_close=base_bm,
+                portfolio_cum_return=portfolio_cum_return,
+            )
+            r.benchmark_return_pct = bm_ret
+            r.benchmark_cum_return_pct = bm_cum
+            r.alpha_cum_pct = alpha_cum
+            stats["updated"] += 1
+
+        session.commit()
+        return stats
+
     def get_recent_snapshots(self, n_days: int = 90) -> list[dict]:
         """回傳本組合最近 n_days 個 snapshot（asc by snapshot_date）。
 
@@ -916,6 +1027,9 @@ class RotationManager:
                     "daily_return_pct": r.daily_return_pct,
                     "n_holdings": r.n_holdings,
                     "regime_state": r.regime_state,
+                    "benchmark_return_pct": r.benchmark_return_pct,
+                    "benchmark_cum_return_pct": r.benchmark_cum_return_pct,
+                    "alpha_cum_pct": r.alpha_cum_pct,
                 }
                 for r in rows_asc
             ]

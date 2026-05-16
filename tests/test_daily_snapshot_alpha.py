@@ -293,3 +293,285 @@ class TestMigrationIdempotent:
         assert ("rotation_daily_snapshot", "benchmark_return_pct") in cols
         assert ("rotation_daily_snapshot", "benchmark_cum_return_pct") in cols
         assert ("rotation_daily_snapshot", "alpha_cum_pct") in cols
+
+
+# ====================================================================== #
+# P2-E: 純函數 compute_benchmark_alpha_fields
+# ====================================================================== #
+
+
+class TestComputeBenchmarkAlphaFields:
+    """純函數：與 DB 解耦的計算邏輯。"""
+
+    def test_all_inputs_present_returns_three_values(self):
+        from src.portfolio.manager import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(
+            today_bm_close=105.0,
+            prev_bm_close=100.0,
+            base_bm_close=100.0,
+            portfolio_cum_return=0.08,
+        )
+        assert bm_ret == pytest.approx(0.05)
+        assert bm_cum == pytest.approx(0.05)
+        assert alpha == pytest.approx(0.03)
+
+    def test_missing_today_returns_all_none(self):
+        from src.portfolio.manager import compute_benchmark_alpha_fields
+
+        result = compute_benchmark_alpha_fields(None, 100.0, 100.0, 0.05)
+        assert result == (None, None, None)
+
+    def test_missing_prev_drops_daily_only(self):
+        from src.portfolio.manager import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(105.0, None, 100.0, 0.08)
+        assert bm_ret is None
+        assert bm_cum == pytest.approx(0.05)
+        assert alpha == pytest.approx(0.03)
+
+    def test_zero_or_negative_base_drops_cum_and_alpha(self):
+        from src.portfolio.manager import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(105.0, 100.0, 0.0, 0.08)
+        assert bm_ret == pytest.approx(0.05)
+        assert bm_cum is None
+        assert alpha is None
+
+    def test_missing_portfolio_cum_return_drops_alpha_only(self):
+        from src.portfolio.manager import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(105.0, 100.0, 100.0, None)
+        assert bm_cum == pytest.approx(0.05)
+        assert alpha is None
+
+
+# ====================================================================== #
+# P2-F: backfill_snapshot_benchmark_alpha — 一次性補齊歷史 NULL 列
+# ====================================================================== #
+
+
+class TestBackfillSnapshotBenchmarkAlpha:
+    def test_backfill_fills_null_rows(self, db_session):
+        """歷史 snapshot 的 alpha 三欄位為 NULL 時，backfill 後應計算正確。"""
+        from src.portfolio.manager import RotationManager
+
+        _seed_0050(
+            db_session,
+            {date(2026, 5, 6): 100.0, date(2026, 5, 7): 102.0, date(2026, 5, 8): 105.0},
+        )
+        portfolio = _make_portfolio(db_session, name="bf_test", initial=1_000_000.0)
+
+        # 手動寫入 3 筆 snapshot — alpha 欄位全部 NULL（模擬 commit 7f13f08 前的歷史資料）
+        for d, cap in [
+            (date(2026, 5, 6), 1_000_000.0),
+            (date(2026, 5, 7), 1_010_000.0),
+            (date(2026, 5, 8), 1_080_000.0),
+        ]:
+            db_session.add(
+                RotationDailySnapshot(
+                    portfolio_name="bf_test",
+                    snapshot_date=d,
+                    total_capital=cap,
+                    total_market_value=0.0,
+                    total_cash=cap,
+                    unrealized_pnl=0.0,
+                    n_holdings=0,
+                    daily_return_pct=None,
+                )
+            )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session, portfolio_name="bf_test")
+        assert stats["updated"] == 3
+        assert stats["skipped_no_benchmark"] == 0
+
+        rows = (
+            db_session.execute(
+                select(RotationDailySnapshot)
+                .where(RotationDailySnapshot.portfolio_name == "bf_test")
+                .order_by(RotationDailySnapshot.snapshot_date)
+            )
+            .scalars()
+            .all()
+        )
+        # row 0: base = self → cum=0, daily=None（無 prev）
+        assert rows[0].benchmark_return_pct is None
+        assert rows[0].benchmark_cum_return_pct == pytest.approx(0.0)
+        assert rows[0].alpha_cum_pct == pytest.approx(0.0)
+        # row 1: prev=100, today=102 → daily=+2%, cum=+2%, port=+1% → alpha=-1%
+        assert rows[1].benchmark_return_pct == pytest.approx(0.02)
+        assert rows[1].benchmark_cum_return_pct == pytest.approx(0.02)
+        assert rows[1].alpha_cum_pct == pytest.approx(-0.01, abs=1e-6)
+        # row 2: prev=102, today=105 → daily≈+2.94%, cum=+5%, port=+8% → alpha=+3%
+        assert rows[2].benchmark_cum_return_pct == pytest.approx(0.05)
+        assert rows[2].alpha_cum_pct == pytest.approx(0.03, abs=1e-6)
+
+    def test_backfill_default_skips_already_filled(self, db_session):
+        """已有值的列不應被覆蓋（除非 overwrite=True）。"""
+        from src.portfolio.manager import RotationManager
+
+        _seed_0050(db_session, {date(2026, 5, 6): 100.0, date(2026, 5, 7): 110.0})
+        _make_portfolio(db_session, name="bf_test", initial=1_000_000.0)
+        # 第一筆已有 alpha 值（人工塞 sentinel 偵測是否被覆蓋）
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name="bf_test",
+                snapshot_date=date(2026, 5, 6),
+                total_capital=1_000_000.0,
+                total_market_value=0.0,
+                total_cash=1_000_000.0,
+                unrealized_pnl=0.0,
+                n_holdings=0,
+                alpha_cum_pct=999.0,  # sentinel
+            )
+        )
+        # 第二筆 alpha=NULL（待補）
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name="bf_test",
+                snapshot_date=date(2026, 5, 7),
+                total_capital=1_050_000.0,
+                total_market_value=0.0,
+                total_cash=1_050_000.0,
+                unrealized_pnl=0.0,
+                n_holdings=0,
+            )
+        )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session)
+        assert stats["updated"] == 1  # 只補第二筆
+
+        rows = (
+            db_session.execute(select(RotationDailySnapshot).order_by(RotationDailySnapshot.snapshot_date))
+            .scalars()
+            .all()
+        )
+        assert rows[0].alpha_cum_pct == 999.0  # 未被覆蓋
+        assert rows[1].alpha_cum_pct is not None
+
+    def test_backfill_overwrite_recomputes_all(self, db_session):
+        """overwrite=True 時連已有值的列也重算。"""
+        from src.portfolio.manager import RotationManager
+
+        _seed_0050(db_session, {date(2026, 5, 6): 100.0})
+        _make_portfolio(db_session, name="bf_test", initial=1_000_000.0)
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name="bf_test",
+                snapshot_date=date(2026, 5, 6),
+                total_capital=1_000_000.0,
+                total_market_value=0.0,
+                total_cash=1_000_000.0,
+                unrealized_pnl=0.0,
+                n_holdings=0,
+                alpha_cum_pct=999.0,  # 錯誤 sentinel
+            )
+        )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session, overwrite=True)
+        assert stats["updated"] == 1
+
+        row = db_session.execute(select(RotationDailySnapshot)).scalar_one()
+        assert row.alpha_cum_pct == pytest.approx(0.0)  # base=self → 0
+
+    def test_backfill_no_benchmark_skips_row(self, db_session):
+        """0050 完全缺資料時，row 被歸到 skipped_no_benchmark 不擲例外。"""
+        from src.portfolio.manager import RotationManager
+
+        _make_portfolio(db_session, name="bf_test", initial=1_000_000.0)
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name="bf_test",
+                snapshot_date=date(2026, 5, 6),
+                total_capital=1_000_000.0,
+                total_market_value=0.0,
+                total_cash=1_000_000.0,
+                unrealized_pnl=0.0,
+                n_holdings=0,
+            )
+        )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session)
+        assert stats["updated"] == 0
+        assert stats["skipped_no_benchmark"] == 1
+
+        row = db_session.execute(select(RotationDailySnapshot)).scalar_one()
+        assert row.alpha_cum_pct is None  # 仍維持 NULL
+
+    def test_backfill_filters_by_portfolio_name(self, db_session):
+        """指定 portfolio_name 時不影響其他 portfolio。"""
+        from src.portfolio.manager import RotationManager
+
+        _seed_0050(db_session, {date(2026, 5, 6): 100.0})
+        _make_portfolio(db_session, name="bf_a", initial=1_000_000.0)
+        _make_portfolio(db_session, name="bf_b", initial=1_000_000.0)
+        for name in ("bf_a", "bf_b"):
+            db_session.add(
+                RotationDailySnapshot(
+                    portfolio_name=name,
+                    snapshot_date=date(2026, 5, 6),
+                    total_capital=1_000_000.0,
+                    total_market_value=0.0,
+                    total_cash=1_000_000.0,
+                    unrealized_pnl=0.0,
+                    n_holdings=0,
+                )
+            )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session, portfolio_name="bf_a")
+        assert stats["updated"] == 1
+
+        rows = (
+            db_session.execute(select(RotationDailySnapshot).order_by(RotationDailySnapshot.portfolio_name))
+            .scalars()
+            .all()
+        )
+        assert rows[0].alpha_cum_pct is not None  # bf_a 被補
+        assert rows[1].alpha_cum_pct is None  # bf_b 未動
+
+
+# ====================================================================== #
+# P2-G: get_recent_snapshots 暴露 alpha 欄位（dashboard 串接前置）
+# ====================================================================== #
+
+
+class TestGetRecentSnapshotsExposesAlpha:
+    def test_returns_benchmark_and_alpha_fields(self, db_session):
+        from src.portfolio.manager import RotationManager
+
+        _seed_0050(db_session, {date(2026, 5, 15): 100.0, date(2026, 5, 16): 105.0})
+        portfolio = _make_portfolio(db_session, name="exp_test", initial=1_000_000.0)
+        mgr = RotationManager("exp_test")
+        mgr._write_daily_snapshot(
+            db_session,
+            portfolio=portfolio,
+            snapshot_date=date(2026, 5, 15),
+            market_value=0.0,
+            n_holdings=0,
+            regime="bull",
+        )
+        portfolio.current_capital = 1_080_000.0
+        mgr._write_daily_snapshot(
+            db_session,
+            portfolio=portfolio,
+            snapshot_date=date(2026, 5, 16),
+            market_value=500_000.0,
+            n_holdings=2,
+            regime="bull",
+        )
+
+        snaps = mgr.get_recent_snapshots(n_days=90)
+        assert len(snaps) == 2
+        for s in snaps:
+            assert "benchmark_return_pct" in s
+            assert "benchmark_cum_return_pct" in s
+            assert "alpha_cum_pct" in s
+
+        # 第二筆值正確
+        assert snaps[1]["benchmark_cum_return_pct"] == pytest.approx(0.05)
+        assert snaps[1]["alpha_cum_pct"] == pytest.approx(0.03, abs=1e-6)
