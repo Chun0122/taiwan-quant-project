@@ -69,6 +69,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("rotation_position", "buy_slippage", "REAL"),
     ("rotation_position", "sell_slippage", "REAL"),
     ("rotation_position", "trade_cost", "REAL"),
+    # 2026-05-15 sprint：rotation_daily_snapshot 加 benchmark/alpha（5/29 audit alpha 對比）
+    ("rotation_daily_snapshot", "benchmark_return_pct", "REAL"),
+    ("rotation_daily_snapshot", "benchmark_cum_return_pct", "REAL"),
+    ("rotation_daily_snapshot", "alpha_cum_pct", "REAL"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

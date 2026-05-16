@@ -428,6 +428,32 @@ def _get_taiex_prices(session, start: date, end: date) -> dict[date, float]:
     return {row[0]: row[1] for row in session.execute(stmt).all()}
 
 
+# Daily snapshot benchmark：採 0050 ETF 作為 alpha 對標
+SNAPSHOT_BENCHMARK_STOCK_ID = "0050"
+
+
+def _get_benchmark_close_on_or_before(session, target_date: date, lookback_days: int = 7) -> float | None:
+    """取得 ≤ target_date 的最近一個 0050 收盤價（fallback 非交易日 / 假日）。
+
+    lookback_days 控制最大回溯範圍（預設 7 天 = 涵蓋一週末 + 連假）。
+    若找不到回傳 None，呼叫端將寫入 NULL（audit query 過濾即可）。
+    """
+    from datetime import timedelta
+
+    stmt = (
+        select(DailyPrice.close)
+        .where(
+            DailyPrice.stock_id == SNAPSHOT_BENCHMARK_STOCK_ID,
+            DailyPrice.date <= target_date,
+            DailyPrice.date >= target_date - timedelta(days=lookback_days),
+        )
+        .order_by(DailyPrice.date.desc())
+        .limit(1)
+    )
+    row = session.execute(stmt).first()
+    return float(row[0]) if row else None
+
+
 # ---------------------------------------------------------------------------
 # RotationManager
 # ---------------------------------------------------------------------------
@@ -774,7 +800,15 @@ class RotationManager:
         n_holdings: int,
         regime: str | None,
     ) -> None:
-        """寫入單日權益快照（同日重複呼叫採 update 而非新增，避免 UniqueConstraint 衝突）。"""
+        """寫入單日權益快照（同日重複呼叫採 update 而非新增，避免 UniqueConstraint 衝突）。
+
+        2026-05-15 sprint：附加計算 0050 benchmark 與 alpha：
+        - benchmark_return_pct = (today_0050 - prev_snapshot_0050) / prev_snapshot_0050
+        - benchmark_cum_return_pct = (today_0050 - base_0050) / base_0050
+          base = 該 portfolio 在 rotation_daily_snapshot 中最早一筆的對應 0050 close
+        - alpha_cum_pct = portfolio_cum_return - benchmark_cum_return_pct
+        0050 缺資料時 3 欄位皆 None。
+        """
         unrealized_pnl = market_value + portfolio.current_cash - portfolio.initial_capital
 
         existing = session.execute(
@@ -794,11 +828,39 @@ class RotationManager:
             .limit(1)
         ).scalar_one_or_none()
 
+        # 該 portfolio 最早 snapshot — 作為 cum return 的 base
+        # 若 existing 為當前正在寫入的第一筆（None prev），則 base 也是當前 snapshot_date
+        first_snapshot = session.execute(
+            select(RotationDailySnapshot)
+            .where(RotationDailySnapshot.portfolio_name == portfolio.name)
+            .order_by(RotationDailySnapshot.snapshot_date.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+
         daily_return_pct: float | None
         if prev is not None and prev.total_capital > 0:
             daily_return_pct = (portfolio.current_capital - prev.total_capital) / prev.total_capital
         else:
             daily_return_pct = None
+
+        # ── Benchmark / alpha 計算 ──
+        today_bm_close = _get_benchmark_close_on_or_before(session, snapshot_date)
+        prev_bm_close = _get_benchmark_close_on_or_before(session, prev.snapshot_date) if prev is not None else None
+        base_date = first_snapshot.snapshot_date if first_snapshot is not None else snapshot_date
+        base_bm_close = _get_benchmark_close_on_or_before(session, base_date)
+
+        benchmark_return_pct: float | None = None
+        if today_bm_close is not None and prev_bm_close is not None and prev_bm_close > 0:
+            benchmark_return_pct = (today_bm_close - prev_bm_close) / prev_bm_close
+
+        benchmark_cum_return_pct: float | None = None
+        if today_bm_close is not None and base_bm_close is not None and base_bm_close > 0:
+            benchmark_cum_return_pct = (today_bm_close - base_bm_close) / base_bm_close
+
+        alpha_cum_pct: float | None = None
+        if benchmark_cum_return_pct is not None and portfolio.initial_capital > 0:
+            portfolio_cum_return = (portfolio.current_capital - portfolio.initial_capital) / portfolio.initial_capital
+            alpha_cum_pct = portfolio_cum_return - benchmark_cum_return_pct
 
         if existing is not None:
             existing.total_capital = portfolio.current_capital
@@ -808,6 +870,9 @@ class RotationManager:
             existing.daily_return_pct = daily_return_pct
             existing.n_holdings = n_holdings
             existing.regime_state = regime
+            existing.benchmark_return_pct = benchmark_return_pct
+            existing.benchmark_cum_return_pct = benchmark_cum_return_pct
+            existing.alpha_cum_pct = alpha_cum_pct
         else:
             session.add(
                 RotationDailySnapshot(
@@ -820,6 +885,9 @@ class RotationManager:
                     daily_return_pct=daily_return_pct,
                     n_holdings=n_holdings,
                     regime_state=regime,
+                    benchmark_return_pct=benchmark_return_pct,
+                    benchmark_cum_return_pct=benchmark_cum_return_pct,
+                    alpha_cum_pct=alpha_cum_pct,
                 )
             )
         session.commit()

@@ -812,6 +812,11 @@ class RotationDailySnapshot(Base):
     daily_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # vs 前一筆 snapshot
     n_holdings: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     regime_state: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Benchmark / alpha 追蹤（2026-05-15 sprint：對應 5/29 audit alpha 對比需求）
+    # benchmark 採 0050；缺資料時三欄位皆 None（audit query 用 IS NOT NULL 過濾）
+    benchmark_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 當日 0050 報酬
+    benchmark_cum_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 自 base 累積
+    alpha_cum_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # portfolio - benchmark
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
