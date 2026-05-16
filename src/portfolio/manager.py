@@ -1654,7 +1654,8 @@ class RotationManager:
 
         exit_price = sell.get("exit_price", pos.entry_price)
         pnl, return_pct = compute_position_pnl(pos.entry_price, exit_price, pos.shares)
-        sell_proceeds = exit_price * pos.shares * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
+        sell_costs = compute_trade_costs(exit_price, pos.shares, SLIPPAGE_RATE, side="sell")
+        sell_proceeds = exit_price * pos.shares - sell_costs.total
 
         pos.exit_date = today
         pos.exit_price = exit_price
@@ -1663,6 +1664,9 @@ class RotationManager:
         pos.return_pct = return_pct
         pos.status = "closed"
         pos.holding_days_count = sell.get("days_held", 0)
+        # 滑價/成本 instrumentation：sell 端記滑價率 + 累加 trade_cost（買端已寫入）
+        pos.sell_slippage = SLIPPAGE_RATE
+        pos.trade_cost = round((pos.trade_cost or 0.0) + sell_costs.total, 2)
 
         return cash + sell_proceeds
 
@@ -1691,13 +1695,15 @@ class RotationManager:
         if shares <= 0:
             return cash
 
-        buy_cost = price * shares * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+        buy_costs = compute_trade_costs(price, shares, SLIPPAGE_RATE, side="buy")
+        buy_cost = price * shares + buy_costs.total
         if buy_cost > cash:
             # 資金不足，縮減股數
             shares = compute_shares(cash, price)
             if shares <= 0:
                 return cash
-            buy_cost = price * shares * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
+            buy_costs = compute_trade_costs(price, shares, SLIPPAGE_RATE, side="buy")
+            buy_cost = price * shares + buy_costs.total
 
         from src.portfolio.rotation import compute_planned_exit_date
 
@@ -1719,6 +1725,9 @@ class RotationManager:
             allocated_capital=buy.get("allocated_capital", buy_cost),
             stop_loss=buy.get("stop_loss"),
             status="open",
+            # 滑價/成本 instrumentation：buy 端記滑價率 + 初始化 trade_cost（賣出時累加）
+            buy_slippage=SLIPPAGE_RATE,
+            trade_cost=round(buy_costs.total, 2),
         )
         session.add(pos)
         return cash - buy_cost

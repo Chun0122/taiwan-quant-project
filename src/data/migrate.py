@@ -65,6 +65,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("rotation_backtest_trade", "buy_slippage", "REAL"),
     ("rotation_backtest_trade", "sell_slippage", "REAL"),
     ("rotation_backtest_trade", "trade_cost", "REAL"),
+    # 2026-05-15 sprint：實盤 rotation_position 加入相同 3 欄位（供 5/29 audit 算淨報酬）
+    ("rotation_position", "buy_slippage", "REAL"),
+    ("rotation_position", "sell_slippage", "REAL"),
+    ("rotation_position", "trade_cost", "REAL"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

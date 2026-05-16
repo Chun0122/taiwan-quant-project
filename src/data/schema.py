@@ -709,6 +709,11 @@ class RotationPosition(Base):
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)  # 已實現損益
     return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 報酬率
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open/closed
+    # 實盤滑價/成本 instrumentation（2026-05-15 sprint：對應 RotationBacktestTrade 同名欄位，
+    # 供 5/29 audit 計算實盤淨報酬與 dampen/chip 阻擋 ROI 試算）
+    buy_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場滑價率
+    sell_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # 出場滑價率
+    trade_cost: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進+出兩端總成本金額
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
