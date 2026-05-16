@@ -396,8 +396,13 @@ def _export_dashboard_step(top_n: int = 20, target_date: date | None = None) -> 
     )
 
 
-def _check_strategy_decay() -> None:
-    """檢查所有 Discover 模式的策略衰減（供 morning-routine Step 9 呼叫）。"""
+def _check_strategy_decay(scan_date: date | None = None) -> None:
+    """檢查所有 Discover 模式的策略衰減（供 morning-routine Step 15 呼叫）。
+
+    2026-05-15 sprint：除了 print，新增 StrategyDecayLog 落庫供 5/29 audit
+    訊號穩定性時序對比。同日重複呼叫採 update path 避免 UniqueConstraint 衝突。
+    持久化失敗不擋後續步驟（warning + continue）。
+    """
     from src.discovery.performance import check_all_modes_decay
 
     mode_labels = {
@@ -410,12 +415,24 @@ def _check_strategy_decay() -> None:
 
     results = check_all_modes_decay(recent_days=30, holding_days=10)
     has_decay = False
+    log_date = scan_date or date.today()
+    rows_to_persist: list[dict] = []
 
     for r in results:
         mode = r.get("mode", "?")
         label = mode_labels.get(mode, mode)
         if r["recent_count"] == 0:
             print(f"  {label}: 近 30 天無足夠推薦績效資料，跳過")
+            rows_to_persist.append(
+                {
+                    "mode": mode,
+                    "recent_win_rate": None,
+                    "recent_avg_return": None,
+                    "recent_count": 0,
+                    "is_decaying": False,
+                    "warning": None,
+                }
+            )
             continue
 
         wr = r["recent_win_rate"]
@@ -433,12 +450,62 @@ def _check_strategy_decay() -> None:
             status = "✓ 正常"
         print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({n}筆) → {status}")
 
+        warning_text: str | None = None
         if r["is_decaying"] and n >= MIN_SAMPLE:
             has_decay = True
-            print(f"    {r['warning']}")
+            warning_text = r.get("warning")
+            print(f"    {warning_text}")
+
+        rows_to_persist.append(
+            {
+                "mode": mode,
+                "recent_win_rate": wr,
+                "recent_avg_return": avg,
+                "recent_count": n,
+                "is_decaying": bool(r["is_decaying"]),
+                "warning": warning_text,
+            }
+        )
 
     if not has_decay:
         print("  所有模式績效正常，無衰減警告。")
+
+    # 持久化（同日重複呼叫採 update path）
+    try:
+        from sqlalchemy import select
+
+        from src.data.database import get_session
+        from src.data.schema import StrategyDecayLog
+
+        with get_session() as session:
+            for row in rows_to_persist:
+                existing = session.execute(
+                    select(StrategyDecayLog).where(
+                        StrategyDecayLog.scan_date == log_date,
+                        StrategyDecayLog.mode == row["mode"],
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    existing.recent_win_rate = row["recent_win_rate"]
+                    existing.recent_avg_return = row["recent_avg_return"]
+                    existing.recent_count = row["recent_count"]
+                    existing.is_decaying = row["is_decaying"]
+                    existing.warning = row["warning"]
+                else:
+                    session.add(
+                        StrategyDecayLog(
+                            scan_date=log_date,
+                            mode=row["mode"],
+                            recent_win_rate=row["recent_win_rate"],
+                            recent_avg_return=row["recent_avg_return"],
+                            recent_count=row["recent_count"],
+                            is_decaying=row["is_decaying"],
+                            warning=row["warning"],
+                        )
+                    )
+            session.commit()
+    except Exception as exc:
+        print(f"  ⚠ StrategyDecayLog 持久化失敗：{exc}")
 
 
 # 各模式關鍵因子 — 共用 SSOT（src/constants.py:DISCOVERY_KEY_FACTOR_MAP）
@@ -1041,7 +1108,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             15,
             "策略衰減監控（30/60/90 天績效趨勢）",
             {"dry_run"},
-            lambda: _check_strategy_decay(),
+            lambda: _check_strategy_decay(scan_date=today),
         ),
         (
             16,

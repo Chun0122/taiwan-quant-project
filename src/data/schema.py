@@ -821,3 +821,27 @@ class RotationDailySnapshot(Base):
 
     def __repr__(self) -> str:
         return f"<RotationDailySnapshot {self.portfolio_name} {self.snapshot_date} capital={self.total_capital:.0f}>"
+
+
+class StrategyDecayLog(Base):
+    """策略衰減監控每日紀錄（2026-05-15 sprint）。
+
+    對應 morning-routine Step 15 計算結果落庫，供 5/29 audit 訊號穩定性
+    時序對比與後續 dashboard 趨勢圖。每日每模式各一筆。
+    """
+
+    __tablename__ = "strategy_decay_log"
+    __table_args__ = (UniqueConstraint("scan_date", "mode", name="uq_strategy_decay_log"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    recent_win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recent_avg_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_decaying: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    warning: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<StrategyDecayLog {self.scan_date} {self.mode} wr={self.recent_win_rate} n={self.recent_count}>"
