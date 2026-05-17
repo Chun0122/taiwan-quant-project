@@ -379,6 +379,31 @@ def main() -> None:
     sp_vb.add_argument("--lookback-days", type=int, default=90, help="回溯天數（預設 90）")
     sp_vb.add_argument("--min-samples", type=int, default=30, help="最低樣本數（預設 30）")
 
+    # validate-baseline 子命令（P0 任務 3：策略劣化守門）
+    sp_vbs = subparsers.add_parser(
+        "validate-baseline",
+        help="對比當前 portfolio 指標與 baseline；regression 退出碼 1（morning-routine Step 17 守門）",
+    )
+    sp_vbs.add_argument(
+        "--tolerance",
+        type=float,
+        default=1.0,
+        help="閾值倍率（1.0=預設 deltas；0.5=嚴格半量；2.0=寬鬆雙倍）",
+    )
+    sp_vbs.add_argument("--lookback-days", type=int, default=90, help="snapshot 回溯天數（預設 90）")
+    sp_vbs.add_argument("--quiet", action="store_true", help="只用退出碼回報，不印 report")
+
+    # update-baseline 子命令（重寫 baseline 檔）
+    sp_ub = subparsers.add_parser("update-baseline", help="以當前 active portfolio 指標重寫 baseline_metrics.json")
+    sp_ub.add_argument("--confirm", action="store_true", help="確認覆寫 baseline（必填，防誤操作）")
+    sp_ub.add_argument(
+        "--portfolios",
+        nargs="+",
+        default=None,
+        help="指定 portfolio 名稱清單（預設使用所有 active）",
+    )
+    sp_ub.add_argument("--lookback-days", type=int, default=90, help="snapshot 回溯天數（預設 90）")
+
     # discover-backtest 子命令
     sp_db = subparsers.add_parser("discover-backtest", help="評估 Discover 推薦的歷史績效")
     sp_db.add_argument(
@@ -805,6 +830,14 @@ def main() -> None:
             min_samples=args.min_samples,
         )
         print(format_validation_report(validations))
+    elif args.command == "validate-baseline":
+        from src.cli.baseline_cmd import cmd_validate_baseline
+
+        sys.exit(cmd_validate_baseline(args))
+    elif args.command == "update-baseline":
+        from src.cli.baseline_cmd import cmd_update_baseline
+
+        sys.exit(cmd_update_baseline(args))
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":

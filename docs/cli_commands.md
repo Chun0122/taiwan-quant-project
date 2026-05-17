@@ -251,6 +251,14 @@ python main.py validate
 python main.py validate --stocks 2330 2317
 python main.py validate --export issues.csv
 
+# Baseline Regression 守門（5/29 audit 策略劣化偵測，morning-routine Step 17 自動執行）
+python main.py update-baseline --confirm                  # 凍結當前 active portfolio 指標為新 baseline
+python main.py validate-baseline                          # 對比當前 vs baseline；regression 退出碼 1
+python main.py validate-baseline --tolerance 0.5          # 嚴格半量閾值
+python main.py validate-baseline --tolerance 2.0 --quiet  # 寬鬆 + 只用 exit code（CI 用）
+# baseline_metrics.json 結構：每個 portfolio 凍結 sharpe / max_drawdown_pct / win_rate_pct / alpha_cum_pct
+# 預設 deltas：sharpe -0.20 / mdd +2pp / win_rate -5pp / alpha -3pp 觸發 regression
+
 # 匯出
 python main.py export --list
 python main.py export daily_price -o data/export/daily_price.csv

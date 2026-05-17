@@ -46,6 +46,7 @@ def _build_morning_discord_summary(
     ic_status: list[dict] | None = None,
     disabled_modes: list[str] | None = None,
     discover_blocked: bool = False,
+    baseline_regressions: list | None = None,
 ) -> str:
     """建立早晨例行報告的 Discord 訊息摘要。
 
@@ -99,6 +100,15 @@ def _build_morning_discord_summary(
             lines.append("")
         elif stress_result.get("regime") is None:
             lines.append("⚠️ **Regime 未知** — Step 0 宏觀壓力預檢失敗，Rotation 以保守模式運行")
+            lines.append("")
+
+    # ── Baseline Regression 守門（Step 17）────────────────────
+    if baseline_regressions:
+        from src.cli.baseline_cmd import format_regressions_for_discord
+
+        block = format_regressions_for_discord(baseline_regressions)
+        if block:
+            lines.append(block.rstrip("\n"))
             lines.append("")
 
     # ── IC 健康度狀態（M3：顯示被降權/停用的子因子）────────────────
@@ -394,6 +404,47 @@ def _export_dashboard_step(top_n: int = 20, target_date: date | None = None) -> 
             regenerate_ai_summary=False,
         )
     )
+
+
+def _baseline_regression_check(state: dict | None = None) -> None:
+    """morning-routine Step 17：對比當前 portfolio 指標與 baseline。
+
+    失敗不阻擋（外層 try/except）；發現 regression 時：
+      - 寫入 baseline_state["regressions"] 供 _build_morning_discord_summary 顯示
+      - stdout 列出明細
+      - 不抛例外（不影響後續步驟，與 Step 15 風格一致）
+    """
+    from src.cli.baseline_cmd import (
+        collect_current_metrics,
+        compare_metrics,
+        load_baseline,
+    )
+
+    baseline = load_baseline()
+    if not baseline:
+        print("  [baseline] 找不到 baseline_metrics.json — 請先執行 python main.py update-baseline --confirm")
+        if state is not None:
+            state["missing"] = True
+        return
+
+    current = collect_current_metrics(portfolio_names=list(baseline.keys()))
+    all_findings = []
+    for name, bm in baseline.items():
+        cm = current.get(name)
+        if cm is None:
+            continue
+        all_findings.extend(compare_metrics(bm, cm, tolerance=1.0))
+
+    regressions = [f for f in all_findings if f.is_regression]
+    if state is not None:
+        state["regressions"] = regressions
+
+    if regressions:
+        print(f"  ⚠ Baseline Regression: {len(regressions)} 項")
+        for r in regressions[:10]:
+            print(f"    🔴 [{r.portfolio_name}] {r.metric}: {r.reason}")
+    else:
+        print("  ✅ Baseline 守門通過（無 regression）")
 
 
 def _check_strategy_decay(scan_date: date | None = None) -> None:
@@ -942,6 +993,8 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     # M1：共用變數，Step 9 判斷資料是否過期阻擋
     discover_blocked_state: dict = {"blocked": False, "reason": ""}
     MAX_STALE_HARD_BLOCK_DAYS = 7  # 超過 7 天資料過期直接阻擋 Step 9（M1）
+    # Step 17 baseline regression — Step 17 寫入，Discord summary 讀取
+    baseline_state: dict = {"regressions": [], "missing": False}
 
     def _step_8c_ic_precheck() -> None:
         """Step 8c：在 Step 9 discover 前檢查關鍵因子 IC，反向模式自動停用（M2）。
@@ -1116,6 +1169,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run"},
             lambda: _export_dashboard_step(top_n=top_n, target_date=today),
         ),
+        (
+            17,
+            "Baseline Regression 守門（對比已凍結指標）",
+            {"dry_run"},
+            lambda: _baseline_regression_check(state=baseline_state),
+        ),
     ]
 
     active_flags: set[str] = set()
@@ -1169,6 +1228,7 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             ic_status=ic_status_state.get("ic_status") or None,
             disabled_modes=ic_status_state.get("disabled_modes") or None,
             discover_blocked=discover_blocked_state.get("blocked", False),
+            baseline_regressions=baseline_state.get("regressions") or None,
         )
         # 失敗步驟附加至 Discord 摘要
         if failed_steps:
