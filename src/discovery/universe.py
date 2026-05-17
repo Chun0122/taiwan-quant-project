@@ -26,7 +26,7 @@ from sqlalchemy import func, select
 
 from src.constants import REGIME_UNIVERSE_ADJUSTMENTS
 from src.data.database import get_session
-from src.data.schema import DailyFeature, DailyPrice, DiscoveryRecord, StockInfo
+from src.data.schema import DailyFeature, DailyPrice, DiscoveryRecord, StockInfo, UniverseStatLog
 
 # Sentinel 值：區分「未傳入」與「明確傳入 None」
 _SENTINEL = object()
@@ -303,6 +303,59 @@ def filter_trend_breakout(df_hist: pd.DataFrame, config: UniverseConfig) -> list
 
     pass_mask = close_above_ma20 & momentum_ok & near_high & vol_ok & not_anomaly
     return list(latest.loc[pass_mask, "stock_id"])
+
+
+# ────────────────────────────────────────────────────────────────
+#  Universe Stats 落庫（P1 任務 8）
+# ────────────────────────────────────────────────────────────────
+
+
+def log_universe_stats(
+    scan_date: date,
+    mode: str,
+    stats: dict,
+    *,
+    regime: str | None = None,
+    turnover_multiplier: float | None = None,
+) -> None:
+    """將單次 UniverseFilter.run() 統計落庫到 universe_stat_log 表。
+
+    Upsert 語意：同 (scan_date, mode) 重複呼叫覆蓋既有列（同日多次 scan 取最後一次）。
+    失敗只 log 不拋例外（與其他 sprint instrumentation 一致）。
+    """
+    try:
+        with get_session() as session:
+            existing = session.execute(
+                select(UniverseStatLog).where(
+                    UniverseStatLog.scan_date == scan_date,
+                    UniverseStatLog.mode == mode,
+                )
+            ).scalar_one_or_none()
+
+            fields = dict(
+                total_after_sql=int(stats.get("total_after_sql", 0)),
+                total_after_liquidity=int(stats.get("total_after_liquidity", 0)),
+                total_after_trend=int(stats.get("total_after_trend", 0)),
+                from_memory=int(stats.get("from_memory", 0)),
+                final_candidates=int(stats.get("final_candidates", 0)),
+                regime=regime,
+                turnover_multiplier=turnover_multiplier,
+            )
+
+            if existing is not None:
+                for k, v in fields.items():
+                    setattr(existing, k, v)
+            else:
+                session.add(
+                    UniverseStatLog(
+                        scan_date=scan_date,
+                        mode=mode,
+                        **fields,
+                    )
+                )
+            session.commit()
+    except Exception as exc:
+        logger.warning("log_universe_stats 失敗 (%s/%s): %s", scan_date, mode, exc)
 
 
 # ────────────────────────────────────────────────────────────────

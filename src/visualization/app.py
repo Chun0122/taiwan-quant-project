@@ -24,6 +24,7 @@ page = st.sidebar.radio(
         "📋 推薦歷史",
         "👁️ 持倉監控",
         "🛡️ 部位控制總覽",
+        "🌐 Universe 統計",
     ],
 )
 
@@ -73,5 +74,9 @@ elif page == "👁️ 持倉監控":
     render()
 elif page == "🛡️ 部位控制總覽":
     from src.visualization.pages.risk_control import render
+
+    render()
+elif page == "🌐 Universe 統計":
+    from src.visualization.pages.universe_stats import render
 
     render()

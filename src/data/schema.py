@@ -848,3 +848,39 @@ class StrategyDecayLog(Base):
 
     def __repr__(self) -> str:
         return f"<StrategyDecayLog {self.scan_date} {self.mode} wr={self.recent_win_rate} n={self.recent_count}>"
+
+
+class UniverseStatLog(Base):
+    """UniverseFilter 三層漏斗每次 scan 統計紀錄（P1 任務 8）。
+
+    `Stage 0.5` UniverseFilter 在 MarketScanner.run() 內呼叫，回傳各階段
+    剩餘股數。本表每次 scan 落庫一筆（unique on scan_date+mode），供
+    dashboard 顯示「過熱閘門 / regime 收緊 是否縮緊 universe」的歷史趨勢。
+
+    為什麼有此表：universe size 是 audit 重要訊號（drop 30%+ 通常意味 regime
+    收緊或 data freshness 問題），但先前只 log 不存，無法做時序對比。
+    """
+
+    __tablename__ = "universe_stat_log"
+    __table_args__ = (
+        UniqueConstraint("scan_date", "mode", name="uq_universe_stat_log"),
+        Index("ix_universe_stat_log_date_mode", "scan_date", "mode"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    regime: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    total_after_sql: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_after_liquidity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_after_trend: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    from_memory: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    final_candidates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Regime 自適應參數透明化（_turnover_multiplier / _volume_ratio_override）
+    turnover_multiplier: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return (
+            f"<UniverseStatLog {self.scan_date} {self.mode} sql={self.total_after_sql}→final={self.final_candidates}>"
+        )

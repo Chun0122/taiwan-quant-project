@@ -431,6 +431,16 @@ class MarketScanner:
             universe_stats.get("total_after_trend", 0),
             universe_stats.get("final_candidates", 0),
         )
+        # P1 任務 8：落庫 universe stats 供 dashboard 時序分析
+        from src.discovery.universe import log_universe_stats
+
+        log_universe_stats(
+            scan_date=getattr(self, "scan_date", None) or date.today(),
+            mode=self.mode_name,
+            stats=universe_stats,
+            regime=getattr(self, "regime", None),
+            turnover_multiplier=getattr(self._universe_filter, "_turnover_multiplier", None),
+        )
         return universe_ids
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:

@@ -21,6 +21,7 @@ from src.data.schema import (
     StockInfo,
     TechnicalIndicator,
     Trade,
+    UniverseStatLog,
     WatchEntry,
 )
 
@@ -869,6 +870,55 @@ def load_rotation_portfolio_names() -> list[str]:
     with get_session() as session:
         rows = session.execute(select(RotationPortfolio.name).order_by(RotationPortfolio.created_at)).scalars().all()
     return list(rows)
+
+
+def load_universe_stat_log(lookback_days: int = 90, mode: str | None = None) -> pd.DataFrame:
+    """讀取 universe_stat_log 最近 N 天（P1 任務 8）。
+
+    回傳 DataFrame: scan_date / mode / regime / total_after_sql /
+                    total_after_liquidity / total_after_trend / from_memory /
+                    final_candidates / turnover_multiplier
+    """
+    from datetime import date, timedelta
+
+    cutoff = date.today() - timedelta(days=lookback_days)
+
+    with get_session() as session:
+        stmt = (
+            select(
+                UniverseStatLog.scan_date,
+                UniverseStatLog.mode,
+                UniverseStatLog.regime,
+                UniverseStatLog.total_after_sql,
+                UniverseStatLog.total_after_liquidity,
+                UniverseStatLog.total_after_trend,
+                UniverseStatLog.from_memory,
+                UniverseStatLog.final_candidates,
+                UniverseStatLog.turnover_multiplier,
+            )
+            .where(UniverseStatLog.scan_date >= cutoff)
+            .order_by(UniverseStatLog.scan_date, UniverseStatLog.mode)
+        )
+        if mode:
+            stmt = stmt.where(UniverseStatLog.mode == mode)
+        rows = session.execute(stmt).all()
+
+    return pd.DataFrame(
+        [
+            {
+                "scan_date": r.scan_date,
+                "mode": r.mode,
+                "regime": r.regime,
+                "total_after_sql": r.total_after_sql,
+                "total_after_liquidity": r.total_after_liquidity,
+                "total_after_trend": r.total_after_trend,
+                "from_memory": r.from_memory,
+                "final_candidates": r.final_candidates,
+                "turnover_multiplier": r.turnover_multiplier,
+            }
+            for r in rows
+        ]
+    )
 
 
 def load_rotation_alpha_series(lookback_days: int = 90, status: str = "active") -> pd.DataFrame:
