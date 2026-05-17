@@ -115,6 +115,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `scheduler/` | 排程（前景 / Windows Task Scheduler / macOS LaunchAgent） |
 | `features/indicators.py` | SMA/RSI/MACD/BB/ADX EAV + 週線聚合 |
 | `features/ml_features.py` | ML 特徵矩陣 + SHAP 篩選 |
+| `factors/registry.py` | **Factor SSOT**：所有因子（dimension/sub_factor/predicate/indicator）的 metadata 註冊表；`python main.py factor-list` 查詢；新增因子須同步註冊 |
 | `config.py` | Pydantic 設定模型（`QuantConfig`：TradingCost/AtrMultiplier/ScoreThreshold/RiskBudget） |
 
 ---

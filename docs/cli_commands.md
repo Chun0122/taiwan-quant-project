@@ -243,6 +243,34 @@ python main.py concept-expand CoWoS封裝 --threshold 0.7 --auto
 
 ---
 
+## Factor Library（P1 任務 6：因子 SSOT）
+
+```bash
+# 列出全部因子
+python main.py factor-list
+
+# 限定維度（technical / chip / fundamental / news / valuation / dividend / regime）
+python main.py factor-list --category chip
+
+# 限定類型（dimension / sub_factor / predicate / indicator）
+python main.py factor-list --type dimension
+python main.py factor-list --type predicate   # screener/factors.py watchlist filter
+python main.py factor-list --type indicator   # features/indicators.py EAV 持久化
+
+# 限定 discover 模式
+python main.py factor-list --mode momentum
+
+# 顯示單一因子完整 spec
+python main.py factor-list --name chip_score
+
+# Introspection 守門：驗證所有 source_module/function 可解析（CI 用）
+python main.py factor-list --check-resolve   # 失敗 exit code 1
+```
+
+註冊位置：`src/factors/registry.py:FACTOR_REGISTRY`。新增因子請同步註冊 metadata（name / category / source / expected_sign / used_in_modes / IC notes）。
+
+---
+
 ## 資料品質 / 匯出匯入
 
 ```bash

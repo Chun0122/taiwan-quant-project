@@ -393,6 +393,37 @@ def main() -> None:
     sp_vbs.add_argument("--lookback-days", type=int, default=90, help="snapshot 回溯天數（預設 90）")
     sp_vbs.add_argument("--quiet", action="store_true", help="只用退出碼回報，不印 report")
 
+    # factor-list 子命令（P1 任務 6：Factor Library SSOT 查詢）
+    sp_fl = subparsers.add_parser(
+        "factor-list",
+        help="列出 src/factors FACTOR_REGISTRY 中所有因子（dimension/sub_factor/predicate/indicator）",
+    )
+    sp_fl.add_argument(
+        "--category",
+        choices=["technical", "chip", "fundamental", "news", "valuation", "dividend", "regime"],
+        default=None,
+        help="限定維度",
+    )
+    sp_fl.add_argument(
+        "--type",
+        choices=["dimension", "sub_factor", "predicate", "indicator"],
+        default=None,
+        help="限定類型",
+    )
+    sp_fl.add_argument(
+        "--mode",
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        default=None,
+        help="限定 discover 模式",
+    )
+    sp_fl.add_argument("--name", default=None, help="顯示單一因子完整 spec")
+    sp_fl.add_argument(
+        "--check-resolve",
+        action="store_true",
+        default=False,
+        help="introspection 驗證 source_module/function 可解析（CI 守門用，失敗 exit code 1）",
+    )
+
     # update-baseline 子命令（重寫 baseline 檔）
     sp_ub = subparsers.add_parser("update-baseline", help="以當前 active portfolio 指標重寫 baseline_metrics.json")
     sp_ub.add_argument("--confirm", action="store_true", help="確認覆寫 baseline（必填，防誤操作）")
@@ -838,6 +869,10 @@ def main() -> None:
         from src.cli.baseline_cmd import cmd_update_baseline
 
         sys.exit(cmd_update_baseline(args))
+    elif args.command == "factor-list":
+        from src.cli.factor_cmd import cmd_factor_list
+
+        sys.exit(cmd_factor_list(args))
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":
