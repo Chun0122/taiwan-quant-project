@@ -1034,6 +1034,63 @@ class RotationManager:
                 for r in rows_asc
             ]
 
+    # ── 成本歸因（5/29 audit alpha 拖累驗證）──
+
+    def get_cost_attribution(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        *,
+        include_open: bool = False,
+    ):
+        """聚合本組合在 [start, end] 期間 RotationPosition 的成本歸因。
+
+        Parameters
+        ----------
+        start_date, end_date : 期間過濾。entry_date 落在窗口內視為納入。
+            None 表不過濾該端。
+        include_open : 是否納入 open position（只計買端成本）。預設 False。
+
+        Returns
+        -------
+        PositionCostAttribution | None
+            找不到 portfolio 時回傳 None。
+        """
+        from src.portfolio.rotation import compute_positions_cost_attribution
+
+        with get_session() as session:
+            portfolio = self._load_portfolio(session)
+            if portfolio is None:
+                return None
+
+            stmt = select(RotationPosition).where(RotationPosition.portfolio_id == portfolio.id)
+            if start_date is not None:
+                stmt = stmt.where(RotationPosition.entry_date >= start_date)
+            if end_date is not None:
+                stmt = stmt.where(RotationPosition.entry_date <= end_date)
+            rows = session.execute(stmt).scalars().all()
+
+            positions: list[dict] = []
+            for r in rows:
+                if r.status != "closed" and not include_open:
+                    continue
+                positions.append(
+                    {
+                        "entry_price": r.entry_price,
+                        "exit_price": r.exit_price,
+                        "shares": r.shares,
+                        "status": r.status,
+                        "buy_slippage": r.buy_slippage,
+                        "sell_slippage": r.sell_slippage,
+                    }
+                )
+
+            return compute_positions_cost_attribution(
+                positions,
+                portfolio_name=portfolio.name,
+                initial_capital=portfolio.initial_capital,
+            )
+
     # ── 回測 ──
 
     def backtest(

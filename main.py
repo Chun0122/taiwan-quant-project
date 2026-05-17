@@ -717,6 +717,21 @@ def main() -> None:
     # rotation list
     rot_sub.add_parser("list", help="列出所有輪動組合")
 
+    # rotation cost-attribution（實盤 RotationPosition 成本歸因 — 5/29 audit alpha 拖累驗證）
+    sp_rca = rot_sub.add_parser(
+        "cost-attribution", help="實盤成本歸因（手續費/交易稅/滑價 + 累計周轉 + bps per turnover）"
+    )
+    sp_rca.add_argument("--name", required=True, help="組合名稱")
+    sp_rca.add_argument("--start", default=None, help="起始日（YYYY-MM-DD，依 entry_date 過濾）")
+    sp_rca.add_argument("--end", default=None, help="結束日（YYYY-MM-DD，依 entry_date 過濾）")
+    sp_rca.add_argument(
+        "--include-open",
+        action="store_true",
+        default=False,
+        help="納入 open position（僅計買端成本，預設 False 只算 closed）",
+    )
+    sp_rca.add_argument("--export", default=None, help="匯出明細 CSV 路徑")
+
     # rotation pause / resume / delete
     sp_rp = rot_sub.add_parser("pause", help="暫停組合每日更新")
     sp_rp.add_argument("--name", required=True, help="組合名稱")

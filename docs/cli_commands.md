@@ -132,6 +132,13 @@ python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12
 python main.py rotation backtest --mode momentum --max-positions 5 --holding-days 3 --start 2025-01-01 --end 2025-12-31
 python main.py rotation backtest --name mom5_3d --start 2025-01-01 --end 2025-12-31 --export-positions positions.csv
 
+# 實盤成本歸因（手續費/交易稅/滑價 + 累計周轉 + bps per turnover，對應 5/29 audit alpha 拖累驗證）
+python main.py rotation cost-attribution --name all10_5d --start 2026-04-01 --end 2026-05-15
+python main.py rotation cost-attribution --name mom5_10d --include-open    # 納入未平倉（僅計買端）
+python main.py rotation cost-attribution --name swing5_3d --export swing_cost.csv
+# 注意：buy/sell_slippage 為 NULL 的歷史 position 會以 SLIPPAGE_RATE 預設值估算，
+# 輸出會顯示「估算滑價(buy/sell): N/M」透明化計數。
+
 # 管理
 python main.py rotation pause --name mom5_3d
 python main.py rotation resume --name mom5_3d

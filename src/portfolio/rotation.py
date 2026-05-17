@@ -318,6 +318,134 @@ class TradeCostBreakdown:
     total: float = 0.0
 
 
+@dataclass
+class PositionCostAttribution:
+    """單一 portfolio 跨多筆 RotationPosition 的成本歸因聚合。
+
+    用法：discover audit / 5/29 alpha 拖累驗證。對 buy_slippage/sell_slippage 為
+    NULL 的歷史 position 採 default_slippage_rate 估算（與實盤寫入時的 SLIPPAGE_RATE
+    一致），確保 commit 649dc2c 之前的歷史 position 也能納入歸因。
+    open position 只計入買端成本；closed position 計入買 + 賣 + 稅。
+    """
+
+    portfolio_name: str
+    initial_capital: float
+    n_positions_total: int
+    n_positions_closed: int
+    n_positions_open: int
+    commission: float
+    tax: float
+    slippage: float
+    total_cost: float
+    notional_traded: float  # 買端 + 賣端金額（closed 是 round trip，open 只買）
+    # 補洞統計：用 default 估算的 buy/sell slippage 筆數（透明化 audit）
+    n_buy_slippage_estimated: int
+    n_sell_slippage_estimated: int
+
+    @property
+    def cost_pct_of_initial(self) -> float:
+        return self.total_cost / self.initial_capital * 100 if self.initial_capital > 0 else 0.0
+
+    @property
+    def commission_pct(self) -> float:
+        return self.commission / self.initial_capital * 100 if self.initial_capital > 0 else 0.0
+
+    @property
+    def tax_pct(self) -> float:
+        return self.tax / self.initial_capital * 100 if self.initial_capital > 0 else 0.0
+
+    @property
+    def slippage_pct(self) -> float:
+        return self.slippage / self.initial_capital * 100 if self.initial_capital > 0 else 0.0
+
+    @property
+    def turnover_ratio(self) -> float:
+        return self.notional_traded / self.initial_capital if self.initial_capital > 0 else 0.0
+
+    @property
+    def cost_per_turnover_bps(self) -> float:
+        return self.total_cost / self.notional_traded * 10000 if self.notional_traded > 0 else 0.0
+
+
+def compute_positions_cost_attribution(
+    positions: list[dict],
+    *,
+    portfolio_name: str,
+    initial_capital: float,
+    default_slippage_rate: float = SLIPPAGE_RATE,
+) -> PositionCostAttribution:
+    """聚合多筆 position dict 的成本歸因（純函數，與 DB 解耦）。
+
+    Parameters
+    ----------
+    positions : list of dict
+        每筆需含 keys: entry_price, exit_price (None for open), shares, status,
+        buy_slippage (None → fallback), sell_slippage (None → fallback)
+    portfolio_name, initial_capital : 報表標籤與分母
+    default_slippage_rate : 滑價 fallback（與實盤寫入一致，預設 SLIPPAGE_RATE=0.05%）
+
+    Returns
+    -------
+    PositionCostAttribution
+    """
+    commission_total = 0.0
+    tax_total = 0.0
+    slippage_total = 0.0
+    notional_total = 0.0
+    n_closed = 0
+    n_open = 0
+    n_buy_est = 0
+    n_sell_est = 0
+
+    for p in positions:
+        entry_price = float(p.get("entry_price") or 0.0)
+        shares = int(p.get("shares") or 0)
+        if entry_price <= 0 or shares <= 0:
+            continue
+
+        # 買端：所有 position 都有
+        buy_slip = p.get("buy_slippage")
+        if buy_slip is None:
+            buy_slip = default_slippage_rate
+            n_buy_est += 1
+        buy_notional = entry_price * shares
+        commission_total += buy_notional * COMMISSION_RATE
+        slippage_total += buy_notional * buy_slip
+        notional_total += buy_notional
+
+        if p.get("status") == "closed" and p.get("exit_price") is not None:
+            n_closed += 1
+            exit_price = float(p["exit_price"])
+            sell_notional = exit_price * shares
+            sell_slip = p.get("sell_slippage")
+            if sell_slip is None:
+                sell_slip = default_slippage_rate
+                n_sell_est += 1
+            commission_total += sell_notional * COMMISSION_RATE
+            tax_total += sell_notional * TAX_RATE
+            slippage_total += sell_notional * sell_slip
+            notional_total += sell_notional
+        else:
+            n_open += 1
+
+    total_cost = commission_total + tax_total + slippage_total
+
+    return PositionCostAttribution(
+        portfolio_name=portfolio_name,
+        initial_capital=initial_capital,
+        n_positions_total=n_closed + n_open,
+        n_positions_closed=n_closed,
+        n_positions_open=n_open,
+        commission=round(commission_total, 2),
+        tax=round(tax_total, 2),
+        slippage=round(slippage_total, 2),
+        total_cost=round(total_cost, 2),
+        notional_traded=round(notional_total, 2),
+        n_buy_slippage_estimated=n_buy_est,
+        n_sell_slippage_estimated=n_sell_est,
+    )
+
+
 def compute_trade_costs(
     price: float,
     shares: int,

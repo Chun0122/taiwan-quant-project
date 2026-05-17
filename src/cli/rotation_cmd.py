@@ -187,6 +187,50 @@ def cmd_rotation(args: argparse.Namespace) -> None:
                 f"{p['current_capital']:>14,.0f} {p['status']:<8s}"
             )
 
+    elif action == "cost-attribution":
+        from datetime import date as date_type
+
+        name = args.name
+        start = date_type.fromisoformat(args.start) if getattr(args, "start", None) else None
+        end = date_type.fromisoformat(args.end) if getattr(args, "end", None) else None
+        include_open = getattr(args, "include_open", False)
+
+        mgr = RotationManager(name)
+        result = mgr.get_cost_attribution(start_date=start, end_date=end, include_open=include_open)
+        if result is None:
+            print(f"找不到組合: {name}")
+            return
+        if result.n_positions_total == 0:
+            print(f"[{name}] 期間內無符合條件的持倉（include_open={include_open}）")
+            return
+
+        _print_cost_attribution(result, start=start, end=end, include_open=include_open)
+
+        export_path = getattr(args, "export", None)
+        if export_path:
+            import csv
+
+            with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["欄位", "金額", "占初始資本(%)"])
+                writer.writerow(["手續費", f"{result.commission:.2f}", f"{result.commission_pct:.4f}"])
+                writer.writerow(["交易稅", f"{result.tax:.2f}", f"{result.tax_pct:.4f}"])
+                writer.writerow(["滑價", f"{result.slippage:.2f}", f"{result.slippage_pct:.4f}"])
+                writer.writerow(["合計", f"{result.total_cost:.2f}", f"{result.cost_pct_of_initial:.4f}"])
+                writer.writerow([])
+                writer.writerow(["指標", "值", ""])
+                writer.writerow(["累計周轉", f"{result.notional_traded:.2f}", f"×{result.turnover_ratio:.2f}"])
+                writer.writerow(["每元周轉成本(bps)", f"{result.cost_per_turnover_bps:.2f}", ""])
+                writer.writerow(["closed/open 筆數", f"{result.n_positions_closed}/{result.n_positions_open}", ""])
+                writer.writerow(
+                    [
+                        "估算滑價筆數(buy/sell)",
+                        f"{result.n_buy_slippage_estimated}/{result.n_sell_slippage_estimated}",
+                        "",
+                    ]
+                )
+            print(f"\n成本歸因明細已匯出: {export_path}")
+
     elif action == "pause":
         mgr = RotationManager(args.name)
         if mgr.pause():
@@ -316,3 +360,33 @@ def _print_rotation_backtest(result) -> None:
             f"(×{metrics.get('turnover_ratio', 0):>4.2f} 初始資金)"
         )
         print(f"  每元周轉成本: {metrics.get('cost_per_turnover_bps', 0):>14.2f} bps")
+
+
+def _print_cost_attribution(result, *, start, end, include_open: bool) -> None:
+    """列印實盤 RotationPosition 的成本歸因（對應 5/29 audit alpha 拖累）。"""
+    start_str = start.isoformat() if start is not None else "全部"
+    end_str = end.isoformat() if end is not None else "全部"
+    print(f"\n{'═' * 60}")
+    print(f"  [{result.portfolio_name}] 實盤成本歸因  {start_str} ~ {end_str}")
+    print(f"{'═' * 60}")
+    print(f"  初始資金:         {result.initial_capital:>14,.0f}")
+    print(
+        f"  持倉筆數(closed/open): {result.n_positions_closed}/{result.n_positions_open} "
+        f"(總 {result.n_positions_total}, include_open={include_open})"
+    )
+    if result.n_buy_slippage_estimated or result.n_sell_slippage_estimated:
+        print(
+            f"  估算滑價(buy/sell):    {result.n_buy_slippage_estimated}/{result.n_sell_slippage_estimated}"
+            f"  ※ 未填欄位以預設 SLIPPAGE_RATE 估算"
+        )
+    print()
+    print(f"  {'項目':<10s} {'金額':>14s} {'占初始資本':>12s}")
+    print(f"  {'─' * 42}")
+    print(f"  {'手續費':<10s} {result.commission:>14,.0f} {result.commission_pct:>11.2f}%")
+    print(f"  {'交易稅':<10s} {result.tax:>14,.0f} {result.tax_pct:>11.2f}%")
+    print(f"  {'滑價':<10s} {result.slippage:>14,.0f} {result.slippage_pct:>11.2f}%")
+    print(f"  {'─' * 42}")
+    print(f"  {'合計':<10s} {result.total_cost:>14,.0f} {result.cost_pct_of_initial:>11.2f}%")
+    print()
+    print(f"  累計周轉:       {result.notional_traded:>14,.0f}  (×{result.turnover_ratio:.2f} 初始資金)")
+    print(f"  每元周轉成本:   {result.cost_per_turnover_bps:>14.2f} bps")
