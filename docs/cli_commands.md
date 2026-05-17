@@ -89,6 +89,13 @@ python main.py discover-backtest --mode momentum
 python main.py discover-backtest --mode momentum --include-costs    # 含交易成本
 python main.py discover-backtest --mode momentum --entry-next-open  # T+1 開盤進場
 
+# OOS Hold-Out 紀律（P1 任務 7：預設保留最近 90 天為 holdout，回測跨界印警告）
+python main.py discover-backtest --mode momentum --start 2026-01-01 --end 2026-02-15  # ✅ 純 in-sample
+python main.py discover-backtest --mode momentum --start 2026-04-01 --end 2026-05-15  # 🟢 純 forward (OOS)
+python main.py discover-backtest --mode momentum --start 2026-01-01 --end 2026-05-15  # ⚠️ partial 跨界
+python main.py discover-backtest --mode momentum --holdout-start 2026-03-01           # 自訂 holdout 起點
+python main.py discover-backtest --mode momentum --start 2026-04-01 --end 2026-05-15 --ignore-holdout  # 明示放行
+
 # 因子診斷
 python main.py factor-diagnostics --mode momentum  # IC + 相關性矩陣 + Rolling IC + Per-Regime IC
 

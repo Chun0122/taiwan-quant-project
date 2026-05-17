@@ -451,6 +451,18 @@ def main() -> None:
     sp_db.add_argument("--export", default=None, help="匯出明細 CSV 路徑")
     sp_db.add_argument("--include-costs", action="store_true", help="績效計算納入交易成本（手續費+稅+滑價）")
     sp_db.add_argument("--entry-next-open", action="store_true", help="以 T+1 開盤價作為進場價（消除 look-ahead bias）")
+    # P1 任務 7：OOS hold-out 紀律
+    sp_db.add_argument(
+        "--holdout-start",
+        default=None,
+        help="OOS holdout 起點（YYYY-MM-DD，含當日）；預設今日 -90 天。回測範圍跨此邊界印警告",
+    )
+    sp_db.add_argument(
+        "--ignore-holdout",
+        action="store_true",
+        default=False,
+        help="明示放行 holdout 違規（forward test 自負其責）",
+    )
 
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")

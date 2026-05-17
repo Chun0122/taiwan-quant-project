@@ -729,12 +729,17 @@ def _show_discovery_comparison(mode: str, current_result) -> None:
 
 def cmd_discover_backtest(args: argparse.Namespace) -> None:
     """評估 Discover 推薦的歷史績效。"""
+    from datetime import date as _date
 
     from src.discovery.performance import DiscoveryPerformance, print_performance_report
 
     init_db()
 
     holding_days = [int(d) for d in args.days.split(",")] if args.days else None
+
+    # P1 任務 7：解析 --holdout-start
+    holdout_start_arg = getattr(args, "holdout_start", None)
+    holdout_start = _date.fromisoformat(holdout_start_arg) if holdout_start_arg else None
 
     perf = DiscoveryPerformance(
         mode=args.mode,
@@ -744,6 +749,8 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
         end_date=args.end,
         include_costs=getattr(args, "include_costs", False),
         entry_at_next_open=getattr(args, "entry_next_open", False),
+        holdout_start=holdout_start,
+        ignore_holdout=getattr(args, "ignore_holdout", False),
     )
 
     print(f"正在計算 {args.mode} 推薦績效...")

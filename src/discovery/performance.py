@@ -5,11 +5,17 @@
 
 包含策略衰減監控（compute_strategy_decay）：比較近期 vs 歷史勝率，
 偵測模式績效衰退。
+
+P1 任務 7（2026-05-17）：Out-of-Sample Hold-Out 紀律。
+settings.yaml 的閾值多為 in-sample 觀察後改的，這裡保留最近 90 天為
+holdout 預設，回測範圍涵蓋此區間時印警告 + 在結果加 `holdout_audit`
+metadata。可用 `--ignore-holdout` 旗標明示「我知道這是 forward test」。
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
 
@@ -21,6 +27,125 @@ from src.data.schema import DailyPrice, DiscoveryRecord
 from src.discovery.scanner._functions import compute_mfe_mae
 
 logger = logging.getLogger(__name__)
+
+# ── P1 任務 7：Hold-Out 紀律 ─────────────────────────────────────────────
+
+DEFAULT_HOLDOUT_DAYS: int = 90  # 預設保留最近 90 天為 OOS holdout
+
+
+@dataclass(frozen=True)
+class HoldoutAudit:
+    """OOS hold-out 紀律驗證結果。
+
+    severity:
+      - "ok"       : 回測 end < holdout_start → 純 in-sample，無污染
+      - "forward"  : 回測 start >= holdout_start → 完全落在 holdout（純 forward test，OOS）
+      - "partial"  : 回測跨 holdout 邊界 → 部分污染（最危險，要 audit）
+      - "no_range" : start/end 未指定 → 範圍由 DB 決定，conservative 仍標記
+    """
+
+    holdout_start: date
+    backtest_start: date | None
+    backtest_end: date | None
+    in_sample_days: int  # holdout_start 之前的窗口天數
+    holdout_days: int  # holdout_start 之後的窗口天數
+    severity: str
+    message: str
+    ignored: bool = False  # 若 user 加 --ignore-holdout → True
+
+    def is_clean(self) -> bool:
+        """純 in-sample 或純 forward test（不跨界）視為乾淨。"""
+        return self.severity in ("ok", "forward")
+
+
+def compute_default_holdout_start(today: date | None = None, days: int = DEFAULT_HOLDOUT_DAYS) -> date:
+    """預設 holdout 起點：today - days（含當天）。"""
+    today = today or date.today()
+    return today - timedelta(days=days)
+
+
+def assess_holdout_violation(
+    backtest_start: date | None,
+    backtest_end: date | None,
+    holdout_start: date,
+    *,
+    ignored: bool = False,
+) -> HoldoutAudit:
+    """評估 backtest [start, end] 範圍對 holdout 期的污染程度（純函數）。
+
+    Parameters
+    ----------
+    backtest_start, backtest_end : 回測範圍；None 表未指定（由 DB 範圍決定）
+    holdout_start : holdout 起點（含此日視為 holdout）
+    ignored : 是否帶 --ignore-holdout 旗標（影響 message，不影響 severity）
+    """
+    # 計算窗口天數
+    if backtest_start is None or backtest_end is None:
+        return HoldoutAudit(
+            holdout_start=holdout_start,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
+            in_sample_days=0,
+            holdout_days=0,
+            severity="no_range",
+            message=(
+                f"回測範圍未指定 start/end，預設由 DB DiscoveryRecord 範圍決定。"
+                f"若涵蓋 {holdout_start.isoformat()} 之後資料即為 holdout 污染風險。"
+                f"建議顯式指定 --start --end 並確認 end < {holdout_start.isoformat()}。"
+            ),
+            ignored=ignored,
+        )
+
+    if backtest_end < holdout_start:
+        in_sample_days = (backtest_end - backtest_start).days + 1
+        return HoldoutAudit(
+            holdout_start=holdout_start,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
+            in_sample_days=in_sample_days,
+            holdout_days=0,
+            severity="ok",
+            message=(
+                f"純 in-sample 回測：{backtest_start} ~ {backtest_end}（{in_sample_days} 天）"
+                f"未觸及 holdout（{holdout_start} 起）。"
+            ),
+            ignored=ignored,
+        )
+
+    if backtest_start >= holdout_start:
+        holdout_days = (backtest_end - backtest_start).days + 1
+        return HoldoutAudit(
+            holdout_start=holdout_start,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
+            in_sample_days=0,
+            holdout_days=holdout_days,
+            severity="forward",
+            message=(
+                f"純 forward test (OOS)：{backtest_start} ~ {backtest_end}（{holdout_days} 天）"
+                f"完全落於 holdout 區間。若 settings.yaml 是在 {holdout_start} 之前定版，此為合法 OOS。"
+            ),
+            ignored=ignored,
+        )
+
+    # 跨邊界 → 部分污染
+    in_sample_days = (holdout_start - backtest_start).days
+    holdout_days = (backtest_end - holdout_start).days + 1
+    return HoldoutAudit(
+        holdout_start=holdout_start,
+        backtest_start=backtest_start,
+        backtest_end=backtest_end,
+        in_sample_days=in_sample_days,
+        holdout_days=holdout_days,
+        severity="partial",
+        message=(
+            f"⚠ 回測範圍跨 holdout 邊界：{backtest_start} ~ {backtest_end}"
+            f"（in-sample {in_sample_days} 天 + holdout {holdout_days} 天）。"
+            f"holdout 預設 {holdout_start} 起；建議拆 --end {(holdout_start - timedelta(days=1)).isoformat()} "
+            f"做純 in-sample，或 --start {holdout_start.isoformat()} 做純 OOS。"
+        ),
+        ignored=ignored,
+    )
 
 
 class DiscoveryPerformance:
@@ -62,6 +187,8 @@ class DiscoveryPerformance:
         end_date: Optional[str] = None,
         include_costs: bool = False,
         entry_at_next_open: bool = False,
+        holdout_start: Optional[date] = None,
+        ignore_holdout: bool = False,
     ):
         self.mode = mode
         self.holding_days = holding_days or self.MODE_HORIZONS.get(mode, [5, 10, 20])
@@ -70,12 +197,23 @@ class DiscoveryPerformance:
         self.end_date = date.fromisoformat(end_date) if end_date else None
         self.include_costs = include_costs
         self.entry_at_next_open = entry_at_next_open
+        # P1 任務 7：holdout 紀律
+        self.holdout_start = holdout_start or compute_default_holdout_start()
+        self.ignore_holdout = ignore_holdout
 
     def evaluate(self) -> dict:
-        """回傳 { "summary", "by_scan", "detail", "by_regime", "turnover", "mfe_mae" }。
+        """回傳 { "summary", "by_scan", "detail", "by_regime", "turnover", "mfe_mae", "holdout_audit" }。
 
         若無推薦記錄，回傳空 DataFrame。
         """
+        # P1 任務 7：holdout 紀律審計（任何回傳路徑都附帶）
+        holdout_audit = assess_holdout_violation(
+            self.start_date,
+            self.end_date,
+            self.holdout_start,
+            ignored=self.ignore_holdout,
+        )
+
         records_df = self._load_records()
         if records_df.empty:
             empty = pd.DataFrame()
@@ -86,6 +224,7 @@ class DiscoveryPerformance:
                 "by_regime": empty,
                 "turnover": empty,
                 "mfe_mae": empty,
+                "holdout_audit": holdout_audit,
             }
 
         prices_df = self._load_prices(records_df)
@@ -98,6 +237,7 @@ class DiscoveryPerformance:
                 "by_regime": empty,
                 "turnover": empty,
                 "mfe_mae": empty,
+                "holdout_audit": holdout_audit,
             }
 
         detail = self._calc_returns(records_df, prices_df)
@@ -110,6 +250,7 @@ class DiscoveryPerformance:
                 "by_regime": empty,
                 "turnover": empty,
                 "mfe_mae": empty,
+                "holdout_audit": holdout_audit,
             }
 
         summary = self._aggregate_summary(detail)
@@ -125,6 +266,7 @@ class DiscoveryPerformance:
             "by_regime": by_regime,
             "turnover": turnover,
             "mfe_mae": mfe_mae,
+            "holdout_audit": holdout_audit,
         }
 
     # ------------------------------------------------------------------
@@ -403,6 +545,28 @@ class DiscoveryPerformance:
         return compute_mfe_mae(records_df, prices_df, holding_days=holding)
 
 
+def _print_holdout_banner(audit: HoldoutAudit) -> None:
+    """印 holdout 紀律 banner。"""
+    severity_icon = {
+        "ok": "✅",
+        "forward": "🟢",
+        "partial": "⚠️ ",
+        "no_range": "⚪",
+    }.get(audit.severity, "❓")
+
+    print(f"\n{'─' * 64}")
+    print(f"  {severity_icon} Hold-Out 紀律審計（OOS）")
+    print(f"{'─' * 64}")
+    print(f"  holdout_start: {audit.holdout_start} (預設 today-{DEFAULT_HOLDOUT_DAYS}d)")
+    print(f"  severity:      {audit.severity}")
+    print(f"  message:       {audit.message}")
+    if audit.severity == "partial" and not audit.ignored:
+        print("  ⚠ 解法：拆兩段（in-sample + OOS）或加 --ignore-holdout 強制執行")
+    elif audit.ignored:
+        print("  ℹ 已加 --ignore-holdout：使用者明示放行（forward test 自負其責）")
+    print()
+
+
 def print_performance_report(
     result: dict,
     mode: str,
@@ -412,6 +576,11 @@ def print_performance_report(
     entry_at_next_open: bool = False,
 ) -> None:
     """輸出績效報告到 console。"""
+    # P1 任務 7：holdout 紀律 banner（在所有結果之前印）
+    audit = result.get("holdout_audit") if isinstance(result, dict) else None
+    if audit is not None:
+        _print_holdout_banner(audit)
+
     summary = result["summary"]
     by_scan = result["by_scan"]
     detail = result["detail"]
