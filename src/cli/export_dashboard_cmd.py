@@ -29,7 +29,7 @@ from src.data.schema import DailyPrice, DiscoveryRecord, WatchEntry
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_TOP_N = 20
 DEFAULT_EVENT_DAYS = 30
 
@@ -509,6 +509,64 @@ def _build_portfolio_review(rotation_block: dict | None, lookback_days: int) -> 
 # ---------------------------------------------------------------------------
 
 
+def _build_alpha_chart(
+    rotations: list[dict] | None,
+    lookback_days: int,
+) -> dict | None:
+    """跨組合 alpha vs 0050 時序（v3 schema）。
+
+    Long format 結構：
+        {
+          "lookback_days": 90,
+          "series": [
+            {"date": "2026-05-15", "name": "all10_5d",
+             "alpha_cum_pct": 0.1101, "benchmark_cum_return_pct": -0.0037,
+             "portfolio_cum_return_pct": 0.1064, "total_capital": 1106467},
+            ...
+          ]
+        }
+
+    每個 active rotation × 每個 snapshot 一筆。downstream 可直接 pivot 畫多線圖。
+    無 active rotation 或所有 snapshot 皆缺 alpha_cum_pct 時回 None（不寫進 payload）。
+    """
+    if not rotations:
+        return None
+
+    from src.portfolio.manager import RotationManager
+
+    series: list[dict] = []
+    for rot in rotations:
+        name = rot.get("name")
+        if not name:
+            continue
+        mgr = RotationManager(name)
+        snaps = mgr.get_recent_snapshots(n_days=lookback_days)
+        for s in snaps:
+            alpha = s.get("alpha_cum_pct")
+            bm_cum = s.get("benchmark_cum_return_pct")
+            cap = s.get("total_capital")
+            if alpha is None and bm_cum is None:
+                continue
+            portfolio_cum: float | None = None
+            if alpha is not None and bm_cum is not None:
+                portfolio_cum = round(alpha + bm_cum, 6)
+            series.append(
+                {
+                    "date": s["snapshot_date"].isoformat(),
+                    "name": name,
+                    "alpha_cum_pct": alpha,
+                    "benchmark_cum_return_pct": bm_cum,
+                    "portfolio_cum_return_pct": portfolio_cum,
+                    "total_capital": float(cap) if cap is not None else None,
+                }
+            )
+
+    if not series:
+        return None
+
+    return {"lookback_days": lookback_days, "series": series}
+
+
 def _build_position_timeseries(
     rotations: list[dict] | None,
     watch_block: list[dict],
@@ -701,6 +759,16 @@ def _build_payload(
     except Exception as exc:
         bundle.record_error("position_timeseries", exc)
 
+    # alpha_chart（v3：跨組合 alpha vs 0050 時序，5/29 audit 串接點）
+    alpha_chart = None
+    try:
+        alpha_chart = _build_alpha_chart(
+            rotations_list,
+            lookback_days=settings.dashboard.portfolio_review_lookback_days,
+        )
+    except Exception as exc:
+        bundle.record_error("alpha_chart", exc)
+
     # 移除 regime 內部欄位
     regime_clean = {k: v for k, v in regime_block.items() if not k.startswith("_")}
 
@@ -718,6 +786,7 @@ def _build_payload(
         "ai_summary": ai_summary,
         "portfolio_review": portfolio_review,
         "position_timeseries": position_timeseries,
+        "alpha_chart": alpha_chart,
         "errors": bundle.errors,
     }
     return bundle.payload
@@ -788,6 +857,10 @@ def cmd_export_dashboard(args: argparse.Namespace) -> None:
         f"  discover={n_disc} | {rotations_summary} | "
         f"watch={n_watch} | signals={n_signals} | events={n_events} | errors={n_errors}"
     )
-    print(f"  portfolio_review.snapshots={n_snapshots} | position_timeseries.series={n_pts_series}")
+    n_alpha = len((payload.get("alpha_chart") or {}).get("series", []) or [])
+    print(
+        f"  portfolio_review.snapshots={n_snapshots} | position_timeseries.series={n_pts_series}"
+        f" | alpha_chart.series={n_alpha}"
+    )
     if n_errors:
         print(f"  ⚠ {n_errors} 個區塊產出失敗（payload.errors[] 內含詳情）")

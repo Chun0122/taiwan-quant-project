@@ -15,6 +15,7 @@ from src.data.schema import (
     MarginTrading,
     PortfolioBacktestResult,
     PortfolioTrade,
+    RotationDailySnapshot,
     RotationPortfolio,
     RotationPosition,
     StockInfo,
@@ -868,6 +869,65 @@ def load_rotation_portfolio_names() -> list[str]:
     with get_session() as session:
         rows = session.execute(select(RotationPortfolio.name).order_by(RotationPortfolio.created_at)).scalars().all()
     return list(rows)
+
+
+def load_rotation_alpha_series(lookback_days: int = 90, status: str = "active") -> pd.DataFrame:
+    """跨組合 alpha vs 0050 時序（餵給 portfolio_review 頁 alpha line chart）。
+
+    回傳 long-format DataFrame：
+        snapshot_date | portfolio_name | alpha_cum_pct | benchmark_cum_return_pct | total_capital
+
+    對應 export-dashboard JSON v3 的 alpha_chart.series。Streamlit 端 pivot 後畫多線圖。
+    任一 portfolio 缺 alpha 不影響其他列。
+    """
+    from datetime import date, timedelta
+
+    cutoff = date.today() - timedelta(days=lookback_days * 2)  # 抓 2× 緩衝，避免假日斷層
+
+    with get_session() as session:
+        # 先取符合 status 的 portfolio 名單
+        name_stmt = select(RotationPortfolio.name)
+        if status != "all":
+            name_stmt = name_stmt.where(RotationPortfolio.status == status)
+        names = [r for r in session.execute(name_stmt).scalars().all()]
+        if not names:
+            return pd.DataFrame(
+                columns=[
+                    "snapshot_date",
+                    "portfolio_name",
+                    "alpha_cum_pct",
+                    "benchmark_cum_return_pct",
+                    "total_capital",
+                ]
+            )
+
+        rows = session.execute(
+            select(
+                RotationDailySnapshot.snapshot_date,
+                RotationDailySnapshot.portfolio_name,
+                RotationDailySnapshot.alpha_cum_pct,
+                RotationDailySnapshot.benchmark_cum_return_pct,
+                RotationDailySnapshot.total_capital,
+            )
+            .where(
+                RotationDailySnapshot.portfolio_name.in_(names),
+                RotationDailySnapshot.snapshot_date >= cutoff,
+            )
+            .order_by(RotationDailySnapshot.snapshot_date, RotationDailySnapshot.portfolio_name)
+        ).all()
+
+    return pd.DataFrame(
+        [
+            {
+                "snapshot_date": r.snapshot_date,
+                "portfolio_name": r.portfolio_name,
+                "alpha_cum_pct": r.alpha_cum_pct,
+                "benchmark_cum_return_pct": r.benchmark_cum_return_pct,
+                "total_capital": r.total_capital,
+            }
+            for r in rows
+        ]
+    )
 
 
 def load_rotation_portfolio_info(name: str) -> dict | None:

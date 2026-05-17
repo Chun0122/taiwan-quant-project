@@ -732,3 +732,164 @@ class TestBuildPositionTimeseries:
         for d_str in ts["trading_days"]:
             d = _dt.date.fromisoformat(d_str)
             assert d.weekday() < 5
+
+
+# ---------------------------------------------------------------------------
+# v3 schema 新區塊：alpha_chart（跨組合 alpha vs 0050 時序）
+# ---------------------------------------------------------------------------
+
+
+def _seed_snapshot_history_with_alpha(
+    db_session,
+    portfolio_name: str,
+    end_date: _dt.date,
+    n_days: int,
+    *,
+    initial: float = 1_000_000.0,
+    daily_drift: float = 0.001,
+    alpha_drift: float = 0.002,
+    fill_alpha: bool = True,
+) -> None:
+    """類似 _seed_snapshot_history，但每筆 snapshot 都帶 alpha 三欄位（v3 測試用）。"""
+    prev_cap: float | None = None
+    for i in range(n_days):
+        d = end_date - _dt.timedelta(days=(n_days - 1 - i))
+        cap = initial * (1 + i * daily_drift)
+        daily_ret = None if prev_cap is None or prev_cap <= 0 else (cap - prev_cap) / prev_cap
+        bm_cum = i * 0.0005 if fill_alpha else None
+        alpha = i * alpha_drift if fill_alpha else None
+        db_session.add(
+            RotationDailySnapshot(
+                portfolio_name=portfolio_name,
+                snapshot_date=d,
+                total_capital=cap,
+                total_market_value=cap * 0.7,
+                total_cash=cap * 0.3,
+                unrealized_pnl=cap - initial,
+                daily_return_pct=daily_ret,
+                n_holdings=3,
+                regime_state="bull",
+                benchmark_return_pct=0.0005 if fill_alpha and i > 0 else None,
+                benchmark_cum_return_pct=bm_cum,
+                alpha_cum_pct=alpha,
+            )
+        )
+        prev_cap = cap
+    db_session.commit()
+
+
+class TestBuildAlphaChart:
+    def test_no_rotations_returns_none(self):
+        assert ed._build_alpha_chart(None, lookback_days=30) is None
+        assert ed._build_alpha_chart([], lookback_days=30) is None
+
+    def test_alpha_filled_returns_long_format_series(self, fresh_db):
+        today = _dt.date(2026, 5, 15)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history_with_alpha(session, "default", today, n_days=10, fill_alpha=True)
+
+        rots = ed._build_rotations()
+        chart = ed._build_alpha_chart(rots, lookback_days=30)
+        assert chart is not None
+        assert chart["lookback_days"] == 30
+        assert len(chart["series"]) == 10
+        # long-format：每筆有 date / name / alpha_cum_pct / benchmark_cum_return_pct / total_capital
+        first = chart["series"][0]
+        for k in (
+            "date",
+            "name",
+            "alpha_cum_pct",
+            "benchmark_cum_return_pct",
+            "portfolio_cum_return_pct",
+            "total_capital",
+        ):
+            assert k in first
+        assert first["name"] == "default"
+        # portfolio_cum_return_pct = alpha + benchmark_cum_return_pct
+        for s in chart["series"]:
+            if s["alpha_cum_pct"] is not None and s["benchmark_cum_return_pct"] is not None:
+                assert s["portfolio_cum_return_pct"] == pytest.approx(
+                    s["alpha_cum_pct"] + s["benchmark_cum_return_pct"], abs=1e-6
+                )
+
+    def test_all_alpha_none_returns_none(self, fresh_db):
+        """所有 snapshot 都缺 alpha → 回 None，不寫入 payload。"""
+        today = _dt.date(2026, 5, 15)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history_with_alpha(session, "default", today, n_days=5, fill_alpha=False)
+
+        rots = ed._build_rotations()
+        chart = ed._build_alpha_chart(rots, lookback_days=30)
+        assert chart is None
+
+    def test_multiple_portfolios_in_series(self, fresh_db):
+        """多 portfolio 各自一段時序，long-format 共同放在 series 陣列。"""
+        today = _dt.date(2026, 5, 15)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            # _seed_dataset 注入 default + small 兩個 active
+            _seed_snapshot_history_with_alpha(session, "default", today, n_days=5, fill_alpha=True)
+            _seed_snapshot_history_with_alpha(
+                session, "small", today, n_days=5, initial=500_000.0, alpha_drift=0.003, fill_alpha=True
+            )
+
+        rots = ed._build_rotations()
+        chart = ed._build_alpha_chart(rots, lookback_days=30)
+        assert chart is not None
+        # 5 × 2 = 10 列
+        assert len(chart["series"]) == 10
+        names_in_series = sorted({s["name"] for s in chart["series"]})
+        assert names_in_series == ["default", "small"]
+
+
+# ---------------------------------------------------------------------------
+# v3 schema 整合：payload top-level + backward compat
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaV3Integration:
+    def test_schema_version_is_3(self):
+        assert ed.SCHEMA_VERSION == 3
+
+    def test_payload_contains_alpha_chart_key(self, fresh_db, stub_heavy_deps):  # noqa: F811
+        """payload 一定要有 alpha_chart key（可能為 None）— 確保 v3 schema 完整。"""
+        today = _dt.date(2026, 5, 15)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history_with_alpha(session, "default", today, n_days=10, fill_alpha=True)
+
+        payload = ed._build_payload(today, top_n=20, event_days=30, regenerate_ai=False)
+        assert payload["version"] == 3
+        assert "alpha_chart" in payload
+        ac = payload["alpha_chart"]
+        assert ac is not None
+        assert len(ac["series"]) == 10
+
+    def test_backward_compat_v1_v2_keys_still_present(self, fresh_db, stub_heavy_deps):  # noqa: F811
+        """v3 不可移除舊欄位（rotation / rotations / portfolio_review / position_timeseries 等）。"""
+        today = _dt.date(2026, 5, 15)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            _seed_snapshot_history_with_alpha(session, "default", today, n_days=10, fill_alpha=True)
+
+        payload = ed._build_payload(today, top_n=20, event_days=30, regenerate_ai=False)
+        required_keys = {
+            "version",
+            "generated_at",
+            "date",
+            "regime",
+            "discover",
+            "rotation",
+            "rotations",
+            "watch_entries",
+            "signals",
+            "strategy_events",
+            "ai_summary",
+            "portfolio_review",
+            "position_timeseries",
+            "alpha_chart",
+            "errors",
+        }
+        assert required_keys.issubset(set(payload.keys()))

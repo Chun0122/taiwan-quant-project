@@ -1,7 +1,13 @@
-"""投資組合回測頁面 — 組合績效、權益曲線、個股貢獻、交易明細。"""
+"""投資組合回測頁面 — 組合績效、權益曲線、個股貢獻、交易明細。
+
+頁面結構：
+  1. 輪動組合 alpha vs 0050 走勢（v3 schema 新增；對應 5/29 audit alpha 拖累驗證）
+  2. PortfolioBacktestResult 多股組合回測歷史
+"""
 
 from __future__ import annotations
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.visualization.charts import (
@@ -12,6 +18,7 @@ from src.visualization.data_loader import (
     load_portfolio_by_id,
     load_portfolio_list,
     load_portfolio_trades,
+    load_rotation_alpha_series,
 )
 
 
@@ -21,8 +28,63 @@ def _fmt(val, suffix="", default="N/A"):
     return f"{val}{suffix}"
 
 
+def _render_rotation_alpha_section(lookback_days: int = 90) -> None:
+    """輪動組合 alpha vs 0050 走勢圖 — 對應 dashboard JSON v3 的 alpha_chart 區塊。"""
+    df = load_rotation_alpha_series(lookback_days=lookback_days)
+    if df.empty:
+        st.info("無 active 輪動組合的 alpha 資料；先執行 `python main.py rotation update --all`")
+        return
+
+    # 過濾掉 alpha 為 None 的列（缺 0050 benchmark）
+    df_alpha = df.dropna(subset=["alpha_cum_pct"])
+    if df_alpha.empty:
+        st.info("snapshot 缺 alpha 欄位；確認 0050 資料是否同步（`python main.py sync --stocks 0050`）")
+        return
+
+    # 最末日彙總指標卡片
+    latest_date = df_alpha["snapshot_date"].max()
+    latest = df_alpha[df_alpha["snapshot_date"] == latest_date].sort_values("alpha_cum_pct", ascending=False)
+    st.caption(f"最末快照日：{latest_date}（lookback={lookback_days} 天）")
+
+    cols = st.columns(max(len(latest), 1))
+    for col, (_, row) in zip(cols, latest.iterrows()):
+        col.metric(
+            row["portfolio_name"],
+            f"{row['alpha_cum_pct'] * 100:+.2f}%",
+            delta=None,
+        )
+
+    # 多線圖（每組合一條 alpha 曲線）
+    fig = go.Figure()
+    for name in sorted(df_alpha["portfolio_name"].unique()):
+        sub = df_alpha[df_alpha["portfolio_name"] == name].sort_values("snapshot_date")
+        fig.add_trace(
+            go.Scatter(
+                x=sub["snapshot_date"],
+                y=sub["alpha_cum_pct"] * 100,
+                mode="lines+markers",
+                name=name,
+            )
+        )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="0050 基準")
+    fig.update_layout(
+        height=380,
+        xaxis_title="日期",
+        yaxis_title="累積 Alpha vs 0050 (%)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render() -> None:
     st.title("📊 投資組合回測")
+
+    # ── v3 schema 新增：輪動組合 alpha vs 0050 走勢 ─────────────────────
+    with st.container(border=True):
+        st.subheader("📈 輪動組合 vs 0050 Alpha 走勢")
+        _render_rotation_alpha_section(lookback_days=90)
+    st.divider()
 
     pf_list = load_portfolio_list()
     if pf_list.empty:
