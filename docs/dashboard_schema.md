@@ -155,6 +155,40 @@
 | `unrealized_pnl` | float | |
 | `unrealized_pct` | float | |
 | `entry_rank` | int \| null | 進場時的排名 |
+| `entry_breakdown` | object \| null | 進場時凍結的選股 rationale（v3.1 新增 P1 任務 5）；歷史 position 與 schema 變更前可能為 `null`。詳見下方。 |
+
+#### `entry_breakdown`（凍結進場理由）
+
+```json
+{
+  "scan_date": "2026-05-15",
+  "mode": "momentum",
+  "rank": 1,
+  "composite_score": 0.85,
+  "regime": "bull",
+  "scores": {
+    "chip": 0.72,
+    "technical": 0.0,
+    "fundamental": 0.91,
+    "news": 0.55
+  },
+  "chip_tier": "7F",
+  "chip_tier_change": null,
+  "concept_bonus": 0.05,
+  "daytrade_penalty": null,
+  "discovery_record_id": 12345,
+  "primary_mode": "swing",     // 僅 portfolio.mode='all' 時出現
+  "mode_scores": {              // 僅 portfolio.mode='all' 時出現
+    "momentum": 0.6,
+    "swing": 0.9
+  },
+  "avg_score": 0.75             // 僅 portfolio.mode='all' 時出現
+}
+```
+
+- 寫入時機：`_execute_buy()` 時序列化當下 DiscoveryRecord 內容到 `RotationPosition.entry_score_breakdown_json`。
+- 用途：debug「為何進這檔」；日後 scanner 規則改動仍可回溯當時 rationale，是 audit drill-down 主要入口。
+- 補洞：`RotationManager.backfill_entry_score_breakdown(session, portfolio_name=None, overwrite=False)` 可回填歷史 position（依 entry_date + portfolio.mode + stock_id 反查 DiscoveryRecord）。
 
 ---
 

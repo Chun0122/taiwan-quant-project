@@ -714,6 +714,9 @@ class RotationPosition(Base):
     buy_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進場滑價率
     sell_slippage: Mapped[float | None] = mapped_column(Float, nullable=True)  # 出場滑價率
     trade_cost: Mapped[float | None] = mapped_column(Float, nullable=True)  # 進+出兩端總成本金額
+    # P1 任務 5（2026-05-17）：進場理由凍結 JSON — debug「為何進這檔」用，
+    # 即使日後 scanner 規則 / settings.yaml 改動，仍可重現當時的選股 rationale
+    entry_score_breakdown_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

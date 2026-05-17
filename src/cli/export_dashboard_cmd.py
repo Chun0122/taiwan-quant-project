@@ -151,6 +151,14 @@ def _build_rotations() -> list[dict]:
         holdings = []
         for h in status.get("holdings", []) or []:
             entry_date = h.get("entry_date")
+            # P1 任務 5：解析進場理由 JSON（debug audit 用，序列化失敗則為 None）
+            breakdown_raw = h.get("entry_score_breakdown_json")
+            entry_breakdown: dict | None = None
+            if breakdown_raw:
+                try:
+                    entry_breakdown = json.loads(breakdown_raw)
+                except (TypeError, ValueError):
+                    entry_breakdown = None
             holdings.append(
                 {
                     "stock_id": h.get("stock_id"),
@@ -163,6 +171,7 @@ def _build_rotations() -> list[dict]:
                     "unrealized_pnl": h.get("unrealized_pnl"),
                     "unrealized_pct": h.get("unrealized_pct"),
                     "entry_rank": h.get("entry_rank"),
+                    "entry_breakdown": entry_breakdown,
                 }
             )
 

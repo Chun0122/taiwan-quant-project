@@ -73,6 +73,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("rotation_daily_snapshot", "benchmark_return_pct", "REAL"),
     ("rotation_daily_snapshot", "benchmark_cum_return_pct", "REAL"),
     ("rotation_daily_snapshot", "alpha_cum_pct", "REAL"),
+    # P1 任務 5（2026-05-17）：進場理由凍結 JSON（debug 為何進這檔，audit 用）
+    ("rotation_position", "entry_score_breakdown_json", "TEXT"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

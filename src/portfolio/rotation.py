@@ -966,6 +966,8 @@ def compute_rotation_actions(
                     "shares": shares,
                     "allocated_capital": adj_capital,
                     "stop_loss": candidate_sl,
+                    # P1 任務 5：透傳 score_breakdown（_execute_buy 會 JSON 化寫入 RotationPosition）
+                    "score_breakdown": r.get("score_breakdown"),
                 }
             )
             held_ids.add(sid)

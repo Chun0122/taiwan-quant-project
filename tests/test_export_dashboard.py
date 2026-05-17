@@ -421,6 +421,56 @@ class TestBuildRotations:
         rots = ed._build_rotations()
         assert rots == []
 
+    def test_holdings_include_parsed_entry_breakdown(self, fresh_db):
+        """P1 任務 5：holdings 應 parse entry_score_breakdown_json → entry_breakdown dict。"""
+        today = _dt.date(2026, 5, 1)
+        breakdown = {
+            "scan_date": today.isoformat(),
+            "mode": "momentum",
+            "rank": 1,
+            "composite_score": 0.85,
+            "scores": {"chip": 0.7, "technical": 0.9, "fundamental": 0.6, "news": 0.4},
+            "chip_tier": "7F",
+            "regime": "bull",
+        }
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            # 把 default 組合的持倉補上 entry_score_breakdown_json
+            pos = session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
+            pos.entry_score_breakdown_json = json.dumps(breakdown, ensure_ascii=False)
+            session.commit()
+
+        rots = ed._build_rotations()
+        primary = rots[0]
+        h = primary["holdings"][0]
+        assert h["stock_id"] == "2330"
+        assert h["entry_breakdown"] == breakdown
+
+    def test_holdings_entry_breakdown_null_when_unset(self, fresh_db):
+        """歷史 position 無 entry_score_breakdown_json → entry_breakdown 為 None（不擲例外）。"""
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+
+        rots = ed._build_rotations()
+        h = rots[0]["holdings"][0]
+        assert h["entry_breakdown"] is None
+
+    def test_holdings_entry_breakdown_malformed_json_falls_back_to_none(self, fresh_db):
+        """malformed JSON → entry_breakdown 為 None，不阻擋整個 holdings 區塊。"""
+        today = _dt.date(2026, 5, 1)
+        with fresh_db() as session:
+            _seed_dataset(session, today)
+            pos = session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
+            pos.entry_score_breakdown_json = "{this is not valid json"
+            session.commit()
+
+        rots = ed._build_rotations()
+        h = rots[0]["holdings"][0]
+        assert h["entry_breakdown"] is None
+        # 其他欄位仍正常
+        assert h["stock_id"] == "2330"
+
 
 class TestBuildDataFreshnessSignal:
     def test_levels(self, db_session):

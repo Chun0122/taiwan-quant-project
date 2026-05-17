@@ -132,9 +132,38 @@ def resolve_rankings(
             "score": r.composite_score,
             "close": r.close,
             "stop_loss": r.stop_loss,
+            "score_breakdown": _record_to_score_breakdown(r),
         }
         for r in records
     ]
+
+
+def _record_to_score_breakdown(r: DiscoveryRecord, *, primary_mode: str | None = None) -> dict:
+    """單筆 DiscoveryRecord → 進場理由 audit dict（JSON-serializable）。
+
+    供 P1 任務 5 凍結進場 rationale；即使日後 scanner 規則改動，仍可回溯當時選股理由。
+    """
+    out: dict = {
+        "scan_date": r.scan_date.isoformat() if r.scan_date else None,
+        "mode": r.mode,
+        "rank": r.rank,
+        "composite_score": r.composite_score,
+        "regime": r.regime,
+        "scores": {
+            "chip": r.chip_score,
+            "technical": r.technical_score,
+            "fundamental": r.fundamental_score,
+            "news": r.news_score,
+        },
+        "chip_tier": r.chip_tier,
+        "chip_tier_change": r.chip_tier_change,
+        "concept_bonus": r.concept_bonus,
+        "daytrade_penalty": r.daytrade_penalty,
+        "discovery_record_id": r.id,
+    }
+    if primary_mode is not None:
+        out["primary_mode"] = primary_mode
+    return out
 
 
 def _resolve_all_mode_rankings(
@@ -163,10 +192,14 @@ def _resolve_all_mode_rankings(
     stmt = select(DiscoveryRecord).where(DiscoveryRecord.scan_date == scan_date)
     records = session.execute(stmt).scalars().all()
 
-    # 按 stock_id 分組，計算 avg_score + 紀錄各 mode 分數
+    # 按 stock_id 分組，計算 avg_score + 紀錄各 mode 分數 + 保留每 mode 最佳 record（給 breakdown）
     stock_data: dict[str, dict] = {}
+    stock_records: dict[str, dict[str, DiscoveryRecord]] = {}  # sid → {mode → record (最高分)}
     for r in records:
         sid = r.stock_id
+        prev_rec = stock_records.setdefault(sid, {}).get(r.mode)
+        if prev_rec is None or r.composite_score > prev_rec.composite_score:
+            stock_records[sid][r.mode] = r
         if sid not in stock_data:
             stock_data[sid] = {
                 "stock_id": sid,
@@ -192,6 +225,14 @@ def _resolve_all_mode_rankings(
     for sid, data in stock_data.items():
         avg_score = sum(data["scores"]) / len(data["scores"])
         primary_mode = max(data["mode_scores"].items(), key=lambda kv: kv[1])[0] if data["mode_scores"] else "unknown"
+        # 取 primary_mode 對應的 record 作為 breakdown 主體（保留各 mode 分數於 mode_scores）
+        primary_record = stock_records.get(sid, {}).get(primary_mode)
+        breakdown: dict | None = None
+        if primary_record is not None:
+            breakdown = _record_to_score_breakdown(primary_record, primary_mode=primary_mode)
+            breakdown["mode_scores"] = dict(data["mode_scores"])  # 揭露各模式 composite_score
+            breakdown["avg_score"] = round(avg_score, 6)
+            breakdown["mode"] = "all"  # 來源 portfolio 是 all
         ranked.append(
             {
                 "stock_id": sid,
@@ -200,6 +241,7 @@ def _resolve_all_mode_rankings(
                 "close": data["close"],
                 "stop_loss": data["stop_loss"],
                 "primary_mode": primary_mode,
+                "score_breakdown": breakdown,
             }
         )
     ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -1034,6 +1076,88 @@ class RotationManager:
                 for r in rows_asc
             ]
 
+    # ── 進場理由 backfill（P1 任務 5）──
+
+    @staticmethod
+    def backfill_entry_score_breakdown(
+        session,
+        *,
+        portfolio_name: str | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, int]:
+        """重建歷史 RotationPosition 的 entry_score_breakdown_json。
+
+        以 (entry_date, portfolio.mode, stock_id) 反查 DiscoveryRecord；mode='all' 時
+        以 _record_to_score_breakdown 同邏輯挑 primary_mode。找不到 record 則略過。
+
+        Args:
+            portfolio_name: 限制單一 portfolio；None=全部
+            overwrite: True 連已有值的列也重算；False（預設）只補 NULL
+
+        Returns:
+            {"updated": N, "skipped_no_record": K, "skipped_already_filled": M}
+        """
+        import json
+
+        stmt = select(RotationPosition, RotationPortfolio).join(
+            RotationPortfolio, RotationPosition.portfolio_id == RotationPortfolio.id
+        )
+        if portfolio_name is not None:
+            stmt = stmt.where(RotationPortfolio.name == portfolio_name)
+        rows = session.execute(stmt).all()
+
+        stats = {"updated": 0, "skipped_no_record": 0, "skipped_already_filled": 0}
+
+        for pos, portfolio in rows:
+            if pos.entry_score_breakdown_json is not None and not overwrite:
+                stats["skipped_already_filled"] += 1
+                continue
+
+            breakdown: dict | None = None
+            if portfolio.mode == "all":
+                # 多 mode：抓該股當日所有 record，挑 primary_mode
+                recs = (
+                    session.execute(
+                        select(DiscoveryRecord).where(
+                            DiscoveryRecord.scan_date == pos.entry_date,
+                            DiscoveryRecord.stock_id == pos.stock_id,
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if recs:
+                    mode_scores = {r.mode: r.composite_score for r in recs}
+                    primary_mode = max(mode_scores.items(), key=lambda kv: kv[1])[0]
+                    primary_rec = next(r for r in recs if r.mode == primary_mode)
+                    breakdown = _record_to_score_breakdown(primary_rec, primary_mode=primary_mode)
+                    breakdown["mode_scores"] = mode_scores
+                    breakdown["avg_score"] = round(sum(mode_scores.values()) / len(mode_scores), 6)
+                    breakdown["mode"] = "all"
+            else:
+                rec = session.execute(
+                    select(DiscoveryRecord).where(
+                        DiscoveryRecord.scan_date == pos.entry_date,
+                        DiscoveryRecord.mode == portfolio.mode,
+                        DiscoveryRecord.stock_id == pos.stock_id,
+                    )
+                ).scalar_one_or_none()
+                if rec is not None:
+                    breakdown = _record_to_score_breakdown(rec)
+
+            if breakdown is None:
+                stats["skipped_no_record"] += 1
+                continue
+
+            try:
+                pos.entry_score_breakdown_json = json.dumps(breakdown, ensure_ascii=False, default=str)
+                stats["updated"] += 1
+            except (TypeError, ValueError):
+                stats["skipped_no_record"] += 1
+
+        session.commit()
+        return stats
+
     # ── 成本歸因（5/29 audit alpha 拖累驗證）──
 
     def get_cost_attribution(
@@ -1855,6 +1979,7 @@ class RotationManager:
                 "allocated_capital": p.allocated_capital,
                 "planned_exit_date": p.planned_exit_date,
                 "stop_loss": p.stop_loss,
+                "entry_score_breakdown_json": p.entry_score_breakdown_json,
             }
             for p in positions
         ]
@@ -1950,6 +2075,18 @@ class RotationManager:
         portfolio = session.execute(select(RotationPortfolio).where(RotationPortfolio.id == portfolio_id)).scalar_one()
         planned_exit = compute_planned_exit_date(today, portfolio.holding_days, trading_cal)
 
+        # P1 任務 5：序列化進場理由 JSON（debug 為何進這檔，audit 用）
+        breakdown_json: str | None = None
+        breakdown = buy.get("score_breakdown")
+        if breakdown:
+            import json
+
+            try:
+                breakdown_json = json.dumps(breakdown, ensure_ascii=False, default=str)
+            except (TypeError, ValueError) as exc:
+                logger.warning("[%s] entry_score_breakdown_json 序列化失敗 (%s)，寫入 NULL", buy["stock_id"], exc)
+                breakdown_json = None
+
         pos = RotationPosition(
             portfolio_id=portfolio_id,
             stock_id=buy["stock_id"],
@@ -1967,6 +2104,7 @@ class RotationManager:
             # 滑價/成本 instrumentation：buy 端記滑價率 + 初始化 trade_cost（賣出時累加）
             buy_slippage=SLIPPAGE_RATE,
             trade_cost=round(buy_costs.total, 2),
+            entry_score_breakdown_json=breakdown_json,
         )
         session.add(pos)
         return cash - buy_cost
