@@ -424,6 +424,26 @@ def main() -> None:
         help="introspection 驗證 source_module/function 可解析（CI 守門用，失敗 exit code 1）",
     )
 
+    # experiment 子命令（P2 任務 10：A/B 試驗歷史軌跡）
+    sp_exp_reg = subparsers.add_parser(
+        "experiment",
+        help="實驗註冊表（record/list/show/compare）— A/B 試驗歷史軌跡",
+    )
+    exp_sub = sp_exp_reg.add_subparsers(dest="exp_action")
+
+    sp_exp_rec = exp_sub.add_parser("record", help="凍結當前 settings + metrics 為一筆 experiment")
+    sp_exp_rec.add_argument("--description", default=None, help="人話描述（例：test new chip weight 0.6）")
+
+    sp_exp_lst = exp_sub.add_parser("list", help="列出最近的 experiments")
+    sp_exp_lst.add_argument("--limit", type=int, default=20, help="顯示筆數（預設 20）")
+
+    sp_exp_show = exp_sub.add_parser("show", help="顯示單一 experiment 完整內容")
+    sp_exp_show.add_argument("experiment_id", help="例：exp_20260518_a3f8c1")
+
+    sp_exp_cmp = exp_sub.add_parser("compare", help="比對兩個 experiments 的 settings + metrics 差異")
+    sp_exp_cmp.add_argument("id_a", help="experiment A")
+    sp_exp_cmp.add_argument("id_b", help="experiment B")
+
     # update-baseline 子命令（重寫 baseline 檔）
     sp_ub = subparsers.add_parser("update-baseline", help="以當前 active portfolio 指標重寫 baseline_metrics.json")
     sp_ub.add_argument("--confirm", action="store_true", help="確認覆寫 baseline（必填，防誤操作）")
@@ -894,6 +914,10 @@ def main() -> None:
         from src.cli.factor_cmd import cmd_factor_list
 
         sys.exit(cmd_factor_list(args))
+    elif args.command == "experiment":
+        from src.cli.experiment_cmd import cmd_experiment
+
+        sys.exit(cmd_experiment(args))
     elif args.command == "sync-mops":
         cmd_sync_mops(args)
     elif args.command == "sync-revenue":

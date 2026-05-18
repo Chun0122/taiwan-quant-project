@@ -884,3 +884,31 @@ class UniverseStatLog(Base):
         return (
             f"<UniverseStatLog {self.scan_date} {self.mode} sql={self.total_after_sql}→final={self.final_candidates}>"
         )
+
+
+class ExperimentLog(Base):
+    """實驗註冊表（P2 任務 10）— experiment_id → settings_hash → metrics_json。
+
+    每次手動執行 `experiment record` 寫入一筆，凍結當下：
+      1. git_commit（可重現的程式碼版本）
+      2. settings_hash + settings_snapshot_json（quant + fetcher 區塊，已 sanitize 去掉 token）
+      3. metrics_json（4 portfolio × {sharpe, mdd, win_rate, alpha_cum_pct}）
+
+    與 baseline_metrics.json 互補：baseline 是「當下 frozen reference」（單一 JSON），
+    experiment 是「多版本歷史軌跡」（DB 表，可比對 A/B 試驗）。
+    """
+
+    __tablename__ = "experiment_log"
+    __table_args__ = (UniqueConstraint("experiment_id", name="uq_experiment_log_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    git_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    settings_hash: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    metrics_json: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    def __repr__(self) -> str:
+        return f"<ExperimentLog {self.experiment_id} hash={self.settings_hash[:8]} git={self.git_commit}>"

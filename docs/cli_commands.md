@@ -291,6 +291,14 @@ python main.py validate
 python main.py validate --stocks 2330 2317
 python main.py validate --export issues.csv
 
+# Experiment Registry（P2 任務 10：A/B 試驗歷史軌跡，與 baseline_metrics.json 互補）
+python main.py experiment record --description "test new chip weight 0.6"   # 凍結 settings + metrics
+python main.py experiment list                                                # 最近 20 筆
+python main.py experiment list --limit 50
+python main.py experiment show exp_20260518_a3f8c1                            # 完整 settings + metrics
+python main.py experiment compare exp_A exp_B                                 # 逐 metric 差異 + settings_hash 變動標記
+# 注意：settings_snapshot 只記 quant + fetcher 區塊，不含 API token / webhook URL
+
 # Baseline Regression 守門（5/29 audit 策略劣化偵測，morning-routine Step 17 自動執行）
 python main.py update-baseline --confirm                  # 凍結當前 active portfolio 指標為新 baseline
 python main.py validate-baseline                          # 對比當前 vs baseline；regression 退出碼 1
