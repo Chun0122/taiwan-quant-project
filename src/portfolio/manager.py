@@ -566,7 +566,13 @@ class RotationManager:
 
     # ── 每日更新 ──
 
-    def update(self, today: date | None = None, regime: str | None = None) -> RotationActions | None:
+    def update(
+        self,
+        today: date | None = None,
+        regime: str | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> RotationActions | None:
         """每日更新：讀取 discover 排名 → 計算 rotation → 寫入 DB。
 
         Parameters
@@ -576,6 +582,10 @@ class RotationManager:
         regime : str | None
             目前市場狀態（bull/sideways/bear/crisis），用於 Crisis 硬阻擋。
             None 時嘗試從 RegimeStateMachine JSON 持久化讀取。
+        dry_run : bool
+            P2 任務 9（2026-05-17）：True 時跑完整 rotation 邏輯但不 commit
+            任何寫入（含 drawdown 強制平倉、buy/sell/renew、daily snapshot），
+            session 在最後 rollback。供 `rotation preview` 預覽明日換股清單用。
         """
         if today is None:
             today = date.today()
@@ -724,22 +734,29 @@ class RotationManager:
                     self.portfolio_name,
                     dd_pct,
                 )
-                cash = portfolio.current_cash
-                for pos in open_positions:
-                    sell_action = {
-                        "stock_id": pos["stock_id"],
-                        "reason": "max_drawdown_liquidation",
-                        "exit_price": today_prices.get(pos["stock_id"], pos["entry_price"]),
-                        "days_held": 0,
-                        **pos,
-                    }
-                    cash = self._execute_sell(session, portfolio.id, sell_action, today, cash)
-                portfolio.current_cash = cash
-                portfolio.current_capital = cash
-                portfolio.status = "liquidated"
-                portfolio.updated_at = datetime.utcnow()
-                session.commit()
-                logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
+                if dry_run:
+                    logger.info(
+                        "[%s] DRY RUN — 偵測到回撤熔斷將平倉 %d 倉位（未實際寫入）",
+                        self.portfolio_name,
+                        len(open_positions),
+                    )
+                else:
+                    cash = portfolio.current_cash
+                    for pos in open_positions:
+                        sell_action = {
+                            "stock_id": pos["stock_id"],
+                            "reason": "max_drawdown_liquidation",
+                            "exit_price": today_prices.get(pos["stock_id"], pos["entry_price"]),
+                            "days_held": 0,
+                            **pos,
+                        }
+                        cash = self._execute_sell(session, portfolio.id, sell_action, today, cash)
+                    portfolio.current_cash = cash
+                    portfolio.current_capital = cash
+                    portfolio.status = "liquidated"
+                    portfolio.updated_at = datetime.utcnow()
+                    session.commit()
+                    logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
                 return RotationActions(to_sell=[{**p, "reason": "max_drawdown_liquidation"} for p in open_positions])
 
             # ── Rotation 成本閘門（A/B/C）參數 ──
@@ -785,29 +802,50 @@ class RotationManager:
                 weekly_swaps_used=weekly_swaps_used,
             )
 
-            # 執行賣出
             cash = portfolio.current_cash
-            for sell in actions.to_sell:
-                cash = self._execute_sell(session, portfolio.id, sell, today, cash)
 
-            # 執行續持（從 rankings 取最新止損價，只上移不下移）
-            ranking_sl = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
-            for renew in actions.renewed:
-                new_sl = ranking_sl.get(renew["stock_id"])
-                self._execute_renewal(session, portfolio.id, renew, new_stop_loss=new_sl)
+            if dry_run:
+                # P2 任務 9：純估算 cash，避開所有 _execute_* / session.add 副作用
+                # 簡化估算：忽略滑價/手續費（與顯示用 cash 預估誤差 < 1%）
+                for sell in actions.to_sell:
+                    cash += float(sell.get("exit_price", 0) or 0) * int(sell.get("shares", 0) or 0)
+                for buy in actions.to_buy:
+                    cash -= float(buy.get("entry_price", 0) or 0) * int(buy.get("shares", 0) or 0)
+                # 預估 market_value：保留下的 to_hold + renewed + to_buy 倉位
+                market_value = 0.0
+                for hold in actions.to_hold:
+                    market_value += today_prices.get(hold["stock_id"], hold.get("entry_price", 0)) * hold.get(
+                        "shares", 0
+                    )
+                for renew in actions.renewed:
+                    market_value += today_prices.get(renew["stock_id"], renew.get("entry_price", 0)) * renew.get(
+                        "shares", 0
+                    )
+                for buy in actions.to_buy:
+                    market_value += float(buy.get("entry_price", 0) or 0) * int(buy.get("shares", 0) or 0)
+                open_after = []  # 給後續 VaR 段跳過用
+            else:
+                # 執行賣出
+                for sell in actions.to_sell:
+                    cash = self._execute_sell(session, portfolio.id, sell, today, cash)
 
-            # 執行買入
-            for buy in actions.to_buy:
-                cash = self._execute_buy(session, portfolio.id, buy, today, trading_cal, cash)
+                # 執行續持（從 rankings 取最新止損價，只上移不下移）
+                ranking_sl = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
+                for renew in actions.renewed:
+                    new_sl = ranking_sl.get(renew["stock_id"])
+                    self._execute_renewal(session, portfolio.id, renew, new_stop_loss=new_sl)
 
-            # 更新組合狀態
-            portfolio.current_cash = cash
-            # 重新計算 current_capital = cash + 持倉市值
-            open_after = self._load_open_positions(session, portfolio.id)
-            market_value = sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in open_after)
-            portfolio.current_capital = cash + market_value
-            portfolio.updated_at = datetime.utcnow()
-            session.commit()
+                # 執行買入
+                for buy in actions.to_buy:
+                    cash = self._execute_buy(session, portfolio.id, buy, today, trading_cal, cash)
+
+                # 重新計算 current_capital = cash + 持倉市值
+                open_after = self._load_open_positions(session, portfolio.id)
+                market_value = sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in open_after)
+                portfolio.current_cash = cash
+                portfolio.current_capital = cash + market_value
+                portfolio.updated_at = datetime.utcnow()
+                session.commit()
 
             # Ex-Ante VaR（不阻擋交易，僅記錄日誌）
             if open_after and portfolio.current_capital > 0 and price_rows:
@@ -833,27 +871,30 @@ class RotationManager:
                         )
 
             # ── Daily Snapshot：dashboard portfolio_review 與 equity curve 來源 ──
-            try:
-                self._write_daily_snapshot(
-                    session,
-                    portfolio=portfolio,
-                    snapshot_date=today,
-                    market_value=market_value,
-                    n_holdings=len(open_after),
-                    regime=regime,
-                )
-            except Exception as exc:
-                logger.warning("[%s] 寫入 daily snapshot 失敗：%s", self.portfolio_name, exc)
+            if not dry_run:
+                try:
+                    self._write_daily_snapshot(
+                        session,
+                        portfolio=portfolio,
+                        snapshot_date=today,
+                        market_value=market_value,
+                        n_holdings=len(open_after),
+                        regime=regime,
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] 寫入 daily snapshot 失敗：%s", self.portfolio_name, exc)
 
+            verb = "DRY RUN 預覽" if dry_run else "更新完成"
             logger.info(
-                "[%s] 更新完成: 賣出=%d, 續持=%d, 買入=%d, 保持=%d | 現金=%.0f, 總資產=%.0f",
+                "[%s] %s: 賣出=%d, 續持=%d, 買入=%d, 保持=%d | 預估現金=%.0f, 預估總資產=%.0f",
                 self.portfolio_name,
+                verb,
                 len(actions.to_sell),
                 len(actions.renewed),
                 len(actions.to_buy),
                 len(actions.to_hold),
-                portfolio.current_cash,
-                portfolio.current_capital,
+                cash,
+                cash + market_value,
             )
             return actions
 

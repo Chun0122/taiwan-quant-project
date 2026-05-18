@@ -128,6 +128,11 @@ python main.py rotation create --name all10_5d --mode all --max-positions 10 --h
 python main.py rotation update --name mom5_3d
 python main.py rotation update --all
 
+# Pre-Trade 預覽（P2 任務 9：dry_run，不寫 DB）
+python main.py rotation preview --name swing5_3d                # 預覽單一組合明日換股清單
+python main.py rotation preview --all                            # 預覽所有 active 組合
+python main.py rotation preview --name swing5_3d --date 2026-05-20  # 指定目標日
+
 # 查詢
 python main.py rotation status --name mom5_3d
 python main.py rotation status --all

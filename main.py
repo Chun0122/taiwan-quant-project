@@ -785,6 +785,15 @@ def main() -> None:
     # rotation list
     rot_sub.add_parser("list", help="列出所有輪動組合")
 
+    # rotation preview（P2 任務 9：Pre-Trade 預覽明日換股清單，不寫 DB）
+    sp_rpv = rot_sub.add_parser(
+        "preview",
+        help="預覽明日換股清單（dry_run，不寫 DB）— P2 任務 9",
+    )
+    sp_rpv.add_argument("--name", default=None, help="指定組合名稱")
+    sp_rpv.add_argument("--all", action="store_true", help="預覽所有 active 組合")
+    sp_rpv.add_argument("--date", default=None, help="目標日期 (YYYY-MM-DD)，預設今日")
+
     # rotation cost-attribution（實盤 RotationPosition 成本歸因 — 5/29 audit alpha 拖累驗證）
     sp_rca = rot_sub.add_parser(
         "cost-attribution", help="實盤成本歸因（手續費/交易稅/滑價 + 累計周轉 + bps per turnover）"

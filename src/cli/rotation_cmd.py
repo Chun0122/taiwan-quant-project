@@ -187,6 +187,37 @@ def cmd_rotation(args: argparse.Namespace) -> None:
                 f"{p['current_capital']:>14,.0f} {p['status']:<8s}"
             )
 
+    elif action == "preview":
+        from datetime import date as date_type
+
+        target_date_arg = getattr(args, "date", None)
+        target_date = date_type.fromisoformat(target_date_arg) if target_date_arg else None
+        all_active = getattr(args, "all", False)
+        name = getattr(args, "name", None)
+
+        if all_active:
+            portfolios = RotationManager.list_portfolios()
+            actives = [p for p in portfolios if p["status"] == "active"]
+            if not actives:
+                print("無 active 的輪動組合")
+                return
+            for p in actives:
+                mgr = RotationManager(p["name"])
+                actions = mgr.update(today=target_date, dry_run=True)
+                if actions is None:
+                    print(f"\n[{p['name']}] 找不到組合或已暫停")
+                    continue
+                _print_rotation_preview(p["name"], actions, target_date=target_date)
+        elif name:
+            mgr = RotationManager(name)
+            actions = mgr.update(today=target_date, dry_run=True)
+            if actions is None:
+                print(f"找不到組合或已暫停: {name}")
+                return
+            _print_rotation_preview(name, actions, target_date=target_date)
+        else:
+            print("請指定 --name 或 --all")
+
     elif action == "cost-attribution":
         from datetime import date as date_type
 
@@ -390,3 +421,49 @@ def _print_cost_attribution(result, *, start, end, include_open: bool) -> None:
     print()
     print(f"  累計周轉:       {result.notional_traded:>14,.0f}  (×{result.turnover_ratio:.2f} 初始資金)")
     print(f"  每元周轉成本:   {result.cost_per_turnover_bps:>14.2f} bps")
+
+
+def _print_rotation_preview(name: str, actions, target_date) -> None:
+    """列印 rotation preview（P2 任務 9）— Pre-trade 預覽明日換股清單。
+
+    與 _print_rotation_actions 類似但語意是「將做什麼」而非「已做什麼」。
+    """
+    date_str = target_date.isoformat() if target_date else "今日"
+    print(f"\n{'═' * 64}")
+    print(f"  [{name}] Pre-Trade 預覽 — 目標日：{date_str}")
+    print(f"{'═' * 64}")
+
+    if not (actions.to_sell or actions.renewed or actions.to_buy or actions.to_hold):
+        print("  （無動作）")
+        return
+
+    if actions.to_sell:
+        print(f"\n  將賣出 ({len(actions.to_sell)} 檔)：")
+        for s in actions.to_sell:
+            reason = s.get("reason", "")
+            exit_price = s.get("exit_price")
+            price_str = f"@{exit_price:.2f}" if isinstance(exit_price, (int, float)) else ""
+            print(f"    🔴 {s['stock_id']:<8s} {reason:<26s} {price_str}")
+
+    if actions.renewed:
+        print(f"\n  將續持 ({len(actions.renewed)} 檔)：")
+        for r in actions.renewed:
+            new_exit = r.get("new_planned_exit_date")
+            print(f"    🟡 {r['stock_id']:<8s} 延長至 {new_exit}")
+
+    if actions.to_buy:
+        print(f"\n  將買入 ({len(actions.to_buy)} 檔)：")
+        for b in actions.to_buy:
+            entry_price = b.get("entry_price", 0)
+            shares = b.get("shares", 0)
+            alloc = b.get("allocated_capital", entry_price * shares)
+            print(
+                f"    🟢 {b['stock_id']:<8s} rank#{b.get('rank', '?'):<3} @{entry_price:.2f} × {shares} 股"
+                f"  ({alloc:>10,.0f} 元)"
+            )
+
+    if actions.to_hold:
+        print(f"\n  將保持 ({len(actions.to_hold)} 檔持倉不變)")
+
+    print()
+    print("  ※ DRY RUN：未實際寫入 DB；要執行請改 `rotation update --name {}`。".format(name))
