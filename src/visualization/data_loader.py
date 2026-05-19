@@ -1106,14 +1106,37 @@ def load_multi_stock_closes(stock_ids: list[str], days: int = 90) -> pd.DataFram
 
 
 def load_regime_state() -> dict | None:
-    """從 JSON 檔讀取最新 Regime 狀態。"""
+    """讀取最新 Regime 狀態（P2 任務 12 後改走 DB；舊 JSON 仍為 fallback）。
+
+    優先順序：
+      1. RegimeStateLog 最新一筆（append-only history）
+      2. legacy data/regime_state.json（DB 尚未遷移完成的相容路徑）
+    """
+    from src.data.schema import RegimeStateLog
+
+    try:
+        with get_session() as session:
+            row = session.execute(
+                select(RegimeStateLog).order_by(RegimeStateLog.created_at.desc()).limit(1)
+            ).scalar_one_or_none()
+            if row is not None:
+                return {
+                    "regime": row.regime,
+                    "regime_since": row.regime_since,
+                    "last_updated": row.last_updated,
+                    "confirmation_count": row.confirmation_count,
+                    "pending_transition": row.pending_transition,
+                }
+    except Exception:
+        pass
+
+    # Fallback：legacy JSON（任務 12 遷移前的相容）
     import json
     from pathlib import Path
 
     state_file = Path("data/regime_state.json")
     if not state_file.exists():
         return None
-
     try:
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)

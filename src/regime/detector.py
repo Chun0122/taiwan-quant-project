@@ -354,13 +354,16 @@ class RegimeState:
 class RegimeStateMachine:
     """有狀態的 Regime 偵測器，包裝 detect_from_series() + apply_hysteresis()。
 
-    管理 regime 狀態持久化（JSON 檔案）。Cold start 時（無檔案或損壞）
+    管理 regime 狀態持久化。P2 任務 12（2026-05-18）後預設使用 DB
+    （`RegimeStateLog` 表，append-only history）；傳入 `state_path` 仍走
+    JSON 檔案模式（向後相容測試與 legacy 用法）。Cold start 時（無資料或損壞）
     使用 detect_from_series() 的 raw regime 作為初始狀態。
 
     同一天重複呼叫時回傳快取結果（不重複累加 confirmation_count）。
 
     Args:
-        state_path: JSON 狀態檔路徑（預設 data/regime_state.json）
+        state_path: JSON 狀態檔路徑；**傳入即啟用 JSON 模式**（legacy/test 用）。
+            為 None（預設）時使用 DB（RegimeStateLog 表）。
         sma_short: SMA 短期天數
         sma_long: SMA 長期天數
         return_window: 報酬率回溯天數
@@ -373,7 +376,8 @@ class RegimeStateMachine:
         sma_long: int = 120,
         return_window: int = 20,
     ) -> None:
-        self.state_path = Path(state_path) if state_path else _DEFAULT_STATE_PATH
+        self.state_path = Path(state_path) if state_path else None
+        self.use_db = state_path is None  # 沒指定 path = DB 模式
         self.sma_short = sma_short
         self.sma_long = sma_long
         self.return_window = return_window
@@ -463,10 +467,83 @@ class RegimeStateMachine:
         return result
 
     def _load_state(self) -> RegimeState | None:
-        """從 JSON 載入狀態。檔案不存在或損壞時回傳 None（cold start）。"""
+        """載入狀態：DB 模式取 RegimeStateLog 最新一筆；JSON 模式讀檔案。
+
+        Cold start（無資料或損壞）回傳 None。
+        DB 模式且 DB 空：嘗試從 legacy data/regime_state.json 一次性遷移。
+        """
+        if self.use_db:
+            return self._load_state_from_db()
+        return self._load_state_from_json()
+
+    def _save_state(self, state: RegimeState) -> None:
+        """持久化狀態：DB 模式 append RegimeStateLog；JSON 模式寫檔。"""
+        if self.use_db:
+            self._save_state_to_db(state)
+        else:
+            self._save_state_to_json(state)
+
+    # ── DB backend（P2 任務 12 新增）──
+
+    def _load_state_from_db(self) -> RegimeState | None:
+        from sqlalchemy import select
+
+        from src.data.database import get_session
+        from src.data.schema import RegimeStateLog
+
         try:
-            if self.state_path.exists():
-                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            with get_session() as session:
+                row = session.execute(
+                    select(RegimeStateLog).order_by(RegimeStateLog.created_at.desc()).limit(1)
+                ).scalar_one_or_none()
+                if row is not None:
+                    return RegimeState(
+                        regime=row.regime,
+                        regime_since=row.regime_since,
+                        confirmation_count=row.confirmation_count,
+                        pending_transition=row.pending_transition,
+                        last_updated=row.last_updated,
+                    )
+        except Exception:
+            logger.debug("RegimeStateLog 讀取失敗，cold start", exc_info=True)
+            return None
+
+        # DB 空：嘗試從 legacy JSON 一次性遷移
+        legacy_state = self._load_state_from_json(path=_DEFAULT_STATE_PATH)
+        if legacy_state is not None:
+            logger.info("RegimeStateLog 空，從 legacy %s 遷移", _DEFAULT_STATE_PATH)
+            self._save_state_to_db(legacy_state)
+            return legacy_state
+        return None
+
+    def _save_state_to_db(self, state: RegimeState) -> None:
+        from src.data.database import get_session
+        from src.data.schema import RegimeStateLog
+
+        try:
+            with get_session() as session:
+                session.add(
+                    RegimeStateLog(
+                        regime=state.regime,
+                        regime_since=state.regime_since,
+                        confirmation_count=state.confirmation_count,
+                        pending_transition=state.pending_transition,
+                        last_updated=state.last_updated,
+                    )
+                )
+                session.commit()
+        except Exception as exc:
+            logger.warning("RegimeStateLog 寫入失敗: %s", exc)
+
+    # ── JSON backend（legacy / test）──
+
+    def _load_state_from_json(self, path: Path | None = None) -> RegimeState | None:
+        p = path or self.state_path
+        if p is None:
+            return None
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
                 return RegimeState(
                     regime=data["regime"],
                     regime_since=data["regime_since"],
@@ -478,8 +555,9 @@ class RegimeStateMachine:
             logger.debug("regime_state.json 讀取失敗，cold start")
         return None
 
-    def _save_state(self, state: RegimeState) -> None:
-        """將狀態寫入 JSON 檔。"""
+    def _save_state_to_json(self, state: RegimeState) -> None:
+        if self.state_path is None:
+            return
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(

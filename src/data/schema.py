@@ -912,3 +912,27 @@ class ExperimentLog(Base):
 
     def __repr__(self) -> str:
         return f"<ExperimentLog {self.experiment_id} hash={self.settings_hash[:8]} git={self.git_commit}>"
+
+
+class RegimeStateLog(Base):
+    """Regime 狀態歷史記錄表（P2 任務 12）— 取代 data/regime_state.json。
+
+    Append-only history：每次 RegimeStateMachine.update() 寫一筆新 row，
+    保留完整 regime 轉換軌跡供 audit。`_load_state` 取最新一筆（依 created_at DESC）。
+
+    動機（audit_20260509_v2 §10.7 S5）：JSON 檔 IO 易損；DB 持久化更穩定
+    且自帶歷史軌跡（hysteresis transition_blocked 等資訊不再只在 in-memory dict）。
+    """
+
+    __tablename__ = "regime_state_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    regime: Mapped[str] = mapped_column(String(20), nullable=False)
+    regime_since: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO date string
+    confirmation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pending_transition: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_updated: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO date string
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    def __repr__(self) -> str:
+        return f"<RegimeStateLog {self.regime} since={self.regime_since} updated={self.last_updated}>"
