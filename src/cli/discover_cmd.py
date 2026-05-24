@@ -727,6 +727,46 @@ def _show_discovery_comparison(mode: str, current_result) -> None:
         print("  推薦清單無顯著變化")
 
 
+def cmd_cross_mode_corr(args: argparse.Namespace) -> int:
+    """跨模式 score 相關性研究（P2 任務 13）。"""
+    from src.discovery.cross_mode_corr import (
+        compute_cross_mode_correlation,
+        compute_mode_overlap,
+        format_cross_mode_report,
+        load_mode_scores,
+    )
+
+    init_db()
+
+    lookback_days = int(getattr(args, "lookback_days", 60))
+    min_pairs = int(getattr(args, "min_pairs", 5))
+
+    df = load_mode_scores(lookback_days=lookback_days)
+    if df.empty:
+        print(f"無 DiscoveryRecord 資料（lookback={lookback_days}d）")
+        return 0
+
+    n_scan_dates = df["scan_date"].nunique()
+    corr_matrix = compute_cross_mode_correlation(df, min_pairs=min_pairs)
+    overlap_matrix = compute_mode_overlap(df)
+
+    print(
+        format_cross_mode_report(
+            corr_matrix,
+            overlap_matrix,
+            lookback_days=lookback_days,
+            n_scan_dates=n_scan_dates,
+        )
+    )
+
+    export_path = getattr(args, "export", None)
+    if export_path and not corr_matrix.empty:
+        corr_matrix.to_csv(export_path, encoding="utf-8-sig")
+        print(f"\n相關性矩陣已匯出: {export_path}")
+
+    return 0
+
+
 def cmd_discover_backtest(args: argparse.Namespace) -> None:
     """評估 Discover 推薦的歷史績效。"""
     from datetime import date as _date

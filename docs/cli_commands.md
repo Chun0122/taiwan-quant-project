@@ -96,6 +96,12 @@ python main.py discover-backtest --mode momentum --start 2026-01-01 --end 2026-0
 python main.py discover-backtest --mode momentum --holdout-start 2026-03-01           # 自訂 holdout 起點
 python main.py discover-backtest --mode momentum --start 2026-04-01 --end 2026-05-15 --ignore-holdout  # 明示放行
 
+# 跨模式 score 相關性研究（P2 任務 13：5 mode 間 score 是否冗餘/互補）
+python main.py cross-mode-corr                          # 預設 lookback 60 天
+python main.py cross-mode-corr --lookback-days 90 --min-pairs 3
+python main.py cross-mode-corr --export cross_mode.csv  # 匯出相關性矩陣
+# 解讀：corr ≥0.7 = 模式冗餘（all quota 浪費）；corr ≤-0.3 = 互補對沖（分散佳）
+
 # 因子診斷
 python main.py factor-diagnostics --mode momentum  # IC + 相關性矩陣 + Rolling IC + Per-Regime IC
 

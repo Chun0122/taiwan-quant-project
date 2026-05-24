@@ -110,7 +110,13 @@ import sys
 
 from src.cli.anomaly_cmd import cmd_anomaly_scan, cmd_revenue_scan
 from src.cli.backtest_cmd import cmd_backtest, cmd_walk_forward
-from src.cli.discover_cmd import cmd_ablation_test, cmd_discover, cmd_discover_backtest, cmd_factor_diagnostics
+from src.cli.discover_cmd import (
+    cmd_ablation_test,
+    cmd_cross_mode_corr,
+    cmd_discover,
+    cmd_discover_backtest,
+    cmd_factor_diagnostics,
+)
 from src.cli.export_dashboard_cmd import cmd_export_dashboard
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
@@ -483,6 +489,15 @@ def main() -> None:
         default=False,
         help="明示放行 holdout 違規（forward test 自負其責）",
     )
+
+    # cross-mode-corr 子命令（P2 任務 13：跨模式 score 相關性研究）
+    sp_cmc = subparsers.add_parser(
+        "cross-mode-corr",
+        help="跨模式 score 相關性研究（per-date Spearman + 重疊統計）",
+    )
+    sp_cmc.add_argument("--lookback-days", type=int, default=60, help="回溯天數（預設 60）")
+    sp_cmc.add_argument("--min-pairs", type=int, default=5, help="每日每對 mode 最低共同股票數（預設 5）")
+    sp_cmc.add_argument("--export", default=None, help="匯出相關性矩陣 CSV 路徑")
 
     # sync-mops 子命令
     sp_mops = subparsers.add_parser("sync-mops", help="同步 MOPS 最新重大訊息公告")
@@ -889,6 +904,8 @@ def main() -> None:
         cmd_discover(args)
     elif args.command == "discover-backtest":
         cmd_discover_backtest(args)
+    elif args.command == "cross-mode-corr":
+        sys.exit(cmd_cross_mode_corr(args))
     elif args.command == "factor-diagnostics":
         cmd_factor_diagnostics(args)
     elif args.command == "ablation-test":

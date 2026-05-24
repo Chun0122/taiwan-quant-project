@@ -89,6 +89,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/universe.py` | Universe 三層漏斗（SQL→流動性→趨勢）+ Candidate Memory |
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告 |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
+| `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + settings.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
 | `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機 |
