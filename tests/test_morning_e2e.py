@@ -59,29 +59,20 @@ def fresh_db(tmp_path: Path, monkeypatch):
         finally:
             sess.close()
 
+    import sys
+
     import src.data.database as db_mod
 
     monkeypatch.setattr(db_mod, "engine", engine)
     monkeypatch.setattr(db_mod, "SessionLocal", Session)
     monkeypatch.setattr(db_mod, "get_session", _session_factory)
 
-    # 同步 patch 所有已 import 過 get_session 的模組
-    for mod_name in (
-        "src.cli.morning_cmd",
-        "src.cli.export_dashboard_cmd",
-        "src.cli.anomaly_cmd",
-        "src.cli.baseline_cmd",
-        "src.portfolio.manager",
-        "src.discovery.universe",
-        "src.discovery.performance",
-        "src.regime.detector",
-    ):
-        try:
-            mod = __import__(mod_name, fromlist=["get_session"])
-            if hasattr(mod, "get_session"):
-                monkeypatch.setattr(mod, "get_session", _session_factory)
-        except ImportError:
-            pass
+    # 動態 patch 所有已載入且持有 get_session 參考的 src.* 模組，確保 hermetic
+    # （morning-routine 觸發 ~15 個模組：scanner 子模組 + cli + discovery，
+    #  硬編清單易漏，會 leak 寫入真實 data/stock.db 污染其他測試）。
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("src.") and hasattr(mod, "get_session"):
+            monkeypatch.setattr(mod, "get_session", _session_factory, raising=False)
 
     yield _session_factory
 

@@ -104,6 +104,9 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `entry_exit.py` | 共用純函數：ATR 止損止利、進場觸發、時機評估（Discover/Suggest/Watch 三系統共用） |
 | `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR） |
 | `portfolio/manager.py` | RotationManager：每日更新 / Kill Switch / 歷史回測 |
+| `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_all_mode_rankings / 進場理由 breakdown），manager.py 抽出 |
+| `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
+| `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields），manager.py 抽出 |
 
 **CLI/報告/視覺化層**
 
