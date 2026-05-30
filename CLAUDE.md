@@ -107,6 +107,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_all_mode_rankings / 進場理由 breakdown），manager.py 抽出 |
 | `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
 | `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields），manager.py 抽出 |
+| `portfolio/audit.py` | rotation-audit 純函數（trade stats / alpha delta / Jaccard 穩定性），`rotation-audit` CLI 用 |
 
 **CLI/報告/視覺化層**
 

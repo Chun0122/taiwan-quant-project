@@ -399,6 +399,30 @@ def main() -> None:
     sp_vbs.add_argument("--lookback-days", type=int, default=90, help="snapshot 回溯天數（預設 90）")
     sp_vbs.add_argument("--quiet", action="store_true", help="只用退出碼回報，不印 report")
 
+    # rotation-audit 子命令（可重複的修復前後 / 期間對比審計）
+    sp_raud = subparsers.add_parser(
+        "rotation-audit",
+        help="期間對比審計報告（closed trade A/B + benchmark alpha 分解 + 訊號穩定性 Jaccard）",
+    )
+    sp_raud.add_argument(
+        "--period-a",
+        default=None,
+        help="對照期 'YYYY-MM-DD:YYYY-MM-DD'（修復前；可省略只看單期）",
+    )
+    sp_raud.add_argument(
+        "--period-b",
+        required=True,
+        help="主要期 'YYYY-MM-DD:YYYY-MM-DD'（依 entry_date 篩 closed trade / snapshot 端點取 alpha）",
+    )
+    sp_raud.add_argument("--top", type=int, default=5, help="Jaccard top-N（預設 5）")
+    sp_raud.add_argument(
+        "--jaccard-mode",
+        default="momentum",
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="訊號穩定性的 discover 模式（預設 momentum）",
+    )
+    sp_raud.add_argument("--out", default=None, help="輸出 markdown 路徑（預設印到 stdout）")
+
     # factor-list 子命令（P1 任務 6：Factor Library SSOT 查詢）
     sp_fl = subparsers.add_parser(
         "factor-list",
@@ -931,6 +955,10 @@ def main() -> None:
         from src.cli.factor_cmd import cmd_factor_list
 
         sys.exit(cmd_factor_list(args))
+    elif args.command == "rotation-audit":
+        from src.cli.audit_cmd import cmd_rotation_audit
+
+        sys.exit(cmd_rotation_audit(args))
     elif args.command == "experiment":
         from src.cli.experiment_cmd import cmd_experiment
 

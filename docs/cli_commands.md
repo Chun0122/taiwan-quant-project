@@ -163,6 +163,23 @@ python main.py rotation resume --name mom5_3d
 python main.py rotation delete --name mom5_3d
 ```
 
+### 期間對比審計（rotation-audit）
+
+可重複的修復前後 / 期間對比審計，兌現 audit 報告的「定期重審」承諾（取代手工 SQL）。
+
+```bash
+# 修復前 A 期 vs 修復後 B 期
+python main.py rotation-audit --period-a 2026-04-29:2026-05-08 --period-b 2026-05-09:2026-05-29
+# 只看單期 + 寫入檔案
+python main.py rotation-audit --period-b 2026-06-01:2026-06-15 --out logs/audit_20260615/REPORT.md
+python main.py rotation-audit --period-b 2026-06-01:2026-06-15 --jaccard-mode swing --top 10
+```
+
+輸出三大區塊：
+- **Closed Trade A/B 對比**（N / win% / avg ret% / total pnl / stop-loss%；< 10 筆自動標樣本不足）
+- **Benchmark Alpha 分解**（snapshot-based；含 `port Δ ≈ alpha 增量 + bm 增量` 恆等式 + 0050 raw-price cross-check，自動標 > 2pp 的資料異常）
+- **訊號穩定性**（discover top-N 相鄰日 Jaccard）
+
 ---
 
 ## 持倉監控
