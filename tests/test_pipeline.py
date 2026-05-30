@@ -268,6 +268,193 @@ class TestUpsertConvenience:
 
 
 # ================================================================
+# _validate_ohlcv
+# ================================================================
+
+
+class TestValidateOhlcv:
+    def test_empty_df_passthrough(self):
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame()
+        assert _validate_ohlcv(df).empty
+
+    def test_valid_row_kept(self):
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row()])
+        assert len(_validate_ohlcv(df)) == 1
+
+    def test_close_at_high_is_valid(self):
+        """close==high（收在最高價）為合法收盤，不應被攔。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=105.4, low=102.7, close=105.4)])
+        assert len(_validate_ohlcv(df)) == 1
+
+    def test_close_at_low_is_valid(self):
+        """close==low（收在最低價）為合法收盤，不應被攔。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=105.4, low=102.7, close=102.7)])
+        assert len(_validate_ohlcv(df)) == 1
+
+    def test_close_above_high_dropped(self):
+        """close > high：OHLC 不一致，過濾。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=105.4, low=102.7, close=108.0)])
+        assert len(_validate_ohlcv(df)) == 0
+
+    def test_close_below_low_dropped(self):
+        """close < low：OHLC 不一致，過濾。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=105.4, low=102.7, close=100.0)])
+        assert len(_validate_ohlcv(df)) == 0
+
+    def test_consistency_only_drops_offending_row(self):
+        """僅過濾不一致的列，其餘保留。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", high=610.0, low=595.0, close=605.0),
+                _daily_price_row(stock_id="2317", high=105.4, low=102.7, close=108.0),
+                _daily_price_row(stock_id="2454", high=105.4, low=102.7, close=105.4),
+            ]
+        )
+        kept = _validate_ohlcv(df)
+        assert sorted(kept["stock_id"]) == ["2330", "2454"]
+
+    def test_missing_high_skips_close_high_check(self):
+        """high 缺值時跳過 close<=high 邊界檢查（不誤刪）。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=None, low=102.7, close=108.0)])
+        assert len(_validate_ohlcv(df)) == 1
+
+    def test_high_less_than_low_dropped(self):
+        """既有 high<low 檢查不受影響。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(high=100.0, low=105.0, close=102.0)])
+        assert len(_validate_ohlcv(df)) == 0
+
+    def test_nonpositive_close_dropped(self):
+        """既有 close<=0 檢查不受影響。"""
+        from src.data.pipeline import _validate_ohlcv
+
+        df = pd.DataFrame([_daily_price_row(close=0.0)])
+        assert len(_validate_ohlcv(df)) == 0
+
+
+# ================================================================
+# _detect_price_jumps（跳動哨兵）
+# ================================================================
+
+
+class TestDetectPriceJumps:
+    def test_empty_df(self, db_session):
+        from src.data.pipeline import _detect_price_jumps
+
+        assert _detect_price_jumps(pd.DataFrame()) == 0
+
+    def test_within_df_jump_flagged(self, db_session, caplog):
+        """df 內同股相鄰兩日 > 門檻 → WARN 計數。"""
+        import logging
+
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 28), close=100.0),
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 29), close=120.0),  # +20%
+            ]
+        )
+        with caplog.at_level(logging.WARNING):
+            n = _detect_price_jumps(df)
+        assert n == 1
+        assert "跳動哨兵" in caplog.text
+
+    def test_downward_jump_flagged(self, db_session):
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 28), close=100.0),
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 29), close=85.0),  # -15%
+            ]
+        )
+        assert _detect_price_jumps(df) == 1
+
+    def test_normal_move_not_flagged(self, db_session):
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 28), close=100.0),
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 29), close=105.0),  # +5%
+            ]
+        )
+        assert _detect_price_jumps(df) == 0
+
+    def test_0050_intraday_anomaly_not_flagged(self, db_session):
+        """0050 5/29 +4.9%（±10% 內離群）不在單序列哨兵偵測範圍 —— 記錄已知限制。"""
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="0050", date=date(2026, 5, 28), close=100.5),
+                _daily_price_row(stock_id="0050", date=date(2026, 5, 29), close=105.4),  # +4.9%
+            ]
+        )
+        assert _detect_price_jumps(df) == 0
+
+    def test_db_prior_close_used(self, db_session):
+        """單日 df（無 df 內前值）→ 回查 DB 前一交易日收盤。"""
+        from src.data.pipeline import _detect_price_jumps
+
+        db_session.add(DailyPrice(**_daily_price_row(stock_id="2317", date=date(2026, 5, 28), close=100.0)))
+        db_session.flush()
+        df = pd.DataFrame([_daily_price_row(stock_id="2317", date=date(2026, 5, 29), close=120.0)])  # +20%
+        assert _detect_price_jumps(df) == 1
+
+    def test_no_prior_close_skipped(self, db_session):
+        """無任何前值（如新股首日）→ 不誤判。"""
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame([_daily_price_row(stock_id="9999", date=date(2026, 5, 29), close=120.0)])
+        assert _detect_price_jumps(df) == 0
+
+    def test_only_offending_rows_counted(self, db_session):
+        """多股混合，僅計入超門檻列。"""
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 28), close=100.0),
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 29), close=101.0),  # +1%
+                _daily_price_row(stock_id="2317", date=date(2026, 5, 28), close=50.0),
+                _daily_price_row(stock_id="2317", date=date(2026, 5, 29), close=65.0),  # +30%
+            ]
+        )
+        assert _detect_price_jumps(df) == 1
+
+    def test_custom_threshold(self, db_session):
+        """threshold 可調：放寬至 25% 則 +20% 不再觸發。"""
+        from src.data.pipeline import _detect_price_jumps
+
+        df = pd.DataFrame(
+            [
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 28), close=100.0),
+                _daily_price_row(stock_id="2330", date=date(2026, 5, 29), close=120.0),  # +20%
+            ]
+        )
+        assert _detect_price_jumps(df, threshold=0.25) == 0
+
+
+# ================================================================
 # sync_mops_announcements
 # ================================================================
 

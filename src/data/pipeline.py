@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
-from src.constants import UPSERT_BATCH_SIZE
+from src.constants import PRICE_JUMP_WARN_THRESHOLD, UPSERT_BATCH_SIZE
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
@@ -117,7 +117,12 @@ def _upsert_batch(
 def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """驗證 OHLCV 資料值域，過濾無效列並記錄。
 
-    檢查項目：close > 0、high >= low、volume >= 0。
+    檢查項目：close > 0、high >= low、low <= close <= high（OHLC 一致性）、volume >= 0。
+
+    OHLC 一致性（2026-05-30 新增）：close 必須落在 [low, high] 區間內。
+    防範上游回傳「close 超出當日高低範圍」的髒值（如 close 誤填成非當日數值），
+    這類列在 high>=low 檢查下仍會漏網。注意 close==high / close==low 為合法收盤
+    （收在最高/最低價），不會被攔；單日異常跳點需另以日間跳動哨兵處理。
     """
     if df.empty:
         return df
@@ -135,6 +140,14 @@ def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         invalid_hl = df["high"].notna() & df["low"].notna() & (df["high"] < df["low"])
         mask &= ~invalid_hl
 
+    # OHLC 一致性：low <= close <= high（缺值轉 NaN，比較結果為 False 故自動略過）
+    if "close" in df.columns:
+        close_num = pd.to_numeric(df["close"], errors="coerce")
+        if "high" in df.columns:
+            mask &= ~(close_num > pd.to_numeric(df["high"], errors="coerce"))
+        if "low" in df.columns:
+            mask &= ~(close_num < pd.to_numeric(df["low"], errors="coerce"))
+
     # volume >= 0
     if "volume" in df.columns:
         invalid_vol = df["volume"].notna() & (df["volume"] < 0)
@@ -148,9 +161,87 @@ def _validate_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
+def _batch_get_prior_closes(rows: pd.DataFrame, lookback_days: int = 14) -> dict[str, float]:
+    """回查每支股票在其 df 內最早日期之前、DB 最近一筆收盤。
+
+    供跳動哨兵在「單日全市場同步」（df 內無前一日）時取得 close-to-close 基準。
+    一次查詢 DB（lookback 視窗涵蓋連假），於 Python 端逐股取 < 最早日期的最後一筆。
+    """
+    stock_ids = rows["stock_id"].unique().tolist()
+    if not stock_ids:
+        return {}
+    earliest = rows.groupby("stock_id")["date"].min().to_dict()
+    max_date = max(earliest.values())
+    min_lookback = min(earliest.values()) - timedelta(days=lookback_days)
+    with get_session() as session:
+        db_rows = session.execute(
+            select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+            .where(
+                DailyPrice.stock_id.in_(stock_ids),
+                DailyPrice.date < max_date,
+                DailyPrice.date >= min_lookback,
+            )
+            .order_by(DailyPrice.stock_id, DailyPrice.date)
+        ).all()
+    by_stock: dict[str, list] = {}
+    for sid, d, c in db_rows:
+        by_stock.setdefault(sid, []).append((d, c))
+    result: dict[str, float] = {}
+    for sid, pairs in by_stock.items():
+        cutoff = earliest[sid]
+        prior = [c for d, c in pairs if d < cutoff and c is not None]
+        if prior:
+            result[sid] = float(prior[-1])  # pairs 已依日期升冪，取最後一筆
+    return result
+
+
+def _detect_price_jumps(df: pd.DataFrame, threshold: float = PRICE_JUMP_WARN_THRESHOLD) -> int:
+    """日 K close-to-close 跳動哨兵：WARN 記錄異常跳動但不過濾。回傳可疑列數。
+
+    比較每列 close 與「前一交易日收盤」：先取 df 內同股前一列，df 內無前值者
+    （多為單日全市場同步）回查 DB 最近一筆較早收盤。|報酬| > threshold 即記錄。
+
+    僅警示不刪列 —— 合法成因（除權息跳價 / IPO 首日 / 復牌大漲）一併會被點名，
+    過濾會誤殺；此哨兵旨在留下 audit 線索（單一序列內 ±10% 內的離群點如 0050
+    5/29 不在偵測範圍，需另以跨來源 reconciliation 處理）。
+    """
+    if df.empty or not {"stock_id", "date", "close"}.issubset(df.columns):
+        return 0
+
+    work = df[["stock_id", "date", "close"]].copy()
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    work = work.sort_values(["stock_id", "date"])
+    work["prev"] = work.groupby("stock_id")["close"].shift(1)
+
+    need_db = work[work["prev"].isna()]
+    if not need_db.empty:
+        prior = _batch_get_prior_closes(need_db)
+        work.loc[need_db.index, "prev"] = need_db["stock_id"].map(prior)
+
+    n_flagged = 0
+    for _, r in work.iterrows():
+        prev, close = r["prev"], r["close"]
+        if prev is None or pd.isna(prev) or prev <= 0 or pd.isna(close):
+            continue
+        pct = close / prev - 1
+        if abs(pct) > threshold:
+            n_flagged += 1
+            logger.warning(
+                "OHLCV 跳動哨兵：%s %s close=%.2f 較前收 %.2f 跳動 %+.1f%%（>門檻 %.0f%%）",
+                r["stock_id"],
+                r["date"],
+                close,
+                prev,
+                pct * 100,
+                threshold * 100,
+            )
+    return n_flagged
+
+
 def _upsert_daily_price(df: pd.DataFrame) -> int:
-    """將日K線 DataFrame 寫入 daily_price 表（含值域驗證，衝突時略過）。"""
+    """將日K線 DataFrame 寫入 daily_price 表（含值域驗證 + 跳動哨兵，衝突時略過）。"""
     df = _validate_ohlcv(df)
+    _detect_price_jumps(df)
     return _upsert_batch(DailyPrice, df, ["stock_id", "date"])
 
 
