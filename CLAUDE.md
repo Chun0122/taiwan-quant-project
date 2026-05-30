@@ -59,7 +59,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `data/fetcher.py` | FinMind API（逐股/批次/財報 EAV pivot）、US VIX（yfinance） |
 | `data/twse_fetcher.py` | TWSE/TPEX 全市場免費資料、SBL（TWT96U）、DJ 分點（Big5 HTML）、TDCC |
-| `data/pipeline.py` | ETL 調度 + DB 寫入、OHLCV 品質閘門、DailyFeature 計算、Broker Bootstrap |
+| `data/pipeline.py` | ETL 調度 + DB 寫入、OHLCV 品質閘門（值域 + OHLC 一致性 `low≤close≤high`）、close-to-close 跳動哨兵（`_detect_price_jumps` WARN，門檻 `PRICE_JUMP_WARN_THRESHOLD`=11%）、DailyFeature 計算、Broker Bootstrap |
 | `data/mops_fetcher.py` | MOPS 重大訊息 + 月營收、事件分類（7 類）、情緒分類 |
 | `data/schema.py` | 27 張 ORM 表 |
 | `data/validator.py` | 7 個品質檢查純函數 |
