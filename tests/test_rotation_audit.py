@@ -13,6 +13,7 @@ from datetime import date
 
 import pytest
 
+from src.data.schema import DailyPrice  # top-level import：確保 create_all 註冊 daily_price 表（隔離執行時）
 from src.portfolio.audit import (
     compute_alpha_delta,
     compute_jaccard_stability,
@@ -367,3 +368,84 @@ class TestCmdRotationAudit:
         assert code == 0
         assert out_path.exists()
         assert "Rotation Audit Report" in out_path.read_text(encoding="utf-8")
+
+
+# ====================================================================== #
+# Benchmark cross-check lag 對齊（_benchmark_close / _aligned_bm_divergence）
+# ====================================================================== #
+
+
+def _seed_0050(session, rows):
+    """寫入 0050 daily_price（rows = [(date, close), ...]）。"""
+    for d, c in rows:
+        session.add(DailyPrice(stock_id="0050", date=d, open=c, high=c, low=c, close=c, volume=1000, turnover=0))
+    session.flush()
+
+
+class TestBenchmarkClose:
+    def test_on_or_before_includes_same_day(self, db_session):
+        from src.cli.audit_cmd import _benchmark_close
+
+        _seed_0050(db_session, [(date(2026, 5, 28), 100.5), (date(2026, 5, 29), 105.4)])
+        assert _benchmark_close(db_session, date(2026, 5, 29)) == 105.4
+
+    def test_strictly_before_excludes_same_day(self, db_session):
+        """重現 snapshot 早上寫入時「當日收盤尚未入庫」的 lag 語意。"""
+        from src.cli.audit_cmd import _benchmark_close
+
+        _seed_0050(db_session, [(date(2026, 5, 28), 100.5), (date(2026, 5, 29), 105.4)])
+        assert _benchmark_close(db_session, date(2026, 5, 29), strictly_before=True) == 100.5
+
+    def test_none_when_no_data(self, db_session):
+        from src.cli.audit_cmd import _benchmark_close
+
+        assert _benchmark_close(db_session, date(2026, 5, 29)) is None
+
+
+class TestAlignedBmDivergence:
+    def test_benign_lag_reconciles(self, db_session):
+        """重現 0050 5/29 案例：snapshot 凍結用前一交易日(5/28=100.5)，
+        daily_price 期末為 5/29=105.4。對齊後應辨識為 benign lag（偏差 ≤ 2pp）。"""
+        from src.cli.audit_cmd import _aligned_bm_divergence
+
+        _seed_0050(db_session, [(date(2026, 5, 8), 97.0), (date(2026, 5, 28), 100.5), (date(2026, 5, 29), 105.4)])
+        s_start = {"snapshot_date": date(2026, 5, 9)}
+        s_end = {"snapshot_date": date(2026, 5, 29)}
+        snap_delta = round((100.5 - 97.0) / 95.75 * 100, 2)  # snapshot base 正規化凍結值 ≈ 3.66
+        div = _aligned_bm_divergence(db_session, s_start, s_end, snap_delta)
+        assert div is not None and div <= 2.0
+
+    def test_unaligned_would_false_positive(self, db_session):
+        """對照：若不做 lag 對齊（只用 5/29=105.4 同日值），偏差會 > 2pp（舊行為的誤報）。"""
+        _seed_0050(db_session, [(date(2026, 5, 8), 97.0), (date(2026, 5, 28), 100.5), (date(2026, 5, 29), 105.4)])
+        snap_delta = round((100.5 - 97.0) / 95.75 * 100, 2)
+        raw_unaligned = (105.4 / 97.0 - 1) * 100  # 同日（未對齊）
+        assert abs(raw_unaligned - snap_delta) > 2.0
+
+    def test_genuine_corruption_flagged(self, db_session):
+        """期末參照日(5/28)被竄改成 120 → 兩候選都對不上凍結值 → 偏差 > 2pp。"""
+        from src.cli.audit_cmd import _aligned_bm_divergence
+
+        _seed_0050(db_session, [(date(2026, 5, 8), 97.0), (date(2026, 5, 28), 120.0), (date(2026, 5, 29), 105.4)])
+        s_start = {"snapshot_date": date(2026, 5, 9)}
+        s_end = {"snapshot_date": date(2026, 5, 29)}
+        div = _aligned_bm_divergence(db_session, s_start, s_end, 3.66)
+        assert div is not None and div > 2.0
+
+    def test_none_when_snap_missing(self, db_session):
+        from src.cli.audit_cmd import _aligned_bm_divergence
+
+        assert _aligned_bm_divergence(db_session, None, {"snapshot_date": date(2026, 5, 29)}, 3.0) is None
+        assert (
+            _aligned_bm_divergence(
+                db_session, {"snapshot_date": date(2026, 5, 9)}, {"snapshot_date": date(2026, 5, 29)}, None
+            )
+            is None
+        )
+
+    def test_none_when_no_benchmark_data(self, db_session):
+        from src.cli.audit_cmd import _aligned_bm_divergence
+
+        s_start = {"snapshot_date": date(2026, 5, 9)}
+        s_end = {"snapshot_date": date(2026, 5, 29)}
+        assert _aligned_bm_divergence(db_session, s_start, s_end, 3.0) is None
