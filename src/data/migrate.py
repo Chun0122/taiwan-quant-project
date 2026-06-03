@@ -77,6 +77,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("rotation_position", "entry_score_breakdown_json", "TEXT"),
     # P1 任務 8（2026-05-17）：universe_stat_log 新表由 init_db 自動建立，
     # 無需 ALTER COLUMN；此處留註解作為歷史記錄
+    # 訊號穩定性 long-run 監控（2026-06-03，§7.3）：StrategyDecayLog 加每日 top-N Jaccard
+    ("strategy_decay_log", "signal_jaccard_mean", "REAL"),
+    ("strategy_decay_log", "signal_jaccard_pairs", "INTEGER DEFAULT 0"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

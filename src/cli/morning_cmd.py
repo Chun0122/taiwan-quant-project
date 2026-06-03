@@ -454,7 +454,7 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
     訊號穩定性時序對比。同日重複呼叫採 update path 避免 UniqueConstraint 衝突。
     持久化失敗不擋後續步驟（warning + continue）。
     """
-    from src.discovery.performance import check_all_modes_decay
+    from src.discovery.performance import check_all_modes_decay, compute_signal_stability
 
     mode_labels = {
         "momentum": "Momentum 短線動能",
@@ -472,8 +472,15 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
     for r in results:
         mode = r.get("mode", "?")
         label = mode_labels.get(mode, mode)
+
+        # 訊號穩定性 long-run 監控（§7.3）：與績效衰減獨立，無論有無 closed trade 都算
+        stab = compute_signal_stability(mode, window_days=30, top_n=5, reference_date=log_date)
+        jac_mean = stab.mean_jaccard
+        jac_pairs = len(stab.pairs)
+        jac_str = f"Jaccard={jac_mean:.2f}({jac_pairs}對)" if jac_mean is not None else "Jaccard=N/A"
+
         if r["recent_count"] == 0:
-            print(f"  {label}: 近 30 天無足夠推薦績效資料，跳過")
+            print(f"  {label}: 近 30 天無足夠推薦績效資料，跳過 | 訊號穩定 {jac_str}")
             rows_to_persist.append(
                 {
                     "mode": mode,
@@ -482,6 +489,8 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
                     "recent_count": 0,
                     "is_decaying": False,
                     "warning": None,
+                    "signal_jaccard_mean": jac_mean,
+                    "signal_jaccard_pairs": jac_pairs,
                 }
             )
             continue
@@ -499,7 +508,7 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
             status = "⚠ 衰減"
         else:
             status = "✓ 正常"
-        print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({n}筆) → {status}")
+        print(f"  {label}: 勝率={wr_str}, 均報酬={avg_str} ({n}筆) → {status} | 訊號穩定 {jac_str}")
 
         warning_text: str | None = None
         if r["is_decaying"] and n >= MIN_SAMPLE:
@@ -515,6 +524,8 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
                 "recent_count": n,
                 "is_decaying": bool(r["is_decaying"]),
                 "warning": warning_text,
+                "signal_jaccard_mean": jac_mean,
+                "signal_jaccard_pairs": jac_pairs,
             }
         )
 
@@ -542,6 +553,8 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
                     existing.recent_count = row["recent_count"]
                     existing.is_decaying = row["is_decaying"]
                     existing.warning = row["warning"]
+                    existing.signal_jaccard_mean = row["signal_jaccard_mean"]
+                    existing.signal_jaccard_pairs = row["signal_jaccard_pairs"]
                 else:
                     session.add(
                         StrategyDecayLog(
@@ -552,6 +565,8 @@ def _check_strategy_decay(scan_date: date | None = None) -> None:
                             recent_count=row["recent_count"],
                             is_decaying=row["is_decaying"],
                             warning=row["warning"],
+                            signal_jaccard_mean=row["signal_jaccard_mean"],
+                            signal_jaccard_pairs=row["signal_jaccard_pairs"],
                         )
                     )
             session.commit()
