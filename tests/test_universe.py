@@ -715,8 +715,18 @@ class TestCandidateMemory:
         assert result["2330"] == 1  # 最近的
 
     def test_day4_excluded_by_memory_window(self, db_session):
-        """4 天前的推薦 → 超出 memory_days=3，不回傳。"""
-        db_session.add(_make_dr("2330", mode="momentum", scan_date=date.today() - timedelta(days=4)))
+        """超出 memory_days=3 的推薦 → 不回傳。
+
+        days_ago 以「交易日距離」計（W1 修復），故 scan_date 用交易日曆往回推
+        window+1=4 個交易日，避免 `timedelta(days=4)` 在跨週末時只算 3 個交易日
+        而誤入窗內（例如 today=週三時 4 自然日前為週六、僅差 3 交易日）。
+        """
+        from src.data.calendar import get_trading_days
+
+        today = date.today()
+        tds = get_trading_days(today - timedelta(days=4 * 2 + 21), today)
+        scan_date = tds[-(4 + 1)]  # 第 4 個交易日之前 → days_ago == 4 > 3
+        db_session.add(_make_dr("2330", mode="momentum", scan_date=scan_date))
         db_session.flush()
         uf = UniverseFilter(UniverseConfig(candidate_memory_days=3))
         result = uf._load_candidate_memory(mode="momentum", stage1_ids=["2330"])

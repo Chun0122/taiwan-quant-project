@@ -69,6 +69,7 @@ def _load_snapshot_on_or_after(session, name: str, target: date) -> dict | None:
             RotationDailySnapshot.total_capital,
             RotationDailySnapshot.alpha_cum_pct,
             RotationDailySnapshot.benchmark_cum_return_pct,
+            RotationDailySnapshot.snapshot_date,
         )
         .where(
             RotationDailySnapshot.portfolio_name == name,
@@ -79,7 +80,12 @@ def _load_snapshot_on_or_after(session, name: str, target: date) -> dict | None:
     ).first()
     if row is None:
         return None
-    return {"total_capital": row[0], "alpha_cum_pct": row[1], "benchmark_cum_return_pct": row[2]}
+    return {
+        "total_capital": row[0],
+        "alpha_cum_pct": row[1],
+        "benchmark_cum_return_pct": row[2],
+        "snapshot_date": row[3],
+    }
 
 
 def _load_snapshot_on_or_before(session, name: str, target: date) -> dict | None:
@@ -88,6 +94,7 @@ def _load_snapshot_on_or_before(session, name: str, target: date) -> dict | None
             RotationDailySnapshot.total_capital,
             RotationDailySnapshot.alpha_cum_pct,
             RotationDailySnapshot.benchmark_cum_return_pct,
+            RotationDailySnapshot.snapshot_date,
         )
         .where(
             RotationDailySnapshot.portfolio_name == name,
@@ -98,7 +105,12 @@ def _load_snapshot_on_or_before(session, name: str, target: date) -> dict | None
     ).first()
     if row is None:
         return None
-    return {"total_capital": row[0], "alpha_cum_pct": row[1], "benchmark_cum_return_pct": row[2]}
+    return {
+        "total_capital": row[0],
+        "alpha_cum_pct": row[1],
+        "benchmark_cum_return_pct": row[2],
+        "snapshot_date": row[3],
+    }
 
 
 def _load_momentum_topn_sets(session, start: date, end: date, top_n: int, mode: str) -> list[tuple[str, set[str]]]:
@@ -118,26 +130,45 @@ def _load_momentum_topn_sets(session, start: date, end: date, top_n: int, mode: 
     return sorted(by_date.items())
 
 
-def _load_benchmark_return(session, start: date, end: date) -> float | None:
-    """0050 期間報酬（%）：(close_end - close_start) / close_start × 100。
+def _benchmark_close(session, target: date, strictly_before: bool = False) -> float | None:
+    """0050 在 target 當日（含）或之前最近一筆收盤。
 
-    用 on-or-after(start) 與 on-or-before(end) 對齊非交易日。
+    strictly_before=True 取 date < target（重現 snapshot 寫入當下「當日收盤尚未入庫」
+    的早上 lag 語意）；False 取 date <= target（含當日）。
     """
-    start_row = session.execute(
+    cond = DailyPrice.date < target if strictly_before else DailyPrice.date <= target
+    row = session.execute(
         select(DailyPrice.close)
-        .where(DailyPrice.stock_id == _BENCHMARK, DailyPrice.date >= start)
-        .order_by(DailyPrice.date.asc())
-        .limit(1)
-    ).first()
-    end_row = session.execute(
-        select(DailyPrice.close)
-        .where(DailyPrice.stock_id == _BENCHMARK, DailyPrice.date <= end)
+        .where(DailyPrice.stock_id == _BENCHMARK, cond)
         .order_by(DailyPrice.date.desc())
         .limit(1)
     ).first()
-    if start_row is None or end_row is None or not start_row[0]:
+    return float(row[0]) if row and row[0] else None
+
+
+def _aligned_bm_divergence(session, snap_start: dict | None, snap_end: dict | None, snap_delta_pp: float | None):
+    """snapshot 凍結 bm 增量 vs daily_price 重算的最小偏差（pp），已做 lag 端點對齊。
+
+    snapshot 在當日收盤入庫前寫入，凍結的是「前一交易日」0050 收盤；audit 時當日收盤
+    已存在，直接用 on-or-before 會比錯一天。故對 start/end 各取 {含當日, 嚴格前一日}
+    兩個候選，挑出與 snapshot 凍結增量最接近的組合 —— 容忍 0 或 1 個交易日的 lag，
+    只有「對齊後仍偏離」才代表 daily_price 參照日真被竄改。
+
+    回傳最小偏差（pp，四捨五入 2 位）；資料不足回傳 None。
+    """
+    if snap_start is None or snap_end is None or snap_delta_pp is None:
         return None
-    return round((end_row[0] - start_row[0]) / start_row[0] * 100, 2)
+    d_start = snap_start.get("snapshot_date")
+    d_end = snap_end.get("snapshot_date")
+    if d_start is None or d_end is None:
+        return None
+    starts = [c for c in (_benchmark_close(session, d_start, False), _benchmark_close(session, d_start, True)) if c]
+    ends = [c for c in (_benchmark_close(session, d_end, False), _benchmark_close(session, d_end, True)) if c]
+    if not starts or not ends:
+        return None
+    # ratio 正規化（÷ start close）與 snapshot 的 base 正規化差異 < 0.1pp，遠小於 2pp 門檻
+    best = min(abs((ce / cs - 1) * 100 - snap_delta_pp) for cs in starts for ce in ends if cs > 0)
+    return round(best, 2)
 
 
 def _trade_stats_row(name: str, label: str, stats) -> str:
@@ -217,15 +248,14 @@ def cmd_rotation_audit(args: argparse.Namespace) -> int:
         lines.append(
             "|-----------|---------:|---------:|--------:|-----------:|-----------:|-------------------:|------------:|"
         )
-        bm_deltas: list[float] = []
+        cross_rows: list[tuple[str, dict | None, dict | None, float | None]] = []
         for _pid, name, status in portfolios:
             if status != "active":
                 continue
             s_start = _load_snapshot_on_or_after(session, name, period_b[0])
             s_end = _load_snapshot_on_or_before(session, name, period_b[1])
             ad = compute_alpha_delta(name, s_start, s_end)
-            if ad.benchmark_delta_pp is not None:
-                bm_deltas.append(ad.benchmark_delta_pp)
+            cross_rows.append((name, s_start, s_end, ad.benchmark_delta_pp))
 
             def fmt(v, suffix=""):
                 return f"{v}{suffix}" if v is not None else "—"
@@ -244,19 +274,32 @@ def cmd_rotation_audit(args: argparse.Namespace) -> int:
         lines.append("> bm 增量 = snapshot 內凍結之 0050 累積報酬變化（與 alpha 同源，內部一致）。")
         lines.append("")
 
-        # ── 2b. Benchmark 一致性 cross-check（自動抓 0050 資料異常）──
-        raw_bm = _load_benchmark_return(session, period_b[0], period_b[1])
-        snap_bm = round(sum(bm_deltas) / len(bm_deltas), 2) if bm_deltas else None
-        lines.append("**Benchmark cross-check（0050）**")
+        # ── 2b. Benchmark 一致性 cross-check（lag 端點對齊，逐 portfolio）──
+        lines.append("**Benchmark cross-check（0050，lag 端點對齊）**")
         lines.append("")
-        lines.append(f"- raw 0050 收盤對收盤（期內首末交易日）：{raw_bm if raw_bm is not None else 'N/A'}%")
-        lines.append(f"- snapshot 凍結 bm 增量（各 portfolio 平均）：{snap_bm if snap_bm is not None else 'N/A'}pp")
-        if raw_bm is not None and snap_bm is not None and abs(raw_bm - snap_bm) > 2.0:
-            lines.append(
-                f"- ⚠ **兩者差 {abs(raw_bm - snap_bm):.1f}pp（> 2pp）**：可能 0050 期末收盤為可疑跳點 / 補抓延遲，"
-                "或 snapshot benchmark 錨點與期初不同。alpha 增量以 snapshot 為準（內部一致）；raw 僅供對照，"
-                "建議人工檢查 0050 期末收盤是否異常。"
-            )
+        divergences: list[tuple[str, float]] = []
+        for name, s_start, s_end, snap_d in cross_rows:
+            div = _aligned_bm_divergence(session, s_start, s_end, snap_d)
+            if div is None:
+                continue
+            divergences.append((name, div))
+            lines.append(f"- {name}：snapshot bm 增量 {snap_d}pp，對齊後 raw 重算最小偏差 {div}pp")
+        if not divergences:
+            lines.append("- N/A（無足夠 snapshot / benchmark 資料對齊）")
+        else:
+            worst_name, worst = max(divergences, key=lambda x: x[1])
+            lines.append("")
+            if worst > 2.0:
+                lines.append(
+                    f"- ⚠ **{worst_name} 對齊後仍偏 {worst:.1f}pp（> 2pp）**：已排除一交易日 lag，"
+                    "snapshot 凍結之 0050 收盤與當前 daily_price 在參照日仍不符 → "
+                    "可能 daily_price 被事後竄改 / 補抓延遲，建議人工檢查該 portfolio 期末參照日收盤。"
+                )
+            else:
+                lines.append(
+                    f"- ✅ 各 portfolio 對齊後偏差 ≤ 2pp（最大 {worst}pp）：raw 與 snapshot 一致，"
+                    "原始差異為一交易日 snapshot lag（by-design），非資料異常。"
+                )
         lines.append("")
 
         # ── 3. 訊號穩定性 ──
