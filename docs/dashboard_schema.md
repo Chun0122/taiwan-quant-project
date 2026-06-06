@@ -12,7 +12,7 @@
 
 | 欄位 | 型別 | 必填 | 說明 |
 |-----|-----|------|-----|
-| `version` | int | ✓ | Schema 版本，現為 `3`；breaking change 時遞增。 |
+| `version` | int | ✓ | Schema 版本，現為 `4`；breaking change 時遞增。 |
 | `generated_at` | string (ISO 8601) | ✓ | 產出時間（含時區）。 |
 | `date` | string (YYYY-MM-DD) | ✓ | 報告對應日期。 |
 | `regime` | object | ✓ | 市場狀態。 |
@@ -27,6 +27,11 @@
 | `position_timeseries` | object \| null | ✓ | **聚合所有 rotations 的持倉 ∪ Watch** 最近 N 個交易日 close（v1.1 新增；v2 改為跨組合聚合）；無持倉時為 `null`。 |
 | `alpha_chart` | object \| null | ✓ | **跨組合 alpha vs 0050 時序**（v3 新增）；所有 active rotation 全部 snapshot 之 alpha_cum_pct/benchmark_cum_return_pct 長表；無資料時為 `null`。 |
 | `errors` | array of string | ✓ | 子區塊產出失敗訊息（空陣列代表全部成功）。 |
+
+> **v4 schema 變更**（2026-06-06）：
+> - `SCHEMA_VERSION` 從 `3` 升至 `4`。
+> - 每個 `RotationBlock` 新增 `today_actions`：當日該組合的操作明細（回答「今天各 Rotation 做了什麼」），來源為新表 `rotation_action_log`（`RotationManager.update()` 落庫；`rotation preview` dry_run 不寫）。
+> - 結構為 `[{action_type, reason, is_risk_exit, switch_group, stock_id, stock_name, shares, price, entry_rank, pnl, return_pct}, ...]`；`action_type ∈ {open, close, renew, hold}`；無異動時為 `[]`。舊版下游請設為 optional。詳見 `rotations[]` 區塊說明。
 
 > **v3 schema 變更**（2026-05-17）：
 > - `SCHEMA_VERSION` 從 `2` 升至 `3`。
@@ -137,9 +142,32 @@
   "total_return_pct": 0.05,
   "status": "active",
   "updated_at": "2026-05-01T18:30:00",
-  "holdings": [ {RotationHolding}, ... ]
+  "holdings": [ {RotationHolding}, ... ],
+  "today_actions": [ {RotationAction}, ... ]
 }
 ```
+
+### `RotationAction`（v4 新增 — 今日操作）
+
+當日該組合的操作明細，回答「今天這個 Rotation 做了什麼」。來源為 `rotation_action_log`
+（`RotationManager.update()` 落庫，同日重跑冪等覆寫；`rotation preview` dry_run 不寫）。無異動時為 `[]`。
+
+| 欄位 | 型別 | 說明 |
+|-----|-----|-----|
+| `action_type` | string | `open`（買入）/ `close`（賣出）/ `renew`（續持）/ `hold`（保持不動） |
+| `reason` | string \| null | 賣出原因：`holding_expired` / `stop_loss` / `crisis_exit` / `max_drawdown_liquidation`；open/renew/一般 hold 為 `null`（gated hold 可能為 `gate_b_score_gap` / `gate_c_weekly_cap`） |
+| `is_risk_exit` | bool | 風控出場（`stop_loss` / `crisis_exit` / `max_drawdown_liquidation`），UI 以 ⚠️ 區分 |
+| `switch_group` | string \| null | 同日非風控賣出＋買入配對群組 id（「換股」🔁）；無配對為 `null` |
+| `stock_id` | string | |
+| `stock_name` | string \| null | |
+| `shares` | int \| null | |
+| `price` | float \| null | 買入為 entry_price、賣出為 exit_price |
+| `entry_rank` | int \| null | open 為當日排名；close/renew/hold 為進場時排名 |
+| `pnl` | float \| null | 僅 close：以 exit/entry 概算（不含成本，與 RotationPosition 已實現損益略有差異） |
+| `return_pct` | float \| null | 僅 close：概算報酬率（%） |
+
+> **引擎現實**：此 rotation 引擎交易整筆部位，無部分加碼/減碼，故 `action_type` 不含 add/reduce。
+> 「換股」非獨立 action_type，而是以 `switch_group` 標記同日的 close + open 組合。
 
 ### `RotationHolding`
 

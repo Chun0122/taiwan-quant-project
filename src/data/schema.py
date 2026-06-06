@@ -826,6 +826,48 @@ class RotationDailySnapshot(Base):
         return f"<RotationDailySnapshot {self.portfolio_name} {self.snapshot_date} capital={self.total_capital:.0f}>"
 
 
+class RotationActionLog(Base):
+    """輪動組合每日操作明細 — 回答「今天各 Rotation 做了什麼？」。
+
+    每次 RotationManager.update() 結尾，把當日已算好的 RotationActions
+    （to_buy / to_sell / renewed / to_hold）逐筆落庫，供 export-dashboard 帶出
+    `today_actions` 給 iOS App 顯示。dry_run（rotation preview）不寫入。
+
+    冪等：同一 portfolio 同一天可能重跑（morning-routine 重執行），故寫入前先刪除
+    當日同 portfolio 舊紀錄，並以 UniqueConstraint 防重複。
+    """
+
+    __tablename__ = "rotation_action_log"
+    __table_args__ = (
+        UniqueConstraint("portfolio_name", "action_date", "action_type", "stock_id", name="uq_rotation_action_log"),
+        Index("ix_rotation_action_log_name_date", "portfolio_name", "action_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    action_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    # action_type: open（買入）/ close（賣出）/ renew（續持）/ hold（保持不動）
+    action_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    # reason: 對映 RotationActions 各 dict 的 reason
+    # （holding_expired / stop_loss / crisis_exit / max_drawdown_liquidation / rank_dropped），open/hold 為 None
+    reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # 風控出場（stop_loss / crisis_exit / max_drawdown_liquidation），UI 以 ⚠️ 區分
+    is_risk_exit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 同日 sell + buy 配對群組 id（「換股」標記，🔁），無配對為 None
+    switch_group: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    stock_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    shares: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)  # entry_price 或 exit_price
+    entry_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)  # 平倉已實現損益
+    return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)  # 平倉報酬率
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<RotationActionLog {self.portfolio_name} {self.action_date} {self.action_type} {self.stock_id}>"
+
+
 class StrategyDecayLog(Base):
     """策略衰減監控每日紀錄（2026-05-15 sprint）。
 
