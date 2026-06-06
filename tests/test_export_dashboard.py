@@ -900,8 +900,8 @@ class TestBuildAlphaChart:
 
 
 class TestSchemaV3Integration:
-    def test_schema_version_is_3(self):
-        assert ed.SCHEMA_VERSION == 3
+    def test_schema_version_is_4(self):
+        assert ed.SCHEMA_VERSION == 4
 
     def test_payload_contains_alpha_chart_key(self, fresh_db, stub_heavy_deps):  # noqa: F811
         """payload 一定要有 alpha_chart key（可能為 None）— 確保 v3 schema 完整。"""
@@ -911,7 +911,7 @@ class TestSchemaV3Integration:
             _seed_snapshot_history_with_alpha(session, "default", today, n_days=10, fill_alpha=True)
 
         payload = ed._build_payload(today, top_n=20, event_days=30, regenerate_ai=False)
-        assert payload["version"] == 3
+        assert payload["version"] == 4
         assert "alpha_chart" in payload
         ac = payload["alpha_chart"]
         assert ac is not None

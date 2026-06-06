@@ -25,11 +25,11 @@ from src.cli.helpers import init_db
 from src.cli.helpers import safe_print as print
 from src.config import settings
 from src.data.database import get_session
-from src.data.schema import DailyPrice, DiscoveryRecord, WatchEntry
+from src.data.schema import DailyPrice, DiscoveryRecord, RotationActionLog, WatchEntry
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_TOP_N = 20
 DEFAULT_EVENT_DAYS = 30
 
@@ -126,14 +126,59 @@ def _build_discover(target_date: _dt.date, top_n: int) -> dict[str, list[dict]]:
     return out
 
 
-def _build_rotations() -> list[dict]:
-    """取所有 active 輪動組合的快照（依 current_capital 降冪排序，第一筆為 primary）。"""
+def _serialize_action_log_row(row: RotationActionLog) -> dict:
+    """RotationActionLog → dashboard today_actions 單筆。"""
+    return {
+        "action_type": row.action_type,  # open / close / renew / hold
+        "reason": row.reason,
+        "is_risk_exit": bool(row.is_risk_exit),
+        "switch_group": row.switch_group,
+        "stock_id": row.stock_id,
+        "stock_name": row.stock_name,
+        "shares": row.shares,
+        "price": row.price,
+        "entry_rank": row.entry_rank,
+        "pnl": row.pnl,
+        "return_pct": row.return_pct,
+    }
+
+
+def _build_today_actions(target_date: _dt.date) -> dict[str, list[dict]]:
+    """撈 target_date 當日各 portfolio 的操作明細，回傳 {portfolio_name: [action, ...]}。
+
+    排序：open → close → renew → hold，同類型內依 stock_id，讓 UI 呈現穩定。
+    """
+    order = {"open": 0, "close": 1, "renew": 2, "hold": 3}
+    out: dict[str, list[dict]] = {}
+    with get_session() as session:
+        rows = (
+            session.execute(select(RotationActionLog).where(RotationActionLog.action_date == target_date))
+            .scalars()
+            .all()
+        )
+    for r in rows:
+        out.setdefault(r.portfolio_name, []).append(_serialize_action_log_row(r))
+    for name in out:
+        out[name].sort(key=lambda a: (order.get(a["action_type"], 9), a["stock_id"] or ""))
+    return out
+
+
+def _build_rotations(target_date: _dt.date | None = None) -> list[dict]:
+    """取所有 active 輪動組合的快照（依 current_capital 降冪排序，第一筆為 primary）。
+
+    target_date：用於撈當日 today_actions（「今天各 Rotation 做了什麼」）；None=today。
+    """
     from src.portfolio.manager import RotationManager
+
+    if target_date is None:
+        target_date = _dt.date.today()
 
     portfolios = RotationManager.list_portfolios()
     actives = [p for p in portfolios if p.get("status") == "active"]
     if not actives:
         return []
+
+    today_actions_by_name = _build_today_actions(target_date)
 
     actives_sorted = sorted(
         actives,
@@ -191,6 +236,8 @@ def _build_rotations() -> list[dict]:
                 "status": status["status"],
                 "updated_at": status.get("updated_at"),
                 "holdings": holdings,
+                # v4：今日操作（open/close/renew/hold）— 回答「今天這個 Rotation 做了什麼」
+                "today_actions": today_actions_by_name.get(status["name"], []),
             }
         )
 
@@ -700,7 +747,7 @@ def _build_payload(
     rotations_list: list[dict] = []
     rotation_block: dict | None = None
     try:
-        rotations_list = _build_rotations()
+        rotations_list = _build_rotations(target_date)
         rotation_block = rotations_list[0] if rotations_list else None
     except Exception as exc:
         bundle.record_error("rotation", exc)

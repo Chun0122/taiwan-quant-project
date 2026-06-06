@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from src.config import settings
 from src.constants import (
@@ -25,6 +25,7 @@ from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
     DiscoveryRecord,
+    RotationActionLog,
     RotationDailySnapshot,
     RotationPortfolio,
     RotationPosition,
@@ -332,7 +333,28 @@ class RotationManager:
                     portfolio.updated_at = datetime.utcnow()
                     session.commit()
                     logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
-                return RotationActions(to_sell=[{**p, "reason": "max_drawdown_liquidation"} for p in open_positions])
+                liquidation_actions = RotationActions(
+                    to_sell=[
+                        {
+                            **p,
+                            "reason": "max_drawdown_liquidation",
+                            "exit_price": today_prices.get(p["stock_id"], p["entry_price"]),
+                        }
+                        for p in open_positions
+                    ]
+                )
+                if not dry_run:
+                    try:
+                        self._write_action_log(
+                            session,
+                            portfolio_name=self.portfolio_name,
+                            action_date=today,
+                            actions=liquidation_actions,
+                        )
+                        session.commit()
+                    except Exception as exc:
+                        logger.warning("[%s] 寫入 action log（熔斷）失敗：%s", self.portfolio_name, exc)
+                return liquidation_actions
 
             # ── Rotation 成本閘門（A/B/C）參數 ──
             cost_cfg = settings.quant.rotation_cost
@@ -459,6 +481,18 @@ class RotationManager:
                 except Exception as exc:
                     logger.warning("[%s] 寫入 daily snapshot 失敗：%s", self.portfolio_name, exc)
 
+                # ── Action Log：dashboard today_actions 來源（「今天各 Rotation 做了什麼」）──
+                try:
+                    self._write_action_log(
+                        session,
+                        portfolio_name=self.portfolio_name,
+                        action_date=today,
+                        actions=actions,
+                    )
+                    session.commit()
+                except Exception as exc:
+                    logger.warning("[%s] 寫入 action log 失敗：%s", self.portfolio_name, exc)
+
             verb = "DRY RUN 預覽" if dry_run else "更新完成"
             logger.info(
                 "[%s] %s: 賣出=%d, 續持=%d, 買入=%d, 保持=%d | 預估現金=%.0f, 預估總資產=%.0f",
@@ -574,6 +608,126 @@ class RotationManager:
                 )
             )
         session.commit()
+
+    # ── Action Log ──
+
+    # 風控出場原因（UI 以 ⚠️ 區分；非單純到期/排名換股）
+    _RISK_EXIT_REASONS = frozenset({"stop_loss", "crisis_exit", "max_drawdown_liquidation"})
+
+    def _write_action_log(
+        self,
+        session,
+        *,
+        portfolio_name: str,
+        action_date: date,
+        actions: RotationActions,
+    ) -> None:
+        """把當日 RotationActions 逐筆落庫，供 dashboard `today_actions` 帶出。
+
+        冪等：morning-routine 同日可能重跑，故寫入前先刪除當日同 portfolio 舊紀錄，
+        再依 to_buy / to_sell / renewed / to_hold 重建。
+
+        換股標記：同日同時存在「非風控賣出（到期/排名換股）」與「新買入」時，
+        將當日所有非風控賣出與買入標上同一 switch_group，供 UI 顯示 🔁。
+        gated（gate_b/gate_c 阻擋）的 to_hold 不計為換股對象。
+        """
+        session.execute(
+            delete(RotationActionLog).where(
+                RotationActionLog.portfolio_name == portfolio_name,
+                RotationActionLog.action_date == action_date,
+            )
+        )
+
+        non_risk_sells = [s for s in actions.to_sell if s.get("reason") not in self._RISK_EXIT_REASONS]
+        is_switch_day = bool(non_risk_sells) and bool(actions.to_buy)
+        switch_group = f"{portfolio_name}:{action_date.isoformat()}" if is_switch_day else None
+
+        rows: list[RotationActionLog] = []
+
+        for b in actions.to_buy:
+            rows.append(
+                RotationActionLog(
+                    portfolio_name=portfolio_name,
+                    action_date=action_date,
+                    action_type="open",
+                    reason=None,
+                    is_risk_exit=False,
+                    switch_group=switch_group,
+                    stock_id=b["stock_id"],
+                    stock_name=b.get("stock_name"),
+                    shares=b.get("shares"),
+                    price=b.get("entry_price"),
+                    entry_rank=b.get("rank"),
+                )
+            )
+
+        for s in actions.to_sell:
+            reason = s.get("reason")
+            is_risk = reason in self._RISK_EXIT_REASONS
+            entry_price = s.get("entry_price")
+            exit_price = s.get("exit_price")
+            shares = s.get("shares")
+            return_pct: float | None = None
+            pnl: float | None = None
+            # 顯示用報酬：以 exit/entry 概算（不含成本，與 RotationPosition 已實現損益略有差異）
+            if entry_price and exit_price is not None:
+                return_pct = (exit_price - entry_price) / entry_price * 100.0
+                if shares:
+                    pnl = (exit_price - entry_price) * shares
+            rows.append(
+                RotationActionLog(
+                    portfolio_name=portfolio_name,
+                    action_date=action_date,
+                    action_type="close",
+                    reason=reason,
+                    is_risk_exit=is_risk,
+                    switch_group=None if is_risk else switch_group,
+                    stock_id=s["stock_id"],
+                    stock_name=s.get("stock_name"),
+                    shares=shares,
+                    price=exit_price,
+                    entry_rank=s.get("entry_rank"),
+                    pnl=pnl,
+                    return_pct=return_pct,
+                )
+            )
+
+        for r in actions.renewed:
+            rows.append(
+                RotationActionLog(
+                    portfolio_name=portfolio_name,
+                    action_date=action_date,
+                    action_type="renew",
+                    reason=None,
+                    is_risk_exit=False,
+                    switch_group=None,
+                    stock_id=r["stock_id"],
+                    stock_name=r.get("stock_name"),
+                    shares=r.get("shares"),
+                    price=r.get("entry_price"),
+                    entry_rank=r.get("rank") or r.get("entry_rank"),
+                )
+            )
+
+        for h in actions.to_hold:
+            rows.append(
+                RotationActionLog(
+                    portfolio_name=portfolio_name,
+                    action_date=action_date,
+                    action_type="hold",
+                    reason=h.get("gated_by"),  # gate_b_score_gap / gate_c_weekly_cap，一般保持為 None
+                    is_risk_exit=False,
+                    switch_group=None,
+                    stock_id=h["stock_id"],
+                    stock_name=h.get("stock_name"),
+                    shares=h.get("shares"),
+                    price=h.get("entry_price"),
+                    entry_rank=h.get("rank") or h.get("entry_rank"),
+                )
+            )
+
+        if rows:
+            session.add_all(rows)
 
     @staticmethod
     def backfill_snapshot_benchmark_alpha(
