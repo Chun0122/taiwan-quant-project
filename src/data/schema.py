@@ -844,6 +844,10 @@ class StrategyDecayLog(Base):
     recent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_decaying: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     warning: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # 訊號穩定性 long-run 監控（§7.3）：近窗口同模式 top-N 推薦相鄰掃描日 Jaccard
+    # 平均（越低 = 每日換股越劇烈），pairs = 參與計算的日對數（樣本透明度）。
+    signal_jaccard_mean: Mapped[float | None] = mapped_column(Float, nullable=True)
+    signal_jaccard_pairs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

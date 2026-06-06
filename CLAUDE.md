@@ -87,7 +87,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `discovery/scanner/` | 五模式選股（Momentum/Swing/Value/Dividend/Growth）、四維度評分、Regime 動態權重 |
 | `discovery/universe.py` | Universe 三層漏斗（SQL→流動性→趨勢）+ Candidate Memory |
-| `discovery/performance.py` | 推薦績效回測、策略衰減警告 |
+| `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + settings.yaml diff，供 dashboard 事件流） |

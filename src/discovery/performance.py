@@ -25,6 +25,7 @@ from sqlalchemy import select
 from src.data.database import get_session
 from src.data.schema import DailyPrice, DiscoveryRecord
 from src.discovery.scanner._functions import compute_mfe_mae
+from src.portfolio.audit import JaccardStability, compute_jaccard_stability
 
 logger = logging.getLogger(__name__)
 
@@ -846,3 +847,40 @@ def check_all_modes_decay(
         results.append(decay)
 
     return results
+
+
+def compute_signal_stability(
+    mode: str,
+    window_days: int = 30,
+    top_n: int = 5,
+    reference_date: date | None = None,
+) -> JaccardStability:
+    """近 window_days 內，同模式 top-N Discover 推薦的相鄰掃描日 Jaccard 穩定性。
+
+    讀 DiscoveryRecord（DB），把每個 scan_date 的 top-N 股票組成集合後，
+    呼叫純函數 compute_jaccard_stability 算相鄰日 Jaccard 序列。
+
+    供 morning-routine Step 15 落 StrategyDecayLog，做訊號漂移的 long-run
+    監控（§7.3）：Jaccard 越低代表每日換股越劇烈（追逐短期動能 / universe
+    雜訊），單次 audit 易失真，故改逐日落庫看趨勢。
+
+    不足 2 個掃描日時回傳空 JaccardStability（mean_jaccard=None）。
+    """
+    ref = reference_date or date.today()
+    start = ref - timedelta(days=window_days)
+    with get_session() as session:
+        rows = session.execute(
+            select(DiscoveryRecord.scan_date, DiscoveryRecord.stock_id)
+            .where(
+                DiscoveryRecord.mode == mode,
+                DiscoveryRecord.scan_date >= start,
+                DiscoveryRecord.scan_date <= ref,
+                DiscoveryRecord.rank <= top_n,
+            )
+            .order_by(DiscoveryRecord.scan_date, DiscoveryRecord.rank)
+        ).all()
+    by_date: dict[str, set[str]] = {}
+    for scan_date, sid in rows:
+        by_date.setdefault(scan_date.isoformat(), set()).add(sid)
+    daily_sets = sorted(by_date.items())
+    return compute_jaccard_stability(daily_sets)

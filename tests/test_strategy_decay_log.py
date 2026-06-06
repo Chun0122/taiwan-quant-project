@@ -215,3 +215,28 @@ class TestCheckStrategyDecayPersistence:
         rows = db_session.execute(select(StrategyDecayLog)).scalars().all()
         assert len(rows) == 3
         assert all(r.scan_date == date.today() for r in rows)
+
+    def test_persists_signal_jaccard_fields(self, db_session):
+        """訊號穩定性 Jaccard 一同落庫（§7.3）：有掃描資料 → 非空，無 → None/0。"""
+        from src.cli.morning_cmd import _check_strategy_decay
+        from src.data.schema import DiscoveryRecord
+
+        # momentum 連兩日 top-2 完全相同 → Jaccard=1.0；value 不種任何推薦
+        for d in (date(2026, 5, 14), date(2026, 5, 15)):
+            for rank, sid in enumerate(["2330", "2317"], start=1):
+                db_session.add(
+                    DiscoveryRecord(
+                        scan_date=d, mode="momentum", rank=rank, stock_id=sid, close=100.0, composite_score=0.8
+                    )
+                )
+        db_session.flush()
+
+        with patch("src.discovery.performance.check_all_modes_decay", return_value=self._fake_check_results()):
+            _check_strategy_decay(scan_date=date(2026, 5, 15))
+
+        rows = {r.mode: r for r in db_session.execute(select(StrategyDecayLog)).scalars().all()}
+        assert rows["momentum"].signal_jaccard_mean == 1.0
+        assert rows["momentum"].signal_jaccard_pairs == 1
+        # 未種推薦的模式 → None / 0（不誤判）
+        assert rows["value"].signal_jaccard_mean is None
+        assert rows["value"].signal_jaccard_pairs == 0

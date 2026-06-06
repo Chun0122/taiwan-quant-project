@@ -692,3 +692,82 @@ class TestVectorizedCalcReturns:
         # 兩筆推薦的進場價不同，報酬率應不同
         rets = sorted(detail["return_5d"].tolist())
         assert rets[0] != rets[1]
+
+
+# ====================================================================== #
+# compute_signal_stability（訊號穩定性 long-run 監控，§7.3）
+# ====================================================================== #
+
+
+class TestComputeSignalStability:
+    def test_empty_returns_none_mean(self, db_session):
+        from src.discovery.performance import compute_signal_stability
+
+        stab = compute_signal_stability("momentum", reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard is None
+        assert stab.pairs == []
+
+    def test_single_scan_day_insufficient(self, db_session):
+        """只有一個掃描日 → 無相鄰日對，mean=None。"""
+        from src.discovery.performance import compute_signal_stability
+
+        for rank, sid in enumerate(["2330", "2317", "2454"], start=1):
+            _insert_discovery(db_session, date(2026, 6, 2), "momentum", rank, sid, 100.0)
+        stab = compute_signal_stability("momentum", reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard is None
+
+    def test_full_overlap_jaccard_one(self, db_session):
+        """連續兩日 top-N 完全相同 → Jaccard=1.0。"""
+        from src.discovery.performance import compute_signal_stability
+
+        for d in (date(2026, 6, 2), date(2026, 6, 3)):
+            for rank, sid in enumerate(["2330", "2317", "2454"], start=1):
+                _insert_discovery(db_session, d, "momentum", rank, sid, 100.0)
+        stab = compute_signal_stability("momentum", reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard == 1.0
+        assert len(stab.pairs) == 1
+
+    def test_zero_overlap_jaccard_zero(self, db_session):
+        """連續兩日 top-N 完全不同 → Jaccard=0.0。"""
+        from src.discovery.performance import compute_signal_stability
+
+        for rank, sid in enumerate(["2330", "2317"], start=1):
+            _insert_discovery(db_session, date(2026, 6, 2), "momentum", rank, sid, 100.0)
+        for rank, sid in enumerate(["6505", "3008"], start=1):
+            _insert_discovery(db_session, date(2026, 6, 3), "momentum", rank, sid, 100.0)
+        stab = compute_signal_stability("momentum", reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard == 0.0
+
+    def test_respects_top_n(self, db_session):
+        """rank > top_n 的推薦不納入集合。"""
+        from src.discovery.performance import compute_signal_stability
+
+        # 兩日 top-2 相同（2330/2317），但各自有不同的 rank3 → top_n=2 應算 Jaccard=1.0
+        for d in (date(2026, 6, 2), date(2026, 6, 3)):
+            _insert_discovery(db_session, d, "momentum", 1, "2330", 100.0)
+            _insert_discovery(db_session, d, "momentum", 2, "2317", 100.0)
+        _insert_discovery(db_session, date(2026, 6, 2), "momentum", 3, "9001", 100.0)
+        _insert_discovery(db_session, date(2026, 6, 3), "momentum", 3, "9002", 100.0)
+        stab = compute_signal_stability("momentum", top_n=2, reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard == 1.0
+
+    def test_mode_isolation(self, db_session):
+        """不同 mode 的推薦不互相污染。"""
+        from src.discovery.performance import compute_signal_stability
+
+        for d in (date(2026, 6, 2), date(2026, 6, 3)):
+            _insert_discovery(db_session, d, "momentum", 1, "2330", 100.0)
+            _insert_discovery(db_session, d, "swing", 1, "6505", 100.0)
+        stab = compute_signal_stability("swing", reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard == 1.0
+        assert len(stab.pairs) == 1
+
+    def test_window_excludes_old_scans(self, db_session):
+        """window_days 外的掃描日不納入。"""
+        from src.discovery.performance import compute_signal_stability
+
+        # 一筆在窗外（40 天前），一筆在窗內 → 窗內僅 1 日 → mean=None
+        _insert_discovery(db_session, date(2026, 4, 24), "momentum", 1, "2330", 100.0)
+        _insert_discovery(db_session, date(2026, 6, 2), "momentum", 1, "2330", 100.0)
+        stab = compute_signal_stability("momentum", window_days=30, reference_date=date(2026, 6, 3))
+        assert stab.mean_jaccard is None
