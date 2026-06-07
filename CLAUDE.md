@@ -190,6 +190,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
 - FinMind token 為逐股資料必需；TWSE/TPEX 免 token
+- `export-dashboard`（`SCHEMA_VERSION=4`）的 JSON 由獨立 repo **QuantMonitor**（`~/Projects/QuantMonitor`，SwiftUI iOS App）消費；改 export schema 會影響該 App，欄位異動須維持向後相容（新欄位設 optional）
 
 ---
 
