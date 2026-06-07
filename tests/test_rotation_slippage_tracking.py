@@ -202,3 +202,76 @@ class TestMigrationIdempotent:
         assert ("rotation_position", "buy_slippage") in cols
         assert ("rotation_position", "sell_slippage") in cols
         assert ("rotation_position", "trade_cost") in cols
+
+
+# ====================================================================== #
+# P1-4: _execute_buy / _execute_sell 動態滑價 + 流動性限制（audit P1-4）
+# ====================================================================== #
+
+
+class TestExecuteDynamicSlippage:
+    def test_buy_records_passed_slippage(self, db_session):
+        """_execute_buy(slippage=X) → pos.buy_slippage == X（非固定 SLIPPAGE_RATE）。"""
+        p = _make_portfolio(db_session, initial=1_000_000.0)
+        mgr = RotationManager("p_test")
+        buy = {"stock_id": "2330", "entry_price": 600.0, "shares": 100, "rank": 1, "score": 0.85}
+        mgr._execute_buy(
+            db_session, p.id, buy, date(2026, 5, 15), _make_trading_cal(), cash=1_000_000.0, slippage=0.004
+        )
+        db_session.flush()
+        loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
+        assert loaded.buy_slippage == pytest.approx(0.004)
+        assert loaded.buy_slippage != pytest.approx(SLIPPAGE_RATE)
+        # trade_cost 用動態滑價計
+        expected = 600.0 * 100 * (COMMISSION_RATE + 0.004)
+        assert loaded.trade_cost == pytest.approx(expected, abs=0.01)
+
+    def test_buy_applies_liquidity_limit(self, db_session):
+        """daily_volume 很小 → 股數被 apply_liquidity_limit 下調（≤ 量 × 5%）。"""
+        p = _make_portfolio(db_session, initial=1_000_000.0)
+        mgr = RotationManager("p_test")
+        # 想買 100 股，但當日量 1000 股 × 5% = 50 股上限
+        buy = {"stock_id": "2330", "entry_price": 600.0, "shares": 100, "rank": 1, "score": 0.9}
+        mgr._execute_buy(
+            db_session, p.id, buy, date(2026, 5, 15), _make_trading_cal(), cash=1_000_000.0, daily_volume=1000
+        )
+        db_session.flush()
+        loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
+        assert loaded.shares == 50
+
+    def test_sell_records_passed_slippage(self, db_session):
+        """_execute_sell(slippage=Y) → pos.sell_slippage == Y 且成本用 Y 計。"""
+        p = _make_portfolio(db_session, initial=1_000_000.0)
+        mgr = RotationManager("p_test")
+        buy = {"stock_id": "2330", "entry_price": 600.0, "shares": 100, "rank": 1}
+        mgr._execute_buy(
+            db_session, p.id, buy, date(2026, 5, 15), _make_trading_cal(), cash=1_000_000.0, slippage=0.002
+        )
+        db_session.flush()
+        sell = {"stock_id": "2330", "exit_price": 650.0, "reason": "holding_expired", "days_held": 5}
+        mgr._execute_sell(db_session, p.id, sell, date(2026, 5, 22), cash=0.0, slippage=0.006)
+        db_session.flush()
+        loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
+        assert loaded.sell_slippage == pytest.approx(0.006)
+        buy_cost = 600.0 * 100 * (COMMISSION_RATE + 0.002)
+        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + 0.006)
+        assert loaded.trade_cost == pytest.approx(round(buy_cost, 2) + round(sell_cost, 2), abs=0.05)
+
+
+# ====================================================================== #
+# P1-1: _load_open_positions 帶出 entry_score（成本閘門 B live 生效）
+# ====================================================================== #
+
+
+class TestLoadOpenPositionsEntryScore:
+    def test_entry_score_present(self, db_session):
+        """_load_open_positions 應含 entry_score（過去缺此欄 → Gate B live 永遠失效）。"""
+        p = _make_portfolio(db_session, initial=1_000_000.0)
+        mgr = RotationManager("p_test")
+        buy = {"stock_id": "2330", "entry_price": 600.0, "shares": 100, "rank": 1, "score": 0.77}
+        mgr._execute_buy(db_session, p.id, buy, date(2026, 5, 15), _make_trading_cal(), cash=1_000_000.0)
+        db_session.flush()
+        loaded = mgr._load_open_positions(db_session, p.id)
+        assert loaded, "未載入持倉"
+        assert "entry_score" in loaded[0]
+        assert loaded[0]["entry_score"] == pytest.approx(0.77)

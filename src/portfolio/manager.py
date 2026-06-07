@@ -217,6 +217,8 @@ class RotationManager:
             # 今日收盤價
             all_sids = list({p["stock_id"] for p in open_positions} | {r["stock_id"] for r in rankings})
             today_prices = _get_prices_on_date(session, all_sids, today)
+            # P1-4：今日完整 OHLCV，供 _execute_buy/sell 計算動態滑價 + 流動性限制（與 backtest 對齊）
+            today_ohlcv = _get_ohlcv_on_date(session, all_sids, today)
 
             # 止損價：從持倉記錄取進場時鎖定的止損價（不隨 discover 每日浮動）
             stop_losses = {p["stock_id"]: p["stop_loss"] for p in open_positions if p.get("stop_loss") is not None}
@@ -393,6 +395,8 @@ class RotationManager:
                 corr_matrix=corr_matrix,
                 vol_weights=vol_weights,
                 regime=regime,
+                # P1-2：接上 Drawdown Guard 連續減倉（回撤越深、新開倉越小；reuse kill-switch 算好的 equity_history）
+                drawdown_pct=compute_portfolio_drawdown(equity_history),
                 min_hold_days=gate_min_hold,
                 score_gap_threshold=gate_score_gap,
                 weekly_swap_cap=gate_weekly_cap,
@@ -422,9 +426,21 @@ class RotationManager:
                     market_value += float(buy.get("entry_price", 0) or 0) * int(buy.get("shares", 0) or 0)
                 open_after = []  # 給後續 VaR 段跳過用
             else:
-                # 執行賣出
+                # 執行賣出（P1-4：動態滑價）
                 for sell in actions.to_sell:
-                    cash = self._execute_sell(session, portfolio.id, sell, today, cash)
+                    o = today_ohlcv.get(sell["stock_id"])
+                    sell_slip = (
+                        compute_dynamic_slippage(
+                            o.get("volume", 0),
+                            o.get("high", 0),
+                            o.get("low", 0),
+                            sell.get("exit_price") or 0,
+                            side="sell",
+                        )
+                        if o
+                        else SLIPPAGE_RATE
+                    )
+                    cash = self._execute_sell(session, portfolio.id, sell, today, cash, slippage=sell_slip)
 
                 # 執行續持（從 rankings 取最新止損價，只上移不下移）
                 ranking_sl = {r["stock_id"]: r["stop_loss"] for r in rankings if r.get("stop_loss") is not None}
@@ -432,9 +448,30 @@ class RotationManager:
                     new_sl = ranking_sl.get(renew["stock_id"])
                     self._execute_renewal(session, portfolio.id, renew, new_stop_loss=new_sl)
 
-                # 執行買入
+                # 執行買入（P1-4：動態滑價 + 流動性限制）
                 for buy in actions.to_buy:
-                    cash = self._execute_buy(session, portfolio.id, buy, today, trading_cal, cash)
+                    o = today_ohlcv.get(buy["stock_id"])
+                    buy_slip = (
+                        compute_dynamic_slippage(
+                            o.get("volume", 0),
+                            o.get("high", 0),
+                            o.get("low", 0),
+                            buy.get("entry_price") or 0,
+                            side="buy",
+                        )
+                        if o
+                        else SLIPPAGE_RATE
+                    )
+                    cash = self._execute_buy(
+                        session,
+                        portfolio.id,
+                        buy,
+                        today,
+                        trading_cal,
+                        cash,
+                        slippage=buy_slip,
+                        daily_volume=o.get("volume") if o else None,
+                    )
 
                 # 重新計算 current_capital = cash + 持倉市值
                 open_after = self._load_open_positions(session, portfolio.id)
@@ -1390,6 +1427,9 @@ class RotationManager:
                     gate_score_gap = 0.0
                     gate_weekly_cap = 0
 
+                # P1-2：當前回撤（已實現權益序列 + 今日 pre-action 權益）供 Drawdown Guard 連續減倉
+                _dd_pct = compute_portfolio_drawdown([e["equity"] for e in equity_curve] + [pre_equity])
+
                 # 計算 rotation
                 actions = compute_rotation_actions(
                     current_positions=positions,
@@ -1407,6 +1447,8 @@ class RotationManager:
                     corr_matrix=corr_matrix,
                     vol_weights=vol_weights,
                     regime=last_regime,
+                    # P1-2：Drawdown Guard 與 live update() 對齊
+                    drawdown_pct=_dd_pct,
                     min_hold_days=gate_min_hold,
                     score_gap_threshold=gate_score_gap,
                     weekly_swap_cap=gate_weekly_cap,
@@ -1838,6 +1880,9 @@ class RotationManager:
                 "entry_date": p.entry_date,
                 "entry_price": p.entry_price,
                 "entry_rank": p.entry_rank,
+                # P1-1：載入 entry_score，使成本閘門 B（score_gap_threshold）在 live 生效
+                # （過去缺此欄 → Gate B 的 pos.get("entry_score") 永遠 None → 閘門失效）
+                "entry_score": p.entry_score,
                 "shares": p.shares,
                 "allocated_capital": p.allocated_capital,
                 "planned_exit_date": p.planned_exit_date,
@@ -1868,8 +1913,14 @@ class RotationManager:
             return resolve_rankings(mode, row[0], session)
         return []
 
-    def _execute_sell(self, session, portfolio_id: int, sell: dict, today: date, cash: float) -> float:
-        """執行賣出：更新 RotationPosition 狀態並回收資金。"""
+    def _execute_sell(
+        self, session, portfolio_id: int, sell: dict, today: date, cash: float, slippage: float = SLIPPAGE_RATE
+    ) -> float:
+        """執行賣出：更新 RotationPosition 狀態並回收資金。
+
+        P1-4：slippage 由 caller 以 compute_dynamic_slippage 計算（fallback SLIPPAGE_RATE），
+        用於成本/淨收入/已實現 pnl，並寫入 pos.sell_slippage（與 backtest 對齊）。
+        """
         stmt = select(RotationPosition).where(
             RotationPosition.portfolio_id == portfolio_id,
             RotationPosition.stock_id == sell["stock_id"],
@@ -1880,8 +1931,14 @@ class RotationManager:
             return cash
 
         exit_price = sell.get("exit_price", pos.entry_price)
-        pnl, return_pct = compute_position_pnl(pos.entry_price, exit_price, pos.shares)
-        sell_costs = compute_trade_costs(exit_price, pos.shares, SLIPPAGE_RATE, side="sell")
+        pnl, return_pct = compute_position_pnl(
+            pos.entry_price,
+            exit_price,
+            pos.shares,
+            buy_slippage=pos.buy_slippage if pos.buy_slippage is not None else SLIPPAGE_RATE,
+            sell_slippage=slippage,
+        )
+        sell_costs = compute_trade_costs(exit_price, pos.shares, slippage, side="sell")
         sell_proceeds = exit_price * pos.shares - sell_costs.total
 
         pos.exit_date = today
@@ -1892,7 +1949,7 @@ class RotationManager:
         pos.status = "closed"
         pos.holding_days_count = sell.get("days_held", 0)
         # 滑價/成本 instrumentation：sell 端記滑價率 + 累加 trade_cost（買端已寫入）
-        pos.sell_slippage = SLIPPAGE_RATE
+        pos.sell_slippage = slippage
         pos.trade_cost = round((pos.trade_cost or 0.0) + sell_costs.total, 2)
 
         return cash + sell_proceeds
@@ -1914,22 +1971,40 @@ class RotationManager:
                     pos.stop_loss = new_stop_loss
 
     def _execute_buy(
-        self, session, portfolio_id: int, buy: dict, today: date, trading_cal: list[date], cash: float
+        self,
+        session,
+        portfolio_id: int,
+        buy: dict,
+        today: date,
+        trading_cal: list[date],
+        cash: float,
+        slippage: float = SLIPPAGE_RATE,
+        daily_volume: float | None = None,
     ) -> float:
-        """執行買入：建立 RotationPosition 並扣減現金。"""
+        """執行買入：建立 RotationPosition 並扣減現金。
+
+        P1-4：slippage 由 caller 以 compute_dynamic_slippage 計算；daily_volume 提供時
+        以 apply_liquidity_limit 限制單筆量（≤ 當日量 × LIQUIDITY_PARTICIPATION_LIMIT），
+        並寫入 pos.buy_slippage（與 backtest 對齊）。
+        """
+        from src.portfolio.rotation import apply_liquidity_limit
+
         price = buy["entry_price"]
         shares = buy["shares"]
+        # 流動性限制（只下調，不放大 compute_rotation_actions 已算好的 heat/corr 調整後股數）
+        if daily_volume:
+            shares = apply_liquidity_limit(shares, daily_volume, LIQUIDITY_PARTICIPATION_LIMIT)
         if shares <= 0:
             return cash
 
-        buy_costs = compute_trade_costs(price, shares, SLIPPAGE_RATE, side="buy")
+        buy_costs = compute_trade_costs(price, shares, slippage, side="buy")
         buy_cost = price * shares + buy_costs.total
         if buy_cost > cash:
             # 資金不足，縮減股數
-            shares = compute_shares(cash, price)
+            shares = compute_shares(cash, price, slippage=slippage, daily_volume=daily_volume)
             if shares <= 0:
                 return cash
-            buy_costs = compute_trade_costs(price, shares, SLIPPAGE_RATE, side="buy")
+            buy_costs = compute_trade_costs(price, shares, slippage, side="buy")
             buy_cost = price * shares + buy_costs.total
 
         from src.portfolio.rotation import compute_planned_exit_date
@@ -1965,7 +2040,7 @@ class RotationManager:
             stop_loss=buy.get("stop_loss"),
             status="open",
             # 滑價/成本 instrumentation：buy 端記滑價率 + 初始化 trade_cost（賣出時累加）
-            buy_slippage=SLIPPAGE_RATE,
+            buy_slippage=slippage,
             trade_cost=round(buy_costs.total, 2),
             entry_score_breakdown_json=breakdown_json,
         )
