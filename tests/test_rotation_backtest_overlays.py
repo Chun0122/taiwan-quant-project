@@ -188,3 +188,82 @@ def test_backtest_entry_fills_at_next_day_open_not_scan_close(patch_session):
     entry = result.trades[0]
     assert entry["entry_price"] == 110.0, f"進場價應為 D1 開盤 110（T+1），實得 {entry['entry_price']}"
     assert entry["entry_date"] == _START + timedelta(days=1), f"進場日應為 D1，實得 {entry['entry_date']}"
+
+
+# ====================================================================== #
+# P1-3 survivorship：期末持有但個股下市 → 以最後已知價平倉、計數、警告
+# ====================================================================== #
+
+
+def _seed_delisting(db_session) -> RotationPortfolio:
+    """個股 9999 僅 D0~D3 有報價（D3 收 80 後下市），D0 推薦、買進後持有到期末。"""
+    for i in range(_DAYS):
+        d = _START + timedelta(days=i)
+        db_session.add(
+            DailyPrice(stock_id="TAIEX", date=d, open=23000, high=23100, low=22900, close=23050, volume=0, turnover=0.0)
+        )
+    # 9999 只有前 4 天報價：100 → 98 → 90 → 80（之後下市，無資料）
+    closes = {0: 100.0, 1: 98.0, 2: 90.0, 3: 80.0}
+    for i, c in closes.items():
+        o = 100.0 if i <= 1 else c + 1
+        db_session.add(
+            DailyPrice(
+                stock_id="9999",
+                date=_START + timedelta(days=i),
+                open=o,
+                high=c + 2,
+                low=c - 2,
+                close=c,
+                volume=10_000_000,
+                turnover=1e9,
+            )
+        )
+    db_session.add(
+        DiscoveryRecord(
+            scan_date=_START,
+            mode="momentum",
+            rank=1,
+            stock_id="9999",
+            stock_name="下市股",
+            close=100,
+            composite_score=0.9,
+            technical_score=0.8,
+            chip_score=0.7,
+            fundamental_score=0.5,
+            news_score=0.4,
+            regime="bull",
+            entry_price=100,
+            stop_loss=None,
+        )
+    )
+    p = RotationPortfolio(
+        name="delist_test",
+        mode="momentum",
+        max_positions=1,
+        holding_days=30,  # 30 > 視窗 → 持有到期末
+        allow_renewal=True,
+        initial_capital=1_000_000.0,
+        current_capital=1_000_000.0,
+        current_cash=1_000_000.0,
+        status="active",
+    )
+    db_session.add(p)
+    db_session.commit()
+    return p
+
+
+def test_backtest_delisted_holding_realizes_loss_and_warns(patch_session):
+    """下市股持有到期末 → 以最後已知價(80)平倉實現虧損、計入 stranded、發警告。
+
+    舊行為：today_prices 缺值 fallback entry_price(100) → 凍結無虧損（樂觀偏差）。
+    """
+    _seed_delisting(patch_session)
+    r = RotationManager("delist_test").backtest(_START, _START + timedelta(days=_DAYS - 1))
+    assert r.metrics["survivorship_warning"] is True
+    assert r.metrics["survivorship_stranded"] >= 1
+    t = next((x for x in r.trades if x["stock_id"] == "9999"), None)
+    assert t is not None, "9999 未被買進/平倉"
+    assert t["exit_reason"] == "delisted_stranded"
+    # 以最後已知價 80 平倉（非凍結在 entry 100）→ 實現虧損
+    assert t["exit_price"] == pytest.approx(80.0)
+    assert t["pnl"] < 0

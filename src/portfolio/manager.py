@@ -1158,8 +1158,10 @@ class RotationManager:
             total_slippage_cost = 0.0
             turnover_value = 0.0
 
-            # 漲跌停偵測用前日收盤價
+            # 漲跌停偵測用前日收盤價（亦作為停牌/下市個股的「最後已知價」）
             prev_close_map: dict[str, float] = {}
+            # P1-3 survivorship：期末仍持有但個股已停止交易（停牌/下市）的倉位數
+            n_stranded = 0
 
             # VaR 計算用：累計每日收盤價（最近 60 日窗口）
             daily_close_history: dict[str, list[float]] = {}  # {stock_id: [close1, close2, ...]}
@@ -1356,6 +1358,12 @@ class RotationManager:
                     _fb = _get_ohlcv_on_date(session, _cache_miss, day)
                     today_ohlcv.update(_fb)
                 today_prices = {sid: d["close"] for sid, d in today_ohlcv.items()}
+                # P1-3 survivorship：持倉個股今日無報價（停牌/下市）→ 以最後已知收盤估值，
+                # 避免 today_prices 缺值時 fallback 到 entry_price（凍結價=隱藏跌價=樂觀偏差）。
+                # 使停損/到期賣出/MtM 皆以最後已知價計，跌價得以反映。
+                for _p in positions:
+                    if _p["stock_id"] not in today_prices and _p["stock_id"] in prev_close_map:
+                        today_prices[_p["stock_id"]] = prev_close_map[_p["stock_id"]]
 
                 # ── T+1 執行（audit P0-2）：前一決策日算出的 actions 於今日開盤成交 ──
                 if pending_exec is not None:
@@ -1533,7 +1541,15 @@ class RotationManager:
                 for pos in positions:
                     sid = pos["stock_id"]
                     ohlcv = last_ohlcv.get(sid, {})
-                    exit_p = ohlcv.get("close", pos["entry_price"])
+                    # P1-3 survivorship：期末無報價＝停牌/下市仍持有 → 以最後已知價平倉並計數，
+                    # 不再 fallback entry_price（凍結價會把下市虧損藏起來，導致回測樂觀）
+                    is_stranded = "close" not in ohlcv
+                    if is_stranded:
+                        n_stranded += 1
+                        exit_p = prev_close_map.get(sid, pos["entry_price"])
+                    else:
+                        exit_p = ohlcv["close"]
+                    exit_reason = "delisted_stranded" if is_stranded else "backtest_end"
 
                     if dynamic_slippage:
                         sell_slip = compute_dynamic_slippage(
@@ -1573,7 +1589,7 @@ class RotationManager:
                             "shares": pos["shares"],
                             "pnl": pnl,
                             "return_pct": return_pct,
-                            "exit_reason": "backtest_end",
+                            "exit_reason": exit_reason,
                             "entry_rank": pos.get("entry_rank"),
                             "entry_score": pos.get("entry_score"),
                             "buy_slippage": buy_slip,
@@ -1627,7 +1643,17 @@ class RotationManager:
                 "trading_days": len(equity_curve),
                 # TAIEX Benchmark
                 "benchmark_return": benchmark_return,
+                # P1-3 survivorship：期末仍持有但已停牌/下市的倉位數 + 警告旗標
+                "survivorship_stranded": n_stranded,
+                "survivorship_warning": n_stranded > 0,
             }
+            if n_stranded > 0:
+                logger.warning(
+                    "[%s] survivorship：%d 個期末持倉個股已停牌/下市，以最後已知價平倉；"
+                    "歷史回測若含下市股偏樂觀，請留意",
+                    self.portfolio_name,
+                    n_stranded,
+                )
             # 成本歸因 + 拆解（合併進 metrics）
             metrics.update(
                 compute_cost_metrics(
