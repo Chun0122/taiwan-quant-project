@@ -1058,6 +1058,21 @@ class RotationManager:
             for sd in scan_dates:
                 all_rankings[sd] = resolve_rankings(mode, sd, session, top_n=max_positions * 3)
 
+            # 逐日歷史 regime（取自 DiscoveryRecord，與當日 discover 計算一致 → 無 look-ahead）。
+            # P0-1 修復：rotation backtest 過去未傳 regime，導致 Crisis 阻擋/相關性收緊在回測中失效。
+            all_regime: dict[date, str] = {}
+            regime_rows = session.execute(
+                select(DiscoveryRecord.scan_date, DiscoveryRecord.regime)
+                .where(
+                    DiscoveryRecord.scan_date >= start_date,
+                    DiscoveryRecord.scan_date <= end_date,
+                    DiscoveryRecord.regime.isnot(None),
+                )
+                .distinct()
+            ).all()
+            for _sd, _rg in regime_rows:
+                all_regime.setdefault(_sd, _rg)
+
             # TAIEX benchmark 資料
             taiex_prices = _get_taiex_prices(session, trading_cal[0], trading_cal[-1])
 
@@ -1097,6 +1112,8 @@ class RotationManager:
             equity_curve: list[dict] = []
             all_trades: list[dict] = []
             last_rankings: list[dict] = []
+            # 逐日 regime（無 scan 記錄的日子沿用前值；起始用安全預設）
+            last_regime: str = REGIME_FALLBACK_DEFAULT
 
             # 成本歸因累計器
             total_commission = 0.0
@@ -1109,6 +1126,9 @@ class RotationManager:
 
             # VaR 計算用：累計每日收盤價（最近 60 日窗口）
             daily_close_history: dict[str, list[float]] = {}  # {stock_id: [close1, close2, ...]}
+            # Correlation Budget / 波動率反比權重用：日期索引滾動窗口（與 live update 對齊；
+            # 須帶日期 index 才能跨股對齊，避免不同歷史長度的 series 位置錯位）
+            close_window_dated: dict[str, list[tuple[date, float]]] = {}
 
             # 每日持倉快照
             daily_positions_snapshot: list[dict] = []
@@ -1147,6 +1167,45 @@ class RotationManager:
                     if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
                         stop_losses[r["stock_id"]] = r["stop_loss"]
 
+                # ── 風控 overlay（P0-1 修復：與 live update() 對齊）──
+                # Portfolio Heat 分母 = pre-action 權益（cash + 既有持倉 today MtM）
+                pre_equity = cash + sum(
+                    today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions
+                )
+                # 逐日 regime（沿用最近 scan 的歷史 regime）
+                if day in all_regime:
+                    last_regime = all_regime[day]
+
+                held_sids = [p["stock_id"] for p in positions]
+                candidate_sids = [r["stock_id"] for r in last_rankings[:max_positions]]
+
+                # 相關性矩陣（持倉 + 候選，60 日窗口；資料不足回 None → 不生效）
+                corr_matrix = None
+                corr_sids = list(set(held_sids + candidate_sids))
+                if len(corr_sids) >= 2:
+                    corr_price_data = {
+                        sid: pd.Series(
+                            [c for _, c in close_window_dated[sid]],
+                            index=pd.DatetimeIndex([d for d, _ in close_window_dated[sid]]),
+                        )
+                        for sid in corr_sids
+                        if len(close_window_dated.get(sid, [])) >= 2
+                    }
+                    if len(corr_price_data) >= 2:
+                        corr_matrix = compute_correlation_matrix(corr_price_data, window=60)
+
+                # 波動率反比權重（候選股，需 ≥20 日歷史）
+                vol_weights = None
+                vol_dict: dict[str, float] = {}
+                for sid in candidate_sids:
+                    hist = close_window_dated.get(sid, [])
+                    if len(hist) >= 20:
+                        daily_ret = pd.Series([c for _, c in hist]).pct_change().dropna()
+                        if len(daily_ret) >= 10:
+                            vol_dict[sid] = float(daily_ret.std() * (252**0.5))
+                if vol_dict:
+                    vol_weights = compute_vol_inverse_weights(vol_dict)
+
                 # 成本閘門 — 取本 ISO 週 holding_expired 用量
                 iso_y, iso_w, _ = day.isocalendar()
                 if cost_cfg.enabled:
@@ -1172,6 +1231,11 @@ class RotationManager:
                     current_cash=cash,
                     stop_losses=stop_losses,
                     today_prices=today_prices,
+                    # P0-1：風控 overlay 與 live update() 對齊
+                    total_capital=pre_equity,
+                    corr_matrix=corr_matrix,
+                    vol_weights=vol_weights,
+                    regime=last_regime,
                     min_hold_days=gate_min_hold,
                     score_gap_threshold=gate_score_gap,
                     weekly_swap_cap=gate_weekly_cap,
@@ -1339,6 +1403,10 @@ class RotationManager:
                     daily_close_history.setdefault(sid, []).append(ohlcv_data["close"])
                     if len(daily_close_history[sid]) > 65:
                         daily_close_history[sid] = daily_close_history[sid][-65:]
+                    # 日期索引版本（次日 rotation 的 corr/vol overlay 用，含當日收盤、無 look-ahead）
+                    close_window_dated.setdefault(sid, []).append((day, ohlcv_data["close"]))
+                    if len(close_window_dated[sid]) > 65:
+                        close_window_dated[sid] = close_window_dated[sid][-65:]
 
                 # Ex-Ante VaR（有持倉時計算）
                 var_pct = None

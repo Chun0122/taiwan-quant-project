@@ -1,0 +1,123 @@
+"""Rotation 回測風控 overlay 對齊 live（P0-1 修復）測試。
+
+背景：RotationManager.backtest() 過去呼叫 compute_rotation_actions 時未傳
+total_capital / corr_matrix / vol_weights / regime，導致 Portfolio Heat、
+Correlation Budget、波動率反比權重、Crisis 阻擋在回測中全部失效 —— 回測等於
+「等權 top-N」而非實際部署的策略。本測試以「歷史 regime=crisis 應阻擋回測新開倉」
+作為最直接的回歸守門：舊碼會照買（regime 未傳→不阻擋），新碼應為 0 筆交易。
+"""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+import pytest
+
+from src.data.schema import DailyPrice, DiscoveryRecord, RotationPortfolio
+from src.portfolio.manager import RotationManager
+
+_START = date(2025, 3, 3)  # 週一
+_DAYS = 14
+_STOCKS = ("2330", "2317", "2454", "3008", "6669")
+
+
+@pytest.fixture()
+def patch_session(monkeypatch):
+    """專屬 in-memory engine/session（不共用 conftest db_session）。
+
+    backtest() 內部 save_rotation_backtest() 會 commit 共享 session，會撕掉 conftest
+    的 transaction-rollback 隔離造成跨測試污染（見記憶 feedback_test_db_fixture_gotchas）。
+    這裡每個測試建立獨立 engine，徹底隔離。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from src.data.database import Base
+
+    engine = create_engine("sqlite:///:memory:", echo=False)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    class _Ctx:
+        def __enter__(self):
+            return session
+
+        def __exit__(self, *a):
+            return False
+
+    from src.data import pipeline as pipeline_module
+    from src.portfolio import manager as mgr_module
+
+    monkeypatch.setattr(mgr_module, "get_session", lambda: _Ctx())
+    monkeypatch.setattr(pipeline_module, "get_session", lambda: _Ctx())
+    yield session
+    session.close()
+
+
+def _seed(db_session, *, regime: str) -> RotationPortfolio:
+    """TAIEX 行事曆 + 5 檔個股每日 K 線 + 第一日 5 筆 momentum DiscoveryRecord(指定 regime)。"""
+    for i in range(_DAYS):
+        d = _START + timedelta(days=i)
+        db_session.add(
+            DailyPrice(stock_id="TAIEX", date=d, open=23000, high=23100, low=22900, close=23050, volume=0, turnover=0.0)
+        )
+        for sid in _STOCKS:
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid,
+                    date=d,
+                    open=100,
+                    high=102,
+                    low=99,
+                    close=100 + i * 0.1,  # 緩漲，避免觸發止損
+                    volume=10_000_000,
+                    turnover=1_000_000_000.0,
+                )
+            )
+    for rank, sid in enumerate(_STOCKS, start=1):
+        db_session.add(
+            DiscoveryRecord(
+                scan_date=_START,
+                mode="momentum",
+                rank=rank,
+                stock_id=sid,
+                stock_name=f"name_{sid}",
+                close=100,
+                composite_score=0.9 - rank * 0.05,
+                technical_score=0.8,
+                chip_score=0.7,
+                fundamental_score=0.5,
+                news_score=0.4,
+                regime=regime,
+                entry_price=100,
+                stop_loss=90,
+            )
+        )
+    p = RotationPortfolio(
+        name="overlay_test",
+        mode="momentum",
+        max_positions=3,
+        holding_days=10,
+        allow_renewal=True,
+        initial_capital=1_000_000.0,
+        current_capital=1_000_000.0,
+        current_cash=1_000_000.0,
+        status="active",
+    )
+    db_session.add(p)
+    db_session.commit()
+    return p
+
+
+def test_backtest_passes_historical_regime_crisis_blocks_buys(patch_session):
+    """歷史 regime=crisis → 回測不應有任何進場（P0-1：regime 已接線）。"""
+    _seed(patch_session, regime="crisis")
+    result = RotationManager("overlay_test").backtest(_START, _START + timedelta(days=_DAYS - 1))
+    assert result.trades == [], "crisis regime 下回測仍開倉 → regime 未正確傳入 compute_rotation_actions"
+
+
+def test_backtest_non_crisis_regime_allows_buys(patch_session):
+    """對照組：regime=bull → 回測正常進場（確認阻擋來自 regime 而非其他因素）。"""
+    _seed(patch_session, regime="bull")
+    result = RotationManager("overlay_test").backtest(_START, _START + timedelta(days=_DAYS - 1))
+    assert len(result.trades) >= 1, "bull regime 下回測未開倉 → overlay 接線把正常交易也擋掉了"
