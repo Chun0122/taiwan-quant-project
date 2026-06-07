@@ -1137,17 +1137,176 @@ class RotationManager:
             cost_cfg = settings.quant.rotation_cost
             weekly_swap_counter: dict[tuple[int, int], int] = {}
 
+            # ── T+1 執行（audit P0-2）──
+            # D 日收盤後用 close[D] 決策 → 暫存 pending_exec → D+1 開盤成交（買賣一律 open[D+1]），
+            # 消除「用 close[D] 排名又成交在 close[D]」的 look-ahead。
+            pending_exec: tuple[RotationActions, list[dict]] | None = None
+
+            def _execute_action_set(
+                acts: RotationActions,
+                decision_rankings: list[dict],
+                exec_ohlcv: dict[str, dict],
+                exec_day: date,
+            ) -> None:
+                """以 exec_day 開盤價成交 acts（T+1）。就地更新 positions / cash / 成本累計 / all_trades。"""
+                nonlocal cash, positions, total_commission, total_tax, total_slippage_cost, turnover_value
+
+                # ── 賣出（到期/換股/止損/危機/回撤 一律 open[exec_day]）──
+                sold_ids: set[str] = set()
+                for sell in acts.to_sell:
+                    sid = sell["stock_id"]
+                    ohlcv = exec_ohlcv.get(sid, {})
+                    # 成交價 = 執行日開盤；無開盤資料時 fallback 決策日 exit_price / entry_price
+                    exit_price = ohlcv.get("open") or sell.get("exit_price") or sell.get("entry_price", 0)
+                    shares = sell.get("shares", 0)
+
+                    if dynamic_slippage:
+                        sell_slip = compute_dynamic_slippage(
+                            ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), exit_price, side="sell"
+                        )
+                    else:
+                        sell_slip = SLIPPAGE_RATE
+
+                    # 跌停模擬：跌停時以跌停價成交
+                    if limit_price_check:
+                        prev_c = prev_close_map.get(sid)
+                        if prev_c:
+                            _, is_down = detect_limit_price(ohlcv.get("open", exit_price), prev_c)
+                            if is_down:
+                                exit_price = min(exit_price, prev_c * (1 - SLIPPAGE_RATE))
+
+                    buy_slip = sell.get("buy_slippage", SLIPPAGE_RATE)
+                    pnl, return_pct = compute_position_pnl(
+                        sell["entry_price"], exit_price, shares, buy_slippage=buy_slip, sell_slippage=sell_slip
+                    )
+                    costs = compute_trade_costs(exit_price, shares, sell_slip, side="sell")
+                    cash += exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
+
+                    total_commission += costs.commission
+                    total_tax += costs.tax
+                    total_slippage_cost += costs.slippage_cost
+                    turnover_value += exit_price * shares
+
+                    all_trades.append(
+                        {
+                            "stock_id": sid,
+                            "entry_date": sell["entry_date"],
+                            "entry_price": sell["entry_price"],
+                            "exit_date": exec_day,
+                            "exit_price": exit_price,
+                            "shares": shares,
+                            "pnl": pnl,
+                            "return_pct": return_pct,
+                            "exit_reason": sell["reason"],
+                            "entry_rank": sell.get("entry_rank"),
+                            "entry_score": sell.get("entry_score"),
+                            "buy_slippage": buy_slip,
+                            "sell_slippage": sell_slip,
+                            "commission": costs.commission,
+                            "tax": costs.tax,
+                            "slippage_cost": costs.slippage_cost,
+                        }
+                    )
+                    sold_ids.add(sid)
+
+                positions = [p for p in positions if p["stock_id"] not in sold_ids]
+
+                # ── 續持（planned_exit 延展 + 止損價只上移）──
+                renewed_ids = {r["stock_id"] for r in acts.renewed}
+                ranking_sl = {
+                    r["stock_id"]: r["stop_loss"] for r in decision_rankings if r.get("stop_loss") is not None
+                }
+                for pos in positions:
+                    if pos["stock_id"] in renewed_ids:
+                        renew_info = next(r for r in acts.renewed if r["stock_id"] == pos["stock_id"])
+                        pos["planned_exit_date"] = renew_info["new_planned_exit_date"]
+                        new_sl = ranking_sl.get(pos["stock_id"])
+                        if new_sl is not None:
+                            old_sl = pos.get("stop_loss")
+                            if old_sl is None or new_sl > old_sl:
+                                pos["stop_loss"] = new_sl
+
+                # ── 買入（open[exec_day]）──
+                for buy in acts.to_buy:
+                    sid = buy["stock_id"]
+                    ohlcv = exec_ohlcv.get(sid, {})
+                    price = ohlcv.get("open") or buy["entry_price"]
+                    alloc = buy["allocated_capital"]
+
+                    # 漲停跳過（開盤即漲停 → 買不到）
+                    if limit_price_check:
+                        prev_c = prev_close_map.get(sid)
+                        if prev_c:
+                            is_up, _ = detect_limit_price(ohlcv.get("open", price), prev_c)
+                            if is_up:
+                                continue
+
+                    if dynamic_slippage:
+                        buy_slip = compute_dynamic_slippage(
+                            ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), price, side="buy"
+                        )
+                    else:
+                        buy_slip = SLIPPAGE_RATE
+
+                    shares = compute_shares(
+                        alloc,
+                        price,
+                        slippage=buy_slip,
+                        daily_volume=ohlcv.get("volume"),
+                        participation_limit=liquidity_limit,
+                    )
+                    buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
+                    # 資金不足保護：T+1 開盤價可能高於決策日收盤，縮減股數避免現金為負
+                    if buy_cost > cash:
+                        shares = compute_shares(
+                            cash,
+                            price,
+                            slippage=buy_slip,
+                            daily_volume=ohlcv.get("volume"),
+                            participation_limit=liquidity_limit,
+                        )
+                        buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
+                    if shares <= 0:
+                        continue
+
+                    costs = compute_trade_costs(price, shares, buy_slip, side="buy")
+                    cash -= buy_cost
+
+                    total_commission += costs.commission
+                    total_slippage_cost += costs.slippage_cost
+                    turnover_value += price * shares
+
+                    positions.append(
+                        {
+                            "stock_id": sid,
+                            "stock_name": buy.get("stock_name", ""),
+                            "entry_date": exec_day,
+                            "entry_price": price,
+                            "entry_rank": buy["rank"],
+                            "entry_score": buy.get("score"),
+                            "shares": shares,
+                            "allocated_capital": alloc,
+                            "planned_exit_date": compute_planned_exit_date(exec_day, holding_days, trading_cal),
+                            "stop_loss": buy.get("stop_loss"),
+                            "buy_slippage": buy_slip,
+                        }
+                    )
+
             for day in trading_cal:
-                # 取今日排名
+                # 取今日排名（持續沿用最近一次 scan 的結果）
                 if day in all_rankings:
                     last_rankings = all_rankings[day]
 
-                if not last_rankings:
+                # 今日需報價標的：持倉 + 候選 + 待執行（pending）買入標的
+                _pend_buy_sids = [b["stock_id"] for b in pending_exec[0].to_buy] if pending_exec else []
+                all_sids = list(
+                    {p["stock_id"] for p in positions} | {r["stock_id"] for r in last_rankings} | set(_pend_buy_sids)
+                )
+                if not all_sids:
                     equity_curve.append({"date": day, "equity": cash})
                     continue
 
                 # 取今日 OHLCV（優先從預載入快取取得，cache miss 時 fallback 到 DB 查詢）
-                all_sids = list({p["stock_id"] for p in positions} | {r["stock_id"] for r in last_rankings})
                 today_ohlcv: dict[str, dict] = {}
                 _cache_day = _ohlcv_cache.get(day, {})
                 _cache_miss: list[str] = []
@@ -1160,6 +1319,18 @@ class RotationManager:
                     _fb = _get_ohlcv_on_date(session, _cache_miss, day)
                     today_ohlcv.update(_fb)
                 today_prices = {sid: d["close"] for sid, d in today_ohlcv.items()}
+
+                # ── T+1 執行（audit P0-2）：前一決策日算出的 actions 於今日開盤成交 ──
+                if pending_exec is not None:
+                    _prev_actions, _prev_rankings = pending_exec
+                    _execute_action_set(_prev_actions, _prev_rankings, today_ohlcv, day)
+                    pending_exec = None
+
+                # 無排名（首次 scan 前）：記錄權益後跳過決策
+                if not last_rankings:
+                    _eq = cash + sum(today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions)
+                    equity_curve.append({"date": day, "equity": _eq})
+                    continue
 
                 # 止損價：從持倉記錄取進場時鎖定的止損價
                 stop_losses = {p["stock_id"]: p["stop_loss"] for p in positions if p.get("stop_loss") is not None}
@@ -1244,154 +1415,8 @@ class RotationManager:
                 if cost_cfg.enabled and actions.holding_expired_sells > 0:
                     weekly_swap_counter[(iso_y, iso_w)] = weekly_used_this_week + actions.holding_expired_sells
 
-                # ── 執行賣出 ──
-                sold_ids = set()
-                for sell in actions.to_sell:
-                    sid = sell["stock_id"]
-                    exit_price = sell.get("exit_price", sell.get("entry_price", 0))
-                    shares = sell.get("shares", 0)
-                    ohlcv = today_ohlcv.get(sid, {})
-
-                    # 動態滑價
-                    if dynamic_slippage:
-                        sell_slip = compute_dynamic_slippage(
-                            ohlcv.get("volume", 0),
-                            ohlcv.get("high", 0),
-                            ohlcv.get("low", 0),
-                            exit_price,
-                            side="sell",
-                        )
-                    else:
-                        sell_slip = SLIPPAGE_RATE
-
-                    # 跌停模擬：跌停時以跌停價成交
-                    if limit_price_check:
-                        prev_c = prev_close_map.get(sid)
-                        if prev_c:
-                            _, is_down = detect_limit_price(ohlcv.get("open", exit_price), prev_c)
-                            if is_down:
-                                exit_price = min(exit_price, prev_c * (1 - SLIPPAGE_RATE))
-
-                    buy_slip = sell.get("buy_slippage", SLIPPAGE_RATE)
-                    pnl, return_pct = compute_position_pnl(
-                        sell["entry_price"],
-                        exit_price,
-                        shares,
-                        buy_slippage=buy_slip,
-                        sell_slippage=sell_slip,
-                    )
-                    costs = compute_trade_costs(exit_price, shares, sell_slip, side="sell")
-                    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
-                    cash += sell_proceeds
-
-                    total_commission += costs.commission
-                    total_tax += costs.tax
-                    total_slippage_cost += costs.slippage_cost
-                    turnover_value += exit_price * shares
-
-                    all_trades.append(
-                        {
-                            "stock_id": sid,
-                            "entry_date": sell["entry_date"],
-                            "entry_price": sell["entry_price"],
-                            "exit_date": day,
-                            "exit_price": exit_price,
-                            "shares": shares,
-                            "pnl": pnl,
-                            "return_pct": return_pct,
-                            "exit_reason": sell["reason"],
-                            "entry_rank": sell.get("entry_rank"),
-                            "entry_score": sell.get("entry_score"),
-                            "buy_slippage": buy_slip,
-                            "sell_slippage": sell_slip,
-                            "commission": costs.commission,
-                            "tax": costs.tax,
-                            "slippage_cost": costs.slippage_cost,
-                        }
-                    )
-                    sold_ids.add(sid)
-
-                # 更新持倉列表
-                new_positions = []
-                for pos in positions:
-                    if pos["stock_id"] not in sold_ids:
-                        new_positions.append(pos)
-                positions = new_positions
-
-                # 處理續持（止損價只上移不下移）
-                renewed_ids = {r["stock_id"] for r in actions.renewed}
-                ranking_sl = {r["stock_id"]: r["stop_loss"] for r in last_rankings if r.get("stop_loss") is not None}
-                for pos in positions:
-                    if pos["stock_id"] in renewed_ids:
-                        renew_info = next(r for r in actions.renewed if r["stock_id"] == pos["stock_id"])
-                        pos["planned_exit_date"] = renew_info["new_planned_exit_date"]
-                        new_sl = ranking_sl.get(pos["stock_id"])
-                        if new_sl is not None:
-                            old_sl = pos.get("stop_loss")
-                            if old_sl is None or new_sl > old_sl:
-                                pos["stop_loss"] = new_sl
-
-                # ── 執行買入 ──
-                for buy in actions.to_buy:
-                    sid = buy["stock_id"]
-                    price = buy["entry_price"]
-                    alloc = buy["allocated_capital"]
-                    ohlcv = today_ohlcv.get(sid, {})
-
-                    # 漲停跳過
-                    if limit_price_check:
-                        prev_c = prev_close_map.get(sid)
-                        if prev_c:
-                            is_up, _ = detect_limit_price(ohlcv.get("open", price), prev_c)
-                            if is_up:
-                                continue
-
-                    # 動態滑價
-                    if dynamic_slippage:
-                        buy_slip = compute_dynamic_slippage(
-                            ohlcv.get("volume", 0),
-                            ohlcv.get("high", 0),
-                            ohlcv.get("low", 0),
-                            price,
-                            side="buy",
-                        )
-                    else:
-                        buy_slip = SLIPPAGE_RATE
-
-                    shares = compute_shares(
-                        alloc,
-                        price,
-                        slippage=buy_slip,
-                        daily_volume=ohlcv.get("volume"),
-                        participation_limit=liquidity_limit,
-                    )
-                    if shares <= 0:
-                        continue
-
-                    costs = compute_trade_costs(price, shares, buy_slip, side="buy")
-                    buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
-                    cash -= buy_cost
-
-                    total_commission += costs.commission
-                    total_slippage_cost += costs.slippage_cost
-                    turnover_value += price * shares
-
-                    planned_exit = compute_planned_exit_date(day, holding_days, trading_cal)
-                    positions.append(
-                        {
-                            "stock_id": sid,
-                            "stock_name": buy.get("stock_name", ""),
-                            "entry_date": day,
-                            "entry_price": price,
-                            "entry_rank": buy["rank"],
-                            "entry_score": buy.get("score"),
-                            "shares": shares,
-                            "allocated_capital": alloc,
-                            "planned_exit_date": planned_exit,
-                            "stop_loss": buy.get("stop_loss"),
-                            "buy_slippage": buy_slip,
-                        }
-                    )
+                # ── T+1（audit P0-2）：不立即成交，暫存至下一交易日開盤由 _execute_action_set 執行 ──
+                pending_exec = (actions, last_rankings)
 
                 # 計算當日權益
                 total_equity = cash + sum(

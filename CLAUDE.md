@@ -138,7 +138,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
-| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover 回測一致執行訊號延遲，消除 look-ahead bias |
+| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測**一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交（買/賣/止損/危機一律 open[D+1]）。live update() 尚未 T+1（夜間決策時未知 D+1 開盤，待 pending-order 機制） |
 | **動態滑價** | 三因子模型（`compute_dynamic_slippage`）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
 
 ---
