@@ -88,6 +88,20 @@ class RiskBudgetConfig(BaseModel):
     correlation_penalty: float = 0.5  # 高相關時部位縮減比例
 
 
+class RotationCostModeOverride(BaseModel):
+    """單一 mode 的成本閘門覆蓋；欄位為 None 時沿用全域 RotationCostConfig 值。
+
+    動機（投研 2026-06-07）：成本閘門對不同策略效果相反 —— Gate B(score_gap)
+    是動量 alpha 主來源（抱住贏家），卻會勒死波段換手（swing 全開 35%→9%）。
+    per-mode 覆蓋讓動量維持嚴格、波段放寬 score_gap。
+    """
+
+    enabled: bool | None = None
+    min_hold_days: int | None = None
+    score_gap_threshold: float | None = None
+    weekly_swap_cap: int | None = None
+
+
 class RotationCostConfig(BaseModel):
     """Rotation 成本閘門參數（降低高頻換手帶來的成本拖累）。
 
@@ -95,12 +109,34 @@ class RotationCostConfig(BaseModel):
       A. min_hold_days：holding_days 的安全下限（防止極短線換手）
       B. score_gap_threshold：expired 時需要新候選 score 贏現持倉此差距才換
       C. weekly_swap_cap：每 ISO 週最多幾筆 holding_expired 賣出（不含 stop_loss）
+
+    per_mode：以 mode 名（momentum/swing/value/dividend/growth/all）覆蓋上述全域值，
+    未列出的 mode 沿用全域。manager 以 for_mode(portfolio.mode) 取解析後設定。
     """
 
     enabled: bool = False  # 預設關閉以維持向後相容；明確啟用後才生效
     min_hold_days: int = 3  # 最短持有天數（以交易日計）
     score_gap_threshold: float = 0.05  # 切換所需 composite_score 差距
     weekly_swap_cap: int = 4  # 每週非止損換手上限（stop_loss/crisis 不計）
+    per_mode: dict[str, RotationCostModeOverride] = {}  # mode → 覆蓋；空 = 全 mode 用全域（向後相容）
+
+    def for_mode(self, mode: str | None) -> "RotationCostConfig":
+        """回傳指定 mode 解析後的閘門設定（per_mode 覆蓋全域）。
+
+        回傳新的 RotationCostConfig（per_mode 留空），manager 以 .enabled / .min_hold_days
+        等屬性讀取，與既有程式完全相容；無對應 mode 覆蓋時直接回傳 self。
+        """
+        ov = self.per_mode.get(mode) if mode else None
+        if ov is None:
+            return self
+        return RotationCostConfig(
+            enabled=self.enabled if ov.enabled is None else ov.enabled,
+            min_hold_days=self.min_hold_days if ov.min_hold_days is None else ov.min_hold_days,
+            score_gap_threshold=(
+                self.score_gap_threshold if ov.score_gap_threshold is None else ov.score_gap_threshold
+            ),
+            weekly_swap_cap=self.weekly_swap_cap if ov.weekly_swap_cap is None else ov.weekly_swap_cap,
+        )
 
 
 class QuantConfig(BaseModel):

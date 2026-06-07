@@ -358,8 +358,8 @@ class RotationManager:
                         logger.warning("[%s] 寫入 action log（熔斷）失敗：%s", self.portfolio_name, exc)
                 return liquidation_actions
 
-            # ── Rotation 成本閘門（A/B/C）參數 ──
-            cost_cfg = settings.quant.rotation_cost
+            # ── Rotation 成本閘門（A/B/C）參數（per-mode：閘門對 momentum/swing 效果相反）──
+            cost_cfg = settings.quant.rotation_cost.for_mode(portfolio.mode)
             if cost_cfg.enabled:
                 iso_year, iso_week, _ = today.isocalendar()
                 week_start = date.fromisocalendar(iso_year, iso_week, 1)
@@ -1170,8 +1170,8 @@ class RotationManager:
             # 每日持倉快照
             daily_positions_snapshot: list[dict] = []
 
-            # 成本閘門：每 ISO 週 holding_expired 累計
-            cost_cfg = settings.quant.rotation_cost
+            # 成本閘門：每 ISO 週 holding_expired 累計（per-mode 解析，與 live update() 對齊）
+            cost_cfg = settings.quant.rotation_cost.for_mode(mode)
             weekly_swap_counter: dict[tuple[int, int], int] = {}
 
             # ── T+1 執行（audit P0-2）──
