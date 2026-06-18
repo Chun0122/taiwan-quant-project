@@ -242,12 +242,13 @@ class TestAllModePerModeQuota:
         assert result[3]["primary_mode"] == "momentum"
 
     def test_quota_default_from_constants(self, db_session):
-        """per_mode_max=None 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設值（3）。"""
+        """per_mode_max=None 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設值（2）。"""
         from src.constants import ROTATION_ALL_MODE_PER_MODE_MAX
         from src.portfolio.manager import resolve_rankings
 
-        assert ROTATION_ALL_MODE_PER_MODE_MAX == 3
-        # 5 檔 swing，per_mode_max=None → 預設 3
+        # 2026-06-19 收緊 3→2（all10_5d 連兩次審計輸 0050，5/29 報告 §7.1 既定規則）
+        assert ROTATION_ALL_MODE_PER_MODE_MAX == 2
+        # 5 檔 swing，per_mode_max=None → 預設 2
         self._seed(
             db_session,
             date(2025, 5, 7),
@@ -260,7 +261,7 @@ class TestAllModePerModeQuota:
             ],
         )
         result = resolve_rankings("all", date(2025, 5, 7), db_session, top_n=10)
-        assert len(result) == 3
+        assert len(result) == 2
 
     def test_quota_zero_disables(self, db_session):
         """per_mode_max=0 等效於不限制。"""
