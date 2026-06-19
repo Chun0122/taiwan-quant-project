@@ -176,4 +176,6 @@ DISCOVERY_OVERHEATING_DAMPEN_FACTOR: float = 0.85
 #       整 mode 同時爆雷無分散。改用「每個 primary_mode 最多 N 檔」即可避免。
 # primary_mode 定義：該股票在各模式 discovery_record 中 composite_score 最高的 mode
 # 使用方：portfolio.manager._resolve_all_mode_rankings
-ROTATION_ALL_MODE_PER_MODE_MAX: int = 3
+# 2026-06-19 收緊 3→2：all10_5d 連兩次審計（5/29 −4.04pp / 6/15 −5.07pp，後者 N=29
+#   樣本紮實）皆 underperform 0050，觸發 5/29 報告 §7.1 既定收緊規則。
+ROTATION_ALL_MODE_PER_MODE_MAX: int = 2
