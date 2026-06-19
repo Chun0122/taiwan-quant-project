@@ -8541,8 +8541,20 @@ class TestSidewaysRegimeGate:
 class TestIcDecayAdjustment:
     """IC 衰退自動門檻提升測試。"""
 
-    def test_returns_zero_with_no_data(self, momentum_scanner):
+    def test_returns_zero_with_no_data(self, momentum_scanner, monkeypatch):
         """無 DB 資料時回傳 0.0。"""
+        # 隔離 DB：_compute_ic_decay_adjustment 直接呼叫 get_session()，
+        # 若未隔離會讀到本機 dev DB（data/stock.db）造成誤判
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        import src.discovery.scanner._base as base_mod
+        from src.data.database import Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        monkeypatch.setattr(base_mod, "get_session", sessionmaker(bind=engine))
+
         momentum_scanner.regime = "bull"
         momentum_scanner.mode_name = "momentum"
         assert momentum_scanner._compute_ic_decay_adjustment() == 0.0

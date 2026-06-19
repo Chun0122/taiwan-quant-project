@@ -100,8 +100,9 @@ class TestTuneHyperparameters:
         """XGBoost 調優（若已安裝）。"""
         try:
             import xgboost  # noqa: F401
-        except ImportError:
-            pytest.skip("xgboost 未安裝")
+        except Exception:
+            # 未安裝，或已安裝但原生庫無法載入（例如 macOS 缺 libomp）
+            pytest.skip("xgboost 未安裝或無法載入")
         X, y, _ = _make_classification_data(200)
         result = tune_hyperparameters(X, y, model_type="xgboost", n_trials=5, n_splits=3)
         assert result["best_score"] > 0.0
@@ -155,8 +156,9 @@ class TestComputeShapFeatureImportance:
     def test_xgb_shap(self):
         try:
             from xgboost import XGBClassifier
-        except ImportError:
-            pytest.skip("xgboost 未安裝")
+        except Exception:
+            # 未安裝，或已安裝但原生庫無法載入（例如 macOS 缺 libomp）
+            pytest.skip("xgboost 未安裝或無法載入")
         X, y, feature_names = _make_classification_data(100)
         model = XGBClassifier(n_estimators=10, verbosity=0, random_state=42)
         model.fit(X, y)
