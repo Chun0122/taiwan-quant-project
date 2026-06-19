@@ -18,12 +18,10 @@ import warnings
 
 import pandas as pd
 from sqlalchemy import select
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, ADXIndicator, SMAIndicator
-from ta.volatility import BollingerBands
 
 from src.data.database import get_session
 from src.data.schema import DailyPrice
+from src.features.ta_compat import make_adx, make_bollinger, make_macd, make_rsi, make_sma
 
 logger = logging.getLogger(__name__)
 
@@ -68,20 +66,20 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
 
     # --- SMA ---
     for period in (5, 10, 20, 60):
-        sma = SMAIndicator(close=close, n=period).sma_indicator()
+        sma = make_sma(close, period).sma_indicator()
         name = f"sma_{period}"
         for i, val in enumerate(sma):
             if pd.notna(val):
                 records.append({"stock_id": stock_id, "date": dates[i], "name": name, "value": round(val, 4)})
 
     # --- RSI(14) ---
-    rsi = RSIIndicator(close=close, n=14).rsi()
+    rsi = make_rsi(close, 14).rsi()
     for i, val in enumerate(rsi):
         if pd.notna(val):
             records.append({"stock_id": stock_id, "date": dates[i], "name": "rsi_14", "value": round(val, 4)})
 
     # --- MACD(12, 26, 9) ---
-    macd_ind = MACD(close=close, n_slow=26, n_fast=12, n_sign=9)
+    macd_ind = make_macd(close, slow=26, fast=12, sign=9)
     for series, name in [
         (macd_ind.macd(), "macd"),
         (macd_ind.macd_signal(), "macd_signal"),
@@ -92,7 +90,7 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
                 records.append({"stock_id": stock_id, "date": dates[i], "name": name, "value": round(val, 4)})
 
     # --- Bollinger Bands(20, 2) ---
-    bb = BollingerBands(close=close, n=20, ndev=2)
+    bb = make_bollinger(close, period=20, ndev=2)
     for series, name in [
         (bb.bollinger_hband(), "bb_upper"),
         (bb.bollinger_mavg(), "bb_middle"),
@@ -105,7 +103,7 @@ def compute_indicators(stock_id: str) -> pd.DataFrame:
     # --- ADX(14) ---
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        adx = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+        adx = make_adx(high, low, close, 14).adx()
     for i, val in enumerate(adx):
         if pd.notna(val):
             records.append({"stock_id": stock_id, "date": dates[i], "name": "adx_14", "value": round(val, 4)})
@@ -135,19 +133,19 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # SMA
     for period in (5, 10, 20, 60):
-        result[f"sma_{period}"] = SMAIndicator(close=close, n=period).sma_indicator()
+        result[f"sma_{period}"] = make_sma(close, period).sma_indicator()
 
     # RSI(14)
-    result["rsi_14"] = RSIIndicator(close=close, n=14).rsi()
+    result["rsi_14"] = make_rsi(close, 14).rsi()
 
     # MACD(12, 26, 9)
-    macd_ind = MACD(close=close, n_slow=26, n_fast=12, n_sign=9)
+    macd_ind = make_macd(close, slow=26, fast=12, sign=9)
     result["macd"] = macd_ind.macd()
     result["macd_signal"] = macd_ind.macd_signal()
     result["macd_hist"] = macd_ind.macd_diff()
 
     # Bollinger Bands(20, 2)
-    bb = BollingerBands(close=close, n=20, ndev=2)
+    bb = make_bollinger(close, period=20, ndev=2)
     result["bb_upper"] = bb.bollinger_hband()
     result["bb_middle"] = bb.bollinger_mavg()
     result["bb_lower"] = bb.bollinger_lband()
@@ -156,7 +154,7 @@ def compute_indicators_from_df(df: pd.DataFrame) -> pd.DataFrame:
     if len(close) >= 14:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            result["adx_14"] = ADXIndicator(high=high, low=low, close=close, n=14).adx()
+            result["adx_14"] = make_adx(high, low, close, 14).adx()
     else:
         result["adx_14"] = float("nan")
 
@@ -205,13 +203,13 @@ def aggregate_to_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
     close = weekly["close"]
 
     # 週線 SMA(13 週 ≈ 季線)
-    weekly["sma_13"] = SMAIndicator(close=close, n=13).sma_indicator()
+    weekly["sma_13"] = make_sma(close, 13).sma_indicator()
 
     # 週線 RSI(14 週)
-    weekly["rsi_14"] = RSIIndicator(close=close, n=14).rsi()
+    weekly["rsi_14"] = make_rsi(close, 14).rsi()
 
     # 週線 MACD(12, 26, 9)
-    macd_ind = MACD(close=close, n_slow=26, n_fast=12, n_sign=9)
+    macd_ind = make_macd(close, slow=26, fast=12, sign=9)
     weekly["macd"] = macd_ind.macd()
     weekly["macd_signal"] = macd_ind.macd_signal()
     weekly["macd_hist"] = macd_ind.macd_diff()

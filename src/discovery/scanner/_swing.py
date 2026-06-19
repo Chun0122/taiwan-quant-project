@@ -153,7 +153,7 @@ class SwingScanner(MarketScanner):
 
     def _compute_technical_scores(self, stock_ids: list[str], df_price: pd.DataFrame) -> pd.DataFrame:
         """波段模式技術面 5 因子：趨勢確認 + 均線排列 + 60日動能 + 量價齊揚 + ADX趨勢強度。"""
-        from ta.trend import ADXIndicator as _ADXIndicator
+        from src.features.ta_compat import make_adx
 
         results = []
         grouped = df_price.sort_values("date").groupby("stock_id", sort=False)
@@ -240,11 +240,11 @@ class SwingScanner(MarketScanner):
                 window = min(len(closes), 60)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
-                    adx_indicator = _ADXIndicator(
+                    adx_indicator = make_adx(
                         high=pd.Series(highs[-window:]),
                         low=pd.Series(lows[-window:]),
                         close=pd.Series(closes[-window:]),
-                        n=14,
+                        period=14,
                     )
                     adx_s = adx_indicator.adx().dropna()
                     di_pos_s = adx_indicator.adx_pos().dropna()

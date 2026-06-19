@@ -120,6 +120,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `visualization/` | Streamlit 儀表板（12 分頁）+ Plotly 圖表 |
 | `scheduler/` | 排程（前景 / Windows Task Scheduler / macOS LaunchAgent） |
 | `features/indicators.py` | SMA/RSI/MACD/BB/ADX EAV + 週線聚合 |
+| `features/ta_compat.py` | `ta` 套件版本相容層（0.5.x `n=` vs ≥0.7 `window=` 自動偵測，`make_sma/rsi/macd/bollinger/adx` 工廠） |
 | `features/ml_features.py` | ML 特徵矩陣 + SHAP 篩選 |
 | `factors/registry.py` | **Factor SSOT**：所有因子（dimension/sub_factor/predicate/indicator）的 metadata 註冊表；`python main.py factor-list` 查詢；新增因子須同步註冊 |
 | `config.py` | Pydantic 設定模型（`QuantConfig`：TradingCost/AtrMultiplier/ScoreThreshold/RiskBudget/RotationCost）；`RotationCostConfig.for_mode(mode)` per-mode 成本閘門覆蓋（閘門對 momentum/swing 效果相反，manager 依 portfolio.mode 解析） |
