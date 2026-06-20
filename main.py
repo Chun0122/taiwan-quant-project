@@ -802,8 +802,8 @@ def main() -> None:
     sp_rc.add_argument(
         "--mode",
         required=True,
-        choices=["momentum", "swing", "value", "dividend", "growth", "all"],
-        help="discover 模式（all = 綜合排名）",
+        choices=["momentum", "swing", "value", "dividend", "growth", "all", "mom_growth"],
+        help="discover 模式（all = 五模式綜合；mom_growth = 動量+成長雙引擎）",
     )
     sp_rc.add_argument("--max-positions", type=int, required=True, help="最大持股數 N")
     sp_rc.add_argument("--holding-days", type=int, required=True, help="固定持有天數")

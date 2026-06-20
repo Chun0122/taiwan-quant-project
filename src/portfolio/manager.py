@@ -16,10 +16,12 @@ from sqlalchemy import delete, select
 from src.config import settings
 from src.constants import (
     COMMISSION_RATE,
+    COMPOSITE_MODES,
     LIQUIDITY_PARTICIPATION_LIMIT,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
     TAX_RATE,
+    is_composite_mode,
 )
 from src.data.database import get_session
 from src.data.schema import (
@@ -30,6 +32,7 @@ from src.data.schema import (
     RotationPortfolio,
     RotationPosition,
 )
+from src.portfolio.execution_core import simulate_buy, simulate_sell
 
 # P2 任務 14 phase 1：以下函式已抽出至主題模組（rankings/market_data/metrics）。
 # 此處 re-import 維持 `from src.portfolio.manager import X` 的向後相容
@@ -60,7 +63,6 @@ from src.portfolio.rotation import (
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
-    compute_trade_costs,
     compute_vol_inverse_weights,
     detect_limit_price,
 )
@@ -74,6 +76,7 @@ MODE_LABELS = {
     "dividend": "高息",
     "growth": "成長",
     "all": "綜合",
+    "mom_growth": "動量+成長雙引擎",
 }
 
 
@@ -194,7 +197,7 @@ class RotationManager:
 
             _mode_blocked_today = bool(
                 _regime_for_gate
-                and portfolio.mode != "all"
+                and not is_composite_mode(portfolio.mode)
                 and portfolio.mode in _RMB.get(_regime_for_gate, frozenset())
             )
             if not rankings and not _mode_blocked_today:
@@ -921,13 +924,15 @@ class RotationManager:
                 continue
 
             breakdown: dict | None = None
-            if portfolio.mode == "all":
-                # 多 mode：抓該股當日所有 record，挑 primary_mode
+            if is_composite_mode(portfolio.mode):
+                members = COMPOSITE_MODES[portfolio.mode]["members"]
+                # 多 mode：抓該股當日 members 內所有 record，挑 primary_mode
                 recs = (
                     session.execute(
                         select(DiscoveryRecord).where(
                             DiscoveryRecord.scan_date == pos.entry_date,
                             DiscoveryRecord.stock_id == pos.stock_id,
+                            DiscoveryRecord.mode.in_(members),
                         )
                     )
                     .scalars()
@@ -940,7 +945,7 @@ class RotationManager:
                     breakdown = _record_to_score_breakdown(primary_rec, primary_mode=primary_mode)
                     breakdown["mode_scores"] = mode_scores
                     breakdown["avg_score"] = round(sum(mode_scores.values()) / len(mode_scores), 6)
-                    breakdown["mode"] = "all"
+                    breakdown["mode"] = portfolio.mode
             else:
                 rec = session.execute(
                     select(DiscoveryRecord).where(
@@ -1071,7 +1076,7 @@ class RotationManager:
 
             # 收集所有 scan_date 的 DiscoveryRecord
             all_rankings: dict[date, list[dict]] = {}
-            if mode == "all":
+            if is_composite_mode(mode):
                 stmt = (
                     select(DiscoveryRecord.scan_date)
                     .where(
@@ -1215,11 +1220,12 @@ class RotationManager:
                                 exit_price = min(exit_price, prev_c * (1 - SLIPPAGE_RATE))
 
                     buy_slip = sell.get("buy_slippage", SLIPPAGE_RATE)
-                    pnl, return_pct = compute_position_pnl(
+                    fill = simulate_sell(
                         sell["entry_price"], exit_price, shares, buy_slippage=buy_slip, sell_slippage=sell_slip
                     )
-                    costs = compute_trade_costs(exit_price, shares, sell_slip, side="sell")
-                    cash += exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
+                    pnl, return_pct = fill.pnl, fill.return_pct
+                    costs = fill.costs
+                    cash += fill.proceeds
 
                     total_commission += costs.commission
                     total_tax += costs.tax
@@ -1294,9 +1300,9 @@ class RotationManager:
                         daily_volume=ohlcv.get("volume"),
                         participation_limit=liquidity_limit,
                     )
-                    buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
+                    fill = simulate_buy(price, shares, buy_slip)
                     # 資金不足保護：T+1 開盤價可能高於決策日收盤，縮減股數避免現金為負
-                    if buy_cost > cash:
+                    if fill.buy_cost > cash:
                         shares = compute_shares(
                             cash,
                             price,
@@ -1304,12 +1310,12 @@ class RotationManager:
                             daily_volume=ohlcv.get("volume"),
                             participation_limit=liquidity_limit,
                         )
-                        buy_cost = price * shares * (1 + COMMISSION_RATE + buy_slip)
+                        fill = simulate_buy(price, shares, buy_slip)
                     if shares <= 0:
                         continue
 
-                    costs = compute_trade_costs(price, shares, buy_slip, side="buy")
-                    cash -= buy_cost
+                    costs = fill.costs
+                    cash -= fill.buy_cost
 
                     total_commission += costs.commission
                     total_slippage_cost += costs.slippage_cost
@@ -1563,16 +1569,12 @@ class RotationManager:
                         sell_slip = SLIPPAGE_RATE
 
                     buy_slip = pos.get("buy_slippage", SLIPPAGE_RATE)
-                    pnl, return_pct = compute_position_pnl(
-                        pos["entry_price"],
-                        exit_p,
-                        pos["shares"],
-                        buy_slippage=buy_slip,
-                        sell_slippage=sell_slip,
+                    fill = simulate_sell(
+                        pos["entry_price"], exit_p, pos["shares"], buy_slippage=buy_slip, sell_slippage=sell_slip
                     )
-                    costs = compute_trade_costs(exit_p, pos["shares"], sell_slip, side="sell")
-                    sell_proceeds = exit_p * pos["shares"] * (1 - COMMISSION_RATE - TAX_RATE - sell_slip)
-                    cash += sell_proceeds
+                    pnl, return_pct = fill.pnl, fill.return_pct
+                    costs = fill.costs
+                    cash += fill.proceeds
 
                     total_commission += costs.commission
                     total_tax += costs.tax
@@ -1920,7 +1922,7 @@ class RotationManager:
 
     def _find_latest_rankings(self, session, mode: str, before_date: date) -> list[dict]:
         """找最近的 scan_date 排名（當日無 discover 結果時使用）。"""
-        if mode == "all":
+        if is_composite_mode(mode):
             stmt = (
                 select(DiscoveryRecord.scan_date)
                 .where(DiscoveryRecord.scan_date < before_date)
@@ -1957,28 +1959,26 @@ class RotationManager:
             return cash
 
         exit_price = sell.get("exit_price", pos.entry_price)
-        pnl, return_pct = compute_position_pnl(
+        fill = simulate_sell(
             pos.entry_price,
             exit_price,
             pos.shares,
             buy_slippage=pos.buy_slippage if pos.buy_slippage is not None else SLIPPAGE_RATE,
             sell_slippage=slippage,
         )
-        sell_costs = compute_trade_costs(exit_price, pos.shares, slippage, side="sell")
-        sell_proceeds = exit_price * pos.shares - sell_costs.total
 
         pos.exit_date = today
         pos.exit_price = exit_price
         pos.exit_reason = sell["reason"]
-        pos.pnl = pnl
-        pos.return_pct = return_pct
+        pos.pnl = fill.pnl
+        pos.return_pct = fill.return_pct
         pos.status = "closed"
         pos.holding_days_count = sell.get("days_held", 0)
         # 滑價/成本 instrumentation：sell 端記滑價率 + 累加 trade_cost（買端已寫入）
         pos.sell_slippage = slippage
-        pos.trade_cost = round((pos.trade_cost or 0.0) + sell_costs.total, 2)
+        pos.trade_cost = round((pos.trade_cost or 0.0) + fill.costs.total, 2)
 
-        return cash + sell_proceeds
+        return cash + fill.proceeds
 
     def _execute_renewal(self, session, portfolio_id: int, renew: dict, new_stop_loss: float | None = None) -> None:
         """執行續持：更新 planned_exit_date，止損價只能上移（trailing stop）。"""
@@ -2023,15 +2023,13 @@ class RotationManager:
         if shares <= 0:
             return cash
 
-        buy_costs = compute_trade_costs(price, shares, slippage, side="buy")
-        buy_cost = price * shares + buy_costs.total
-        if buy_cost > cash:
+        fill = simulate_buy(price, shares, slippage)
+        if fill.buy_cost > cash:
             # 資金不足，縮減股數
             shares = compute_shares(cash, price, slippage=slippage, daily_volume=daily_volume)
             if shares <= 0:
                 return cash
-            buy_costs = compute_trade_costs(price, shares, slippage, side="buy")
-            buy_cost = price * shares + buy_costs.total
+            fill = simulate_buy(price, shares, slippage)
 
         from src.portfolio.rotation import compute_planned_exit_date
 
@@ -2062,16 +2060,16 @@ class RotationManager:
             holding_days_count=0,
             planned_exit_date=planned_exit,
             shares=shares,
-            allocated_capital=buy.get("allocated_capital", buy_cost),
+            allocated_capital=buy.get("allocated_capital", fill.buy_cost),
             stop_loss=buy.get("stop_loss"),
             status="open",
             # 滑價/成本 instrumentation：buy 端記滑價率 + 初始化 trade_cost（賣出時累加）
             buy_slippage=slippage,
-            trade_cost=round(buy_costs.total, 2),
+            trade_cost=round(fill.costs.total, 2),
             entry_score_breakdown_json=breakdown_json,
         )
         session.add(pos)
-        return cash - buy_cost
+        return cash - fill.buy_cost
 
     @staticmethod
     def _compute_backtest_metrics(

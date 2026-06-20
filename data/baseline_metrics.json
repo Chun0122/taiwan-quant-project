@@ -1,7 +1,7 @@
 {
   "metadata": {
-    "created_at": "2026-05-17 08:34:19",
-    "git_commit": "d5958a7",
+    "created_at": "2026-06-20 10:47:38",
+    "git_commit": "dace4a3",
     "tolerance_deltas": {
       "sharpe_ratio": 0.2,
       "max_drawdown_pct": 2.0,
@@ -10,41 +10,32 @@
     }
   },
   "portfolios": {
-    "all10_5d": {
-      "portfolio_name": "all10_5d",
-      "as_of": "2026-05-17",
-      "snapshot_count": 9,
-      "sharpe_ratio": null,
-      "max_drawdown_pct": 3.77,
-      "win_rate_pct": 37.5,
-      "alpha_cum_pct": 0.110122
-    },
     "mom5_10d": {
       "portfolio_name": "mom5_10d",
-      "as_of": "2026-05-17",
-      "snapshot_count": 6,
-      "sharpe_ratio": null,
-      "max_drawdown_pct": 0.45,
-      "win_rate_pct": 60.0,
-      "alpha_cum_pct": 0.089128
+      "as_of": "2026-06-20",
+      "snapshot_count": 28,
+      "sharpe_ratio": 5.5676,
+      "max_drawdown_pct": 5.43,
+      "win_rate_pct": 62.96,
+      "alpha_cum_pct": 0.064997
     },
     "swing5_3d": {
       "portfolio_name": "swing5_3d",
-      "as_of": "2026-05-17",
-      "snapshot_count": 9,
-      "sharpe_ratio": null,
-      "max_drawdown_pct": 2.44,
-      "win_rate_pct": 37.5,
-      "alpha_cum_pct": -0.016817
+      "as_of": "2026-06-20",
+      "snapshot_count": 31,
+      "sharpe_ratio": 4.8826,
+      "max_drawdown_pct": 9.21,
+      "win_rate_pct": 56.67,
+      "alpha_cum_pct": 0.113428
     },
     "mom3_20d": {
       "portfolio_name": "mom3_20d",
-      "as_of": "2026-05-17",
-      "snapshot_count": 9,
-      "sharpe_ratio": null,
-      "max_drawdown_pct": 4.36,
-      "win_rate_pct": 50.0,
-      "alpha_cum_pct": 0.099429
+      "as_of": "2026-06-20",
+      "snapshot_count": 31,
+      "sharpe_ratio": 1.6141,
+      "max_drawdown_pct": 13.98,
+      "win_rate_pct": 56.67,
+      "alpha_cum_pct": 0.005969
     }
   }
 }

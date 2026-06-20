@@ -10,6 +10,7 @@ from datetime import date
 
 from sqlalchemy import select
 
+from src.constants import COMPOSITE_MODES, is_composite_mode
 from src.data.schema import DiscoveryRecord
 
 
@@ -42,8 +43,12 @@ def resolve_rankings(
         {stock_id, stock_name, rank, score, close, stop_loss}
         （mode='all' 時額外含 primary_mode）
     """
-    if mode == "all":
-        return _resolve_all_mode_rankings(scan_date, session, top_n, per_mode_max=per_mode_max)
+    if is_composite_mode(mode):
+        spec = COMPOSITE_MODES[mode]
+        pmm = per_mode_max if per_mode_max is not None else spec["per_mode_max"]
+        return _resolve_composite_rankings(
+            scan_date, session, top_n, members=spec["members"], per_mode_max=pmm, source_mode=mode
+        )
 
     stmt = (
         select(DiscoveryRecord)
@@ -94,30 +99,36 @@ def _record_to_score_breakdown(r: DiscoveryRecord, *, primary_mode: str | None =
     return out
 
 
-def _resolve_all_mode_rankings(
+def _resolve_composite_rankings(
     scan_date: date,
     session,
     top_n: int,
-    per_mode_max: int | None = None,
+    *,
+    members: tuple[str, ...],
+    per_mode_max: int | None,
+    source_mode: str,
 ) -> list[dict]:
-    """解析 'all' 模式排名 — 所有模式取 avg_score 排序，可選 primary_mode 配額。
+    """解析合成模式排名 — 限定 members 內的模式，取 avg_score 排序 + per_mode_max 配額。
+
+    'all'（五模式）與 'mom_growth'（動量+成長雙引擎）共用本函數。
 
     Parameters
     ----------
+    members : tuple[str, ...]
+        參與合成的單一 scanner 模式（如 ('momentum','growth')）。
     per_mode_max : int | None
-        每個 primary_mode 最多 N 檔。primary_mode 定義：該股票在各模式
-        discovery_record 中 composite_score 最高的 mode。
-        None = 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設；0 或負值 = 不限制。
+        每個 primary_mode 最多 N 檔。primary_mode 定義：該股票在 members 各模式
+        discovery_record 中 composite_score 最高的 mode。None / 0 / 負值 = 不限制。
 
         2026-05-15 audit：all10_5d 5/7-5/8 從 swing 模式同時進 4 檔導致集中爆雷，
         加入此配額避免單一 mode 因子失效時整組合受重傷。
+    source_mode : str
+        來源 portfolio 模式（'all' / 'mom_growth'），寫入 breakdown 供 audit。
     """
-    from src.constants import ROTATION_ALL_MODE_PER_MODE_MAX
-
-    if per_mode_max is None:
-        per_mode_max = ROTATION_ALL_MODE_PER_MODE_MAX
-
-    stmt = select(DiscoveryRecord).where(DiscoveryRecord.scan_date == scan_date)
+    stmt = select(DiscoveryRecord).where(
+        DiscoveryRecord.scan_date == scan_date,
+        DiscoveryRecord.mode.in_(members),
+    )
     records = session.execute(stmt).scalars().all()
 
     # 按 stock_id 分組，計算 avg_score + 紀錄各 mode 分數 + 保留每 mode 最佳 record（給 breakdown）
@@ -160,7 +171,7 @@ def _resolve_all_mode_rankings(
             breakdown = _record_to_score_breakdown(primary_record, primary_mode=primary_mode)
             breakdown["mode_scores"] = dict(data["mode_scores"])  # 揭露各模式 composite_score
             breakdown["avg_score"] = round(avg_score, 6)
-            breakdown["mode"] = "all"  # 來源 portfolio 是 all
+            breakdown["mode"] = source_mode  # 來源 portfolio（'all' / 'mom_growth'）
         ranked.append(
             {
                 "stock_id": sid,
@@ -192,3 +203,17 @@ def _resolve_all_mode_rankings(
         r["rank"] = i
 
     return ranked[:top_n]
+
+
+def _resolve_all_mode_rankings(
+    scan_date: date,
+    session,
+    top_n: int,
+    per_mode_max: int | None = None,
+) -> list[dict]:
+    """'all' 五模式綜合排名（薄包裝，向後相容）。委派 _resolve_composite_rankings。"""
+    spec = COMPOSITE_MODES["all"]
+    pmm = per_mode_max if per_mode_max is not None else spec["per_mode_max"]
+    return _resolve_composite_rankings(
+        scan_date, session, top_n, members=spec["members"], per_mode_max=pmm, source_mode="all"
+    )

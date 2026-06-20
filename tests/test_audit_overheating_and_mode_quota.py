@@ -332,3 +332,99 @@ class TestAllModePerModeQuota:
         # 直查 swing mode：應回 5 筆（per_mode_max 只對 'all' 生效）
         result = resolve_rankings("swing", date(2025, 5, 7), db_session, top_n=10)
         assert len(result) == 5
+
+
+class TestMomGrowthCompositeMode:
+    """mom_growth 雙引擎 composite mode（2026-06-20 alpha 裁決後新增）。"""
+
+    def _seed(self, db_session, scan_date: date, rows: list[tuple[str, str, float]]):
+        from src.data.schema import DiscoveryRecord
+
+        for i, (sid, mode, score) in enumerate(rows):
+            db_session.add(
+                DiscoveryRecord(
+                    scan_date=scan_date,
+                    mode=mode,
+                    rank=i + 1,
+                    stock_id=sid,
+                    stock_name=f"name_{sid}",
+                    close=100.0,
+                    composite_score=score,
+                )
+            )
+        db_session.flush()
+
+    def test_is_composite_mode_truth_table(self):
+        from src.constants import is_composite_mode
+
+        assert is_composite_mode("all") is True
+        assert is_composite_mode("mom_growth") is True
+        assert is_composite_mode("momentum") is False
+        assert is_composite_mode("growth") is False
+        assert is_composite_mode(None) is False
+
+    def test_only_momentum_and_growth_members(self, db_session):
+        """mom_growth 只取 momentum + growth，過濾掉 swing/value/dividend。"""
+        from src.portfolio.manager import resolve_rankings
+
+        self._seed(
+            db_session,
+            date(2025, 5, 7),
+            [
+                ("M1", "momentum", 0.90),
+                ("G1", "growth", 0.88),
+                ("S1", "swing", 0.99),  # 分數最高但非成員 → 應被排除
+                ("V1", "value", 0.95),
+                ("D1", "dividend", 0.93),
+            ],
+        )
+        result = resolve_rankings("mom_growth", date(2025, 5, 7), db_session, top_n=10)
+        sids = {r["stock_id"] for r in result}
+        assert sids == {"M1", "G1"}
+        assert all(r["primary_mode"] in ("momentum", "growth") for r in result)
+
+    def test_per_mode_max_default_is_three(self, db_session):
+        """mom_growth 預設 per_mode_max=3（COMPOSITE_MODES registry）。"""
+        from src.constants import COMPOSITE_MODES
+        from src.portfolio.manager import resolve_rankings
+
+        assert COMPOSITE_MODES["mom_growth"]["per_mode_max"] == 3
+        # 5 檔 momentum → 配額 3 截斷
+        self._seed(
+            db_session,
+            date(2025, 5, 7),
+            [(f"M{i}", "momentum", 0.9 - i * 0.01) for i in range(5)],
+        )
+        result = resolve_rankings("mom_growth", date(2025, 5, 7), db_session, top_n=10)
+        assert len(result) == 3
+
+    def test_breakdown_mode_is_mom_growth(self, db_session):
+        """進場 breakdown 來源 mode 標記為 mom_growth（非 all）。"""
+        from src.portfolio.manager import resolve_rankings
+
+        self._seed(
+            db_session,
+            date(2025, 5, 7),
+            [("M1", "momentum", 0.90), ("G1", "growth", 0.88)],
+        )
+        result = resolve_rankings("mom_growth", date(2025, 5, 7), db_session, top_n=10)
+        assert result[0]["score_breakdown"]["mode"] == "mom_growth"
+
+    def test_all_mode_still_includes_all_five(self, db_session):
+        """回歸護欄：'all' 行為不變，仍納入五模式（per_mode_max=2 預設）。"""
+        from src.portfolio.manager import resolve_rankings
+
+        self._seed(
+            db_session,
+            date(2025, 5, 7),
+            [
+                ("M1", "momentum", 0.90),
+                ("G1", "growth", 0.88),
+                ("S1", "swing", 0.86),
+                ("V1", "value", 0.84),
+                ("D1", "dividend", 0.82),
+            ],
+        )
+        result = resolve_rankings("all", date(2025, 5, 7), db_session, top_n=10)
+        modes = {r["primary_mode"] for r in result}
+        assert modes == {"momentum", "growth", "swing", "value", "dividend"}
