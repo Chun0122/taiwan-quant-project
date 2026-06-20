@@ -1041,6 +1041,8 @@ class RotationManager:
         dynamic_slippage: bool = True,
         liquidity_limit: float = LIQUIDITY_PARTICIPATION_LIMIT,
         limit_price_check: bool = False,
+        disable_stop_loss: bool = False,
+        stop_loss_widen: float = 1.0,
     ) -> RotationBacktestResult:
         """歷史回測：逐日模擬 rotation 策略。
 
@@ -1384,10 +1386,26 @@ class RotationManager:
                     continue
 
                 # 止損價：從持倉記錄取進場時鎖定的止損價
-                stop_losses = {p["stock_id"]: p["stop_loss"] for p in positions if p.get("stop_loss") is not None}
-                for r in last_rankings:
-                    if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
-                        stop_losses[r["stock_id"]] = r["stop_loss"]
+                # 研究旋鈕（B1 診斷：停損砍肥尾贏家）：disable_stop_loss=關閉、
+                # stop_loss_widen>1=放寬停損與參考價距離（持倉用 entry、新候選用 close）。
+                if disable_stop_loss:
+                    stop_losses = {}
+                else:
+                    stop_losses = {}
+                    for p in positions:
+                        sl = p.get("stop_loss")
+                        if sl is not None:
+                            ref = p.get("entry_price")
+                            stop_losses[p["stock_id"]] = (
+                                sl if stop_loss_widen == 1.0 or ref is None else ref - (ref - sl) * stop_loss_widen
+                            )
+                    for r in last_rankings:
+                        sl = r.get("stop_loss")
+                        if r["stock_id"] not in stop_losses and sl is not None:
+                            ref = r.get("close")
+                            stop_losses[r["stock_id"]] = (
+                                sl if stop_loss_widen == 1.0 or ref is None else ref - (ref - sl) * stop_loss_widen
+                            )
 
                 # ── 風控 overlay（P0-1 修復：與 live update() 對齊）──
                 # Portfolio Heat 分母 = pre-action 權益（cash + 既有持倉 today MtM）

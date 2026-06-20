@@ -267,3 +267,95 @@ def test_backtest_delisted_holding_realizes_loss_and_warns(patch_session):
     # 以最後已知價 80 平倉（非凍結在 entry 100）→ 實現虧損
     assert t["exit_price"] == pytest.approx(80.0)
     assert t["pnl"] < 0
+
+
+# ── 停損實驗旋鈕（disable_stop_loss / stop_loss_widen，B1 診斷後）──
+
+
+def _seed_stop(db_session) -> RotationPortfolio:
+    """bull regime，價格在持有期內跌破 stop_loss=90（觸發停損）。
+
+    價路：D0~D1=100、D2=95、D3 起=86（< 90 觸發；> 80 不觸發放寬後停損）。
+    """
+
+    def level(i: int) -> float:
+        if i <= 1:
+            return 100.0
+        if i == 2:
+            return 95.0
+        return 86.0
+
+    for i in range(_DAYS):
+        d = _START + timedelta(days=i)
+        db_session.add(
+            DailyPrice(stock_id="TAIEX", date=d, open=23000, high=23100, low=22900, close=23050, volume=0, turnover=0.0)
+        )
+        px = level(i)
+        for sid in _STOCKS:
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid,
+                    date=d,
+                    open=px,
+                    high=px + 1,
+                    low=px - 1,
+                    close=px,
+                    volume=10_000_000,
+                    turnover=1_000_000_000.0,
+                )
+            )
+    for rank, sid in enumerate(_STOCKS, start=1):
+        db_session.add(
+            DiscoveryRecord(
+                scan_date=_START,
+                mode="momentum",
+                rank=rank,
+                stock_id=sid,
+                stock_name=f"name_{sid}",
+                close=100,
+                composite_score=0.9 - rank * 0.05,
+                regime="bull",
+                entry_price=100,
+                stop_loss=90,
+            )
+        )
+    p = RotationPortfolio(
+        name="stop_test",
+        mode="momentum",
+        max_positions=3,
+        holding_days=10,
+        allow_renewal=True,
+        initial_capital=1_000_000.0,
+        current_capital=1_000_000.0,
+        current_cash=1_000_000.0,
+        status="active",
+    )
+    db_session.add(p)
+    db_session.commit()
+    return p
+
+
+def _stop_exits(result) -> int:
+    return sum(1 for t in result.trades if t.get("exit_reason") == "stop_loss")
+
+
+def test_backtest_baseline_triggers_stop_loss(patch_session):
+    """baseline（預設旋鈕）：價格跌破 90 → 至少一筆 stop_loss 出場。"""
+    _seed_stop(patch_session)
+    result = RotationManager("stop_test").backtest(_START, _START + timedelta(days=_DAYS - 1))
+    assert _stop_exits(result) >= 1
+
+
+def test_backtest_disable_stop_loss_removes_stop_exits(patch_session):
+    """disable_stop_loss=True → 無任何 stop_loss 出場。"""
+    _seed_stop(patch_session)
+    result = RotationManager("stop_test").backtest(_START, _START + timedelta(days=_DAYS - 1), disable_stop_loss=True)
+    assert _stop_exits(result) == 0
+
+
+def test_backtest_widen_stop_reduces_stop_exits(patch_session):
+    """stop_loss_widen=2.0（停損移到 80）→ 86 不觸發，停損出場數 < baseline。"""
+    _seed_stop(patch_session)
+    base = RotationManager("stop_test").backtest(_START, _START + timedelta(days=_DAYS - 1))
+    widened = RotationManager("stop_test").backtest(_START, _START + timedelta(days=_DAYS - 1), stop_loss_widen=2.0)
+    assert _stop_exits(widened) < _stop_exits(base)
