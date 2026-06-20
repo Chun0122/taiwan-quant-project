@@ -104,7 +104,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `entry_exit.py` | 共用純函數：ATR 止損止利、進場觸發、時機評估（Discover/Suggest/Watch 三系統共用） |
 | `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR） |
 | `portfolio/manager.py` | RotationManager：每日更新 / Kill Switch / 歷史回測 |
-| `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_all_mode_rankings / 進場理由 breakdown），manager.py 抽出 |
+| `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；股數定價/滑價/流動性/漲跌停留各 caller |
+| `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_composite_rankings / 進場理由 breakdown），manager.py 抽出。**Composite mode**（`constants.COMPOSITE_MODES` + `is_composite_mode`）：'all'（五模式）與 'mom_growth'（動量+成長雙引擎，2026-06-20 取代結構性失敗的 'all'）共用 avg-score + per_mode_max 配額 resolver |
 | `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
 | `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields），manager.py 抽出 |
 | `portfolio/audit.py` | rotation-audit 純函數（trade stats / alpha delta / Jaccard 穩定性），`rotation-audit` CLI 用 |

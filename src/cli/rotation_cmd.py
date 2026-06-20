@@ -55,7 +55,7 @@ def cmd_rotation(args: argparse.Namespace) -> None:
         capital = args.capital
         allow_renewal = not getattr(args, "no_renewal", False)
 
-        valid_modes = ("momentum", "swing", "value", "dividend", "growth", "all")
+        valid_modes = ("momentum", "swing", "value", "dividend", "growth", "all", "mom_growth")
         if mode not in valid_modes:
             print(f"錯誤: --mode 必須為 {valid_modes} 之一")
             return

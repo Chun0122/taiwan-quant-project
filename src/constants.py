@@ -179,3 +179,28 @@ DISCOVERY_OVERHEATING_DAMPEN_FACTOR: float = 0.85
 # 2026-06-19 收緊 3→2：all10_5d 連兩次審計（5/29 −4.04pp / 6/15 −5.07pp，後者 N=29
 #   樣本紮實）皆 underperform 0050，觸發 5/29 報告 §7.1 既定收緊規則。
 ROTATION_ALL_MODE_PER_MODE_MAX: int = 2
+
+# ── Composite（多模式合成）輪動模式 ─────────────────────────────────────
+# 「合成模式」= 跨多個 scanner 模式以 avg composite_score 排序、並用 per_mode_max
+# 配額避免單一 mode 集中爆雷。'all'（五模式綜合）與 'mom_growth'（動量+成長雙引擎）
+# 共用 portfolio.rankings._resolve_composite_rankings。
+# - 'all'：保留既有行為（五模式，per_mode_max=ROTATION_ALL_MODE_PER_MODE_MAX）。
+# - 'mom_growth'：2026-06-20 alpha 裁決後新增，取代結構性失敗的 'all'。momentum 與
+#   growth cross-mode 相關 −0.469（互補對沖），且為訊號層僅有的兩個贏家。per_mode_max=3
+#   讓兩模式各最多 3 檔（最多 6 候選）足以填滿 5 部位且不單一集中。
+# members 僅限 scanner 會產生 DiscoveryRecord 的單一模式（不可含其他 composite）。
+COMPOSITE_MODES: dict[str, dict] = {
+    "all": {
+        "members": ("momentum", "swing", "value", "dividend", "growth"),
+        "per_mode_max": ROTATION_ALL_MODE_PER_MODE_MAX,
+    },
+    "mom_growth": {
+        "members": ("momentum", "growth"),
+        "per_mode_max": 3,
+    },
+}
+
+
+def is_composite_mode(mode: str | None) -> bool:
+    """是否為合成（多模式）輪動模式（'all' / 'mom_growth'）。"""
+    return mode in COMPOSITE_MODES

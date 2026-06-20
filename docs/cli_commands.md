@@ -129,6 +129,8 @@ python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades
 # 建立
 python main.py rotation create --name mom5_3d --mode momentum --max-positions 5 --holding-days 3 --capital 1000000
 python main.py rotation create --name all10_5d --mode all --max-positions 10 --holding-days 5 --capital 2000000 --no-renewal
+# 合成模式：mom_growth = 動量+成長雙引擎（momentum+growth，per_mode_max=3）
+python main.py rotation create --name mg5_20d --mode mom_growth --max-positions 5 --holding-days 20 --capital 1000000
 
 # 更新
 python main.py rotation update --name mom5_3d
