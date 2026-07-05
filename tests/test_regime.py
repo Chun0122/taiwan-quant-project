@@ -856,3 +856,48 @@ class TestRegimeStateMachine:
         assert sm.current_regime is None  # 未初始化
         sm.update(self._bull_closes())
         assert sm.current_regime == "bull"
+
+
+class TestCrisisSignalAvailability:
+    """P0 止血包 #5 — detect_crisis_signals 回傳 availability（資料可用性自檢）。"""
+
+    def _stable_closes(self, n: int = 130) -> pd.Series:
+        return pd.Series([16000.0] * n)
+
+    def test_missing_vix_marks_unavailable(self):
+        """TW_VIX 死掉情境：vix_series=None → availability False 且訊號恆 False。"""
+        result = detect_crisis_signals(self._stable_closes(), volumes=None, vix_series=None, us_vix_series=None)
+        avail = result["availability"]
+        assert avail["vix_spike"] is False
+        assert avail["us_vix_spike"] is False
+        assert avail["panic_volume"] is False
+        assert result["signals"]["vix_spike"] is False
+        # closes 充足 → 其餘 4 個訊號可用
+        assert avail["fast_return_5d"] is True
+        assert avail["consec_decline"] is True
+        assert avail["vol_spike"] is True
+        assert avail["single_day_drop"] is True
+        assert sum(avail.values()) == 4
+
+    def test_all_series_provided_full_availability(self):
+        closes = self._stable_closes()
+        volumes = pd.Series([1_000_000.0] * 130)
+        vix = pd.Series([18.0] * 30)
+        us_vix = pd.Series([15.0] * 30)
+        result = detect_crisis_signals(closes, volumes=volumes, vix_series=vix, us_vix_series=us_vix)
+        avail = result["availability"]
+        assert len(avail) == 7
+        assert all(avail.values()), f"全序列提供時應 7/7 可用：{avail}"
+
+    def test_existing_keys_unchanged(self):
+        """回歸保護：availability 為純新增 key，既有結構不變。"""
+        result = detect_crisis_signals(self._stable_closes())
+        for key in ("crisis", "signals", "fast_return_5d_val", "vol_ratio_val", "vix_val", "us_vix_val"):
+            assert key in result
+        assert set(result["signals"].keys()) == set(result["availability"].keys())
+
+    def test_short_closes_safe_path_has_availability(self):
+        """資料不足走 _safe 早退時也帶 availability（全 False）。"""
+        result = detect_crisis_signals(pd.Series([16000.0, 15900.0]))
+        assert "availability" in result
+        assert not any(result["availability"].values())
