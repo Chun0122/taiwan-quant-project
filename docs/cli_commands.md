@@ -84,10 +84,11 @@ python main.py discover all --skip-sync --export compare.csv
 python main.py discover momentum --weekly-confirm     # 週線多時框確認
 python main.py discover momentum --use-ic-adjustment  # Factor IC 動態權重調整
 
-# 推薦績效回測
-python main.py discover-backtest --mode momentum
-python main.py discover-backtest --mode momentum --include-costs    # 含交易成本
-python main.py discover-backtest --mode momentum --entry-next-open  # T+1 開盤進場
+# 推薦績效回測（2026-07-05 預設翻轉：含成本 + T+1 開盤進場）
+python main.py discover-backtest --mode momentum                     # 新預設：含成本 + T+1 開盤
+python main.py discover-backtest --mode momentum --naive             # 舊假設（無成本 + T 日收盤，僅供對照）
+python main.py discover-backtest --mode momentum --no-include-costs  # 單獨關閉成本
+python main.py discover-backtest --mode momentum --no-entry-next-open  # 單獨關閉 T+1 進場
 
 # OOS Hold-Out 紀律（P1 任務 7：預設保留最近 90 天為 holdout，回測跨界印警告）
 python main.py discover-backtest --mode momentum --start 2026-01-01 --end 2026-02-15  # ✅ 純 in-sample

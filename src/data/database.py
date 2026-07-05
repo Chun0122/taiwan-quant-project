@@ -62,15 +62,32 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
 
 
+def _prune_old_backups(backup_dir: Path, retention_days: int) -> None:
+    """刪除目錄中超過保留天數的 .bak 舊備份。"""
+    import time as _time
+
+    cutoff = _time.time() - retention_days * 86400
+    for old_bak in backup_dir.glob("*.bak"):
+        if old_bak.stat().st_mtime < cutoff:
+            old_bak.unlink()
+            logger.debug("刪除過期備份: %s", old_bak)
+
+
 def backup_db() -> Path | None:
-    """備份 SQLite 資料庫檔案（複製為 .bak 加時間戳）。
+    """備份 SQLite 資料庫檔案（複製為 .bak 加時間戳）+ 異地副本。
+
+    P0 止血包 #1（2026-07-05）：
+    - 保留天數改讀 settings.backup.retention_days（原硬編碼 7 天）
+    - 本地備份成功後複製到 settings.backup.offsite_dir（預設 iCloud Drive）；
+      異地任何失敗只 warning 不 raise——iCloud 未登入/離線不可拖垮 morning-routine
+    - 由 morning-routine Step 18 每日呼叫（原為零呼叫者死碼）
 
     備份前執行 PRAGMA integrity_check（每次備份時檢查，而非每次啟動）。
 
     Returns
     -------
     Path | None
-        備份檔案路徑，或 None（非檔案型 DB 時）。
+        本地備份檔案路徑，或 None（非檔案型 DB 時）。
     """
     db_path = _resolve_db_path(_resolve_db_url(settings.database.url))
     if db_path is None or not db_path.exists():
@@ -87,6 +104,7 @@ def backup_db() -> Path | None:
     except Exception:
         logger.warning("SQLite integrity check 無法執行", exc_info=True)
 
+    retention_days = settings.backup.retention_days
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = db_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -94,15 +112,20 @@ def backup_db() -> Path | None:
 
     shutil.copy2(db_path, backup_path)
     logger.info("SQLite 備份完成: %s", backup_path)
+    _prune_old_backups(backup_dir, retention_days)
 
-    # 清理超過 7 天的舊備份
-    import time as _time
-
-    cutoff = _time.time() - 7 * 86400
-    for old_bak in backup_dir.glob("*.bak"):
-        if old_bak.stat().st_mtime < cutoff:
-            old_bak.unlink()
-            logger.debug("刪除過期備份: %s", old_bak)
+    # 異地副本（iCloud Drive 等），失敗不影響本地備份結果
+    offsite_dir_str = settings.backup.offsite_dir
+    if offsite_dir_str:
+        try:
+            offsite_dir = Path(offsite_dir_str).expanduser()
+            offsite_dir.mkdir(parents=True, exist_ok=True)
+            offsite_path = offsite_dir / backup_path.name
+            shutil.copy2(backup_path, offsite_path)
+            logger.info("異地副本完成: %s", offsite_path)
+            _prune_old_backups(offsite_dir, retention_days)
+        except Exception:
+            logger.warning("異地副本失敗（本地備份不受影響）: %s", offsite_dir_str, exc_info=True)
 
     return backup_path
 

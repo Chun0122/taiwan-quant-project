@@ -1248,6 +1248,44 @@ def check_drawdown_kill_switch(
     return dd >= threshold_pct
 
 
+def compute_drawdown_with_snapshots(
+    equity_history: list[float],
+    snapshot_capitals: list[float],
+) -> float:
+    """計算當前回撤百分比，peak 額外納入每日 snapshot 權益序列（純函數）。
+
+    P0 止血包 #3（2026-07-05）：`build_equity_history` 的中間序列為 realized-only
+    running balance，浮盈從未實現過的高點不會出現在序列中——「浮盈回吐型」崩跌的
+    真實 peak 被低估，25% 熔斷可能不觸發。`RotationDailySnapshot.total_capital`
+    是每日收盤 MtM 權益（cash + 持倉市值），其歷史 max 能補回浮盈高點。
+
+    設計：peak = max(equity_history ∪ snapshot_capitals)，current = equity_history[-1]
+    （含當日盤中 MtM，保留 C1 修復語意）。snapshot 缺日（熔斷日不寫、update 失敗日）
+    時自動退化為現行 equity_history 行為，不會更差。
+
+    Parameters
+    ----------
+    equity_history : list[float]
+        realized-only 權益序列 + 尾端含 MtM 的 final_equity（build_equity_history 輸出）。
+    snapshot_capitals : list[float]
+        該組合全部 RotationDailySnapshot.total_capital（依日期升序；可為空）。
+
+    Returns
+    -------
+    float
+        當前回撤百分比（0.0~100.0），0.0 = 在高點。
+    """
+    if not equity_history:
+        return 0.0
+    current = equity_history[-1]
+    candidates = [v for v in [*equity_history, *snapshot_capitals] if v is not None]
+    peak = max(candidates)
+    if peak <= 0:
+        return 0.0
+    dd = (peak - current) / peak * 100
+    return round(max(dd, 0.0), 2)
+
+
 def build_equity_history(
     initial_capital: float,
     closed_pnls: list[float],

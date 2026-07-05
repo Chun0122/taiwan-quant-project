@@ -198,6 +198,9 @@ def _seed_rotation_portfolio(session) -> RotationPortfolio:
 
 def _patch_external_io(monkeypatch):
     """攔截 Discord / yfinance / Anthropic / TWSE-fetcher 等外部 IO。"""
+    # Step 18 DB 備份：no-op（否則會對真實 data/stock.db 做 900MB copy + 寫 iCloud）
+    monkeypatch.setattr("src.cli.morning_cmd._run_db_backup", lambda: None, raising=False)
+
     # Discord webhook
     try:
         monkeypatch.setattr("src.notification.line_notify.send_message", lambda *a, **kw: True)
@@ -286,6 +289,7 @@ class TestDryRunFullPipeline:
             "Step 15/",
             "Step 16/",
             "Step 17/",
+            "Step 18/",  # P0 止血包 #1：DB 備份
         ]
         missing = [lbl for lbl in expected_step_labels if lbl not in out]
         assert not missing, f"missing step labels: {missing}"
