@@ -80,6 +80,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # 訊號穩定性 long-run 監控（2026-06-03，§7.3）：StrategyDecayLog 加每日 top-N Jaccard
     ("strategy_decay_log", "signal_jaccard_mean", "REAL"),
     ("strategy_decay_log", "signal_jaccard_pairs", "INTEGER DEFAULT 0"),
+    # A5 決策可重放（2026-07-05）：DiscoveryRecord 版本戳；NULL = A5 前混雜版本
+    ("discovery_record", "git_commit", "VARCHAR(40)"),
+    ("discovery_record", "settings_hash", "VARCHAR(40)"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

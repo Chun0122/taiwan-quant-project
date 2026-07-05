@@ -20,11 +20,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import secrets
-import subprocess
 from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any
@@ -36,10 +34,15 @@ from src.config import Settings, settings
 from src.data.database import get_session
 from src.data.schema import ExperimentLog
 
-logger = logging.getLogger(__name__)
+# A5 抽至 src/provenance.py（DiscoveryRecord 蓋章共用）；此處 re-export 維持既有 import 路徑
+from src.provenance import (
+    RESEARCH_SETTINGS_SECTIONS,  # noqa: F401
+    compute_settings_hash,
+    sanitize_settings,
+    try_git_head,
+)
 
-# 哪些 settings 區塊納入 hash + snapshot（研究相關，排除 API token 等 infra 設定）
-RESEARCH_SETTINGS_SECTIONS: tuple[str, ...] = ("quant", "fetcher")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -47,48 +50,11 @@ RESEARCH_SETTINGS_SECTIONS: tuple[str, ...] = ("quant", "fetcher")
 # ---------------------------------------------------------------------------
 
 
-def sanitize_settings(s: Settings) -> dict[str, Any]:
-    """從 Settings 抽研究相關區塊；不含 API token / webhook URL。
-
-    保留：quant / fetcher.watchlist + fetcher.default_start_date
-    移除：finmind / anthropic.api_key / discord.webhook_url / database / logging
-    """
-    out: dict[str, Any] = {}
-    if "quant" in RESEARCH_SETTINGS_SECTIONS:
-        out["quant"] = s.quant.model_dump()
-    if "fetcher" in RESEARCH_SETTINGS_SECTIONS:
-        out["fetcher"] = {
-            "default_start_date": s.fetcher.default_start_date,
-            "watchlist": list(s.fetcher.watchlist),
-        }
-    return out
-
-
-def compute_settings_hash(sanitized: dict[str, Any]) -> str:
-    """sha256 前 16 hex chars 作為 settings 指紋（idempotent，跨機器一致）。"""
-    canonical = json.dumps(sanitized, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-
-
 def generate_experiment_id(today: date | None = None) -> str:
     """格式：exp_YYYYMMDD_<6 hex>，例 exp_20260518_a3f8c1。"""
     today = today or date.today()
     suffix = secrets.token_hex(3)  # 6 hex chars
     return f"exp_{today.strftime('%Y%m%d')}_{suffix}"
-
-
-def try_git_head() -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return result.stdout.strip() or None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
 
 
 def collect_experiment_payload(

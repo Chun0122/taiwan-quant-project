@@ -495,6 +495,9 @@ class DiscoveryRecord(Base):
     daytrade_penalty: Mapped[float | None] = mapped_column(Float, nullable=True)  # 隔日沖風險扣分（0~1）
     daytrade_tags: Mapped[str | None] = mapped_column(String(200), nullable=True)  # 隔日沖分點名稱（逗號分隔）
     chip_tier_change: Mapped[str | None] = mapped_column(String(20), nullable=True)  # 籌碼層級變化（如 "8F→7F"）
+    # A5 決策可重放：產生本筆記錄的程式版本與參數指紋；NULL = A5 前混雜版本（跨版本不可比）
+    git_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    settings_hash: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
