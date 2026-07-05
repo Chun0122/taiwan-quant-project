@@ -50,7 +50,7 @@ python -m venv /tmp/verify-venv
 
 1. 前往 [FinMind](https://finmindtrade.com/) 註冊帳號
 2. 登入後至「API Token」頁面取得 Token
-3. 將 Token 填入 `config/settings.yaml`：
+3. 將 Token 填入 `config/secrets.yaml`（首次可自 `config/secrets.yaml.example` 複製）：
 
 ```yaml
 finmind:
@@ -66,7 +66,8 @@ taiwan-quant-project/
 ├── main.py                  # CLI 主程式入口
 ├── requirements.txt         # Python 套件清單
 ├── config/
-│   ├── settings.yaml        # 系統設定檔
+│   ├── quant_params.yaml    # 量化參數與非機密設定（進版控）
+│   ├── secrets.yaml         # 機密設定（token/webhook，gitignored）
 │   └── concepts.yaml        # 概念股定義（CoWoS封裝/散熱模組/低軌衛星/AI伺服器/車用電子）
 ├── data/
 │   ├── stock.db             # SQLite 資料庫
@@ -152,13 +153,13 @@ taiwan-quant-project/
 
 ## 3. 設定檔說明
 
-設定檔位於 `config/settings.yaml`：
+設定拆為兩檔（A5，2026-07-05）：`config/quant_params.yaml`（量化參數與非機密設定，**進版控**）+ `config/secrets.yaml`（機密，gitignored，自 `secrets.yaml.example` 複製後填入）。載入時 secrets 深度覆蓋 quant_params；legacy `settings.yaml` 若存在則照舊載入並警告。內容範例：
 
 ```yaml
-# FinMind API 設定
+# --- quant_params.yaml（節錄）---
+# FinMind API 端點（token 在 secrets.yaml）
 finmind:
   api_url: "https://api.finmindtrade.com/api/v4/data"
-  api_token: "你的 token"
 
 # 資料庫設定（預設使用 SQLite）
 database:
@@ -208,7 +209,7 @@ python main.py watchlist remove 2330
 python main.py watchlist list
 ```
 
-> **DB 優先**：若 DB watchlist 非空，所有指令（sync、discover、anomaly-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `settings.yaml` 中的 watchlist。
+> **DB 優先**：若 DB watchlist 非空，所有指令（sync、discover、anomaly-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `quant_params.yaml` 中的 watchlist。
 
 ---
 
@@ -535,7 +536,7 @@ python main.py scan --lookback 10
 
 ### 4.6 Discord Webhook 通知 (`notify`)
 
-發送訊息到 Discord 頻道。需先在 `config/settings.yaml` 設定 Discord Webhook URL。
+發送訊息到 Discord 頻道。需先在 `config/secrets.yaml` 設定 Discord Webhook URL。
 
 ```bash
 # 發送測試訊息
@@ -547,7 +548,7 @@ python main.py notify --message "測試通知"
 1. 開啟 Discord，進入要接收通知的頻道
 2. 頻道設定 → 整合 → Webhook → 建立 Webhook
 3. 複製 Webhook URL
-4. 在 `config/settings.yaml` 新增：
+4. 在 `config/secrets.yaml` 新增：
 
 ```yaml
 discord:
@@ -886,7 +887,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | `--compare` | 顯示與上次推薦的差異（新進/退出/排名變動 >= 3 名，單模式有效） |
 | `--min-appearances N` | [all 模式] 只顯示出現在 N 個以上模式的股票（預設 1 = 全部顯示） |
 | `--weekly-confirm` | 啟用週線多時框確認：從 DB 讀取近 90 天日K 聚合週K，SMA13 + RSI14 週線信號同為多頭 → composite_score ×1.05（+5%），同為空頭 → ×0.95（-5%），預設關閉 |
-| `--ai-summary` | 掃描完成後呼叫 Claude API（`claude-sonnet-4-6`）生成約 300 字繁體中文摘要（市場狀態分析 + 前三名亮點 + 風險提示），需在 `config/settings.yaml` 設定 `anthropic.api_key` |
+| `--ai-summary` | 掃描完成後呼叫 Claude API（`claude-sonnet-4-6`）生成約 300 字繁體中文摘要（市場狀態分析 + 前三名亮點 + 風險提示），需在 `config/secrets.yaml` 設定 `anthropic.api_key` |
 
 **Regime 自適應進出場 ATR 參數（discover 輸出的 stop_loss / take_profit）：**
 
@@ -1464,9 +1465,9 @@ python main.py anomaly-scan --notify
 
 ### 4.26 DB-based 觀察清單管理 (`watchlist`)
 
-將觀察清單從 `settings.yaml` 遷移至資料庫，支援動態新增/移除，無需手動編輯 YAML 檔案。
+將觀察清單從 `quant_params.yaml` 遷移至資料庫，支援動態新增/移除，無需手動編輯 YAML 檔案。
 
-**DB 優先邏輯**：若 DB watchlist 非空，所有命令（sync、discover、anomaly-scan、revenue-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `settings.yaml` 的 watchlist。
+**DB 優先邏輯**：若 DB watchlist 非空，所有命令（sync、discover、anomaly-scan、revenue-scan 等）優先使用 DB 清單；DB 為空時自動 fallback 至 `quant_params.yaml` 的 watchlist。
 
 ```bash
 # 列出目前有效 watchlist（DB 非空顯示 DB，DB 空顯示 YAML）
@@ -1479,7 +1480,7 @@ python main.py watchlist add 2330 --name 台積電 --note 核心持倉
 # 移除股票
 python main.py watchlist remove 2330
 
-# 從 settings.yaml 一次性匯入（首次使用時執行）
+# 從 quant_params.yaml 一次性匯入（首次使用時執行）
 python main.py watchlist import
 ```
 
@@ -1491,7 +1492,7 @@ python main.py watchlist import
 | `--name TEXT` | 股票名稱（可選，例：台積電）|
 | `--note TEXT` | 備註（可選，例：核心持倉）|
 
-> **遷移建議**：首次使用執行 `python main.py watchlist import` 將 YAML 清單匯入 DB，之後即可完全透過 CLI 管理，無需再修改 `settings.yaml`。
+> **遷移建議**：首次使用執行 `python main.py watchlist import` 將 YAML 清單匯入 DB，之後即可完全透過 CLI 管理，無需再修改 `quant_params.yaml`。
 
 ---
 
@@ -2214,7 +2215,7 @@ print(df.tail())
 
 ### Q: 如何新增要追蹤的股票？
 
-推薦使用 DB watchlist 管理（`python main.py watchlist add 2330 --name 台積電`），或編輯 `config/settings.yaml` 的 `fetcher.watchlist`。DB 非空時優先使用 DB 清單。首次可執行 `python main.py watchlist import` 從 YAML 批次匯入。
+推薦使用 DB watchlist 管理（`python main.py watchlist add 2330 --name 台積電`），或編輯 `config/quant_params.yaml` 的 `fetcher.watchlist`。DB 非空時優先使用 DB 清單。首次可執行 `python main.py watchlist import` 從 YAML 批次匯入。
 
 ### Q: 資料多久更新一次？
 
@@ -2237,7 +2238,7 @@ FinMind 免費版有請求頻率限制。系統已內建每次請求後等待 0.
 - 保留策略：本地與異地皆保留 `backup.retention_days` 天（預設 7），過期自動刪除
 - 異地失敗（iCloud 離線等）只記 warning，不影響本地備份與 routine
 
-`config/settings.yaml` 可覆蓋：
+`config/quant_params.yaml` 可覆蓋：
 
 ```yaml
 backup:
@@ -2248,7 +2249,7 @@ backup:
 **Dead-man 告警**（2026-07-05 起）：`morning-routine` 會對 healthchecks.io 發 ping
 （起跑 `/start`、成功完成本體、有步驟失敗 `/fail`；非交易日 short-circuit 視為 success；
 dry-run 不 ping）。到 [healthchecks.io](https://healthchecks.io) 建立 check（排程設為每個
-平日早上 + 適當 grace period），把 ping URL 填入 `config/settings.yaml`：
+平日早上 + 適當 grace period），把 ping URL 填入 `config/secrets.yaml`：
 
 ```yaml
 monitoring:

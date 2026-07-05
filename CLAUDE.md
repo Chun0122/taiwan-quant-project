@@ -21,7 +21,7 @@
 | **回測成本** | 手續費 0.1425%、交易稅 0.3%（賣出）、滑價 0.05% |
 | **Session** | `with get_session() as session:`；批次寫入 `sqlite_upsert().on_conflict_do_nothing()` |
 | **常數** | 全系統共用常數集中於 `src/constants.py`，勿在各模組硬編碼 |
-| **設定** | `config/settings.yaml` → `src/config.py` Pydantic 載入（4 子模型 + 啟動驗證） |
+| **設定** | `config/quant_params.yaml`（量化參數，**進版控**）+ `config/secrets.yaml`（機密，gitignored）→ `src/config.py` deep-merge 載入（A5 拆檔；legacy `settings.yaml` 存在時照舊+警告）；機密勿寫入 quant_params |
 | **資料來源優先序** | ①TWSE/TPEX 官方（免費，全市場）→ ②FinMind 批次（付費）→ ③FinMind 逐股（免費備援） |
 
 ### 提交前必執行
@@ -90,7 +90,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
-| `discovery/strategy_events.py` | 策略調整事件抽取（git log + settings.yaml diff，供 dashboard 事件流） |
+| `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
 | `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機 |
 | `industry/analyzer.py` | 產業輪動、同業相對強度（±3%） |
@@ -135,7 +135,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **策略註冊** | `STRATEGY_REGISTRY`（`src/strategy/__init__.py`）；9 策略；新策略繼承 `Strategy`，實作 `generate_signals(data) → Series[1/-1/0]` |
 | **EAV 指標** | `TechnicalIndicator`（stock_id, date, name, value），`load_data()` pivot 為寬表 |
 | **除權息** | Layer 1 回溯調整 OHLC + 重算指標（保留 `raw_*`）；Layer 2 原始價格交易 + 股利入帳；預設關閉，`--adjust-dividend` 啟用 |
-| **Watchlist** | `get_effective_watchlist()`：DB 優先，`settings.yaml` fallback，全模組統一呼叫 |
+| **Watchlist** | `get_effective_watchlist()`：DB 優先，`quant_params.yaml` fallback，全模組統一呼叫 |
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
@@ -182,13 +182,14 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | [`docs/testing_guide.md`](docs/testing_guide.md) | 45 個測試檔對照表、Fixtures、覆蓋率指引 |
 | [`docs/project_history.md`](docs/project_history.md) | 85 項已完成任務歷史（Phase 1~2） |
 | `usage.md` | 使用者導向操作手冊 |
-| `config/settings.yaml` | 執行期設定（`.gitignore` 已排除） |
+| `config/quant_params.yaml` | 量化參數與非機密設定（進版控，A5） |
+| `config/secrets.yaml` | 機密設定（`.gitignore` 已排除） |
 
 ---
 
 ## 8. 已確認事項（規劃時勿重複提出）
 
-- `config/settings.yaml` 已在 `.gitignore`，token 從未進入 Git
+- `config/secrets.yaml`（及 legacy `settings.yaml`）已在 `.gitignore`，token 從未進入 Git；A5 拆檔後量化參數（`quant_params.yaml`）進版控
 - TWSE/TPEX `verify=False`：刻意設計（Windows 憑證問題）
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能
