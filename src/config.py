@@ -156,6 +156,17 @@ class DashboardConfig(BaseModel):
     portfolio_review_lookback_days: int = 90  # portfolio_review 撈最近 N 天 snapshot 計算指標
 
 
+class BackupConfig(BaseModel):
+    """DB 備份設定（P0 止血包 #1，2026-07-05）。
+
+    offsite_dir：異地副本目錄（預設 iCloud Drive，macOS 自動同步上雲）；
+    設為空字串停用異地副本。retention_days：本地與異地共用的保留天數。
+    """
+
+    offsite_dir: str = "~/Library/Mobile Documents/com~apple~CloudDocs/taiwan-quant-backups"
+    retention_days: int = 7
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
@@ -165,6 +176,7 @@ class Settings(BaseModel):
     anthropic: AnthropicConfig = AnthropicConfig()
     quant: QuantConfig = QuantConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    backup: BackupConfig = BackupConfig()
 
     @model_validator(mode="after")
     def _validate_critical_settings(self) -> "Settings":
