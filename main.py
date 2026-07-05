@@ -162,9 +162,8 @@ from src.constants import (
 )
 
 
-def main() -> None:
-    setup_logging()
-
+def build_parser() -> argparse.ArgumentParser:
+    """建構 CLI 主 parser（獨立函數供 smoke test 驗證所有子命令定義）。"""
     parser = argparse.ArgumentParser(description="台股量化投資系統")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -649,6 +648,8 @@ def main() -> None:
 
     # watch 子命令
     sp_watch = subparsers.add_parser("watch", help="持倉監控管理（新增/列出/平倉/更新狀態）")
+    # 供 dispatch 端在缺 action 時 print_help（parser 已抽至 build_parser，變數不跨作用域）
+    sp_watch.set_defaults(_subparser=sp_watch)
     watch_sub = sp_watch.add_subparsers(dest="action")
 
     # watch add
@@ -794,6 +795,7 @@ def main() -> None:
 
     # rotation 子命令（輪動組合部位控制）
     sp_rot = subparsers.add_parser("rotation", help="輪動組合部位控制（建立/更新/狀態/回測/管理）")
+    sp_rot.set_defaults(_subparser=sp_rot)
     rot_sub = sp_rot.add_subparsers(dest="action")
 
     # rotation create
@@ -896,6 +898,13 @@ def main() -> None:
         help="重新呼叫 Claude API 產生 AI 摘要（預設不呼叫，避免每次燒 token）",
     )
 
+    return parser
+
+
+def main() -> None:
+    setup_logging()
+
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "sync":
@@ -1009,12 +1018,12 @@ def main() -> None:
         cmd_watchlist(args)
     elif args.command == "watch":
         if not args.action:
-            sp_watch.print_help()
+            args._subparser.print_help()
         else:
             cmd_watch(args)
     elif args.command == "rotation":
         if not getattr(args, "action", None):
-            sp_rot.print_help()
+            args._subparser.print_help()
         else:
             cmd_rotation(args)
     elif args.command == "export-dashboard":

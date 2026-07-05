@@ -156,9 +156,9 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 ### CLI 設計原則
 
-- 入口：`python main.py <子命令>`（39 子命令，dispatch table 在 `main.py`）
+- 入口：`python main.py <子命令>`（49 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
 - 每日例行：`morning-routine`（Step 0~15+8b，含全市場同步 + discover + 風控 + 通知）
-- 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`
+- 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
 - 完整指令參考見 [`docs/cli_commands.md`](docs/cli_commands.md)
 
 ---
@@ -167,7 +167,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（1784 測試 / 47 檔）
+- **執行**：`pytest -v`（2417 測試 / 83 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 
