@@ -167,6 +167,18 @@ class BackupConfig(BaseModel):
     retention_days: int = 7
 
 
+class MonitoringConfig(BaseModel):
+    """運維監控設定（P0 止血包 #5，2026-07-05）。
+
+    healthchecks_url：healthchecks.io 的完整 ping URL（如
+    https://hc-ping.com/<uuid>）。morning-routine 起跑 ping /start、
+    成功 ping 本體、有步驟失敗 ping /fail；健檢平台端設定排程 + grace period，
+    未收到 ping 即發告警（dead-man switch）。空字串 = 停用。
+    """
+
+    healthchecks_url: str = ""
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
@@ -177,6 +189,7 @@ class Settings(BaseModel):
     quant: QuantConfig = QuantConfig()
     dashboard: DashboardConfig = DashboardConfig()
     backup: BackupConfig = BackupConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
 
     @model_validator(mode="after")
     def _validate_critical_settings(self) -> "Settings":

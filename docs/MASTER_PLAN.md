@@ -116,7 +116,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 2 | **確認 bug：`Announcement.title`** | `pipeline.py:1802` 欄位應為 `subject`，`sync-concepts --from-mops` 100% crash。修復 + CLI smoke test 制度化 |
 | 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
-| 5 | **Dead-man 告警** | healthchecks.io ping + Step 0 印出「crisis 訊號 N/7 可用」自檢（TW_VIX 已死須可見） |
+| 5 | **Dead-man 告警** | ✅ 2026-07-05 完成：`monitoring.healthchecks_url` config + start/success/fail ping（例外全吞不影響主流程；非交易日視為 success；dry-run 不 ping）；`detect_crisis_signals` 新增 `availability`，Step 0 與 Discord 摘要每日印「crisis 訊號可用 N/7」。**待辦**：使用者自行到 healthchecks.io 建 check 填 URL |
 | 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
 | 7 | **重入保護** | morning-routine 檔案鎖；`rotation update` 同日冪等檢查（查 ActionLog） |
 
