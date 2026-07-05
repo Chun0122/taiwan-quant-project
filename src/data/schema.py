@@ -871,6 +871,50 @@ class RotationActionLog(Base):
         return f"<RotationActionLog {self.portfolio_name} {self.action_date} {self.action_type} {self.stock_id}>"
 
 
+class RotationPendingOrder(Base):
+    """待成交意圖（live T+1，A2）：D 日決策、D+1 開盤成交之間的持久化暫存。
+
+    設計文件：docs/design/live_t1_pending_order.md。
+    RotationManager.decide(D) 寫入 status="pending"；fill_pending(D+1) 以
+    open[D+1] 成交後標 "filled" 並回填 exec_date；買單跨 TTL 未成交（停牌）
+    標 "cancelled"，風控賣單無 TTL 順延。這是**模擬**的待成交意圖，非真實掛單。
+    """
+
+    __tablename__ = "rotation_pending_order"
+    __table_args__ = (
+        # 同 portfolio 同決策日同 side 同標的唯一（防重複決策）
+        UniqueConstraint("portfolio_name", "decision_date", "side", "stock_id", name="uq_pending_order"),
+        Index("ix_pending_status", "portfolio_name", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    portfolio_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    decision_date: Mapped[date] = mapped_column(Date, nullable=False)  # D：產生此意圖的決策日
+    exec_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # D+1：實際成交日（成交後回填）
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # buy | sell
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False)
+    stock_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # 決策時規劃股數（買=目標股數，賣=持倉股數）；實際成交股數以 RotationPosition/ActionLog 為準
+    shares: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 決策日 close——非成交價，僅供 audit 與「D+1 open 高於決策價 → 資金不足縮股」保護比較
+    ref_price: Mapped[float] = mapped_column(Float, nullable=False)
+    # sell 的 exit_reason（stop_loss/holding_expired/crisis_exit/rank_dropped...），buy 為 None
+    reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    entry_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)  # buy 用
+    entry_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # buy 用（Gate B / audit）
+    score_breakdown_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # buy 用（進場理由凍結）
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)  # buy 用（進場時鎖定）
+    # 狀態機：pending → filled | cancelled（無其他轉移）
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return (
+            f"<RotationPendingOrder {self.portfolio_name} {self.decision_date} "
+            f"{self.side} {self.stock_id} x{self.shares} [{self.status}]>"
+        )
+
+
 class StrategyDecayLog(Base):
     """策略衰減監控每日紀錄（2026-05-15 sprint）。
 

@@ -204,3 +204,25 @@ COMPOSITE_MODES: dict[str, dict] = {
 def is_composite_mode(mode: str | None) -> bool:
     """是否為合成（多模式）輪動模式（'all' / 'mom_growth'）。"""
     return mode in COMPOSITE_MODES
+
+
+# ── Live T+1 Pending-Order（A2，MASTER_PLAN §6.2 #9）───────────────────────
+# 設計：docs/design/live_t1_pending_order.md。D 日收盤後決策寫 pending order，
+# D+1 開盤後以 open[D+1] 成交——與 rotation backtest 的 pending_exec 對齊，
+# 消除 live「夜間決策、當日收盤成交」的 look-ahead。
+# 買單 TTL：決策已過期（rankings 是 D 日的），跨 N 個交易日未成交（停牌等）即
+# cancel；風控賣單（stop_loss/crisis 等）不設 TTL，必須出場，順延至有報價為止。
+PENDING_BUY_TTL_TRADING_DAYS: int = 2
+
+# RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
+PENDING_STATUS_PENDING: str = "pending"
+PENDING_STATUS_FILLED: str = "filled"
+PENDING_STATUS_CANCELLED: str = "cancelled"
+
+# RotationPendingOrder.side
+PENDING_SIDE_BUY: str = "buy"
+PENDING_SIDE_SELL: str = "sell"
+
+# RotationActionLog.action_type 新值：decide() 寫入的「明日預定操作」
+# （dashboard 顯示用；D+1 成交後另寫 open/close）
+ACTION_TYPE_PENDING: str = "pending"
