@@ -767,6 +767,35 @@ def cmd_cross_mode_corr(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_backtest_flags(args: argparse.Namespace) -> tuple[bool, bool]:
+    """解析 discover-backtest 的成本/進場 flags（P0 止血包 #4，2026-07-05）。
+
+    預設翻轉：未明示時 (include_costs, entry_next_open) = (True, True)——
+    舊預設（不含成本 + T 日收盤進場）是 look-ahead，改由 --naive 明示取得。
+
+    規則：
+    - --naive 與 --include-costs/--no-include-costs/--entry-next-open/
+      --no-entry-next-open 並用 → SystemExit（語意衝突，不猜使用者意圖）
+    - --naive → (False, False)
+    - 個別 flag 明示（is not None）→ 用明示值；未明示 → True（新預設）
+
+    引擎層 DiscoveryPerformance 預設不動（dashboard / compute_strategy_decay 依賴）。
+    """
+    include_costs = getattr(args, "include_costs", None)
+    entry_next_open = getattr(args, "entry_next_open", None)
+    naive = getattr(args, "naive", False)
+
+    if naive:
+        if include_costs is not None or entry_next_open is not None:
+            raise SystemExit("錯誤: --naive 不可與 --include-costs/--entry-next-open（含 --no-* 形式）並用")
+        return False, False
+
+    return (
+        include_costs if include_costs is not None else True,
+        entry_next_open if entry_next_open is not None else True,
+    )
+
+
 def cmd_discover_backtest(args: argparse.Namespace) -> None:
     """評估 Discover 推薦的歷史績效。"""
     from datetime import date as _date
@@ -781,14 +810,16 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
     holdout_start_arg = getattr(args, "holdout_start", None)
     holdout_start = _date.fromisoformat(holdout_start_arg) if holdout_start_arg else None
 
+    include_costs, entry_next_open = _resolve_backtest_flags(args)
+
     perf = DiscoveryPerformance(
         mode=args.mode,
         holding_days=holding_days,
         top_n=args.top,
         start_date=args.start,
         end_date=args.end,
-        include_costs=getattr(args, "include_costs", False),
-        entry_at_next_open=getattr(args, "entry_next_open", False),
+        include_costs=include_costs,
+        entry_at_next_open=entry_next_open,
         holdout_start=holdout_start,
         ignore_holdout=getattr(args, "ignore_holdout", False),
     )
@@ -801,8 +832,8 @@ def cmd_discover_backtest(args: argparse.Namespace) -> None:
         args.mode,
         args.start,
         args.end,
-        include_costs=getattr(args, "include_costs", False),
-        entry_at_next_open=getattr(args, "entry_next_open", False),
+        include_costs=include_costs,
+        entry_at_next_open=entry_next_open,
     )
 
     # 匯出 CSV
