@@ -835,6 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_ru = rot_sub.add_parser("update", help="每日更新（讀取 discover 排名，執行換股）")
     sp_ru.add_argument("--name", default=None, help="指定組合名稱")
     sp_ru.add_argument("--all", action="store_true", help="更新所有 active 組合")
+    sp_ru.add_argument("--force", action="store_true", help="繞過同日冪等保護，強制重跑今日 update")
 
     # rotation status
     sp_rs = rot_sub.add_parser("status", help="查看組合狀態與持倉")

@@ -317,3 +317,85 @@ class TestSerializeAndExport:
 
         rots = ed._build_rotations(today)
         assert rots[0]["today_actions"] == []
+
+
+# ====================================================================== #
+# P0 止血包 #7：update() 入口同日冪等 guard
+# ====================================================================== #
+
+
+class TestUpdateEntryGuard:
+    def test_second_run_same_day_is_skipped(self, patch_session):
+        """同日第二次 update 應在入口被 guard 短路：回傳 None、持倉/現金零變化。"""
+        today = date(2026, 6, 1)
+        _seed_universe(patch_session, today)
+        _make_portfolio(patch_session)
+
+        mgr = RotationManager("al_test")
+        first_actions = mgr.update(today=today, regime="bull")
+        assert first_actions is not None and len(first_actions.to_buy) == 3
+
+        positions_before = patch_session.execute(select(RotationPosition)).scalars().all()
+        cash_before = patch_session.execute(select(RotationPortfolio)).scalar_one().current_cash
+
+        second_actions = mgr.update(today=today, regime="bull")
+
+        assert second_actions is None, "同日第二次 update 應被冪等 guard 跳過"
+        positions_after = patch_session.execute(select(RotationPosition)).scalars().all()
+        assert len(positions_after) == len(positions_before)
+        assert patch_session.execute(select(RotationPortfolio)).scalar_one().current_cash == cash_before
+
+    def test_force_overrides_guard(self, patch_session):
+        """force=True 繞過 guard 正常執行（人工修復情境）。"""
+        today = date(2026, 6, 1)
+        _seed_universe(patch_session, today)
+        _make_portfolio(patch_session)
+
+        mgr = RotationManager("al_test")
+        mgr.update(today=today, regime="bull")
+        forced_actions = mgr.update(today=today, regime="bull", force=True)
+
+        assert forced_actions is not None, "force=True 應繞過冪等 guard"
+        # ActionLog 仍靠 delete-rebuild 收斂，不重複
+        assert len(_log_rows(patch_session)) == 3
+
+    def test_dry_run_bypasses_guard(self, patch_session):
+        """dry_run 不受 guard 限制（preview 隨時可跑）。"""
+        today = date(2026, 6, 1)
+        _seed_universe(patch_session, today)
+        _make_portfolio(patch_session)
+
+        mgr = RotationManager("al_test")
+        mgr.update(today=today, regime="bull")
+        preview = mgr.update(today=today, regime="bull", dry_run=True)
+
+        assert preview is not None, "dry_run 應繞過冪等 guard"
+
+    def test_circuit_breaker_day_still_guarded(self, patch_session, monkeypatch):
+        """熔斷日只寫 ActionLog 不寫 snapshot——guard 靠 ActionLog 仍應攔住第二次。"""
+        today = date(2026, 6, 1)
+        _seed_universe(patch_session, today)
+        p = _make_portfolio(patch_session)
+        _add_position(patch_session, p.id, "1111", today, days_ago=3, stop_loss=50)
+
+        # 強制熔斷。相容兩種熔斷實作（與止血包 #3 PR 的 merge 順序解耦）：
+        # #3 合併後熔斷判斷改用 compute_drawdown_with_snapshots，合併前用 check_drawdown_kill_switch
+        from src.portfolio import manager as mgr_mod
+
+        if hasattr(mgr_mod, "compute_drawdown_with_snapshots"):
+            monkeypatch.setattr(mgr_mod, "compute_drawdown_with_snapshots", lambda *a, **kw: 30.0)
+        else:
+            monkeypatch.setattr(mgr_mod, "check_drawdown_kill_switch", lambda *a, **kw: True)
+            monkeypatch.setattr(mgr_mod, "compute_portfolio_drawdown", lambda *a, **kw: 30.0)
+
+        mgr = RotationManager("al_test")
+        first = mgr.update(today=today, regime="bull")
+        assert first is not None and len(first.to_sell) == 1
+
+        # 熔斷後組合 status="liquidated"，第二次會先被 status 檢查擋掉；
+        # 這裡強制改回 active 以驗證 guard 本身（僅 ActionLog、無 snapshot 的情境）
+        p.status = "active"
+        patch_session.commit()
+
+        second = mgr.update(today=today, regime="bull")
+        assert second is None, "熔斷日（無 snapshot）第二次 update 仍應被 ActionLog guard 攔住"

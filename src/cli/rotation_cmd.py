@@ -78,6 +78,7 @@ def cmd_rotation(args: argparse.Namespace) -> None:
     elif action == "update":
         name = getattr(args, "name", None)
         update_all = getattr(args, "all", False)
+        force = getattr(args, "force", False)
 
         if update_all:
             portfolios = RotationManager.list_portfolios()
@@ -88,16 +89,16 @@ def cmd_rotation(args: argparse.Namespace) -> None:
             for p in active:
                 print(f"\n── 更新 [{p['name']}] ──")
                 mgr = RotationManager(p["name"])
-                actions = mgr.update()
+                actions = mgr.update(force=force)
                 if actions:
                     _print_rotation_actions(p["name"], actions)
         elif name:
             mgr = RotationManager(name)
-            actions = mgr.update()
+            actions = mgr.update(force=force)
             if actions:
                 _print_rotation_actions(name, actions)
             elif actions is None:
-                print(f"找不到組合或已暫停: {name}")
+                print(f"未執行: {name}（找不到組合、已暫停、或今日已更新——重跑請加 --force）")
         else:
             print("請指定 --name 或 --all")
 

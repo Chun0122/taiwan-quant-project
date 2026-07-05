@@ -430,7 +430,8 @@ class TestStepInventory:
         """morning_cmd 應宣告 TOTAL = 18，與 _steps 內的條目對應。"""
         import inspect
 
-        from src.cli.morning_cmd import cmd_morning_routine
+        # P0 止血包 #7 後主體移至 _run_morning_routine（cmd_morning_routine 為鎖 wrapper）
+        from src.cli.morning_cmd import _run_morning_routine
 
-        src = inspect.getsource(cmd_morning_routine)
+        src = inspect.getsource(_run_morning_routine)
         assert "TOTAL = 18" in src, "TOTAL 應為 18（若 step 數變動請更新此測試）"
