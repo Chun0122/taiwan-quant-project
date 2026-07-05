@@ -114,7 +114,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 |---|------|------------|
 | 1 | **DB 自動備份** | `backup_db()` 現為零呼叫者。morning-routine 加尾步 + 異地副本；做一次還原演練。全 repo ROI 最高單項 |
 | 2 | **確認 bug：`Announcement.title`** | `pipeline.py:1802` 欄位應為 `subject`，`sync-concepts --from-mops` 100% crash。修復 + CLI smoke test 制度化 |
-| 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
+| 3 | **Kill Switch peak 修復** | ✅ 2026-07-05 完成：新增 `compute_drawdown_with_snapshots` 純函數（peak = max(equity_history ∪ snapshot 序列)，容忍缺日）；熔斷與 Drawdown Guard 共用同一 dd_pct。backtest 路徑經查無此 bug（equity_curve 逐日含 MtM） |
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
 | 5 | **Dead-man 告警** | healthchecks.io ping + Step 0 印出「crisis 訊號 N/7 可用」自檢（TW_VIX 已死須可見） |
 | 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
