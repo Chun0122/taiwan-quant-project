@@ -1,6 +1,6 @@
-"""測試 src/config.py — 設定載入 + D2 量化參數外部化。"""
+"""測試 src/config.py — 設定載入 + D2 量化參數外部化 + A5 拆檔（雙檔模式）。"""
 
-from src.config import QuantConfig, Settings, load_settings
+from src.config import QuantConfig, Settings, _deep_merge, load_settings
 
 
 class TestLoadSettings:
@@ -144,3 +144,97 @@ class TestRotationCostPerMode:
         result = load_settings(config_file)
         assert result.quant.rotation_cost.for_mode("swing").score_gap_threshold == 0.0
         assert result.quant.rotation_cost.for_mode("momentum").score_gap_threshold == 0.05
+
+
+# ---------------------------------------------------------------------------
+# A5: settings 拆檔（quant_params.yaml + secrets.yaml 雙檔模式）
+# ---------------------------------------------------------------------------
+
+
+class TestDeepMerge:
+    def test_nested_override(self):
+        base = {"a": {"x": 1, "y": 2}, "b": 1}
+        overlay = {"a": {"y": 99, "z": 3}, "c": 2}
+        merged = _deep_merge(base, overlay)
+        assert merged == {"a": {"x": 1, "y": 99, "z": 3}, "b": 1, "c": 2}
+
+    def test_empty_overlay_returns_base(self):
+        base = {"a": {"x": 1}}
+        assert _deep_merge(base, {}) == base
+
+    def test_scalar_replaces_dict(self):
+        # overlay 型別與 base 不同時直接取代（不嘗試合併）
+        assert _deep_merge({"a": {"x": 1}}, {"a": "flat"}) == {"a": "flat"}
+
+    def test_does_not_mutate_inputs(self):
+        base = {"a": {"x": 1}}
+        overlay = {"a": {"y": 2}}
+        _deep_merge(base, overlay)
+        assert base == {"a": {"x": 1}}
+        assert overlay == {"a": {"y": 2}}
+
+
+class TestSettingsSplit:
+    def _no_legacy(self, monkeypatch, tmp_path):
+        """把 CONFIG_PATH 指向不存在的檔，隔離本機 legacy settings.yaml。"""
+        monkeypatch.setattr("src.config.CONFIG_PATH", tmp_path / "no_settings.yaml")
+
+    def test_two_file_mode_secrets_override_params(self, monkeypatch, tmp_path):
+        self._no_legacy(monkeypatch, tmp_path)
+        qp = tmp_path / "quant_params.yaml"
+        qp.write_text(
+            "finmind:\n  api_url: 'https://example.com'\nlogging:\n  level: DEBUG\n",
+            encoding="utf-8",
+        )
+        sec = tmp_path / "secrets.yaml"
+        sec.write_text("finmind:\n  api_token: sekret\n", encoding="utf-8")
+        result = load_settings(quant_params_path=qp, secrets_path=sec)
+        # 巢狀合併：同區塊內 secrets 補 token、quant_params 的 api_url 保留
+        assert result.finmind.api_token == "sekret"
+        assert result.finmind.api_url == "https://example.com"
+        assert result.logging.level == "DEBUG"
+
+    def test_two_file_mode_both_missing_returns_defaults(self, monkeypatch, tmp_path):
+        self._no_legacy(monkeypatch, tmp_path)
+        result = load_settings(
+            quant_params_path=tmp_path / "nope1.yaml",
+            secrets_path=tmp_path / "nope2.yaml",
+        )
+        assert isinstance(result, Settings)
+        assert result.finmind.api_token == ""
+
+    def test_legacy_settings_yaml_takes_precedence(self, monkeypatch, tmp_path):
+        legacy = tmp_path / "settings.yaml"
+        legacy.write_text("logging:\n  level: WARNING\n", encoding="utf-8")
+        monkeypatch.setattr("src.config.CONFIG_PATH", legacy)
+        qp = tmp_path / "quant_params.yaml"
+        qp.write_text("logging:\n  level: DEBUG\n", encoding="utf-8")
+        result = load_settings(quant_params_path=qp, secrets_path=tmp_path / "nope.yaml")
+        # legacy 存在 → 完全走舊模式，雙檔被忽略
+        assert result.logging.level == "WARNING"
+
+    def test_monitoring_healthchecks_nested_parse(self, monkeypatch, tmp_path):
+        """regression：healthchecks_url 必須用巢狀寫法才解析得到。
+
+        原 settings.yaml 曾以 flat dotted key（`monitoring.healthchecks_url: ...`）
+        書寫，Pydantic 視為未知頂層 key 靜默忽略 → dead-man 告警靜默失效。
+        """
+        self._no_legacy(monkeypatch, tmp_path)
+        sec = tmp_path / "secrets.yaml"
+        sec.write_text(
+            "monitoring:\n  healthchecks_url: 'https://hc-ping.com/abc'\n",
+            encoding="utf-8",
+        )
+        result = load_settings(quant_params_path=tmp_path / "nope.yaml", secrets_path=sec)
+        assert result.monitoring.healthchecks_url == "https://hc-ping.com/abc"
+
+    def test_flat_dotted_key_is_ignored(self, monkeypatch, tmp_path):
+        """flat dotted key 寫法不會被解析（documenting 已知行為，防回歸誤解）。"""
+        self._no_legacy(monkeypatch, tmp_path)
+        sec = tmp_path / "secrets.yaml"
+        sec.write_text(
+            "monitoring.healthchecks_url: 'https://hc-ping.com/abc'\n",
+            encoding="utf-8",
+        )
+        result = load_settings(quant_params_path=tmp_path / "nope.yaml", secrets_path=sec)
+        assert result.monitoring.healthchecks_url == ""

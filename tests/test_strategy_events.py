@@ -2,7 +2,7 @@
 
 涵蓋：
 - 主旨前綴過濾（feat/fix/refactor/perf vs docs/chore）
-- settings.yaml 變動偵測
+- quant_params.yaml 變動偵測（A5 拆檔後量化參數檔進版控）
 - 非 git 倉庫 graceful degradation
 - 同 commit 兩種事件去重
 """
@@ -30,9 +30,9 @@ def git_repo(tmp_path: Path):
     _run(["git", "init", "-q"], cwd=repo)
     _run(["git", "config", "user.name", "Tester"], cwd=repo)
     _run(["git", "config", "user.email", "tester@example.com"], cwd=repo)
-    # 預先建立 config 目錄與 settings 檔
+    # 預先建立 config 目錄與量化參數檔
     (repo / "config").mkdir()
-    (repo / "config" / "settings.yaml").write_text("score_threshold:\n  bull: 0.45\n", encoding="utf-8")
+    (repo / "config" / "quant_params.yaml").write_text("score_threshold:\n  bull: 0.45\n", encoding="utf-8")
     (repo / "README.md").write_text("readme\n", encoding="utf-8")
     _run(["git", "add", "."], cwd=repo)
     _run(["git", "commit", "-q", "-m", "chore: initial scaffold"], cwd=repo)
@@ -70,13 +70,13 @@ class TestCollectStrategyEvents:
     def test_settings_diff_detected(self, git_repo: Path):
         _add_commit(
             git_repo,
-            "config/settings.yaml",
+            "config/quant_params.yaml",
             "score_threshold:\n  bull: 0.50\n",
             "fix(config): tighten bull threshold to 0.50",
         )
         events = collect_strategy_events(repo_root=git_repo, days=30)
         diff_events = [e for e in events if e.type == "settings_diff"]
-        # 至少包含本次 fix（git_repo fixture 的 initial commit 也動到 settings.yaml）
+        # 至少包含本次 fix（git_repo fixture 的 initial commit 也動到 quant_params.yaml）
         assert any("fix(config)" in e.summary for e in diff_events)
         # 同 commit 也會出現在 git_commit（dedup key 是 (ref, type)）
         latest = next(e for e in diff_events if "fix(config)" in e.summary)

@@ -1,0 +1,62 @@
+# 量化參數與非機密設定（A5 決策可重放，2026-07-05 起進版控）
+# 機密（token/webhook）一律放 config/secrets.yaml（gitignored），勿寫入本檔。
+# 本檔的 git 歷史供 strategy_events（dashboard 事件流）與 settings_hash 溯源使用。
+
+# FinMind API 端點（token 在 secrets.yaml）
+finmind:
+  api_url: "https://api.finmindtrade.com/api/v4/data"
+
+# 資料庫設定
+database:
+  url: "sqlite:///data/stock.db"
+
+# 資料抓取預設參數
+fetcher:
+  default_start_date: "2020-01-01"
+  # 預設關注的股票清單（DB watchlist 優先，本清單為 fallback）
+  watchlist:
+    - "2330"
+    - "2317"
+    - "2208"
+    - "2515"
+    - "2834"
+    - "1104"
+    - "1464"
+    - "2344"
+    - "3037"
+
+# 日誌等級
+logging:
+  level: "INFO"
+
+# Discord Webhook 通知設定（webhook_url 在 secrets.yaml）
+discord:
+  username: "台股量化系統"       # Webhook 顯示名稱
+  enabled: true                # 設為 false 可暫時停用通知
+
+# iOS 監控 App 日報 JSON 設定（export-dashboard）
+dashboard:
+  position_timeseries_days: 14         # 持倉/Watch 個股小走勢圖窗口（交易日）
+  portfolio_review_lookback_days: 90   # portfolio_review 計算指標的回看窗口
+
+# 量化參數覆寫（QuantConfig，僅列出需偏離預設者）
+# 2026-05-09 audit 後啟用 rotation_cost 三道閘門（全域值為 momentum 校準）：
+#   - momentum 因子於台股短期呈 reversal（5天勝率 47%、20天 64%）
+#   - mom5_3d 實測滑價 16.4% / Alpha -41.94%（2026-01~05）
+# 2026-06-07 投研：成本閘門對策略效果相反 —— Gate B(score_gap) 是動量 alpha
+# 主來源（隔離測 0.5%→59%），卻會勒死波段換手（swing 全開 35%→9%）。
+# 故全域沿用 momentum 校準，並以 per_mode 放寬 swing。
+quant:
+  rotation_cost:
+    enabled: true        # 全域啟用三道成本閘門
+    min_hold_days: 7     # holding_days 安全下限（拉高短期換手）
+    score_gap_threshold: 0.05  # 切換需新候選 score 贏現持倉 ≥0.05
+    weekly_swap_cap: 4   # 每 ISO 週非止損換手上限
+    per_mode:            # mode 覆蓋（未列出者沿用上方全域 momentum 校準）
+      swing:             # 波段：放開 Gate B(score_gap) 與 min_hold，保留 weekly_cap 當安全閥
+        min_hold_days: 0       # 不拉高持有期（波段 edge 在短線換手）
+        score_gap_threshold: 0.0  # 關閉 Gate B（對波段是 35%→3% 災難）
+        # weekly_swap_cap 沿用全域 4（隔離測對波段近乎中性，留作 tail churn 安全閥）
+      all:               # 綜合：Gate B+A 有益（B 是品質濾網、A 降 churn），但 Gate C 有害
+        weekly_swap_cap: 0     # 關閉 Gate C（10 檔組合下 cap=4 太緊、擋掉有益換股，-7pp）
+        # min_hold_days / score_gap_threshold 沿用全域 7 / 0.05（B+A 對 all 最佳）

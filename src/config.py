@@ -1,4 +1,11 @@
-"""設定管理模組 — 載入 config/settings.yaml 並提供統一存取介面。"""
+"""設定管理模組 — 載入 config/ 下的設定檔並提供統一存取介面。
+
+A5 拆檔（2026-07-05）：設定拆為兩檔——
+  - config/quant_params.yaml：量化參數與非機密設定（**進版控**，供決策可重放溯源）
+  - config/secrets.yaml：token/webhook 等機密（gitignored）
+載入時 secrets 深度覆蓋 quant_params。舊單檔 config/settings.yaml 若仍存在，
+則以 legacy 模式照舊載入並提示遷移（過渡保護，一個版本週期後移除）。
+"""
 
 import logging
 from pathlib import Path
@@ -9,7 +16,11 @@ from pydantic import BaseModel, model_validator
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Legacy 單檔設定（A5 拆檔前）；存在時優先以舊模式載入
 CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
+# A5 雙檔模式：量化參數（進版控）+ 機密（gitignored）
+QUANT_PARAMS_PATH = PROJECT_ROOT / "config" / "quant_params.yaml"
+SECRETS_PATH = PROJECT_ROOT / "config" / "secrets.yaml"
 
 
 class FinMindConfig(BaseModel):
@@ -201,13 +212,47 @@ class Settings(BaseModel):
         return self
 
 
-def load_settings(path: Path = CONFIG_PATH) -> Settings:
-    """從 YAML 檔案載入設定，檔案不存在時使用預設值。"""
-    if path.exists():
-        with open(path, encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        return Settings(**raw)
-    return Settings()
+def _read_yaml(path: Path) -> dict:
+    """讀取 YAML 檔為 dict；檔案不存在或內容為空時回傳空 dict。"""
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """遞迴合併兩個 dict：overlay 覆蓋 base，巢狀 dict 逐層合併（不修改原 dict）。"""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_settings(
+    path: Path | None = None,
+    quant_params_path: Path = QUANT_PARAMS_PATH,
+    secrets_path: Path = SECRETS_PATH,
+) -> Settings:
+    """載入設定。
+
+    三種模式：
+      1. 明確指定 ``path``（測試/工具用）：單檔載入，不存在時回預設值。
+      2. legacy ``config/settings.yaml`` 存在：照舊單檔載入 + 警告提示遷移。
+      3. 雙檔模式：quant_params.yaml 為底、secrets.yaml 深度覆蓋；兩檔皆缺回預設值。
+    """
+    if path is not None:
+        return Settings(**_read_yaml(path))
+    if CONFIG_PATH.exists():
+        logger.warning(
+            "偵測到 legacy config/settings.yaml — 以舊模式載入。"
+            "請遷移至 quant_params.yaml + secrets.yaml 後刪除本檔（A5 拆檔）"
+        )
+        return Settings(**_read_yaml(CONFIG_PATH))
+    merged = _deep_merge(_read_yaml(quant_params_path), _read_yaml(secrets_path))
+    return Settings(**merged)
 
 
 # 全域設定單例
