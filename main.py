@@ -498,8 +498,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp_db.add_argument("--start", default=None, help="掃描日期範圍起始 (YYYY-MM-DD)")
     sp_db.add_argument("--end", default=None, help="掃描日期範圍結束 (YYYY-MM-DD)")
     sp_db.add_argument("--export", default=None, help="匯出明細 CSV 路徑")
-    sp_db.add_argument("--include-costs", action="store_true", help="績效計算納入交易成本（手續費+稅+滑價）")
-    sp_db.add_argument("--entry-next-open", action="store_true", help="以 T+1 開盤價作為進場價（消除 look-ahead bias）")
+    # P0 止血包 #4（2026-07-05）：預設翻轉——含成本 + T+1 開盤進場（舊預設 = naive 的
+    # same-close entry 是 look-ahead）。BooleanOptionalAction 自動提供 --no-* 反向 flag；
+    # default=None 作 sentinel，由 _resolve_backtest_flags 解析與 --naive 的互動
+    sp_db.add_argument(
+        "--include-costs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="績效計算納入交易成本（手續費+稅+滑價）；預設啟用，--no-include-costs 關閉",
+    )
+    sp_db.add_argument(
+        "--entry-next-open",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="以 T+1 開盤價作為進場價（消除 look-ahead bias）；預設啟用，--no-entry-next-open 關閉",
+    )
+    sp_db.add_argument(
+        "--naive",
+        action="store_true",
+        default=False,
+        help="回到 naive 假設：不含成本 + T 日收盤進場（等同 2026-07 前的舊預設；不可與上兩個 flag 並用）",
+    )
     # P1 任務 7：OOS hold-out 紀律
     sp_db.add_argument(
         "--holdout-start",

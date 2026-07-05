@@ -611,6 +611,11 @@ def print_performance_report(
     print(f"\n{'=' * 80}")
     print(f"Discover 推薦績效回測 [{mode_label}]{cost_tag}{entry_tag}")
     print(f"掃描期間：{date_min} ~ {date_max}（共 {scan_count} 次掃描，{total_recs} 筆推薦）")
+    # P0 止血包 #4（2026-07-05）：明示回測假設，讓報告一眼可辨跑的是哪種
+    cost_desc = "含交易成本（手續費+稅+滑價）" if include_costs else "naive（無交易成本）"
+    entry_desc = "T+1 開盤價" if entry_at_next_open else "T 日收盤價（look-ahead，僅供對照）"
+    print(f"成本模型：{cost_desc}")
+    print(f"進場假設：{entry_desc}")
     print(f"{'=' * 80}")
 
     # 整體摘要

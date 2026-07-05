@@ -115,7 +115,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 1 | **DB 自動備份** | ✅ 2026-07-05 完成：morning-routine Step 18 接上 `backup_db()`；異地副本至 iCloud Drive（`backup.offsite_dir` 可覆蓋，失敗僅 warning）；保留天數 config 化。還原演練 2026-07-05 完成（integrity ok + 功能驗證），SOP 見 usage.md §8 |
 | 2 | **確認 bug：`Announcement.title`** | ✅ 2026-07-05 完成：`title`→`subject` 修復；`main.py` 抽出 `build_parser()`；新增 `tests/test_cli_smoke.py`（全 49 子命令 parse + handler 鏈路回歸測試） |
 | 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
-| 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
+| 4 | **discover-backtest 預設翻轉** | ✅ 2026-07-05 完成（僅 CLI 層）：未明示 → (True, True)；`--naive` 取得舊行為（與明示 flag 並用即報錯）；`--no-*` 可單獨關閉；報告 header 印「成本模型/進場假設」。引擎預設不動（dashboard/decay 依賴 False） |
 | 5 | **Dead-man 告警** | ✅ 2026-07-05 完成：`monitoring.healthchecks_url` config + start/success/fail ping（例外全吞不影響主流程；非交易日視為 success；dry-run 不 ping）；`detect_crisis_signals` 新增 `availability`，Step 0 與 Discord 摘要每日印「crisis 訊號可用 N/7」。**待辦**：使用者自行到 healthchecks.io 建 check 填 URL |
 | 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
 | 7 | **重入保護** | morning-routine 檔案鎖；`rotation update` 同日冪等檢查（查 ActionLog） |

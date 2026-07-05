@@ -995,15 +995,17 @@ python main.py discover-backtest --mode momentum --start 2025-06-01 --end 2025-1
 # 匯出明細 CSV
 python main.py discover-backtest --mode momentum --export result.csv
 
-# 含交易成本（手續費+稅+滑價）
-python main.py discover-backtest --mode momentum --include-costs
+# 舊 naive 假設（不含成本 + T 日收盤進場 = 2026-07 前的舊預設，僅供對照）
+python main.py discover-backtest --mode momentum --naive
 
-# T+1 開盤價進場（消除 look-ahead bias）
-python main.py discover-backtest --mode momentum --entry-next-open
-
-# 同時啟用成本 + T+1 開盤進場
-python main.py discover-backtest --mode momentum --include-costs --entry-next-open
+# 單獨關閉其中一項（--no-* 反向 flag）
+python main.py discover-backtest --mode momentum --no-include-costs
+python main.py discover-backtest --mode momentum --no-entry-next-open
 ```
+
+> ⚠️ **2026-07-05 起預設翻轉**：`discover-backtest` 預設改為**含交易成本 + T+1 開盤進場**
+> （舊預設的 T 日收盤進場是 look-ahead、無成本高估報酬）。舊行為請明示 `--naive`。
+> 報告 header 會印出「成本模型 / 進場假設」兩行，一眼可辨。
 
 **參數說明：**
 
@@ -1015,8 +1017,9 @@ python main.py discover-backtest --mode momentum --include-costs --entry-next-op
 | `--start` | 掃描日期範圍起始（YYYY-MM-DD） |
 | `--end` | 掃描日期範圍結束（YYYY-MM-DD） |
 | `--export` | 匯出明細 CSV 路徑 |
-| `--include-costs` | 績效計算納入交易成本（手續費 0.1425% + 交易稅 0.3% + 滑價 0.05%） |
-| `--entry-next-open` | 以 T+1 開盤價作為進場價（預設使用推薦日收盤價） |
+| `--include-costs` | 交易成本（手續費 0.1425% + 稅 0.3% + 滑價 0.05%）。**預設啟用**；`--no-include-costs` 關閉 |
+| `--entry-next-open` | T+1 開盤價進場。**預設啟用**；`--no-entry-next-open` 關閉 |
+| `--naive` | 舊假設（無成本 + T 日收盤進場）；不可與上兩個 flag 並用 |
 
 **輸出三層聚合：**
 
