@@ -893,6 +893,8 @@ def _run_lock(lock_path: Path | None = None):
         yield
     finally:
         fd.close()  # close 即釋放 flock
+
+
 def _run_db_backup() -> None:
     """Step 18：DB 備份（P0 止血包 #1）——本地 backups/ + 異地副本（iCloud）。"""
     from src.config import settings

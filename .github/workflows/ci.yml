@@ -15,10 +15,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
+      # ruff 版本與 requirements.txt 鎖定檔一致（避免本機過、CI 掛的版本漂移）
       - name: Install ruff
-        run: pip install ruff
+        run: pip install "$(grep -E '^ruff==' requirements.txt)"
 
       - name: Check lint
         run: ruff check src/ tests/
@@ -32,13 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python 版本與鎖定檔產生環境一致（requirements.txt 由 Python 3.14 freeze）
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
 
+      # --no-deps 必要：FinMind 上游 metadata 釘過緊（1.x 釘 ta~=0.5、2.x 釘 lxml<5），
+      # 正常 resolver 會 ResolutionImpossible；實際組合由全套測試背書（詳見 USAGE.md §1）
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --no-deps -r requirements.txt
 
       - name: Run tests
         run: pytest -v --tb=short --cov=src --cov-report=term-missing
