@@ -18,6 +18,7 @@ from src.constants import (
     COMMISSION_RATE,
     COMPOSITE_MODES,
     LIQUIDITY_PARTICIPATION_LIMIT,
+    MAX_DRAWDOWN_LIQUIDATE_PCT,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
     TAX_RATE,
@@ -53,9 +54,9 @@ from src.portfolio.rankings import (
 )
 from src.portfolio.rotation import (
     RotationActions,
-    check_drawdown_kill_switch,
     compute_correlation_matrix,
     compute_covariance_matrix,
+    compute_drawdown_with_snapshots,
     compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
@@ -151,6 +152,7 @@ class RotationManager:
         regime: str | None = None,
         *,
         dry_run: bool = False,
+        force: bool = False,
     ) -> RotationActions | None:
         """每日更新：讀取 discover 排名 → 計算 rotation → 寫入 DB。
 
@@ -165,6 +167,10 @@ class RotationManager:
             P2 任務 9（2026-05-17）：True 時跑完整 rotation 邏輯但不 commit
             任何寫入（含 drawdown 強制平倉、buy/sell/renew、daily snapshot），
             session 在最後 rollback。供 `rotation preview` 預覽明日換股清單用。
+        force : bool
+            P0 止血包 #7（2026-07-05）：True 時繞過同日冪等 guard，強制重跑。
+            供人工修復情境（CLI `rotation update --force`）；回補歷史時傳入
+            自訂 today 亦受 guard 約束，需要重算該日請搭配 force=True。
         """
         if today is None:
             today = date.today()
@@ -176,6 +182,18 @@ class RotationManager:
                 return None
             if portfolio.status != "active":
                 logger.info("組合 %s 已暫停，跳過更新", self.portfolio_name)
+                return None
+
+            # P0 止血包 #7（2026-07-05）：同日冪等 guard——重複執行時 rankings/價格
+            # 可能已變動，實際部位不保證天然收斂（可能二次交易）。ActionLog 與
+            # Snapshot 雙重判斷缺一不可：熔斷日提早 return 只寫 ActionLog；
+            # 而 ActionLog 記錄含 hold，正常日兩者皆有，任一存在即視為已執行。
+            if not dry_run and not force and self._already_updated_today(session, today):
+                logger.info(
+                    "[%s] 今日（%s）已執行過 update，跳過（--force 可覆蓋）",
+                    self.portfolio_name,
+                    today,
+                )
                 return None
 
             # 載入 open positions
@@ -308,8 +326,12 @@ class RotationManager:
                 open_positions=open_positions,
                 today_prices=today_prices,
             )
-            if check_drawdown_kill_switch(equity_history):
-                dd_pct = compute_portfolio_drawdown(equity_history)
+            # P0 止血包 #3（2026-07-05）：peak 額外納入每日 snapshot MtM 權益序列，
+            # 修復 realized-only 序列低估「浮盈回吐型」回撤、熔斷不觸發的漏洞。
+            # dd_pct 同時供熔斷判斷與下方 Drawdown Guard 使用，兩處必須同值。
+            snapshot_capitals = self._load_snapshot_capitals(session)
+            dd_pct = compute_drawdown_with_snapshots(equity_history, snapshot_capitals)
+            if dd_pct >= MAX_DRAWDOWN_LIQUIDATE_PCT:
                 logger.error(
                     "⚠️ [%s] 回撤熔斷觸發 (%.1f%%)！強制平倉所有持倉",
                     self.portfolio_name,
@@ -398,8 +420,8 @@ class RotationManager:
                 corr_matrix=corr_matrix,
                 vol_weights=vol_weights,
                 regime=regime,
-                # P1-2：接上 Drawdown Guard 連續減倉（回撤越深、新開倉越小；reuse kill-switch 算好的 equity_history）
-                drawdown_pct=compute_portfolio_drawdown(equity_history),
+                # P1-2：接上 Drawdown Guard 連續減倉（回撤越深、新開倉越小；reuse kill-switch 算好的 dd_pct，含 snapshot peak）
+                drawdown_pct=dd_pct,
                 min_hold_days=gate_min_hold,
                 score_gap_threshold=gate_score_gap,
                 weekly_swap_cap=gate_weekly_cap,
@@ -648,6 +670,38 @@ class RotationManager:
                 )
             )
         session.commit()
+
+    def _already_updated_today(self, session, today: date) -> bool:
+        """同日冪等 guard（P0 止血包 #7）：今日是否已有 ActionLog 或 Snapshot。
+
+        兩表聯集判斷：熔斷日提早 return 不寫 snapshot（只有 ActionLog）；
+        ActionLog 含 hold 紀錄，正常執行日兩表皆有列。
+        """
+        has_action_log = (
+            session.execute(
+                select(RotationActionLog.id)
+                .where(
+                    RotationActionLog.portfolio_name == self.portfolio_name,
+                    RotationActionLog.action_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        if has_action_log:
+            return True
+        has_snapshot = (
+            session.execute(
+                select(RotationDailySnapshot.id)
+                .where(
+                    RotationDailySnapshot.portfolio_name == self.portfolio_name,
+                    RotationDailySnapshot.snapshot_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        return has_snapshot
 
     # ── Action Log ──
 
@@ -1912,6 +1966,19 @@ class RotationManager:
             final_equity = portfolio.current_capital
 
         return build_equity_history(portfolio.initial_capital, closed_pnls, final_equity)
+
+    def _load_snapshot_capitals(self, session) -> list[float]:
+        """載入該組合全部每日 snapshot 的 MtM 權益序列（依日期升序）。
+
+        P0 止血包 #3（2026-07-05）：供 compute_drawdown_with_snapshots 補回
+        realized-only equity_history 缺失的浮盈高點（peak 低估 → 熔斷不觸發）。
+        """
+        stmt = (
+            select(RotationDailySnapshot.total_capital)
+            .where(RotationDailySnapshot.portfolio_name == self.portfolio_name)
+            .order_by(RotationDailySnapshot.snapshot_date)
+        )
+        return [v for v in session.execute(stmt).scalars().all() if v is not None]
 
     def _load_open_positions(self, session, portfolio_id: int) -> list[dict]:
         stmt = select(RotationPosition).where(

@@ -43,3 +43,9 @@ logs/
 
 # 分點匯入清單
 stocks.txt
+# morning-routine 重入保護鎖檔（P0 止血包 #7）
+data/.morning_routine.lock
+# DB 備份（P0 止血包 #1）——備份檔勿進 git
+data/backups/
+data/*.bak
+data/stock.db.pre-restore

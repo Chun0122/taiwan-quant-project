@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -100,6 +103,11 @@ def _build_morning_discord_summary(
             lines.append("")
         elif stress_result.get("regime") is None:
             lines.append("⚠️ **Regime 未知** — Step 0 宏觀壓力預檢失敗，Rotation 以保守模式運行")
+            lines.append("")
+        # P0 止血包 #5：crisis 訊號可用性自檢（缺口每日可見）
+        avail_msg = _format_crisis_availability(stress_result)
+        if avail_msg:
+            lines.append(f"🩺 {avail_msg}")
             lines.append("")
 
     # ── Baseline Regression 守門（Step 17）────────────────────
@@ -853,7 +861,81 @@ def _verify_data_freshness(today_str: str) -> dict:
     return result
 
 
+@contextmanager
+def _run_lock(lock_path: Path | None = None):
+    """morning-routine 重入保護（P0 止血包 #7）：flock 排他鎖。
+
+    - 選 flock 的理由：process 死亡（crash/kill）時 OS 自動釋放，無 stale lock
+      問題，因此不需要 --force 逃生口。
+    - 鎖檔固定放本機 data/（flock 在 iCloud/網路磁碟上不可靠，勿移至同步目錄）。
+    - 取鎖失敗（另一個 morning-routine 執行中）→ 印訊息後 SystemExit(1)。
+    - Windows 無 fcntl → 降級為無鎖並告警（graceful degradation 但不靜默）。
+    """
+    path = lock_path or Path("data/.morning_routine.lock")
+    try:
+        import fcntl
+    except ImportError:
+        logger.warning("此平台不支援 fcntl，morning-routine 重入保護停用")
+        yield
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"⚠️ 另一個 morning-routine 正在執行中（鎖檔 {path}），本次退出。")
+            raise SystemExit(1) from None
+        # 寫入 PID + 啟動時間供診斷（誰持有鎖）
+        fd.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
+        fd.flush()
+        yield
+    finally:
+        fd.close()  # close 即釋放 flock
+def _run_db_backup() -> None:
+    """Step 18：DB 備份（P0 止血包 #1）——本地 backups/ + 異地副本（iCloud）。"""
+    from src.config import settings
+    from src.data.database import backup_db
+
+    backup_path = backup_db()
+    if backup_path is None:
+        print("  ⚠️ 備份未執行（非檔案型 DB 或 DB 檔不存在）")
+        return
+    print(f"  ✓ 本地備份：{backup_path}")
+    offsite_dir = settings.backup.offsite_dir
+    if offsite_dir:
+        print(f"  ✓ 異地副本目錄：{offsite_dir}（失敗時見 log warning）")
+    else:
+        print("  - 異地副本停用（backup.offsite_dir 為空）")
+
+
+def _format_crisis_availability(stress_result: dict | None) -> str | None:
+    """組出「crisis 訊號可用 N/7」自檢字串（P0 止血包 #5）；無 availability 資料回 None。
+
+    availability 來自 detect_crisis_signals：區分「訊號未觸發」與「資料缺失無法計算」
+    （TW_VIX 已死 → vix_spike 恆 False，此自檢讓缺口每天可見）。
+    """
+    if not stress_result:
+        return None
+    avail = stress_result.get("availability") or {}
+    if not avail:
+        return None
+    total = len(avail)
+    ok = sum(1 for v in avail.values() if v)
+    missing = [k for k, v in avail.items() if not v]
+    if missing:
+        return f"crisis 訊號可用 {ok}/{total}（不可用：{', '.join(missing)}）"
+    return f"crisis 訊號可用 {ok}/{total}"
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
+    """每日早晨例行流程進入點（重入保護 wrapper，主體見 _run_morning_routine）。"""
+    with _run_lock():
+        _run_morning_routine(args)
+
+
+def _run_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
     依序執行：
@@ -900,6 +982,12 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
     top_n: int = getattr(args, "top", 20)
     notify: bool = getattr(args, "notify", False)
 
+    # P0 止血包 #5：dead-man ping（dry-run 不 ping，避免手動預覽干擾排程監控）
+    from src.notification.healthchecks import ping_healthchecks
+
+    if not dry_run:
+        ping_healthchecks("start")
+
     # C3 修復（2026-05-09 audit）：建立單一 today 物件貫穿全流程，避免跨午夜執行時
     # 各 step 各自呼叫 date.today() 拿到不同日期（observed: 23:13 啟動跑到 02:17 隔日）。
     # 此 today 會被傳遞給 Step 8c IC 預檢與 Step 16 export-dashboard，
@@ -927,6 +1015,8 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         if not has_calendar_data(today.year):
             print(f"  （注意：{today.year} 年假日資料尚未建立，僅依週末判斷）")
         print(f"{'═' * 64}\n")
+        # 非交易日 short-circuit 屬正常結束（避免假日誤發 dead-man 告警）
+        ping_healthchecks("success")
         return
 
     # ── Step 0: VIX 同步 + 宏觀壓力預檢（Macro Stress Check）──────
@@ -946,6 +1036,9 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             regime_now = stress_result.get("regime")
             print(f"  [dry-run] 市場狀態預覽: {(regime_now or 'unknown').upper()}")
             print(f"  [dry-run] {stress_result.get('summary', '')}")
+            avail_msg = _format_crisis_availability(stress_result)
+            if avail_msg:
+                print(f"  [dry-run] {avail_msg}")
         except Exception as exc:
             logger.warning("dry-run stress check 失敗: %s", exc, exc_info=True)
             stress_result = {}
@@ -983,6 +1076,10 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
         else:
             print("  !! 市場狀態: UNKNOWN（壓力預檢失敗或資料不足，Rotation 將使用保守預設）")
         print(f"  {stress_result.get('summary', '')}")
+        # P0 止血包 #5：crisis 訊號可用性自檢（TW_VIX 已死 → 每天可見 6/7）
+        avail_msg = _format_crisis_availability(stress_result)
+        if avail_msg:
+            print(f"  🩺 {avail_msg}")
         if stress_result.get("breadth_downgraded"):
             bpct = stress_result.get("breadth_below_ma20_pct", 0.0) or 0.0
             print(f"  📊 市場廣度警示：{bpct:.0%} 股票跌破 MA20 → regime 降級")
@@ -1190,6 +1287,13 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run"},
             lambda: _baseline_regression_check(state=baseline_state),
         ),
+        # P0 止血包 #1（2026-07-05）：放最後 → 備到當日全部同步/更新後的最新狀態
+        (
+            18,
+            "DB 備份（本地 + 異地副本）",
+            {"dry_run"},
+            _run_db_backup,
+        ),
     ]
 
     active_flags: set[str] = set()
@@ -1223,6 +1327,9 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
 
     # ── 完成提示（含失敗步驟摘要）──────────────────────────────
     failed_steps = [(n, t) for n, t, s in step_results if s == "failed"]
+    # P0 止血包 #5：dead-man ping——部分步驟失敗也 ping /fail（healthchecks 顯示紅色）
+    if not dry_run:
+        ping_healthchecks("fail" if failed_steps else "success")
     suffix = "（dry-run 模式，未執行任何操作）" if dry_run else ""
     print(f"\n{'═' * 64}")
     if failed_steps:
