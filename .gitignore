@@ -43,3 +43,7 @@ logs/
 
 # 分點匯入清單
 stocks.txt
+# DB 備份（P0 止血包 #1）——備份檔勿進 git
+data/backups/
+data/*.bak
+data/stock.db.pre-restore
