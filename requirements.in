@@ -1,0 +1,55 @@
+# 依賴來源檔（人工維護；requirements.txt 為凍結鎖定檔，勿手改）
+#
+# 鎖定方式（2026-07-05，P0 止血包 #6）：pip freeze 快照 + `pip install --no-deps`。
+# 無法用 pip-compile 嚴格求解的原因：FinMind 上游 metadata 三角衝突——
+#   - FinMind 1.x 釘 ta~=0.5.25（與我們刻意的 ta>=0.11 衝突，ta 事故根源）
+#   - FinMind 2.x 釘 lxml<5.0（lxml 4.9.4 無 Python 3.14 wheel，source build 失敗）
+# 現行環境（FinMind 1.9.7 + ta 0.11 + lxml 6.1）違反 FinMind 的 ta pin 但實測可運作
+# （指標一律走 src/features/ta_compat.py 相容層）。FinMind 修 pin 後可改回 pip-compile。
+
+# Data fetching
+requests>=2.31.0
+FinMind>=1.6.0
+beautifulsoup4>=4.12.0
+yfinance>=0.2.36
+
+# Data processing
+pandas>=2.3.0,<3
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Configuration
+pyyaml>=6.0.1
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Technical indicators (P1)
+ta>=0.11  # 釘新版 API（window= 參數）；src/features/ta_compat.py 仍相容舊 0.5.x（n=）
+
+# Backtesting (P2)
+# vectorbt>=0.26.0
+
+# Visualization (P3)
+plotly>=5.18.0
+streamlit>=1.29.0
+
+# Scheduling (P4)
+schedule>=1.2.0
+
+# Machine Learning (P7)
+scikit-learn>=1.3.0
+xgboost>=2.0.0  # 可選，未安裝時 fallback 到 Random Forest
+optuna>=3.5.0  # 超參數調優（Phase C3）
+shap>=0.44.0  # 特徵重要性解釋（Phase C4/C5）
+
+# Claude AI (P30)
+anthropic>=0.40.0
+
+# Testing & Linting
+pytest>=7.4.0
+pytest-mock>=3.12.0
+pytest-cov>=4.1.0
+ruff>=0.4.0

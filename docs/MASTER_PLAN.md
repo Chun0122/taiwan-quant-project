@@ -117,7 +117,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 3 | **Kill Switch peak 修復** | ✅ 2026-07-05 完成：新增 `compute_drawdown_with_snapshots` 純函數（peak = max(equity_history ∪ snapshot 序列)，容忍缺日）；熔斷與 Drawdown Guard 共用同一 dd_pct。backtest 路徑經查無此 bug（equity_curve 逐日含 MtM） |
 | 4 | **discover-backtest 預設翻轉** | ✅ 2026-07-05 完成（僅 CLI 層）：未明示 → (True, True)；`--naive` 取得舊行為（與明示 flag 並用即報錯）；`--no-*` 可單獨關閉；報告 header 印「成本模型/進場假設」。引擎預設不動（dashboard/decay 依賴 False） |
 | 5 | **Dead-man 告警** | ✅ 2026-07-05 完成：`monitoring.healthchecks_url` config + start/success/fail ping（例外全吞不影響主流程；非交易日視為 success；dry-run 不 ping）；`detect_crisis_signals` 新增 `availability`，Step 0 與 Discord 摘要每日印「crisis 訊號可用 N/7」。**待辦**：使用者自行到 healthchecks.io 建 check 填 URL |
-| 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
+| 6 | **依賴鎖定** | ✅ 2026-07-05 完成：requirements.in（來源）+ freeze 鎖定 requirements.txt（131 套件全 `==`，`--no-deps` 安裝）。pip-compile 無解：FinMind 1.x 釘 ta~=0.5 / 2.x 釘 lxml<5（Py3.14 無 wheel），上游修 pin 後再改回。全新 venv 全測試綠驗收；升級 SOP 見 USAGE.md §1 |
 | 7 | **重入保護** | ✅ 2026-07-05 完成：morning-routine flock 檔案鎖（`data/.morning_routine.lock`，process 死亡自動釋放）；`update()` 入口同日冪等 guard（ActionLog ∪ Snapshot 雙重判斷，`--force` 覆蓋，dry_run 不受限） |
 
 ### 6.2 帳本可信三部曲

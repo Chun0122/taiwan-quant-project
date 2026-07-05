@@ -7,7 +7,8 @@
 ## 安裝
 
 ```bash
-pip install -r requirements.txt
+# requirements.txt 為凍結鎖定檔；--no-deps 必要（FinMind 上游 pin 過緊，詳見 USAGE.md §1）
+pip install --no-deps -r requirements.txt
 ```
 
 ---

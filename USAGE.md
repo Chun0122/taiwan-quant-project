@@ -10,9 +10,39 @@
 ### 安裝步驟
 
 ```bash
-# 1. 安裝 Python 套件
-pip install -r requirements.txt
+# 1. 安裝 Python 套件（requirements.txt 為凍結鎖定檔，--no-deps 必要，原因見下）
+pip install --no-deps -r requirements.txt
 ```
+
+### 依賴管理與升級 SOP（2026-07-05 起）
+
+依賴採兩檔管理（動機：`ta` 套件 0.5.x → 0.7 API 分歧事故，未鎖版本導致本機過、別處掛）：
+
+- **`requirements.in`**：人工維護的來源檔（`>=` 下限 + 註解）
+- **`requirements.txt`**：`pip freeze` 產出的完整鎖定檔（全 `==`，含 transitive 依賴）——**勿手改**
+
+> **為何用 freeze 而非 pip-compile**：FinMind 上游 metadata 釘過緊且無可行版本——
+> 1.x 釘 `ta~=0.5.25`（與我們刻意的 `ta>=0.11` 衝突），2.x 釘 `lxml<5`
+>（lxml 4.9.4 無 Python 3.14 wheel）。實際運作組合（FinMind 1.9.7 + ta 0.11 +
+> lxml 6.1）已由 2400+ 測試驗證，但正常 resolver 會拒絕它，故鎖定與安裝都須
+> `--no-deps` 繞過 metadata 檢查。FinMind 修 pin 後可改回 pip-compile。
+
+升級依賴（依 MASTER_PLAN 編碼規範，須獨立 PR）：
+
+```bash
+# 1. 改 requirements.in 下限（如需），在現行 .venv 升級目標套件
+pip install --upgrade <pkg>
+# 2. 全套測試綠才算升級成功
+pytest -q
+# 3. 重新凍結（保留檔頭註解區）
+pip freeze --exclude pip-tools > requirements.txt   # 手動補回 header
+# 4. 驗證可重現：全新 venv 裝鎖定版 → 全套測試綠才 commit
+python -m venv /tmp/verify-venv
+/tmp/verify-venv/bin/pip install --no-deps -r requirements.txt
+/tmp/verify-venv/bin/python -m pytest -q
+```
+
+> 鎖定檔由 Python 3.14 / macOS 產生；跨 Python 版本部分套件（wheel 可用性）可能不同。
 
 ### FinMind API Token
 
