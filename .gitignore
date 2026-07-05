@@ -43,3 +43,5 @@ logs/
 
 # 分點匯入清單
 stocks.txt
+# morning-routine 重入保護鎖檔（P0 止血包 #7）
+data/.morning_routine.lock

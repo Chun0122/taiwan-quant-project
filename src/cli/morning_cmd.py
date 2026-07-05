@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -853,7 +856,47 @@ def _verify_data_freshness(today_str: str) -> dict:
     return result
 
 
+@contextmanager
+def _run_lock(lock_path: Path | None = None):
+    """morning-routine 重入保護（P0 止血包 #7）：flock 排他鎖。
+
+    - 選 flock 的理由：process 死亡（crash/kill）時 OS 自動釋放，無 stale lock
+      問題，因此不需要 --force 逃生口。
+    - 鎖檔固定放本機 data/（flock 在 iCloud/網路磁碟上不可靠，勿移至同步目錄）。
+    - 取鎖失敗（另一個 morning-routine 執行中）→ 印訊息後 SystemExit(1)。
+    - Windows 無 fcntl → 降級為無鎖並告警（graceful degradation 但不靜默）。
+    """
+    path = lock_path or Path("data/.morning_routine.lock")
+    try:
+        import fcntl
+    except ImportError:
+        logger.warning("此平台不支援 fcntl，morning-routine 重入保護停用")
+        yield
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"⚠️ 另一個 morning-routine 正在執行中（鎖檔 {path}），本次退出。")
+            raise SystemExit(1) from None
+        # 寫入 PID + 啟動時間供診斷（誰持有鎖）
+        fd.write(f"pid={os.getpid()} started={datetime.now().isoformat()}\n")
+        fd.flush()
+        yield
+    finally:
+        fd.close()  # close 即釋放 flock
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
+    """每日早晨例行流程進入點（重入保護 wrapper，主體見 _run_morning_routine）。"""
+    with _run_lock():
+        _run_morning_routine(args)
+
+
+def _run_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
     依序執行：

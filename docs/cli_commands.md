@@ -132,9 +132,10 @@ python main.py rotation create --name all10_5d --mode all --max-positions 10 --h
 # 合成模式：mom_growth = 動量+成長雙引擎（momentum+growth，per_mode_max=3）
 python main.py rotation create --name mg5_20d --mode mom_growth --max-positions 5 --holding-days 20 --capital 1000000
 
-# 更新
+# 更新（P0 止血包 #7：同日冪等——當日已有 ActionLog/Snapshot 時自動跳過）
 python main.py rotation update --name mom5_3d
 python main.py rotation update --all
+python main.py rotation update --name mom5_3d --force   # 繞過同日冪等保護，強制重跑
 
 # Pre-Trade 預覽（P2 任務 9：dry_run，不寫 DB）
 python main.py rotation preview --name swing5_3d                # 預覽單一組合明日換股清單

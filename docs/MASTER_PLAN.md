@@ -118,7 +118,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
 | 5 | **Dead-man 告警** | healthchecks.io ping + Step 0 印出「crisis 訊號 N/7 可用」自檢（TW_VIX 已死須可見） |
 | 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
-| 7 | **重入保護** | morning-routine 檔案鎖；`rotation update` 同日冪等檢查（查 ActionLog） |
+| 7 | **重入保護** | ✅ 2026-07-05 完成：morning-routine flock 檔案鎖（`data/.morning_routine.lock`，process 死亡自動釋放）；`update()` 入口同日冪等 guard（ActionLog ∪ Snapshot 雙重判斷，`--force` 覆蓋，dry_run 不受限） |
 
 ### 6.2 帳本可信三部曲
 

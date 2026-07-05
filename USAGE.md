@@ -1560,7 +1560,12 @@ python main.py rotation create --name all10_5d --mode all --max-positions 10 --h
 ```bash
 python main.py rotation update --name mom5_3d   # 指定組合
 python main.py rotation update --all            # 所有 active 組合
+python main.py rotation update --name mom5_3d --force  # 強制重跑（繞過同日冪等保護）
 ```
+
+> **同日冪等保護**（2026-07-05）：同一組合同一天重複執行 `update` 會自動跳過
+> （避免排名/價格變動導致二次交易）。人工修復或回補情境請加 `--force`。
+> `morning-routine` 亦有檔案鎖：偵測到另一個執行中的 routine 會直接退出。
 
 **查看狀態 / 歷史：**
 

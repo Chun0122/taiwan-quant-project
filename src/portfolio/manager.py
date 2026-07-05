@@ -151,6 +151,7 @@ class RotationManager:
         regime: str | None = None,
         *,
         dry_run: bool = False,
+        force: bool = False,
     ) -> RotationActions | None:
         """每日更新：讀取 discover 排名 → 計算 rotation → 寫入 DB。
 
@@ -165,6 +166,10 @@ class RotationManager:
             P2 任務 9（2026-05-17）：True 時跑完整 rotation 邏輯但不 commit
             任何寫入（含 drawdown 強制平倉、buy/sell/renew、daily snapshot），
             session 在最後 rollback。供 `rotation preview` 預覽明日換股清單用。
+        force : bool
+            P0 止血包 #7（2026-07-05）：True 時繞過同日冪等 guard，強制重跑。
+            供人工修復情境（CLI `rotation update --force`）；回補歷史時傳入
+            自訂 today 亦受 guard 約束，需要重算該日請搭配 force=True。
         """
         if today is None:
             today = date.today()
@@ -176,6 +181,18 @@ class RotationManager:
                 return None
             if portfolio.status != "active":
                 logger.info("組合 %s 已暫停，跳過更新", self.portfolio_name)
+                return None
+
+            # P0 止血包 #7（2026-07-05）：同日冪等 guard——重複執行時 rankings/價格
+            # 可能已變動，實際部位不保證天然收斂（可能二次交易）。ActionLog 與
+            # Snapshot 雙重判斷缺一不可：熔斷日提早 return 只寫 ActionLog；
+            # 而 ActionLog 記錄含 hold，正常日兩者皆有，任一存在即視為已執行。
+            if not dry_run and not force and self._already_updated_today(session, today):
+                logger.info(
+                    "[%s] 今日（%s）已執行過 update，跳過（--force 可覆蓋）",
+                    self.portfolio_name,
+                    today,
+                )
                 return None
 
             # 載入 open positions
@@ -648,6 +665,38 @@ class RotationManager:
                 )
             )
         session.commit()
+
+    def _already_updated_today(self, session, today: date) -> bool:
+        """同日冪等 guard（P0 止血包 #7）：今日是否已有 ActionLog 或 Snapshot。
+
+        兩表聯集判斷：熔斷日提早 return 不寫 snapshot（只有 ActionLog）；
+        ActionLog 含 hold 紀錄，正常執行日兩表皆有列。
+        """
+        has_action_log = (
+            session.execute(
+                select(RotationActionLog.id)
+                .where(
+                    RotationActionLog.portfolio_name == self.portfolio_name,
+                    RotationActionLog.action_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        if has_action_log:
+            return True
+        has_snapshot = (
+            session.execute(
+                select(RotationDailySnapshot.id)
+                .where(
+                    RotationDailySnapshot.portfolio_name == self.portfolio_name,
+                    RotationDailySnapshot.snapshot_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        return has_snapshot
 
     # ── Action Log ──
 
