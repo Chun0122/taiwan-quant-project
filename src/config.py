@@ -156,6 +156,29 @@ class DashboardConfig(BaseModel):
     portfolio_review_lookback_days: int = 90  # portfolio_review 撈最近 N 天 snapshot 計算指標
 
 
+class BackupConfig(BaseModel):
+    """DB 備份設定（P0 止血包 #1，2026-07-05）。
+
+    offsite_dir：異地副本目錄（預設 iCloud Drive，macOS 自動同步上雲）；
+    設為空字串停用異地副本。retention_days：本地與異地共用的保留天數。
+    """
+
+    offsite_dir: str = "~/Library/Mobile Documents/com~apple~CloudDocs/taiwan-quant-backups"
+    retention_days: int = 7
+
+
+class MonitoringConfig(BaseModel):
+    """運維監控設定（P0 止血包 #5，2026-07-05）。
+
+    healthchecks_url：healthchecks.io 的完整 ping URL（如
+    https://hc-ping.com/<uuid>）。morning-routine 起跑 ping /start、
+    成功 ping 本體、有步驟失敗 ping /fail；健檢平台端設定排程 + grace period，
+    未收到 ping 即發告警（dead-man switch）。空字串 = 停用。
+    """
+
+    healthchecks_url: str = ""
+
+
 class Settings(BaseModel):
     finmind: FinMindConfig = FinMindConfig()
     database: DatabaseConfig = DatabaseConfig()
@@ -165,6 +188,8 @@ class Settings(BaseModel):
     anthropic: AnthropicConfig = AnthropicConfig()
     quant: QuantConfig = QuantConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    backup: BackupConfig = BackupConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
 
     @model_validator(mode="after")
     def _validate_critical_settings(self) -> "Settings":

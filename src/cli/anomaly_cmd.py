@@ -151,6 +151,8 @@ def _compute_macro_stress_check() -> dict:
             "vix_val": vix_val,
             "us_vix_val": us_vix_val,
             "signals": crisis_info.get("signals", {}),
+            # P0 止血包 #5：各 crisis 訊號的資料可用性（TW_VIX 已死須可見）
+            "availability": crisis_info.get("availability", {}),
             "summary": summary,
             "breadth_below_ma20_pct": breadth_pct,
             "breadth_downgraded": breadth_downgraded,

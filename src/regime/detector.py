@@ -679,6 +679,21 @@ def detect_crisis_signals(
         "us_vix_val": 0.0,
     }
 
+    # P0 止血包 #5（2026-07-05）：各訊號的「資料可用性」——區分「訊號 False」與
+    # 「資料缺失無法計算」（TW_VIX 已死 → vix_spike 恆 False，過去不可見）。
+    # 純新增 key，signals 結構不動，既有呼叫者零影響。
+    # 注意：availability 只反映輸入資料是否存在，勿與 signals（觸發與否）混用計數。
+    availability = {
+        "fast_return_5d": len(closes) >= 6,
+        "consec_decline": len(closes) >= consec_down_days + 1,
+        "vol_spike": len(closes) >= vol_window + 10,
+        "panic_volume": volumes is not None and len(volumes) >= vol_window + 1,
+        "vix_spike": vix_series is not None and len(vix_series) >= 2,
+        "single_day_drop": len(closes) >= 2,
+        "us_vix_spike": us_vix_series is not None and len(us_vix_series) >= 2,
+    }
+    _safe["availability"] = {k: False for k in availability}
+
     if len(closes) < max(consec_down_days + 1, 10):
         return _safe
 
@@ -775,6 +790,7 @@ def detect_crisis_signals(
     return {
         "crisis": crisis,
         "signals": signals,
+        "availability": availability,
         "fast_return_5d_val": ret5d_val,
         "vol_ratio_val": vol_ratio_val,
         "vix_val": vix_val,
