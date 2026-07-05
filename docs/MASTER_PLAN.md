@@ -113,7 +113,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | # | 項目 | 內容 / 驗收 |
 |---|------|------------|
 | 1 | **DB 自動備份** | `backup_db()` 現為零呼叫者。morning-routine 加尾步 + 異地副本；做一次還原演練。全 repo ROI 最高單項 |
-| 2 | **確認 bug：`Announcement.title`** | `pipeline.py:1802` 欄位應為 `subject`，`sync-concepts --from-mops` 100% crash。修復 + CLI smoke test 制度化 |
+| 2 | **確認 bug：`Announcement.title`** | ✅ 2026-07-05 完成：`title`→`subject` 修復；`main.py` 抽出 `build_parser()`；新增 `tests/test_cli_smoke.py`（全 49 子命令 parse + handler 鏈路回歸測試） |
 | 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
 | 5 | **Dead-man 告警** | healthchecks.io ping + Step 0 印出「crisis 訊號 N/7 可用」自檢（TW_VIX 已死須可見） |
@@ -200,7 +200,7 @@ R1 歷史裁決重審（A2+A3 後）→ R2 跨 regime 穩健性 2020–2026（B1
 ### 確認的 bug / 死碼（已驗證）
 | 項目 | 位置 | 狀態 |
 |------|------|------|
-| `Announcement.title` 欄位不存在 | `pipeline.py:1802` | **P0 #2 修復中** |
+| `Announcement.title` 欄位不存在 | `pipeline.py:1802` | ✅ 2026-07-05 已修復（`subject` + smoke test） |
 | `backup_db()` 零呼叫者 | `database.py` | **P0 #1 修復中** |
 | `_compute_backtest_metrics` 死碼 | `manager.py` 尾端 | 待 sweep |
 | `fetch_taiwan_vix` 永遠回空（dataset 已亡） | `fetcher.py` | 待替代（期交所 VIX）或移除 |

@@ -1799,12 +1799,12 @@ def sync_concept_tags_from_mops(days: int = 90) -> int:
     added = 0
 
     with get_session() as session:
-        rows = session.query(Announcement.stock_id, Announcement.title).filter(Announcement.date >= cutoff).all()
+        rows = session.query(Announcement.stock_id, Announcement.subject).filter(Announcement.date >= cutoff).all()
 
-        for stock_id, title in rows:
-            if not title:
+        for stock_id, subject in rows:
+            if not subject:
                 continue
-            matched_concepts = classify_concepts(title)
+            matched_concepts = classify_concepts(subject)
             for concept_name in matched_concepts:
                 existing = (
                     session.query(ConceptMembership)
