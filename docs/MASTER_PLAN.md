@@ -117,7 +117,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
 | 5 | **Dead-man 告警** | healthchecks.io ping + Step 0 印出「crisis 訊號 N/7 可用」自檢（TW_VIX 已死須可見） |
-| 6 | **依賴鎖定** | pip-compile lockfile（ta 套件事故不再重演） |
+| 6 | **依賴鎖定** | ✅ 2026-07-05 完成：requirements.in（來源）+ freeze 鎖定 requirements.txt（131 套件全 `==`，`--no-deps` 安裝）。pip-compile 無解：FinMind 1.x 釘 ta~=0.5 / 2.x 釘 lxml<5（Py3.14 無 wheel），上游修 pin 後再改回。全新 venv 全測試綠驗收；升級 SOP 見 USAGE.md §1 |
 | 7 | **重入保護** | morning-routine 檔案鎖；`rotation update` 同日冪等檢查（查 ActionLog） |
 
 ### 6.2 帳本可信三部曲
