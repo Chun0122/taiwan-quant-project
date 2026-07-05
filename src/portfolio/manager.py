@@ -18,6 +18,7 @@ from src.constants import (
     COMMISSION_RATE,
     COMPOSITE_MODES,
     LIQUIDITY_PARTICIPATION_LIMIT,
+    MAX_DRAWDOWN_LIQUIDATE_PCT,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
     TAX_RATE,
@@ -53,9 +54,9 @@ from src.portfolio.rankings import (
 )
 from src.portfolio.rotation import (
     RotationActions,
-    check_drawdown_kill_switch,
     compute_correlation_matrix,
     compute_covariance_matrix,
+    compute_drawdown_with_snapshots,
     compute_dynamic_slippage,
     compute_planned_exit_date,
     compute_portfolio_drawdown,
@@ -308,8 +309,12 @@ class RotationManager:
                 open_positions=open_positions,
                 today_prices=today_prices,
             )
-            if check_drawdown_kill_switch(equity_history):
-                dd_pct = compute_portfolio_drawdown(equity_history)
+            # P0 止血包 #3（2026-07-05）：peak 額外納入每日 snapshot MtM 權益序列，
+            # 修復 realized-only 序列低估「浮盈回吐型」回撤、熔斷不觸發的漏洞。
+            # dd_pct 同時供熔斷判斷與下方 Drawdown Guard 使用，兩處必須同值。
+            snapshot_capitals = self._load_snapshot_capitals(session)
+            dd_pct = compute_drawdown_with_snapshots(equity_history, snapshot_capitals)
+            if dd_pct >= MAX_DRAWDOWN_LIQUIDATE_PCT:
                 logger.error(
                     "⚠️ [%s] 回撤熔斷觸發 (%.1f%%)！強制平倉所有持倉",
                     self.portfolio_name,
@@ -398,8 +403,8 @@ class RotationManager:
                 corr_matrix=corr_matrix,
                 vol_weights=vol_weights,
                 regime=regime,
-                # P1-2：接上 Drawdown Guard 連續減倉（回撤越深、新開倉越小；reuse kill-switch 算好的 equity_history）
-                drawdown_pct=compute_portfolio_drawdown(equity_history),
+                # P1-2：接上 Drawdown Guard 連續減倉（回撤越深、新開倉越小；reuse kill-switch 算好的 dd_pct，含 snapshot peak）
+                drawdown_pct=dd_pct,
                 min_hold_days=gate_min_hold,
                 score_gap_threshold=gate_score_gap,
                 weekly_swap_cap=gate_weekly_cap,
@@ -1912,6 +1917,19 @@ class RotationManager:
             final_equity = portfolio.current_capital
 
         return build_equity_history(portfolio.initial_capital, closed_pnls, final_equity)
+
+    def _load_snapshot_capitals(self, session) -> list[float]:
+        """載入該組合全部每日 snapshot 的 MtM 權益序列（依日期升序）。
+
+        P0 止血包 #3（2026-07-05）：供 compute_drawdown_with_snapshots 補回
+        realized-only equity_history 缺失的浮盈高點（peak 低估 → 熔斷不觸發）。
+        """
+        stmt = (
+            select(RotationDailySnapshot.total_capital)
+            .where(RotationDailySnapshot.portfolio_name == self.portfolio_name)
+            .order_by(RotationDailySnapshot.snapshot_date)
+        )
+        return [v for v in session.execute(stmt).scalars().all() if v is not None]
 
     def _load_open_positions(self, session, portfolio_id: int) -> list[dict]:
         stmt = select(RotationPosition).where(

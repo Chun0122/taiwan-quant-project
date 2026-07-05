@@ -223,8 +223,8 @@ class TestUpdateWritesActionLog:
         p = _make_portfolio(patch_session)
         _add_position(patch_session, p.id, "1111", today, days_ago=3, stop_loss=50)
 
-        monkeypatch.setattr("src.portfolio.manager.check_drawdown_kill_switch", lambda *a, **kw: True)
-        monkeypatch.setattr("src.portfolio.manager.compute_portfolio_drawdown", lambda *a, **kw: 30.0)
+        # P0 止血包 #3 後熔斷判斷改用 compute_drawdown_with_snapshots 回傳的 dd_pct
+        monkeypatch.setattr("src.portfolio.manager.compute_drawdown_with_snapshots", lambda *a, **kw: 30.0)
 
         RotationManager("al_test").update(today=today, regime="bull")
 

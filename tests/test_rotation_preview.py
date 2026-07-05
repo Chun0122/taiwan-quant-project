@@ -218,9 +218,8 @@ class TestDryRunSkipsLiquidation:
         )
         patch_session.commit()
 
-        # 強制 drawdown kill switch 觸發
-        monkeypatch.setattr("src.portfolio.manager.check_drawdown_kill_switch", lambda *a, **kw: True)
-        monkeypatch.setattr("src.portfolio.manager.compute_portfolio_drawdown", lambda *a, **kw: 30.0)
+        # 強制 drawdown kill switch 觸發（P0 止血包 #3 後熔斷判斷改用 compute_drawdown_with_snapshots）
+        monkeypatch.setattr("src.portfolio.manager.compute_drawdown_with_snapshots", lambda *a, **kw: 30.0)
 
         mgr = RotationManager("prev_test")
         actions = mgr.update(today=today, regime="bull", dry_run=True)
