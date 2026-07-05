@@ -112,7 +112,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 
 | # | 項目 | 內容 / 驗收 |
 |---|------|------------|
-| 1 | **DB 自動備份** | `backup_db()` 現為零呼叫者。morning-routine 加尾步 + 異地副本；做一次還原演練。全 repo ROI 最高單項 |
+| 1 | **DB 自動備份** | ✅ 2026-07-05 完成：morning-routine Step 18 接上 `backup_db()`；異地副本至 iCloud Drive（`backup.offsite_dir` 可覆蓋，失敗僅 warning）；保留天數 config 化。還原演練 2026-07-05 完成（integrity ok + 功能驗證），SOP 見 usage.md §8 |
 | 2 | **確認 bug：`Announcement.title`** | `pipeline.py:1802` 欄位應為 `subject`，`sync-concepts --from-mops` 100% crash。修復 + CLI smoke test 制度化 |
 | 3 | **Kill Switch peak 修復** | `_compute_equity_history` 的 peak 改用 `RotationDailySnapshot.total_capital` 序列（現用 realized-only 累積，浮盈回吐型崩跌不觸發熔斷） |
 | 4 | **discover-backtest 預設翻轉** | 預設 `entry_next_open=True, include_costs=True`（現預設 same-close entry = look-ahead），舊行為改 `--naive` |
@@ -201,7 +201,7 @@ R1 歷史裁決重審（A2+A3 後）→ R2 跨 regime 穩健性 2020–2026（B1
 | 項目 | 位置 | 狀態 |
 |------|------|------|
 | `Announcement.title` 欄位不存在 | `pipeline.py:1802` | **P0 #2 修復中** |
-| `backup_db()` 零呼叫者 | `database.py` | **P0 #1 修復中** |
+| `backup_db()` 零呼叫者 | `database.py` | ✅ 2026-07-05 已接上 morning-routine Step 18 |
 | `_compute_backtest_metrics` 死碼 | `manager.py` 尾端 | 待 sweep |
 | `fetch_taiwan_vix` 永遠回空（dataset 已亡） | `fetcher.py` | 待替代（期交所 VIX）或移除 |
 | `_collect_settings_diffs` 永遠回空（settings.yaml 不在 git） | `strategy_events.py` | A5 修復後自動復活 |

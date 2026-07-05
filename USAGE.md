@@ -2189,3 +2189,29 @@ FinMind 免費版有請求頻率限制。系統已內建每次請求後等待 0.
 ### Q: 資料庫檔案在哪裡？
 
 `data/stock.db`，是一個 SQLite 檔案，可用任何 SQLite 工具（如 DB Browser for SQLite）直接瀏覽。
+
+## 8. DB 備份與災難還原
+
+**自動備份**（2026-07-05 起）：`morning-routine` Step 18 每日執行 `backup_db()`：
+
+- 本地備份：`data/backups/stock_<時間戳>.bak`（備份前跑 `PRAGMA integrity_check`）
+- 異地副本：複製到 `backup.offsite_dir`（預設 iCloud Drive `~/Library/Mobile Documents/com~apple~CloudDocs/taiwan-quant-backups`，macOS 自動同步上雲；設空字串停用）
+- 保留策略：本地與異地皆保留 `backup.retention_days` 天（預設 7），過期自動刪除
+- 異地失敗（iCloud 離線等）只記 warning，不影響本地備份與 routine
+
+`config/settings.yaml` 可覆蓋：
+
+```yaml
+backup:
+  offsite_dir: "~/Library/Mobile Documents/com~apple~CloudDocs/taiwan-quant-backups"
+  retention_days: 7
+```
+
+**災難還原步驟**：
+
+1. 停止所有排程與執行中的 CLI（launchd unload / 關閉終端）
+2. 保留現場：`cp data/stock.db data/stock.db.pre-restore`
+3. 從 `data/backups/`（或 iCloud 目錄）挑最新備份覆蓋：`cp data/backups/stock_<最新>.bak data/stock.db`
+4. 完整性驗證：`sqlite3 data/stock.db "PRAGMA integrity_check;"` 應回 `ok`
+5. 功能驗證：`python main.py status` 與 `python main.py rotation list` 確認資料正常
+6. 重新啟用排程；在 `docs/MASTER_PLAN.md` §6.1 #1 註記還原演練日期

@@ -853,6 +853,23 @@ def _verify_data_freshness(today_str: str) -> dict:
     return result
 
 
+def _run_db_backup() -> None:
+    """Step 18：DB 備份（P0 止血包 #1）——本地 backups/ + 異地副本（iCloud）。"""
+    from src.config import settings
+    from src.data.database import backup_db
+
+    backup_path = backup_db()
+    if backup_path is None:
+        print("  ⚠️ 備份未執行（非檔案型 DB 或 DB 檔不存在）")
+        return
+    print(f"  ✓ 本地備份：{backup_path}")
+    offsite_dir = settings.backup.offsite_dir
+    if offsite_dir:
+        print(f"  ✓ 異地副本目錄：{offsite_dir}（失敗時見 log warning）")
+    else:
+        print("  - 異地副本停用（backup.offsite_dir 為空）")
+
+
 def cmd_morning_routine(args: argparse.Namespace) -> None:
     """每日早晨例行流程。
 
@@ -1189,6 +1206,13 @@ def cmd_morning_routine(args: argparse.Namespace) -> None:
             "Baseline Regression 守門（對比已凍結指標）",
             {"dry_run"},
             lambda: _baseline_regression_check(state=baseline_state),
+        ),
+        # P0 止血包 #1（2026-07-05）：放最後 → 備到當日全部同步/更新後的最新狀態
+        (
+            18,
+            "DB 備份（本地 + 異地副本）",
+            {"dry_run"},
+            _run_db_backup,
         ),
     ]
 
