@@ -177,6 +177,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 文件 | 內容 |
 |------|------|
+| [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) | **專案主計畫 SSOT**：成熟度評估、設計原則、P0/P1/P2 TODO、長期路線圖、技術債登記簿（規劃/審計/裁決前必讀） |
 | [`docs/cli_commands.md`](docs/cli_commands.md) | 38 個子命令完整用法與範例 |
 | [`docs/testing_guide.md`](docs/testing_guide.md) | 45 個測試檔對照表、Fixtures、覆蓋率指引 |
 | [`docs/project_history.md`](docs/project_history.md) | 85 項已完成任務歷史（Phase 1~2） |
