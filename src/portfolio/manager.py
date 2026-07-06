@@ -15,10 +15,15 @@ from sqlalchemy import delete, select
 
 from src.config import settings
 from src.constants import (
+    ACTION_TYPE_PENDING_BUY,
+    ACTION_TYPE_PENDING_SELL,
     COMMISSION_RATE,
     COMPOSITE_MODES,
+    DECIDE_STAGE_ACTION_TYPES,
     LIQUIDITY_PARTICIPATION_LIMIT,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
+    PENDING_STATUS_CANCELLED,
+    PENDING_STATUS_PENDING,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
     TAX_RATE,
@@ -30,6 +35,7 @@ from src.data.schema import (
     DiscoveryRecord,
     RotationActionLog,
     RotationDailySnapshot,
+    RotationPendingOrder,
     RotationPortfolio,
     RotationPosition,
 )
@@ -101,6 +107,30 @@ class _TradeAdapter:
     entry_date: date | None = None
     exit_date: date | None = None
     exit_reason: str = ""
+
+
+@dataclass
+class _DecisionContext:
+    """update()/decide() 共用的決策日組裝結果（A2：兩入口單一實作防 drift）。
+
+    純查詢與計算，無任何 DB 寫入副作用；kill-switch 的平倉執行留在 caller。
+    """
+
+    open_positions: list[dict]
+    rankings: list[dict]
+    trading_cal: list[date]
+    today_prices: dict[str, float]
+    today_ohlcv: dict[str, dict]
+    stop_losses: dict[str, float]
+    regime: str
+    corr_matrix: pd.DataFrame | None
+    price_rows: list | None
+    vol_weights: dict[str, float] | None
+    dd_pct: float
+    gate_min_hold: int
+    gate_score_gap: float
+    gate_weekly_cap: int
+    weekly_swaps_used: int
 
 
 # ---------------------------------------------------------------------------
@@ -196,141 +226,21 @@ class RotationManager:
                 )
                 return None
 
-            # 載入 open positions
-            open_positions = self._load_open_positions(session, portfolio.id)
-
-            # 載入今日排名
-            rankings = resolve_rankings(portfolio.mode, today, session, top_n=portfolio.max_positions * 3)
-            # 若掃描器因 regime 封鎖回傳空結果，不拉取前日排名（避免用不同 regime 的名單買入）
-            # regime 變數稍後才解析，這裡先預讀一次（若失敗視為未封鎖，由 fallback 處理）
-            _regime_for_gate = regime
-            if _regime_for_gate is None:
-                try:
-                    from src.regime.detector import RegimeStateMachine
-
-                    _regime_for_gate = RegimeStateMachine().current_regime
-                except Exception:
-                    _regime_for_gate = None
-            from src.constants import REGIME_MODE_BLOCK as _RMB
-
-            _mode_blocked_today = bool(
-                _regime_for_gate
-                and not is_composite_mode(portfolio.mode)
-                and portfolio.mode in _RMB.get(_regime_for_gate, frozenset())
-            )
-            if not rankings and not _mode_blocked_today:
-                # 嘗試找最近的 scan_date（未被 regime 封鎖時才 fallback）
-                rankings = self._find_latest_rankings(session, portfolio.mode, today)
-            elif not rankings and _mode_blocked_today:
-                logger.info(
-                    "Rotation: %s 模式在 %s 被封鎖 — 跳過新買入，僅處理止損/到期/風控",
-                    portfolio.mode,
-                    _regime_for_gate,
-                )
-
-            # 交易日曆（前 120 天 ~ 未來 30 天）
-            from datetime import timedelta
-
-            cal_start = today - timedelta(days=180)
-            cal_end = today + timedelta(days=60)
-            trading_cal = _get_trading_calendar(session, cal_start, cal_end)
-
-            # 今日收盤價
-            all_sids = list({p["stock_id"] for p in open_positions} | {r["stock_id"] for r in rankings})
-            today_prices = _get_prices_on_date(session, all_sids, today)
-            # P1-4：今日完整 OHLCV，供 _execute_buy/sell 計算動態滑價 + 流動性限制（與 backtest 對齊）
-            today_ohlcv = _get_ohlcv_on_date(session, all_sids, today)
-
-            # 止損價：從持倉記錄取進場時鎖定的止損價（不隨 discover 每日浮動）
-            stop_losses = {p["stock_id"]: p["stop_loss"] for p in open_positions if p.get("stop_loss") is not None}
-            # 新買入候選的止損價從 rankings 取（進場後會寫入 position）
-            for r in rankings:
-                if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
-                    stop_losses[r["stock_id"]] = r["stop_loss"]
-
-            # ── Regime fallback：嘗試從 JSON 持久化讀取 ──
-            if regime is None:
-                try:
-                    from src.regime.detector import RegimeStateMachine
-
-                    rsm = RegimeStateMachine()
-                    regime = rsm.current_regime
-                    if regime:
-                        logger.info("從 RegimeStateMachine 讀取 regime=%s", regime)
-                except Exception:
-                    logger.warning(
-                        "Regime 偵測失敗，使用安全預設值 %s",
-                        REGIME_FALLBACK_DEFAULT,
-                    )
-                    regime = REGIME_FALLBACK_DEFAULT
-            # 最終防線：若 rsm.current_regime 回傳 None / 空字串
-            if not regime:
-                logger.warning(
-                    "Regime 為空值，使用安全預設值 %s",
-                    REGIME_FALLBACK_DEFAULT,
-                )
-                regime = REGIME_FALLBACK_DEFAULT
-
-            # ── Correlation Budget：計算持倉+候選相關性矩陣 ──
-            corr_matrix = None
-            price_rows = None  # 用於後續 VaR 計算
-            held_sids = [p["stock_id"] for p in open_positions]
-            candidate_sids = [r["stock_id"] for r in rankings[: portfolio.max_positions]]
-            corr_sids = list(set(held_sids + candidate_sids))
-            if len(corr_sids) >= 2:
-                from datetime import timedelta
-
-                price_start = today - timedelta(days=90)
-                stmt_prices = (
-                    select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
-                    .where(
-                        DailyPrice.stock_id.in_(corr_sids),
-                        DailyPrice.date >= price_start,
-                        DailyPrice.date <= today,
-                    )
-                    .order_by(DailyPrice.date)
-                )
-                price_rows = session.execute(stmt_prices).all()
-                if price_rows:
-                    price_data: dict[str, pd.Series] = {}
-                    for sid in corr_sids:
-                        sid_rows = [(r[1], r[2]) for r in price_rows if r[0] == sid]
-                        if sid_rows:
-                            dates_list, prices_list = zip(*sid_rows)
-                            price_data[sid] = pd.Series(prices_list, index=pd.DatetimeIndex(dates_list))
-                    if len(price_data) >= 2:
-                        corr_matrix = compute_correlation_matrix(price_data, window=60)
-
-            # ── 波動率反比權重：候選股波動率較高者分配較少資金 ──
-            vol_weights = None
-            if candidate_sids and price_rows:
-                vol_dict: dict[str, float] = {}
-                for sid in candidate_sids:
-                    sid_rows = [r[2] for r in price_rows if r[0] == sid]
-                    if len(sid_rows) >= 20:
-                        s = pd.Series(sid_rows)
-                        daily_ret = s.pct_change().dropna()
-                        if len(daily_ret) >= 10:
-                            vol_dict[sid] = float(daily_ret.std() * (252**0.5))
-                if vol_dict:
-                    vol_weights = compute_vol_inverse_weights(vol_dict)
-                    logger.info("波動率反比權重：%s", vol_weights)
+            # A2：決策日組裝（與 decide() 共用單一實作，防兩入口 drift）
+            ctx = self._build_decision_context(session, portfolio, today, regime)
+            open_positions = ctx.open_positions
+            rankings = ctx.rankings
+            trading_cal = ctx.trading_cal
+            today_prices = ctx.today_prices
+            today_ohlcv = ctx.today_ohlcv
+            stop_losses = ctx.stop_losses
+            regime = ctx.regime
+            corr_matrix = ctx.corr_matrix
+            price_rows = ctx.price_rows
+            vol_weights = ctx.vol_weights
+            dd_pct = ctx.dd_pct
 
             # ── Max Drawdown Kill Switch：回撤超過閾值強制平倉 ──
-            # C1 修復（2026-05-09）：傳入 open_positions + today_prices，
-            # 讓 equity_history 反映當日盤中浮動損益（含 gap-down），
-            # 否則用過時 portfolio.current_capital 會在真實回撤時不觸發熔斷。
-            equity_history = self._compute_equity_history(
-                session,
-                portfolio,
-                open_positions=open_positions,
-                today_prices=today_prices,
-            )
-            # P0 止血包 #3（2026-07-05）：peak 額外納入每日 snapshot MtM 權益序列，
-            # 修復 realized-only 序列低估「浮盈回吐型」回撤、熔斷不觸發的漏洞。
-            # dd_pct 同時供熔斷判斷與下方 Drawdown Guard 使用，兩處必須同值。
-            snapshot_capitals = self._load_snapshot_capitals(session)
-            dd_pct = compute_drawdown_with_snapshots(equity_history, snapshot_capitals)
             if dd_pct >= MAX_DRAWDOWN_LIQUIDATE_PCT:
                 logger.error(
                     "⚠️ [%s] 回撤熔斷觸發 (%.1f%%)！強制平倉所有持倉",
@@ -383,26 +293,11 @@ class RotationManager:
                         logger.warning("[%s] 寫入 action log（熔斷）失敗：%s", self.portfolio_name, exc)
                 return liquidation_actions
 
-            # ── Rotation 成本閘門（A/B/C）參數（per-mode：閘門對 momentum/swing 效果相反）──
-            cost_cfg = settings.quant.rotation_cost.for_mode(portfolio.mode)
-            if cost_cfg.enabled:
-                iso_year, iso_week, _ = today.isocalendar()
-                week_start = date.fromisocalendar(iso_year, iso_week, 1)
-                stmt_swaps = select(RotationPosition).where(
-                    RotationPosition.portfolio_id == portfolio.id,
-                    RotationPosition.exit_reason == "holding_expired",
-                    RotationPosition.exit_date >= week_start,
-                    RotationPosition.exit_date <= today,
-                )
-                weekly_swaps_used = len(list(session.execute(stmt_swaps).scalars()))
-                gate_min_hold = cost_cfg.min_hold_days
-                gate_score_gap = cost_cfg.score_gap_threshold
-                gate_weekly_cap = cost_cfg.weekly_swap_cap
-            else:
-                weekly_swaps_used = 0
-                gate_min_hold = 0
-                gate_score_gap = 0.0
-                gate_weekly_cap = 0
+            # 成本閘門參數已於 _build_decision_context 解析（per-mode）
+            weekly_swaps_used = ctx.weekly_swaps_used
+            gate_min_hold = ctx.gate_min_hold
+            gate_score_gap = ctx.gate_score_gap
+            gate_weekly_cap = ctx.gate_weekly_cap
 
             # 計算 rotation
             actions = compute_rotation_actions(
@@ -569,6 +464,492 @@ class RotationManager:
             )
             return actions
 
+    # ── 決策日組裝（update/decide 共用）──
+
+    def _build_decision_context(
+        self,
+        session,
+        portfolio: RotationPortfolio,
+        today: date,
+        regime: str | None,
+    ) -> _DecisionContext:
+        """組裝決策日所需全部輸入（無 DB 寫入副作用）。
+
+        A2：update()（legacy 同日成交）與 decide()（T+1 決策）共用單一實作，
+        差異只允許存在於「執行時點」；kill-switch 的平倉執行留在 caller。
+        """
+        # 載入 open positions
+        open_positions = self._load_open_positions(session, portfolio.id)
+
+        # 載入今日排名
+        rankings = resolve_rankings(portfolio.mode, today, session, top_n=portfolio.max_positions * 3)
+        # 若掃描器因 regime 封鎖回傳空結果，不拉取前日排名（避免用不同 regime 的名單買入）
+        # regime 變數稍後才解析，這裡先預讀一次（若失敗視為未封鎖，由 fallback 處理）
+        _regime_for_gate = regime
+        if _regime_for_gate is None:
+            try:
+                from src.regime.detector import RegimeStateMachine
+
+                _regime_for_gate = RegimeStateMachine().current_regime
+            except Exception:
+                _regime_for_gate = None
+        from src.constants import REGIME_MODE_BLOCK as _RMB
+
+        _mode_blocked_today = bool(
+            _regime_for_gate
+            and not is_composite_mode(portfolio.mode)
+            and portfolio.mode in _RMB.get(_regime_for_gate, frozenset())
+        )
+        if not rankings and not _mode_blocked_today:
+            # 嘗試找最近的 scan_date（未被 regime 封鎖時才 fallback）
+            rankings = self._find_latest_rankings(session, portfolio.mode, today)
+        elif not rankings and _mode_blocked_today:
+            logger.info(
+                "Rotation: %s 模式在 %s 被封鎖 — 跳過新買入，僅處理止損/到期/風控",
+                portfolio.mode,
+                _regime_for_gate,
+            )
+
+        # 交易日曆（前 120 天 ~ 未來 30 天）
+        from datetime import timedelta
+
+        cal_start = today - timedelta(days=180)
+        cal_end = today + timedelta(days=60)
+        trading_cal = _get_trading_calendar(session, cal_start, cal_end)
+
+        # 今日收盤價
+        all_sids = list({p["stock_id"] for p in open_positions} | {r["stock_id"] for r in rankings})
+        today_prices = _get_prices_on_date(session, all_sids, today)
+        # P1-4：今日完整 OHLCV，供成交端計算動態滑價 + 流動性限制（與 backtest 對齊）
+        today_ohlcv = _get_ohlcv_on_date(session, all_sids, today)
+
+        # 止損價：從持倉記錄取進場時鎖定的止損價（不隨 discover 每日浮動）
+        stop_losses = {p["stock_id"]: p["stop_loss"] for p in open_positions if p.get("stop_loss") is not None}
+        # 新買入候選的止損價從 rankings 取（進場後會寫入 position）
+        for r in rankings:
+            if r["stock_id"] not in stop_losses and r.get("stop_loss") is not None:
+                stop_losses[r["stock_id"]] = r["stop_loss"]
+
+        # ── Regime fallback：嘗試從持久化狀態讀取 ──
+        if regime is None:
+            try:
+                from src.regime.detector import RegimeStateMachine
+
+                rsm = RegimeStateMachine()
+                regime = rsm.current_regime
+                if regime:
+                    logger.info("從 RegimeStateMachine 讀取 regime=%s", regime)
+            except Exception:
+                logger.warning(
+                    "Regime 偵測失敗，使用安全預設值 %s",
+                    REGIME_FALLBACK_DEFAULT,
+                )
+                regime = REGIME_FALLBACK_DEFAULT
+        # 最終防線：若 rsm.current_regime 回傳 None / 空字串
+        if not regime:
+            logger.warning(
+                "Regime 為空值，使用安全預設值 %s",
+                REGIME_FALLBACK_DEFAULT,
+            )
+            regime = REGIME_FALLBACK_DEFAULT
+
+        # ── Correlation Budget：計算持倉+候選相關性矩陣 ──
+        corr_matrix = None
+        price_rows = None  # 用於後續 VaR 計算
+        held_sids = [p["stock_id"] for p in open_positions]
+        candidate_sids = [r["stock_id"] for r in rankings[: portfolio.max_positions]]
+        corr_sids = list(set(held_sids + candidate_sids))
+        if len(corr_sids) >= 2:
+            price_start = today - timedelta(days=90)
+            stmt_prices = (
+                select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
+                .where(
+                    DailyPrice.stock_id.in_(corr_sids),
+                    DailyPrice.date >= price_start,
+                    DailyPrice.date <= today,
+                )
+                .order_by(DailyPrice.date)
+            )
+            price_rows = session.execute(stmt_prices).all()
+            if price_rows:
+                price_data: dict[str, pd.Series] = {}
+                for sid in corr_sids:
+                    sid_rows = [(r[1], r[2]) for r in price_rows if r[0] == sid]
+                    if sid_rows:
+                        dates_list, prices_list = zip(*sid_rows)
+                        price_data[sid] = pd.Series(prices_list, index=pd.DatetimeIndex(dates_list))
+                if len(price_data) >= 2:
+                    corr_matrix = compute_correlation_matrix(price_data, window=60)
+
+        # ── 波動率反比權重：候選股波動率較高者分配較少資金 ──
+        vol_weights = None
+        if candidate_sids and price_rows:
+            vol_dict: dict[str, float] = {}
+            for sid in candidate_sids:
+                sid_rows = [r[2] for r in price_rows if r[0] == sid]
+                if len(sid_rows) >= 20:
+                    s = pd.Series(sid_rows)
+                    daily_ret = s.pct_change().dropna()
+                    if len(daily_ret) >= 10:
+                        vol_dict[sid] = float(daily_ret.std() * (252**0.5))
+            if vol_dict:
+                vol_weights = compute_vol_inverse_weights(vol_dict)
+                logger.info("波動率反比權重：%s", vol_weights)
+
+        # ── 回撤（kill-switch 判斷 + Drawdown Guard 共用同一 dd_pct）──
+        # C1 修復（2026-05-09）：傳入 open_positions + today_prices，
+        # 讓 equity_history 反映當日盤中浮動損益（含 gap-down），
+        # 否則用過時 portfolio.current_capital 會在真實回撤時不觸發熔斷。
+        equity_history = self._compute_equity_history(
+            session,
+            portfolio,
+            open_positions=open_positions,
+            today_prices=today_prices,
+        )
+        # P0 止血包 #3（2026-07-05）：peak 額外納入每日 snapshot MtM 權益序列，
+        # 修復 realized-only 序列低估「浮盈回吐型」回撤、熔斷不觸發的漏洞。
+        snapshot_capitals = self._load_snapshot_capitals(session)
+        dd_pct = compute_drawdown_with_snapshots(equity_history, snapshot_capitals)
+
+        # ── Rotation 成本閘門（A/B/C）參數（per-mode：閘門對 momentum/swing 效果相反）──
+        cost_cfg = settings.quant.rotation_cost.for_mode(portfolio.mode)
+        if cost_cfg.enabled:
+            iso_year, iso_week, _ = today.isocalendar()
+            week_start = date.fromisocalendar(iso_year, iso_week, 1)
+            stmt_swaps = select(RotationPosition).where(
+                RotationPosition.portfolio_id == portfolio.id,
+                RotationPosition.exit_reason == "holding_expired",
+                RotationPosition.exit_date >= week_start,
+                RotationPosition.exit_date <= today,
+            )
+            weekly_swaps_used = len(list(session.execute(stmt_swaps).scalars()))
+            gate_min_hold = cost_cfg.min_hold_days
+            gate_score_gap = cost_cfg.score_gap_threshold
+            gate_weekly_cap = cost_cfg.weekly_swap_cap
+        else:
+            weekly_swaps_used = 0
+            gate_min_hold = 0
+            gate_score_gap = 0.0
+            gate_weekly_cap = 0
+
+        return _DecisionContext(
+            open_positions=open_positions,
+            rankings=rankings,
+            trading_cal=trading_cal,
+            today_prices=today_prices,
+            today_ohlcv=today_ohlcv,
+            stop_losses=stop_losses,
+            regime=regime,
+            corr_matrix=corr_matrix,
+            price_rows=price_rows,
+            vol_weights=vol_weights,
+            dd_pct=dd_pct,
+            gate_min_hold=gate_min_hold,
+            gate_score_gap=gate_score_gap,
+            gate_weekly_cap=gate_weekly_cap,
+            weekly_swaps_used=weekly_swaps_used,
+        )
+
+    # ── T+1 兩段式：階段 A 決策（A2）──
+
+    def decide(
+        self,
+        today: date | None = None,
+        regime: str | None = None,
+        *,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> RotationActions | None:
+        """T+1 階段 A：D 日收盤後決策，把買賣意圖寫成 RotationPendingOrder。
+
+        與 update() 的差異：to_buy / to_sell **不成交**，逐筆落
+        RotationPendingOrder(status="pending")，由 fill_pending(D+1) 以
+        open[D+1] 成交。續持（renew）與 kill-switch 熔斷維持即時：
+        - renew 只動 planned_exit_date / trailing stop，不涉及成交；
+        - 熔斷為風控優先於 T+1 parity 的**刻意差異**（backtest 熔斷走 T+1
+          open，live 即時清倉，parity 測試須顯式排除此情境）。
+
+        當日 snapshot 於此寫入（今日 close MtM；含尚未賣出的到期持倉——
+        比 legacy「假裝當日已成交」更誠實）。
+        """
+        if today is None:
+            today = date.today()
+
+        with get_session() as session:
+            portfolio = self._load_portfolio(session)
+            if portfolio is None:
+                logger.warning("找不到組合: %s", self.portfolio_name)
+                return None
+            if portfolio.status != "active":
+                logger.info("組合 %s 已暫停，跳過決策", self.portfolio_name)
+                return None
+
+            # 同日冪等 guard（decide 階段）：pending orders ∪ decide 階段 ActionLog ∪ snapshot
+            if not dry_run and not force and self._already_decided_today(session, today):
+                logger.info(
+                    "[%s] 今日（%s）已執行過 decide，跳過（--force 可覆蓋）",
+                    self.portfolio_name,
+                    today,
+                )
+                return None
+
+            ctx = self._build_decision_context(session, portfolio, today, regime)
+
+            # ── Max Drawdown Kill Switch：即時強制平倉（不走 T+1）──
+            if ctx.dd_pct >= MAX_DRAWDOWN_LIQUIDATE_PCT:
+                logger.error(
+                    "⚠️ [%s] 回撤熔斷觸發 (%.1f%%)！強制平倉所有持倉",
+                    self.portfolio_name,
+                    ctx.dd_pct,
+                )
+                if dry_run:
+                    logger.info(
+                        "[%s] DRY RUN — 偵測到回撤熔斷將平倉 %d 倉位（未實際寫入）",
+                        self.portfolio_name,
+                        len(ctx.open_positions),
+                    )
+                else:
+                    cash = portfolio.current_cash
+                    for pos in ctx.open_positions:
+                        sell_action = {
+                            "stock_id": pos["stock_id"],
+                            "reason": "max_drawdown_liquidation",
+                            "exit_price": ctx.today_prices.get(pos["stock_id"], pos["entry_price"]),
+                            "days_held": 0,
+                            **pos,
+                        }
+                        cash = self._execute_sell(session, portfolio.id, sell_action, today, cash)
+                    portfolio.current_cash = cash
+                    portfolio.current_capital = cash
+                    portfolio.status = "liquidated"
+                    portfolio.updated_at = datetime.utcnow()
+                    # 組合清算 → 尚未成交的 pending 買單全部作廢（賣單標的已強平）
+                    self._cancel_pending_orders(session, reason="max_drawdown_liquidation")
+                    session.commit()
+                    logger.error("[%s] 已強制平倉，組合狀態設為 liquidated", self.portfolio_name)
+                liquidation_actions = RotationActions(
+                    to_sell=[
+                        {
+                            **p,
+                            "reason": "max_drawdown_liquidation",
+                            "exit_price": ctx.today_prices.get(p["stock_id"], p["entry_price"]),
+                        }
+                        for p in ctx.open_positions
+                    ]
+                )
+                if not dry_run:
+                    try:
+                        self._write_action_log(
+                            session,
+                            portfolio_name=self.portfolio_name,
+                            action_date=today,
+                            actions=liquidation_actions,
+                        )
+                        session.commit()
+                    except Exception as exc:
+                        logger.warning("[%s] 寫入 action log（熔斷）失敗：%s", self.portfolio_name, exc)
+                return liquidation_actions
+
+            actions = compute_rotation_actions(
+                current_positions=ctx.open_positions,
+                new_rankings=ctx.rankings,
+                max_positions=portfolio.max_positions,
+                holding_days=portfolio.holding_days,
+                allow_renewal=portfolio.allow_renewal,
+                today=today,
+                trading_calendar=ctx.trading_cal,
+                current_cash=portfolio.current_cash,
+                stop_losses=ctx.stop_losses,
+                today_prices=ctx.today_prices,
+                total_capital=portfolio.current_capital,
+                corr_matrix=ctx.corr_matrix,
+                vol_weights=ctx.vol_weights,
+                regime=ctx.regime,
+                drawdown_pct=ctx.dd_pct,
+                min_hold_days=ctx.gate_min_hold,
+                score_gap_threshold=ctx.gate_score_gap,
+                weekly_swap_cap=ctx.gate_weekly_cap,
+                weekly_swaps_used=ctx.weekly_swaps_used,
+            )
+
+            if dry_run:
+                logger.info(
+                    "[%s] DRY RUN 決策預覽: 明日預定賣出=%d, 續持=%d, 明日預定買入=%d, 保持=%d",
+                    self.portfolio_name,
+                    len(actions.to_sell),
+                    len(actions.renewed),
+                    len(actions.to_buy),
+                    len(actions.to_hold),
+                )
+                return actions
+
+            # ── 續持即時執行（只動 planned_exit / trailing stop，不涉及成交）──
+            ranking_sl = {r["stock_id"]: r["stop_loss"] for r in ctx.rankings if r.get("stop_loss") is not None}
+            for renew in actions.renewed:
+                self._execute_renewal(session, portfolio.id, renew, new_stop_loss=ranking_sl.get(renew["stock_id"]))
+
+            # ── 買賣意圖落庫（明日開盤成交）──
+            self._write_pending_orders(session, actions, today)
+
+            # ── ActionLog（decide 階段：pending_buy/pending_sell/renew/hold）──
+            try:
+                self._write_action_log(
+                    session,
+                    portfolio_name=self.portfolio_name,
+                    action_date=today,
+                    actions=actions,
+                    stage="decide",
+                )
+            except Exception as exc:
+                logger.warning("[%s] 寫入 action log（decide）失敗：%s", self.portfolio_name, exc)
+
+            # ── Daily Snapshot：今日 close MtM（持倉未變動，到期倉明日才出）──
+            market_value = sum(
+                ctx.today_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in ctx.open_positions
+            )
+            portfolio.current_capital = portfolio.current_cash + market_value
+            portfolio.updated_at = datetime.utcnow()
+            try:
+                self._write_daily_snapshot(
+                    session,
+                    portfolio=portfolio,
+                    snapshot_date=today,
+                    market_value=market_value,
+                    n_holdings=len(ctx.open_positions),
+                    regime=ctx.regime,
+                )
+            except Exception as exc:
+                logger.warning("[%s] 寫入 daily snapshot 失敗：%s", self.portfolio_name, exc)
+            session.commit()
+
+            logger.info(
+                "[%s] 決策完成: 明日預定賣出=%d, 續持=%d, 明日預定買入=%d, 保持=%d",
+                self.portfolio_name,
+                len(actions.to_sell),
+                len(actions.renewed),
+                len(actions.to_buy),
+                len(actions.to_hold),
+            )
+            return actions
+
+    def _already_decided_today(self, session, today: date) -> bool:
+        """decide 階段同日冪等 guard：pending orders ∪ decide 階段 ActionLog ∪ snapshot。
+
+        與 fill 階段分開判斷：fill 靠 pending order 的 status 轉移天然冪等，
+        decide 靠本 guard。snapshot 由 decide 寫入，納入聯集與 legacy guard 一致。
+        """
+        has_pending = (
+            session.execute(
+                select(RotationPendingOrder.id)
+                .where(
+                    RotationPendingOrder.portfolio_name == self.portfolio_name,
+                    RotationPendingOrder.decision_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        if has_pending:
+            return True
+        has_decide_log = (
+            session.execute(
+                select(RotationActionLog.id)
+                .where(
+                    RotationActionLog.portfolio_name == self.portfolio_name,
+                    RotationActionLog.action_date == today,
+                    RotationActionLog.action_type.in_(DECIDE_STAGE_ACTION_TYPES),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        if has_decide_log:
+            return True
+        has_snapshot = (
+            session.execute(
+                select(RotationDailySnapshot.id)
+                .where(
+                    RotationDailySnapshot.portfolio_name == self.portfolio_name,
+                    RotationDailySnapshot.snapshot_date == today,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        return has_snapshot
+
+    def _write_pending_orders(self, session, actions: RotationActions, decision_date: date) -> None:
+        """把 to_buy / to_sell 逐筆寫成 RotationPendingOrder（冪等：先刪同決策日舊單）。
+
+        buy 存 allocated_capital——fill 日以 open[D+1] 重算股數（與 backtest 同式）；
+        sell 存 days_held——成交時寫回 position.holding_days_count。
+        """
+        session.execute(
+            delete(RotationPendingOrder).where(
+                RotationPendingOrder.portfolio_name == self.portfolio_name,
+                RotationPendingOrder.decision_date == decision_date,
+            )
+        )
+
+        import json
+
+        rows: list[RotationPendingOrder] = []
+        for sell in actions.to_sell:
+            rows.append(
+                RotationPendingOrder(
+                    portfolio_name=self.portfolio_name,
+                    decision_date=decision_date,
+                    side="sell",
+                    stock_id=sell["stock_id"],
+                    stock_name=sell.get("stock_name") or "",
+                    shares=int(sell.get("shares") or 0),
+                    ref_price=float(sell.get("exit_price") or sell.get("entry_price") or 0.0),
+                    days_held=sell.get("days_held"),
+                    reason=sell.get("reason"),
+                    status=PENDING_STATUS_PENDING,
+                )
+            )
+        for buy in actions.to_buy:
+            breakdown = buy.get("score_breakdown")
+            breakdown_json: str | None = None
+            if breakdown:
+                try:
+                    breakdown_json = json.dumps(breakdown, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    breakdown_json = None
+            rows.append(
+                RotationPendingOrder(
+                    portfolio_name=self.portfolio_name,
+                    decision_date=decision_date,
+                    side="buy",
+                    stock_id=buy["stock_id"],
+                    stock_name=buy.get("stock_name") or "",
+                    shares=int(buy.get("shares") or 0),
+                    ref_price=float(buy.get("entry_price") or 0.0),
+                    allocated_capital=buy.get("allocated_capital"),
+                    entry_rank=buy.get("rank"),
+                    entry_score=buy.get("score"),
+                    score_breakdown_json=breakdown_json,
+                    stop_loss=buy.get("stop_loss"),
+                    status=PENDING_STATUS_PENDING,
+                )
+            )
+        if rows:
+            session.add_all(rows)
+
+    def _cancel_pending_orders(self, session, *, reason: str) -> int:
+        """把本組合所有 status=pending 的訂單標為 cancelled（清算/停用時呼叫）。"""
+        stmt = select(RotationPendingOrder).where(
+            RotationPendingOrder.portfolio_name == self.portfolio_name,
+            RotationPendingOrder.status == PENDING_STATUS_PENDING,
+        )
+        orders = list(session.execute(stmt).scalars())
+        for order in orders:
+            order.status = PENDING_STATUS_CANCELLED
+        if orders:
+            logger.info("[%s] 取消 %d 筆 pending orders（%s）", self.portfolio_name, len(orders), reason)
+        return len(orders)
+
     # ── Daily Snapshot ──
 
     def _write_daily_snapshot(
@@ -715,22 +1096,34 @@ class RotationManager:
         portfolio_name: str,
         action_date: date,
         actions: RotationActions,
+        stage: str = "legacy",
     ) -> None:
         """把當日 RotationActions 逐筆落庫，供 dashboard `today_actions` 帶出。
 
         冪等：morning-routine 同日可能重跑，故寫入前先刪除當日同 portfolio 舊紀錄，
         再依 to_buy / to_sell / renewed / to_hold 重建。
 
+        stage（A2 T+1 兩段式）：
+        - "legacy"：update() 同日成交路徑——buy/sell 寫 open/close，刪除範圍為
+          當日全部紀錄（維持既有行為，熔斷路徑亦走此）。
+        - "decide"：decide() 決策路徑——buy/sell 寫 pending_buy/pending_sell
+          （明日預定操作），刪除範圍僅限 decide 階段類型，**不可**動到同日
+          fill_pending() 已寫入的 open/close（D 日早上先 fill 昨日單、晚上才 decide）。
+
         換股標記：同日同時存在「非風控賣出（到期/排名換股）」與「新買入」時，
         將當日所有非風控賣出與買入標上同一 switch_group，供 UI 顯示 🔁。
         gated（gate_b/gate_c 阻擋）的 to_hold 不計為換股對象。
         """
-        session.execute(
-            delete(RotationActionLog).where(
-                RotationActionLog.portfolio_name == portfolio_name,
-                RotationActionLog.action_date == action_date,
-            )
+        delete_stmt = delete(RotationActionLog).where(
+            RotationActionLog.portfolio_name == portfolio_name,
+            RotationActionLog.action_date == action_date,
         )
+        if stage == "decide":
+            delete_stmt = delete_stmt.where(RotationActionLog.action_type.in_(DECIDE_STAGE_ACTION_TYPES))
+        session.execute(delete_stmt)
+
+        buy_type = ACTION_TYPE_PENDING_BUY if stage == "decide" else "open"
+        sell_type = ACTION_TYPE_PENDING_SELL if stage == "decide" else "close"
 
         non_risk_sells = [s for s in actions.to_sell if s.get("reason") not in self._RISK_EXIT_REASONS]
         is_switch_day = bool(non_risk_sells) and bool(actions.to_buy)
@@ -743,7 +1136,7 @@ class RotationManager:
                 RotationActionLog(
                     portfolio_name=portfolio_name,
                     action_date=action_date,
-                    action_type="open",
+                    action_type=buy_type,
                     reason=None,
                     is_risk_exit=False,
                     switch_group=switch_group,
@@ -772,7 +1165,7 @@ class RotationManager:
                 RotationActionLog(
                     portfolio_name=portfolio_name,
                     action_date=action_date,
-                    action_type="close",
+                    action_type=sell_type,
                     reason=reason,
                     is_risk_exit=is_risk,
                     switch_group=None if is_risk else switch_group,

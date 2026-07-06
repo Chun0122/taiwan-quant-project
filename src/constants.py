@@ -224,5 +224,8 @@ PENDING_SIDE_BUY: str = "buy"
 PENDING_SIDE_SELL: str = "sell"
 
 # RotationActionLog.action_type 新值：decide() 寫入的「明日預定操作」
-# （dashboard 顯示用；D+1 成交後另寫 open/close）
-ACTION_TYPE_PENDING: str = "pending"
+# （dashboard 顯示用；D+1 成交後另寫 open/close）。買賣分兩型供 UI 直接區分。
+ACTION_TYPE_PENDING_BUY: str = "pending_buy"
+ACTION_TYPE_PENDING_SELL: str = "pending_sell"
+# decide 階段寫入的 action_type 集合（decide 冪等刪除範圍；open/close 屬 fill 階段）
+DECIDE_STAGE_ACTION_TYPES: tuple[str, ...] = (ACTION_TYPE_PENDING_BUY, ACTION_TYPE_PENDING_SELL, "renew", "hold")

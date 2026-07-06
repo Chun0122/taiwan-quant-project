@@ -83,6 +83,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # A5 決策可重放（2026-07-05）：DiscoveryRecord 版本戳；NULL = A5 前混雜版本
     ("discovery_record", "git_commit", "VARCHAR(40)"),
     ("discovery_record", "settings_hash", "VARCHAR(40)"),
+    # A2 T+1（2026-07-06）：pending order 補欄（表本體由 init_db 自動建，
+    # 但 A2-1 已在部分環境建過無此二欄的版本，需 ALTER 補齊）
+    ("rotation_pending_order", "allocated_capital", "REAL"),
+    ("rotation_pending_order", "days_held", "INTEGER"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

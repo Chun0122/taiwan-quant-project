@@ -898,6 +898,11 @@ class RotationPendingOrder(Base):
     shares: Mapped[int] = mapped_column(Integer, nullable=False)
     # 決策日 close——非成交價，僅供 audit 與「D+1 open 高於決策價 → 資金不足縮股」保護比較
     ref_price: Mapped[float] = mapped_column(Float, nullable=False)
+    # buy 用：決策時分配資金。fill 日以 open[D+1] 對此金額重算股數（與 backtest
+    # _execute_action_set 同式），而非沿用決策日股數——開盤跳空時股數才會正確縮放
+    allocated_capital: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # sell 用：決策日算出的已持有交易日數（成交時寫回 position.holding_days_count）
+    days_held: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # sell 的 exit_reason（stop_loss/holding_expired/crisis_exit/rank_dropped...），buy 為 None
     reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
     entry_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)  # buy 用
