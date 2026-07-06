@@ -35,6 +35,7 @@ from src.data.database import get_session
 from src.data.schema import (
     DailyPrice,
     DiscoveryRecord,
+    Dividend,
     RotationActionLog,
     RotationDailySnapshot,
     RotationPendingOrder,
@@ -1617,6 +1618,27 @@ class RotationManager:
                         "volume": v or 0,
                     }
 
+            # ── A3 股利會計：預載全候選池區間內除息事件（{ex_date: {sid: event}}）──
+            from src.portfolio.dividends import (
+                adjust_stop_loss_for_dividend,
+                dividend_cash_for_position,
+                load_dividend_events,
+            )
+
+            _div_sids = sorted(_bt_stock_ids - {"TAIEX"})
+            dividend_events = load_dividend_events(session, _div_sids, start_date, end_date)
+            _div_covered = {
+                r[0]
+                for r in session.execute(select(Dividend.stock_id).where(Dividend.stock_id.in_(_div_sids)).distinct())
+            }
+            if _div_sids:
+                logger.info(
+                    "[%s] 股利資料涵蓋 %d/%d 檔候選（缺席=無法區分未配息 vs 未同步，見 A3 資料前提）",
+                    self.portfolio_name,
+                    len(_div_covered),
+                    len(_div_sids),
+                )
+
             # 逐日模擬
             positions: list[dict] = []  # 模擬持倉
             cash = capital
@@ -1631,6 +1653,9 @@ class RotationManager:
             total_tax = 0.0
             total_slippage_cost = 0.0
             turnover_value = 0.0
+            # A3 股利累計器
+            total_dividend_cash = 0.0
+            n_dividend_events = 0
 
             # 漲跌停偵測用前日收盤價（亦作為停牌/下市個股的「最後已知價」）
             prev_close_map: dict[str, float] = {}
@@ -1839,6 +1864,41 @@ class RotationManager:
                 for _p in positions:
                     if _p["stock_id"] not in today_prices and _p["stock_id"] in prev_close_map:
                         today_prices[_p["stock_id"]] = prev_close_map[_p["stock_id"]]
+
+                # ── A3 股利會計：持倉除息入帳 + 停損價調整 ──
+                # 必須在 pending 成交**之前**：D 日 open 已是除息價；且僅 D-1 收盤前
+                # 已持有者獲配（D 日開盤才買進的 pending 買單無股利，順序即正確語意）。
+                _day_events = dividend_events.get(day)
+                if _day_events:
+                    for _pos in positions:
+                        _ev = _day_events.get(_pos["stock_id"])
+                        if _ev is None:
+                            continue
+                        _prev_c = prev_close_map.get(_pos["stock_id"])
+                        _payout = dividend_cash_for_position(_pos["shares"], _ev.cash_dividend)
+                        if _payout > 0:
+                            cash += _payout
+                            total_dividend_cash += _payout
+                            n_dividend_events += 1
+                            logger.debug(
+                                "[%s] %s 除息入帳 %.0f（%d 股 × %.4f）",
+                                self.portfolio_name,
+                                _pos["stock_id"],
+                                _payout,
+                                _pos["shares"],
+                                _ev.cash_dividend,
+                            )
+                        if _pos.get("stop_loss") is not None:
+                            _pos["stop_loss"] = adjust_stop_loss_for_dividend(
+                                _pos["stop_loss"], _prev_c, _ev.cash_dividend, _ev.stock_dividend
+                            )
+                        if _ev.stock_dividend > 0:
+                            logger.warning(
+                                "[%s] %s 配股 %.2f 未調整持倉股數（A3 第一版僅現金入帳+停損調整）",
+                                self.portfolio_name,
+                                _pos["stock_id"],
+                                _ev.stock_dividend,
+                            )
 
                 # ── T+1 執行（audit P0-2）：前一決策日算出的 actions 於今日開盤成交 ──
                 if pending_exec is not None:
@@ -2139,6 +2199,9 @@ class RotationManager:
                 # P1-3 survivorship：期末仍持有但已停牌/下市的倉位數 + 警告旗標
                 "survivorship_stranded": n_stranded,
                 "survivorship_warning": n_stranded > 0,
+                # A3 股利會計：持倉除息現金入帳（已含在權益曲線與報酬中）
+                "total_dividend_cash": round(total_dividend_cash, 2),
+                "dividend_events": n_dividend_events,
             }
             if n_stranded > 0:
                 logger.warning(
