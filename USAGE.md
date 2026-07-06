@@ -1597,6 +1597,11 @@ python main.py rotation update --all            # 所有 active 組合
 python main.py rotation update --name mom5_3d --force  # 強制重跑（繞過同日冪等保護）
 ```
 
+> **T+1 兩段式**（2026-07-06，A2）：`update` = 先以**今日開盤**成交昨日決策的
+> pending orders（`rotation_pending_order` 表），再以**今日收盤**決策、寫明日
+> pending。買賣不再以決策當日收盤成交（該價格夜間決策時拿不到）。續持與
+> 回撤熔斷維持即時。買單停牌逾 2 交易日自動取消；風控賣單以最後已知價成交不凍結。
+>
 > **同日冪等保護**（2026-07-05）：同一組合同一天重複執行 `update` 會自動跳過
 > （避免排名/價格變動導致二次交易）。人工修復或回補情境請加 `--force`。
 > `morning-routine` 亦有檔案鎖：偵測到另一個執行中的 routine 會直接退出。
@@ -1700,7 +1705,7 @@ python main.py morning-routine --top 30 --notify
 | Step 9 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 10 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 11 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
-| Step 12 | `rotation update --all` | 更新所有 active 輪動組合（讀取 discover 排名，執行換股） |
+| Step 12 | `rotation update --all` | 更新所有 active 輪動組合（T+1 兩段式：先成交昨日 pending，再做今日決策） |
 | Step 13 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
 | Step 14 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
 | Step 15 | 策略衰減監控 | 比較五模式近 30 天 vs 歷史勝率/均報酬，衰減時顯示警告（勝率<40% 或均報酬<0） |

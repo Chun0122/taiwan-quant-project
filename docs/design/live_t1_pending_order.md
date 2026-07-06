@@ -1,9 +1,12 @@
 # 設計文件：Live 全面 T+1（Pending-Order 機制）
 
-> 狀態：**設計（DESIGN ONLY，尚未實作）** — 路線 B2，2026-06-20
-> 前置依賴：路線 B1 已完成（`src/portfolio/execution_core.py` 的 `simulate_buy`/`simulate_sell`）。
-> 延後實作主因：目前系統 paper-only，paper 階段 live 同日成交與 T+1 的 parity 差異影響有限；
-> 且本案會動到每日例行流程（morning-routine + 排程），成本高於眼前效益。實盤上線（Route C）前再落地。
+> 狀態：**✅ 已實作（2026-07-06，A2 / MASTER_PLAN §6.2 #9）**
+> 實作分支：a2-pending-schema → a2-decide → a2-fill → a2-wiring（stacked）。
+> 落地重點：`RotationManager.decide()` / `fill_pending()` / `update()` wrapper（先 fill 再 decide）、
+> `RotationPendingOrder` 表（追加 `allocated_capital`/`days_held` 兩欄）、
+> `_build_decision_context()` 共用組裝、ActionLog `pending_buy`/`pending_sell` 兩型。
+> 交付物：`docs/reports/t1_parity_20260706.md`（close vs T+1 open 四組合對照）。
+> §5 未決點已全部定案（見各項註記）。
 
 ---
 
@@ -99,13 +102,21 @@ class RotationPendingOrder(Base):
 
 ---
 
-## 5. 未決點（實作時定案）
+## 5. 未決點（2026-07-06 全部定案）
 
-1. **D+1 open 缺報價（停牌/暫停交易）**：pending order 如何處理？選項：(a) 順延至下一交易日（保持 pending）；(b) 直接 cancel。建議買單順延有 TTL、賣單（尤其 stop_loss）以最後已知價成交避免凍結（對齊 backtest survivorship 守門）。
-2. **pending order TTL**：跨日未成交保留幾日？建議買單 ≤2 交易日後 cancel（決策已過期），風控賣單不設 TTL（必須出場）。
-3. **dry_run preview**：現行 `update(dry_run=True)`（rotation preview CLI）如何顯示？建議 `decide(dry_run=True)` 列出將寫入的 pending orders 但不落庫。
-4. **危機/kill-switch 的即時性**：drawdown kill switch（≥25% 清倉）目前 live 同日強平。T+1 化後，熔斷是否也延到 open[D+1]？風控上「越快越好」與「T+1 一致性」衝突。建議**熔斷維持即時**（風控優先於 parity），僅一般換股走 T+1。需在 backtest 對應（backtest 目前熔斷也走 T+1 open，會有 live/backtest 對此項的刻意差異，需註記）。
-5. **部分成交**：流動性限制下單筆買不滿目標股數，剩餘是否轉下一日？建議不轉（當日 fill 多少算多少，與 backtest 一致）。
+1. **D+1 open 缺報價（停牌/暫停交易）**：✅ 定案——賣單以 `ref_price`（決策日 close）fallback 成交
+   （與 backtest fallback 一致，風控賣單絕不凍結）；買單順延（保持 pending）。fill 端改用
+   `_get_ohlcv_exact_date`（無 5 天 fallback），停牌股缺席即不可成交，避免帶舊 open 誤成交。
+2. **pending order TTL**：✅ 定案——買單逾 `PENDING_BUY_TTL_TRADING_DAYS=2` 個**交易日**未成交
+   即 cancelled（constants.py）；風控賣單不設 TTL。
+3. **dry_run preview**：✅ 定案——`update(dry_run=True)` = fill(dry) + decide(dry) 全鏈不落庫；
+   preview CLI 額外列出現存 pending 佇列（「待成交」區）。
+4. **危機/kill-switch 即時性**：✅ 定案——熔斷維持**即時**（decide 內同日強平 + cancel 全部
+   pending 買單），為 live/backtest 的**刻意差異**（backtest 熔斷走 T+1 open）；parity 測試
+   （tests/test_rotation_t1_parity.py）顯式排除熔斷情境並於 test_rotation_decide.py 驗證即時性。
+5. **部分成交**：✅ 定案——不轉次日（fill 多少算多少，order 仍標 filled，與 backtest 一致）。
+   另定案：買單股數於 fill 日以 `allocated_capital` 對 open 重算（compute_shares，與 backtest
+   同式），跳空日股數自動縮放——故 schema 增列 `allocated_capital` 欄。
 
 ---
 

@@ -250,7 +250,7 @@ class TestPrintRotationPreview:
         assert "Pre-Trade 預覽" in out
         assert "2330" in out
         assert "rank#1" in out
-        assert "將買入" in out
+        assert "明日預定買入" in out
         assert "DRY RUN" in out
 
     def test_prints_will_sell_section(self, capsys):
@@ -261,11 +261,11 @@ class TestPrintRotationPreview:
         )
         _print_rotation_preview("test_pf", actions, target_date=None)
         out = capsys.readouterr().out
-        assert "將賣出" in out
+        assert "明日預定賣出" in out
         assert "holding_expired" in out
         assert "@650" in out
 
     def test_prints_no_actions_message_when_empty(self, capsys):
         _print_rotation_preview("test_pf", RotationActions(), target_date=date(2026, 5, 17))
         out = capsys.readouterr().out
-        assert "（無動作）" in out
+        assert "（無新決策動作）" in out

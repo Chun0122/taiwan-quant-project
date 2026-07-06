@@ -103,7 +103,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `entry_exit.py` | 共用純函數：ATR 止損止利、進場觸發、時機評估（Discover/Suggest/Watch 三系統共用） |
 | `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR） |
-| `portfolio/manager.py` | RotationManager：每日更新 / Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`，僅回測用、live 不受影響） |
+| `portfolio/manager.py` | RotationManager：每日更新（A2 T+1 兩段式：`decide`/`fill_pending`/`update` wrapper + `_build_decision_context` 共用組裝）/ Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`/`t1_execution`/`save_result`，僅回測用、live 不受影響） |
 | `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；股數定價/滑價/流動性/漲跌停留各 caller |
 | `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_composite_rankings / 進場理由 breakdown），manager.py 抽出。**Composite mode**（`constants.COMPOSITE_MODES` + `is_composite_mode`）：'all'（五模式）與 'mom_growth'（動量+成長雙引擎，2026-06-20 取代結構性失敗的 'all'）共用 avg-score + per_mode_max 配額 resolver |
 | `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
@@ -140,7 +140,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
-| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測**一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交（買/賣/止損/危機一律 open[D+1]）。live update() 尚未 T+1（夜間決策時未知 D+1 開盤，待 pending-order 機制） |
+| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日、風控賣單停牌以 ref_price 成交不凍結 |
 | **動態滑價** | 三因子模型（`compute_dynamic_slippage`）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
 
 ---
