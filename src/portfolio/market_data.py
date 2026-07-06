@@ -81,6 +81,37 @@ def _get_prices_on_date(session, stock_ids: list[str], target_date: date) -> dic
     return result
 
 
+def _get_ohlcv_exact_date(session, stock_ids: list[str], target_date: date) -> dict[str, dict]:
+    """取得指定日期**精確比對**的 OHLCV（無 fallback）。
+
+    A2 fill_pending 用：成交必須用當日真實報價，停牌股缺席即代表不可成交
+    （_get_ohlcv_on_date 的 5 天 fallback 會讓停牌股帶著舊 open 誤成交）。
+    """
+    if not stock_ids:
+        return {}
+    stmt = select(
+        DailyPrice.stock_id,
+        DailyPrice.open,
+        DailyPrice.high,
+        DailyPrice.low,
+        DailyPrice.close,
+        DailyPrice.volume,
+    ).where(
+        DailyPrice.stock_id.in_(stock_ids),
+        DailyPrice.date == target_date,
+    )
+    result: dict[str, dict] = {}
+    for row in session.execute(stmt).all():
+        result[row[0]] = {
+            "open": row[1],
+            "high": row[2],
+            "low": row[3],
+            "close": row[4],
+            "volume": row[5] or 0,
+        }
+    return result
+
+
 def _get_ohlcv_on_date(session, stock_ids: list[str], target_date: date) -> dict[str, dict]:
     """取得指定日期（或最近交易日）的 OHLCV 完整資料。
 

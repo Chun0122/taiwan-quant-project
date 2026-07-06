@@ -22,7 +22,9 @@ from src.constants import (
     DECIDE_STAGE_ACTION_TYPES,
     LIQUIDITY_PARTICIPATION_LIMIT,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
+    PENDING_BUY_TTL_TRADING_DAYS,
     PENDING_STATUS_CANCELLED,
+    PENDING_STATUS_FILLED,
     PENDING_STATUS_PENDING,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
@@ -47,6 +49,7 @@ from src.portfolio.execution_core import simulate_buy, simulate_sell
 from src.portfolio.market_data import (
     SNAPSHOT_BENCHMARK_STOCK_ID,  # noqa: F401  re-export
     _get_benchmark_close_on_or_before,
+    _get_ohlcv_exact_date,
     _get_ohlcv_on_date,
     _get_prices_on_date,
     _get_taiex_prices,
@@ -744,6 +747,7 @@ class RotationManager:
                             portfolio_name=self.portfolio_name,
                             action_date=today,
                             actions=liquidation_actions,
+                            stage="liquidation",
                         )
                         session.commit()
                     except Exception as exc:
@@ -950,6 +954,283 @@ class RotationManager:
             logger.info("[%s] 取消 %d 筆 pending orders（%s）", self.portfolio_name, len(orders), reason)
         return len(orders)
 
+    # ── T+1 兩段式：階段 B 成交（A2）──
+
+    def fill_pending(
+        self,
+        exec_day: date | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict | None:
+        """T+1 階段 B：以 open[exec_day] 成交 decision_date < exec_day 的 pending orders。
+
+        規則（設計文件 §3/§5 定案）：
+        - 賣單優先於買單（先回收現金再買，與 backtest _execute_action_set 順序一致）。
+        - 賣單無報價（停牌）時 fallback 以 ref_price（決策日 close）成交——與
+          backtest 的 fallback 一致，風控賣單絕不凍結。
+        - 買單無報價時順延（保持 pending）；跨逾 PENDING_BUY_TTL_TRADING_DAYS
+          個交易日未成交即 cancelled（決策已過期）。此為與 backtest 的刻意差異
+          （backtest 無視停牌 fallback 買進；live 買不到就是買不到）。
+        - 買單股數以 allocated_capital 對 open[exec_day] 重算（compute_shares，
+          與 backtest 同式）；資金不足由 _execute_buy 內建 reshrink 縮股。
+        - 部分成交不轉次日（流動性縮股後 fill 多少算多少，order 仍標 filled）。
+        - 冪等：靠 status 轉移天然冪等（重跑時查無 pending → no-op）。
+
+        Returns:
+            {"filled": n, "cancelled": n, "deferred": n} — portfolio 不存在時 None。
+            dry_run=True 時只計算不寫入。
+        """
+        if exec_day is None:
+            exec_day = date.today()
+
+        with get_session() as session:
+            portfolio = self._load_portfolio(session)
+            if portfolio is None:
+                logger.warning("找不到組合: %s", self.portfolio_name)
+                return None
+            if portfolio.status != "active":
+                logger.info("組合 %s 非 active，跳過 fill_pending", self.portfolio_name)
+                return None
+
+            stmt = (
+                select(RotationPendingOrder)
+                .where(
+                    RotationPendingOrder.portfolio_name == self.portfolio_name,
+                    RotationPendingOrder.status == PENDING_STATUS_PENDING,
+                    RotationPendingOrder.decision_date < exec_day,
+                )
+                .order_by(RotationPendingOrder.decision_date)
+            )
+            orders = list(session.execute(stmt).scalars())
+            if not orders:
+                return {"filled": 0, "cancelled": 0, "deferred": 0}
+
+            from datetime import timedelta
+
+            sids = [o.stock_id for o in orders]
+            # 精確比對當日報價（無 fallback）：停牌股缺席 = 不可成交
+            exec_ohlcv = _get_ohlcv_exact_date(session, sids, exec_day)
+            trading_cal = _get_trading_calendar(session, exec_day - timedelta(days=30), exec_day + timedelta(days=60))
+
+            filled = cancelled = deferred = 0
+            fill_rows: list[dict] = []  # ActionLog 用（實際成交價/股數）
+            cash = portfolio.current_cash
+
+            # ── 賣單優先（回收現金）──
+            sells = [o for o in orders if o.side == "sell"]
+            buys = [o for o in orders if o.side == "buy"]
+
+            for order in sells:
+                ohlcv = exec_ohlcv.get(order.stock_id) or {}
+                # 停牌 fallback：以決策日 close 成交（與 backtest 一致，風控賣單不凍結）
+                exit_price = ohlcv.get("open") or order.ref_price
+                sell_slip = (
+                    compute_dynamic_slippage(
+                        ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), exit_price, side="sell"
+                    )
+                    if ohlcv
+                    else SLIPPAGE_RATE
+                )
+                if dry_run:
+                    filled += 1
+                    continue
+                sell_action = {
+                    "stock_id": order.stock_id,
+                    "reason": order.reason or "holding_expired",
+                    "exit_price": exit_price,
+                    "days_held": order.days_held or 0,
+                }
+                cash = self._execute_sell(session, portfolio.id, sell_action, exec_day, cash, slippage=sell_slip)
+                order.status = PENDING_STATUS_FILLED
+                order.exec_date = exec_day
+                filled += 1
+                fill_rows.append(
+                    {
+                        "action_type": "close",
+                        "reason": order.reason,
+                        "stock_id": order.stock_id,
+                        "stock_name": order.stock_name,
+                        "shares": order.shares,
+                        "price": exit_price,
+                        "ref_price": order.ref_price,
+                    }
+                )
+
+            # ── 買單 ──
+            for order in buys:
+                ohlcv = exec_ohlcv.get(order.stock_id) or {}
+                open_price = ohlcv.get("open")
+                if not open_price:
+                    # 無報價：TTL 內順延，逾期 cancel（買單決策已過期）
+                    elapsed_tds = sum(1 for d in trading_cal if order.decision_date < d <= exec_day)
+                    if elapsed_tds > PENDING_BUY_TTL_TRADING_DAYS:
+                        if not dry_run:
+                            order.status = PENDING_STATUS_CANCELLED
+                        cancelled += 1
+                        logger.info(
+                            "[%s] pending 買單 %s 逾 %d 交易日無報價，取消",
+                            self.portfolio_name,
+                            order.stock_id,
+                            PENDING_BUY_TTL_TRADING_DAYS,
+                        )
+                    else:
+                        deferred += 1
+                    continue
+
+                buy_slip = compute_dynamic_slippage(
+                    ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), open_price, side="buy"
+                )
+                # 股數以決策時分配資金對 open 重算（與 backtest 同式）；
+                # 舊單無 allocated_capital 時以 ref_price × 規劃股數近似
+                alloc = order.allocated_capital or (order.ref_price * order.shares)
+                shares = compute_shares(
+                    alloc,
+                    open_price,
+                    slippage=buy_slip,
+                    daily_volume=ohlcv.get("volume"),
+                    participation_limit=LIQUIDITY_PARTICIPATION_LIMIT,
+                )
+                if shares <= 0:
+                    if not dry_run:
+                        order.status = PENDING_STATUS_CANCELLED
+                    cancelled += 1
+                    continue
+                if dry_run:
+                    filled += 1
+                    continue
+
+                breakdown = None
+                if order.score_breakdown_json:
+                    import json
+
+                    try:
+                        breakdown = json.loads(order.score_breakdown_json)
+                    except (TypeError, ValueError):
+                        breakdown = None
+                buy_action = {
+                    "stock_id": order.stock_id,
+                    "stock_name": order.stock_name or "",
+                    "entry_price": open_price,
+                    "shares": shares,
+                    "rank": order.entry_rank or 0,
+                    "score": order.entry_score,
+                    "allocated_capital": alloc,
+                    "stop_loss": order.stop_loss,
+                    "score_breakdown": breakdown,
+                }
+                cash_after = self._execute_buy(
+                    session,
+                    portfolio.id,
+                    buy_action,
+                    exec_day,
+                    trading_cal,
+                    cash,
+                    slippage=buy_slip,
+                    daily_volume=ohlcv.get("volume"),
+                )
+                if cash_after == cash:
+                    # _execute_buy 內 reshrink 後 shares<=0 → 未成交（現金不足）
+                    order.status = PENDING_STATUS_CANCELLED
+                    cancelled += 1
+                    logger.warning("[%s] pending 買單 %s 現金不足未成交，取消", self.portfolio_name, order.stock_id)
+                    continue
+                cash = cash_after
+                order.status = PENDING_STATUS_FILLED
+                order.exec_date = exec_day
+                filled += 1
+                fill_rows.append(
+                    {
+                        "action_type": "open",
+                        "reason": None,
+                        "stock_id": order.stock_id,
+                        "stock_name": order.stock_name,
+                        "shares": shares,
+                        "price": open_price,
+                        "entry_rank": order.entry_rank,
+                        "ref_price": order.ref_price,
+                    }
+                )
+
+            if dry_run:
+                logger.info(
+                    "[%s] DRY RUN fill_pending(%s)：可成交=%d, 取消=%d, 順延=%d",
+                    self.portfolio_name,
+                    exec_day,
+                    filled,
+                    cancelled,
+                    deferred,
+                )
+                return {"filled": filled, "cancelled": cancelled, "deferred": deferred}
+
+            # ── 資金與市值收斂 ──
+            open_after = self._load_open_positions(session, portfolio.id)
+            after_prices = _get_prices_on_date(session, [p["stock_id"] for p in open_after], exec_day)
+            market_value = sum(after_prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in open_after)
+            portfolio.current_cash = cash
+            portfolio.current_capital = cash + market_value
+            portfolio.updated_at = datetime.utcnow()
+
+            # ── ActionLog（fill 階段：open/close，實際成交價）──
+            try:
+                self._write_fill_action_log(session, exec_day, fill_rows)
+            except Exception as exc:
+                logger.warning("[%s] 寫入 action log（fill）失敗：%s", self.portfolio_name, exc)
+            session.commit()
+
+            logger.info(
+                "[%s] fill_pending(%s) 完成：成交=%d, 取消=%d, 順延=%d | 現金=%.0f, 總資產=%.0f",
+                self.portfolio_name,
+                exec_day,
+                filled,
+                cancelled,
+                deferred,
+                cash,
+                portfolio.current_capital,
+            )
+            return {"filled": filled, "cancelled": cancelled, "deferred": deferred}
+
+    def _write_fill_action_log(self, session, exec_day: date, fill_rows: list[dict]) -> None:
+        """fill 階段 ActionLog：寫實際成交的 open/close 列（冪等：只刪同日 open/close）。
+
+        不動同日 decide 階段的 pending_buy/pending_sell/renew/hold 列。
+        """
+        if not fill_rows:
+            return
+        session.execute(
+            delete(RotationActionLog).where(
+                RotationActionLog.portfolio_name == self.portfolio_name,
+                RotationActionLog.action_date == exec_day,
+                RotationActionLog.action_type.in_(("open", "close")),
+            )
+        )
+        non_risk_sells = [
+            r for r in fill_rows if r["action_type"] == "close" and r.get("reason") not in self._RISK_EXIT_REASONS
+        ]
+        has_buys = any(r["action_type"] == "open" for r in fill_rows)
+        is_switch_day = bool(non_risk_sells) and has_buys
+        switch_group = f"{self.portfolio_name}:{exec_day.isoformat()}" if is_switch_day else None
+
+        rows: list[RotationActionLog] = []
+        for r in fill_rows:
+            is_close = r["action_type"] == "close"
+            is_risk = is_close and r.get("reason") in self._RISK_EXIT_REASONS
+            rows.append(
+                RotationActionLog(
+                    portfolio_name=self.portfolio_name,
+                    action_date=exec_day,
+                    action_type=r["action_type"],
+                    reason=r.get("reason"),
+                    is_risk_exit=is_risk,
+                    switch_group=None if is_risk else switch_group,
+                    stock_id=r["stock_id"],
+                    stock_name=r.get("stock_name"),
+                    shares=r.get("shares"),
+                    price=r.get("price"),
+                    entry_rank=r.get("entry_rank"),
+                )
+            )
+        session.add_all(rows)
+
     # ── Daily Snapshot ──
 
     def _write_daily_snapshot(
@@ -1105,10 +1386,12 @@ class RotationManager:
 
         stage（A2 T+1 兩段式）：
         - "legacy"：update() 同日成交路徑——buy/sell 寫 open/close，刪除範圍為
-          當日全部紀錄（維持既有行為，熔斷路徑亦走此）。
+          當日全部紀錄（維持既有行為）。
         - "decide"：decide() 決策路徑——buy/sell 寫 pending_buy/pending_sell
           （明日預定操作），刪除範圍僅限 decide 階段類型，**不可**動到同日
-          fill_pending() 已寫入的 open/close（D 日早上先 fill 昨日單、晚上才 decide）。
+          fill_pending() 已寫入的 open/close（D 日先 fill 昨日單、再 decide）。
+        - "liquidation"：decide() 的熔斷即時清倉——sell 寫 close，但刪除範圍
+          同 decide 階段（保留同日早上 fill 的成交紀錄）。
 
         換股標記：同日同時存在「非風控賣出（到期/排名換股）」與「新買入」時，
         將當日所有非風控賣出與買入標上同一 switch_group，供 UI 顯示 🔁。
@@ -1118,7 +1401,7 @@ class RotationManager:
             RotationActionLog.portfolio_name == portfolio_name,
             RotationActionLog.action_date == action_date,
         )
-        if stage == "decide":
+        if stage in ("decide", "liquidation"):
             delete_stmt = delete_stmt.where(RotationActionLog.action_type.in_(DECIDE_STAGE_ACTION_TYPES))
         session.execute(delete_stmt)
 
