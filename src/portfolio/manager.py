@@ -51,6 +51,7 @@ from src.portfolio.execution_core import simulate_buy, simulate_sell
 from src.portfolio.market_data import (
     SNAPSHOT_BENCHMARK_STOCK_ID,  # noqa: F401  re-export
     _get_benchmark_close_on_or_before,
+    _get_benchmark_dividends_between,
     _get_ohlcv_exact_date,
     _get_ohlcv_on_date,
     _get_prices_on_date,
@@ -1173,11 +1174,15 @@ class RotationManager:
         else:
             daily_return_pct = None
 
-        # ── Benchmark / alpha 計算（純函數）──
+        # ── Benchmark / alpha 計算（純函數；A3-4 total return：0050 股利加法還原）──
         today_bm_close = _get_benchmark_close_on_or_before(session, snapshot_date)
         prev_bm_close = _get_benchmark_close_on_or_before(session, prev.snapshot_date) if prev is not None else None
         base_date = first_snapshot.snapshot_date if first_snapshot is not None else snapshot_date
         base_bm_close = _get_benchmark_close_on_or_before(session, base_date)
+        div_since_prev = (
+            _get_benchmark_dividends_between(session, prev.snapshot_date, snapshot_date) if prev is not None else 0.0
+        )
+        div_since_base = _get_benchmark_dividends_between(session, base_date, snapshot_date)
 
         portfolio_cum_return: float | None = None
         if portfolio.initial_capital > 0:
@@ -1188,6 +1193,8 @@ class RotationManager:
             prev_bm_close=prev_bm_close,
             base_bm_close=base_bm_close,
             portfolio_cum_return=portfolio_cum_return,
+            div_since_prev=div_since_prev,
+            div_since_base=div_since_base,
         )
 
         if existing is not None:
@@ -1426,11 +1433,18 @@ class RotationManager:
                 continue
 
             portfolio_cum_return = (r.total_capital - initial_capital) / initial_capital
+            base_d = base_date_map.get(r.portfolio_name, r.snapshot_date)
+            div_prev = (
+                _get_benchmark_dividends_between(session, prev_date, r.snapshot_date) if prev_date is not None else 0.0
+            )
+            div_base = _get_benchmark_dividends_between(session, base_d, r.snapshot_date)
             bm_ret, bm_cum, alpha_cum = compute_benchmark_alpha_fields(
                 today_bm_close=today_bm,
                 prev_bm_close=prev_bm,
                 base_bm_close=base_bm,
                 portfolio_cum_return=portfolio_cum_return,
+                div_since_prev=div_prev,
+                div_since_base=div_base,
             )
             r.benchmark_return_pct = bm_ret
             r.benchmark_cum_return_pct = bm_cum

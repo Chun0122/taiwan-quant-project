@@ -6,7 +6,7 @@ benchmark 採 0050；缺資料時三欄位皆 None。
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -575,3 +575,115 @@ class TestGetRecentSnapshotsExposesAlpha:
         # 第二筆值正確
         assert snaps[1]["benchmark_cum_return_pct"] == pytest.approx(0.05)
         assert snaps[1]["alpha_cum_pct"] == pytest.approx(0.03, abs=1e-6)
+
+
+# ====================================================================== #
+# A3-4: 0050 total return 還原（benchmark 除息缺口不再灌水 alpha）
+# ====================================================================== #
+
+
+class TestBenchmarkTotalReturn:
+    def test_pure_function_dividend_restores_return(self):
+        """0050 除息跳空 100→94 + 股利 6：total return = 0，alpha 不被灌水。"""
+        from src.portfolio.metrics import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(
+            today_bm_close=94.0,
+            prev_bm_close=100.0,
+            base_bm_close=100.0,
+            portfolio_cum_return=0.0,
+            div_since_prev=6.0,
+            div_since_base=6.0,
+        )
+        assert bm_ret == pytest.approx(0.0)
+        assert bm_cum == pytest.approx(0.0)
+        assert alpha == pytest.approx(0.0)
+
+    def test_pure_function_default_is_price_return(self):
+        """未傳股利參數 → 舊 price-return 行為（向後相容）。"""
+        from src.portfolio.metrics import compute_benchmark_alpha_fields
+
+        bm_ret, bm_cum, alpha = compute_benchmark_alpha_fields(
+            today_bm_close=94.0,
+            prev_bm_close=100.0,
+            base_bm_close=100.0,
+            portfolio_cum_return=0.0,
+        )
+        assert bm_cum == pytest.approx(-0.06)
+        assert alpha == pytest.approx(0.06)
+
+    def test_dividends_between_window_semantics(self, db_session):
+        """(start, end] 窗口：start 當日除息不計、end 當日計；無資料回 0。"""
+        from src.data.schema import Dividend
+        from src.portfolio.market_data import _get_benchmark_dividends_between
+
+        d1, d2, d3 = date(2026, 7, 1), date(2026, 7, 2), date(2026, 7, 3)
+        db_session.add(Dividend(stock_id="0050", date=d1, year="115", cash_dividend=1.5, stock_dividend=0.0))
+        db_session.add(Dividend(stock_id="0050", date=d3, year="115", cash_dividend=2.0, stock_dividend=0.0))
+        db_session.flush()
+
+        assert _get_benchmark_dividends_between(db_session, d1, d3) == pytest.approx(2.0)
+        assert _get_benchmark_dividends_between(db_session, d1 - timedelta(days=1), d3) == pytest.approx(3.5)
+        assert _get_benchmark_dividends_between(db_session, d3, d3) == 0.0
+        assert _get_benchmark_dividends_between(db_session, date(2027, 1, 1), date(2027, 2, 1)) == 0.0
+
+    def test_snapshot_uses_total_return_across_ex_date(self, db_session):
+        """0050 除息日 snapshot：cum/daily benchmark 皆以還原值計。"""
+        from src.data.schema import Dividend
+
+        d1, d2 = date(2026, 5, 15), date(2026, 5, 16)
+        _seed_0050(db_session, {d1: 100.0, d2: 94.0})
+        db_session.add(Dividend(stock_id="0050", date=d2, year="115", cash_dividend=6.0, stock_dividend=0.0))
+        portfolio = _make_portfolio(db_session, name="tr_test", initial=1_000_000.0)
+        mgr = RotationManager("tr_test")
+
+        mgr._write_daily_snapshot(
+            db_session, portfolio=portfolio, snapshot_date=d1, market_value=0.0, n_holdings=0, regime="bull"
+        )
+        mgr._write_daily_snapshot(
+            db_session, portfolio=portfolio, snapshot_date=d2, market_value=0.0, n_holdings=0, regime="bull"
+        )
+
+        s = db_session.execute(
+            select(RotationDailySnapshot).where(
+                RotationDailySnapshot.portfolio_name == "tr_test", RotationDailySnapshot.snapshot_date == d2
+            )
+        ).scalar_one()
+        assert s.benchmark_return_pct == pytest.approx(0.0), "除息日 benchmark 日報酬應為 0（跳空被股利補回）"
+        assert s.benchmark_cum_return_pct == pytest.approx(0.0)
+        assert s.alpha_cum_pct == pytest.approx(0.0), "組合持平 vs 除息的 0050：alpha 不得被灌水為 +6%"
+
+    def test_backfill_overwrite_applies_total_return(self, db_session):
+        """backfill --overwrite：歷史列以還原後 benchmark 重算。"""
+        from src.data.schema import Dividend
+
+        d1, d2 = date(2026, 5, 15), date(2026, 5, 16)
+        _seed_0050(db_session, {d1: 100.0, d2: 94.0})
+        db_session.add(Dividend(stock_id="0050", date=d2, year="115", cash_dividend=6.0, stock_dividend=0.0))
+        _make_portfolio(db_session, name="tr_bf", initial=1_000_000.0)
+        for d in (d1, d2):
+            db_session.add(
+                RotationDailySnapshot(
+                    portfolio_name="tr_bf",
+                    snapshot_date=d,
+                    total_capital=1_000_000.0,
+                    total_market_value=0.0,
+                    total_cash=1_000_000.0,
+                    unrealized_pnl=0.0,
+                    n_holdings=0,
+                    benchmark_cum_return_pct=-0.06,  # 舊 price-return 值
+                    alpha_cum_pct=0.06,
+                )
+            )
+        db_session.commit()
+
+        stats = RotationManager.backfill_snapshot_benchmark_alpha(db_session, portfolio_name="tr_bf", overwrite=True)
+
+        assert stats["updated"] == 2
+        s2 = db_session.execute(
+            select(RotationDailySnapshot).where(
+                RotationDailySnapshot.portfolio_name == "tr_bf", RotationDailySnapshot.snapshot_date == d2
+            )
+        ).scalar_one()
+        assert s2.benchmark_cum_return_pct == pytest.approx(0.0)
+        assert s2.alpha_cum_pct == pytest.approx(0.0)

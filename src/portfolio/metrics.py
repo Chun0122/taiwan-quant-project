@@ -50,20 +50,29 @@ def compute_benchmark_alpha_fields(
     prev_bm_close: float | None,
     base_bm_close: float | None,
     portfolio_cum_return: float | None,
+    *,
+    div_since_prev: float = 0.0,
+    div_since_base: float = 0.0,
 ) -> tuple[float | None, float | None, float | None]:
     """純函數：回傳 (benchmark_return_pct, benchmark_cum_return_pct, alpha_cum_pct)。
 
     供 `_write_daily_snapshot` 與 `backfill_snapshot_benchmark_alpha` 共用，
     確保兩條路徑的計算邏輯一致（audit S4 純函數化建議）。
     任一輸入為 None / 0 / 非正值即回傳 None，不擲例外。
+
+    A3-4（total return benchmark）：div_since_prev / div_since_base 為 0050
+    每股現金股利在 (prev, today] / (base, today] 窗口的加總，加法式還原——
+    benchmark 除息缺口以「股利現金持有不再投資」補回，與 rotation 組合端
+    的股利會計（現金入帳、不自動再投資）對稱，alpha 不再被 benchmark
+    除息缺口灌水。預設 0.0 = 舊 price-return 行為（向後相容）。
     """
     benchmark_return_pct: float | None = None
     if today_bm_close is not None and prev_bm_close is not None and prev_bm_close > 0:
-        benchmark_return_pct = (today_bm_close - prev_bm_close) / prev_bm_close
+        benchmark_return_pct = (today_bm_close + div_since_prev - prev_bm_close) / prev_bm_close
 
     benchmark_cum_return_pct: float | None = None
     if today_bm_close is not None and base_bm_close is not None and base_bm_close > 0:
-        benchmark_cum_return_pct = (today_bm_close - base_bm_close) / base_bm_close
+        benchmark_cum_return_pct = (today_bm_close + div_since_base - base_bm_close) / base_bm_close
 
     alpha_cum_pct: float | None = None
     if benchmark_cum_return_pct is not None and portfolio_cum_return is not None:

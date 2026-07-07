@@ -107,8 +107,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `portfolio/dividends.py` | 股利會計純函數（A3）：`load_dividend_events` / `dividend_adjustment_factor`（與 Strategy Layer 1 同式）/ `adjust_stop_loss_for_dividend` / `dividend_cash_for_position`；入帳時點=`Dividend.date`（除息日）；配股第一版僅調停損不調股數 |
 | `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；股數定價/滑價/流動性/漲跌停留各 caller |
 | `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_composite_rankings / 進場理由 breakdown），manager.py 抽出。**Composite mode**（`constants.COMPOSITE_MODES` + `is_composite_mode`）：'all'（五模式）與 'mom_growth'（動量+成長雙引擎，2026-06-20 取代結構性失敗的 'all'）共用 avg-score + per_mode_max 配額 resolver |
-| `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
-| `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields），manager.py 抽出 |
+| `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark + `_get_benchmark_dividends_between` 股利窗口加總），manager.py 抽出 |
+| `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields——A3-4 起支援 0050 total return 加法還原，`div_since_prev/base` 參數），manager.py 抽出 |
 | `portfolio/audit.py` | rotation-audit 純函數（trade stats / alpha delta / Jaccard 穩定性），`rotation-audit` CLI 用 |
 
 **CLI/報告/視覺化層**
