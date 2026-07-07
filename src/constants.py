@@ -229,3 +229,7 @@ ACTION_TYPE_PENDING_BUY: str = "pending_buy"
 ACTION_TYPE_PENDING_SELL: str = "pending_sell"
 # decide 階段寫入的 action_type 集合（decide 冪等刪除範圍；open/close 屬 fill 階段）
 DECIDE_STAGE_ACTION_TYPES: tuple[str, ...] = (ACTION_TYPE_PENDING_BUY, ACTION_TYPE_PENDING_SELL, "renew", "hold")
+
+# A3 股利會計：持倉除息入帳的 ActionLog 類型（同時作為同日冪等入帳標記，
+# 與現金更新同一 transaction —— decide/fill 的冪等刪除範圍皆不含此型）
+ACTION_TYPE_DIVIDEND: str = "dividend"

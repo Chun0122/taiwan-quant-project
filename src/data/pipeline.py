@@ -364,6 +364,25 @@ def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
     )
 
 
+def sync_dividends_for_stocks(stock_ids: list[str]) -> int:
+    """為指定股票補抓股利資料（A3：rotation 持倉/pending 除息入帳的資料前提）。
+
+    dividend 表原僅隨 watchlist 逐股同步；rotation 持倉來自全市場 discover，
+    除息入帳需要當日除息事件在庫。morning-routine Step 11b 於 rotation update
+    前呼叫（持倉 + pending 標的，量少：~20 檔 × 0.5s）。
+    lookback_days=400：涵蓋跨年度除息季 + 增量起點。
+    """
+    return _sync_per_stock(
+        model=Dividend,
+        stock_ids=stock_ids,
+        fetch_fn=lambda f, sid, s, e: f.fetch_dividend(sid, s, e),
+        upsert_fn=_upsert_dividend,
+        cache_days=7,
+        lookback_days=400,
+        label="股利補抓",
+    )
+
+
 def _upsert_financial(df: pd.DataFrame) -> int:
     """將財報 DataFrame 寫入 financial_statement 表。"""
     return _upsert_batch(FinancialStatement, df, ["stock_id", "date"])

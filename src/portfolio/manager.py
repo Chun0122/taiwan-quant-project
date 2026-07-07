@@ -15,6 +15,7 @@ from sqlalchemy import delete, select
 
 from src.config import settings
 from src.constants import (
+    ACTION_TYPE_DIVIDEND,
     ACTION_TYPE_PENDING_BUY,
     ACTION_TYPE_PENDING_SELL,
     COMMISSION_RATE,
@@ -739,10 +740,12 @@ class RotationManager:
           與 backtest 同式）；資金不足由 _execute_buy 內建 reshrink 縮股。
         - 部分成交不轉次日（流動性縮股後 fill 多少算多少，order 仍標 filled）。
         - 冪等：靠 status 轉移天然冪等（重跑時查無 pending → no-op）。
+        - A3 股利會計：成交任何 pending **之前**先處理持倉除息（現金入帳 +
+          停損價調整），與 backtest 迴圈頂端位置同構；不依賴是否有 pending。
 
         Returns:
-            {"filled": n, "cancelled": n, "deferred": n} — portfolio 不存在時 None。
-            dry_run=True 時只計算不寫入。
+            {"filled": n, "cancelled": n, "deferred": n, "dividends": n} —
+            portfolio 不存在時 None。dry_run=True 時只計算不寫入。
         """
         if exec_day is None:
             exec_day = date.today()
@@ -756,6 +759,9 @@ class RotationManager:
                 logger.info("組合 %s 非 active，跳過 fill_pending", self.portfolio_name)
                 return None
 
+            # ── A3 股利會計：持倉除息（成交前；D 開盤已除息，僅 D-1 前持有者獲配）──
+            n_dividends = self._process_dividends(session, portfolio, exec_day, dry_run=dry_run)
+
             stmt = (
                 select(RotationPendingOrder)
                 .where(
@@ -767,7 +773,9 @@ class RotationManager:
             )
             orders = list(session.execute(stmt).scalars())
             if not orders:
-                return {"filled": 0, "cancelled": 0, "deferred": 0}
+                if n_dividends and not dry_run:
+                    session.commit()
+                return {"filled": 0, "cancelled": 0, "deferred": 0, "dividends": n_dividends}
 
             from datetime import timedelta
 
@@ -924,7 +932,7 @@ class RotationManager:
                     cancelled,
                     deferred,
                 )
-                return {"filled": filled, "cancelled": cancelled, "deferred": deferred}
+                return {"filled": filled, "cancelled": cancelled, "deferred": deferred, "dividends": n_dividends}
 
             # ── 資金與市值收斂 ──
             open_after = self._load_open_positions(session, portfolio.id)
@@ -951,7 +959,122 @@ class RotationManager:
                 cash,
                 portfolio.current_capital,
             )
-            return {"filled": filled, "cancelled": cancelled, "deferred": deferred}
+            return {"filled": filled, "cancelled": cancelled, "deferred": deferred, "dividends": n_dividends}
+
+    def _process_dividends(self, session, portfolio, exec_day: date, *, dry_run: bool) -> int:
+        """持倉除息處理（A3）：現金入帳 + 停損價除息調整，回傳處理事件數。
+
+        - 時點：exec_day = 除息交易日（Dividend.date）；於任何 pending 成交前執行。
+        - 冪等：以當日 ActionLog(action_type="dividend", stock_id) 為入帳標記——
+          與現金/停損更新同一 transaction，重跑不會二次入帳。
+        - 配股第一版：僅調停損價，股數不調（warning）。
+        - caller 負責 commit（與 fill 成交同批）。
+        """
+        from datetime import timedelta
+
+        from src.portfolio.dividends import (
+            adjust_stop_loss_for_dividend,
+            dividend_cash_for_position,
+            load_dividend_events,
+        )
+
+        open_positions = self._load_open_positions(session, portfolio.id)
+        if not open_positions:
+            return 0
+        sids = [p["stock_id"] for p in open_positions]
+        events = load_dividend_events(session, sids, exec_day, exec_day).get(exec_day)
+        if not events:
+            return 0
+
+        # 前一交易日收盤（5 天 fallback = 最後已知收盤，供除權息因子）
+        prev_ohlcv = _get_ohlcv_on_date(session, list(events.keys()), exec_day - timedelta(days=1))
+
+        processed = 0
+        for pos_dict in open_positions:
+            sid = pos_dict["stock_id"]
+            ev = events.get(sid)
+            if ev is None:
+                continue
+            # 冪等入帳標記
+            already = session.execute(
+                select(RotationActionLog.id)
+                .where(
+                    RotationActionLog.portfolio_name == self.portfolio_name,
+                    RotationActionLog.action_date == exec_day,
+                    RotationActionLog.action_type == ACTION_TYPE_DIVIDEND,
+                    RotationActionLog.stock_id == sid,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if already is not None:
+                continue
+
+            prev_c = (prev_ohlcv.get(sid) or {}).get("close")
+            payout = dividend_cash_for_position(pos_dict["shares"], ev.cash_dividend)
+
+            if dry_run:
+                logger.info(
+                    "[%s] DRY RUN — %s 除息：入帳 %.0f、停損調整（cash=%.4f, stock=%.4f）",
+                    self.portfolio_name,
+                    sid,
+                    payout,
+                    ev.cash_dividend,
+                    ev.stock_dividend,
+                )
+                processed += 1
+                continue
+
+            pos = session.execute(
+                select(RotationPosition).where(
+                    RotationPosition.portfolio_id == portfolio.id,
+                    RotationPosition.stock_id == sid,
+                    RotationPosition.status == "open",
+                )
+            ).scalar_one_or_none()
+            if pos is None:
+                continue
+
+            if payout > 0:
+                portfolio.current_cash += payout
+                portfolio.current_capital += payout
+            if pos.stop_loss is not None:
+                pos.stop_loss = adjust_stop_loss_for_dividend(
+                    pos.stop_loss, prev_c, ev.cash_dividend, ev.stock_dividend
+                )
+            if ev.stock_dividend > 0:
+                logger.warning(
+                    "[%s] %s 配股 %.2f 未調整持倉股數（A3 第一版僅現金入帳+停損調整）",
+                    self.portfolio_name,
+                    sid,
+                    ev.stock_dividend,
+                )
+            # 入帳標記 + 審計軌跡（pnl 欄 = 入帳金額、price 欄 = 每股現金股利）
+            session.add(
+                RotationActionLog(
+                    portfolio_name=self.portfolio_name,
+                    action_date=exec_day,
+                    action_type=ACTION_TYPE_DIVIDEND,
+                    reason=None,
+                    is_risk_exit=False,
+                    switch_group=None,
+                    stock_id=sid,
+                    stock_name=pos_dict.get("stock_name"),
+                    shares=pos_dict["shares"],
+                    price=ev.cash_dividend,
+                    pnl=payout if payout > 0 else None,
+                )
+            )
+            logger.info(
+                "[%s] %s 除息入帳 %.0f（%d 股 × %.4f），停損 %.2f",
+                self.portfolio_name,
+                sid,
+                payout,
+                pos_dict["shares"],
+                ev.cash_dividend,
+                pos.stop_loss or 0.0,
+            )
+            processed += 1
+        return processed
 
     def _write_fill_action_log(self, session, exec_day: date, fill_rows: list[dict]) -> None:
         """fill 階段 ActionLog：寫實際成交的 open/close 列（冪等：只刪同日 open/close）。

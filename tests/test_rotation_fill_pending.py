@@ -173,7 +173,7 @@ class TestFillPendingBuys:
 
         result = mgr.fill_pending(exec_day=D1)
 
-        assert result == {"filled": 3, "cancelled": 0, "deferred": 0}
+        assert result == {"filled": 3, "cancelled": 0, "deferred": 0, "dividends": 0}
         positions = patch_session.execute(select(RotationPosition)).scalars().all()
         assert len(positions) == 3
         assert all(p.entry_price == 105.0 for p in positions), "成交價應為 open[D+1] 而非決策日 close"
@@ -218,12 +218,12 @@ class TestFillPendingBuys:
 
         # D+1：TTL 內（1 個交易日）→ 順延
         result = mgr.fill_pending(exec_day=D1)
-        assert result == {"filled": 0, "cancelled": 0, "deferred": 3}
+        assert result == {"filled": 0, "cancelled": 0, "deferred": 3, "dividends": 0}
         assert all(o.status == "pending" for o in _orders(patch_session))
 
         # D+4：已逾 2 個交易日 → 取消（行事曆每日皆交易日）
         result = mgr.fill_pending(exec_day=D + timedelta(days=4))
-        assert result == {"filled": 0, "cancelled": 3, "deferred": 0}
+        assert result == {"filled": 0, "cancelled": 3, "deferred": 0, "dividends": 0}
         assert all(o.status == "cancelled" for o in _orders(patch_session))
         assert patch_session.execute(select(RotationPosition)).scalars().all() == []
 
@@ -237,7 +237,7 @@ class TestFillPendingBuys:
 
         result = mgr.fill_pending(exec_day=D1)
 
-        assert result == {"filled": 0, "cancelled": 0, "deferred": 0}
+        assert result == {"filled": 0, "cancelled": 0, "deferred": 0, "dividends": 0}
         assert patch_session.execute(select(RotationPortfolio)).scalar_one().current_cash == cash_after
         assert len(patch_session.execute(select(RotationPosition)).scalars().all()) == 3
 
@@ -249,7 +249,7 @@ class TestFillPendingBuys:
 
         result = mgr.fill_pending(exec_day=D1, dry_run=True)
 
-        assert result == {"filled": 3, "cancelled": 0, "deferred": 0}
+        assert result == {"filled": 3, "cancelled": 0, "deferred": 0, "dividends": 0}
         assert all(o.status == "pending" for o in _orders(patch_session))
         assert patch_session.execute(select(RotationPosition)).scalars().all() == []
         assert patch_session.execute(select(RotationPortfolio)).scalar_one().current_cash == 1_000_000.0

@@ -1705,7 +1705,8 @@ python main.py morning-routine --top 30 --notify
 | Step 9 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 10 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 11 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |
-| Step 12 | `rotation update --all` | 更新所有 active 輪動組合（T+1 兩段式：先成交昨日 pending，再做今日決策） |
+| Step 11b | 股利補抓 | 補抓 rotation 持倉/pending 標的的股利資料（A3 除息入帳前提，7 天內抓過者跳過） |
+| Step 12 | `rotation update --all` | 更新所有 active 輪動組合（T+1 兩段式：先成交昨日 pending，再做今日決策；除息日持倉現金入帳 + 停損價調整） |
 | Step 13 | `revenue-scan --min-yoy 10 --top 5` | 高成長個股掃描 |
 | Step 14 | `anomaly-scan` | 籌碼異動掃描（量能/外資/借券/主力/隔日沖） |
 | Step 15 | 策略衰減監控 | 比較五模式近 30 天 vs 歷史勝率/均報酬，衰減時顯示警告（勝率<40% 或均報酬<0） |
