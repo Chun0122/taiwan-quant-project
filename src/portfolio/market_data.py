@@ -229,11 +229,13 @@ def _get_benchmark_dividends_between(session, start_exclusive: date, end_inclusi
         return 0.0
     from src.data.schema import Dividend
 
+    # 以實際除息交易日（fallback 基準日）落窗——與持倉入帳同一時點語意
+    ex_col = func.coalesce(Dividend.cash_ex_dividend_date, Dividend.date)
     total = session.execute(
         select(func.coalesce(func.sum(Dividend.cash_dividend), 0.0)).where(
             Dividend.stock_id == SNAPSHOT_BENCHMARK_STOCK_ID,
-            Dividend.date > start_exclusive,
-            Dividend.date <= end_inclusive,
+            ex_col > start_exclusive,
+            ex_col <= end_inclusive,
         )
     ).scalar_one()
     return float(total or 0.0)

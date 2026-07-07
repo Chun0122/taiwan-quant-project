@@ -119,3 +119,61 @@ class TestLoadDividendEvents:
         assert load_dividend_events(db_session, ["2330"], date(2026, 1, 1), date(2026, 12, 31)) == {}
         assert load_dividend_events(db_session, ["2317"], date(2025, 1, 1), date(2026, 12, 31)) == {}
         assert load_dividend_events(db_session, [], date(2025, 1, 1), date(2026, 12, 31)) == {}
+
+
+class TestExDividendDateSemantics:
+    """A3 修正（2026-07-07）：FinMind date=基準日，事件日須用除息交易日。"""
+
+    def test_event_keyed_at_ex_trading_date_not_record_date(self, db_session):
+        from src.data.schema import Dividend
+        from src.portfolio.dividends import load_dividend_events
+
+        ex_d, record_d = date(2026, 6, 11), date(2026, 6, 17)  # 2330 實例：除息早基準日 6 天
+        db_session.add(
+            Dividend(
+                stock_id="2330",
+                date=record_d,
+                year="115",
+                cash_dividend=6.0,
+                stock_dividend=0.0,
+                cash_ex_dividend_date=ex_d,
+            )
+        )
+        db_session.flush()
+
+        # 以除息交易日查得到、以基準日查不到
+        assert "2330" in load_dividend_events(db_session, ["2330"], ex_d, ex_d).get(ex_d, {})
+        assert load_dividend_events(db_session, ["2330"], record_d, record_d) == {}
+
+    def test_fallback_to_record_date_when_ex_missing(self, db_session):
+        """舊資料（ex 欄位未回填）向後相容：fallback 基準日。"""
+        from src.data.schema import Dividend
+        from src.portfolio.dividends import load_dividend_events
+
+        d = date(2026, 6, 24)
+        db_session.add(Dividend(stock_id="9999", date=d, year="115", cash_dividend=1.0, stock_dividend=0.0))
+        db_session.flush()
+
+        assert "9999" in load_dividend_events(db_session, ["9999"], d, d).get(d, {})
+
+    def test_benchmark_window_uses_ex_trading_date(self, db_session):
+        from src.data.schema import Dividend
+        from src.portfolio.market_data import _get_benchmark_dividends_between
+
+        ex_d, record_d = date(2026, 1, 22), date(2026, 1, 28)  # 0050 實例
+        db_session.add(
+            Dividend(
+                stock_id="0050",
+                date=record_d,
+                year="115",
+                cash_dividend=1.0,
+                stock_dividend=0.0,
+                cash_ex_dividend_date=ex_d,
+            )
+        )
+        db_session.flush()
+
+        # 窗口只含除息日、不含基準日 → 仍計入
+        assert _get_benchmark_dividends_between(db_session, date(2026, 1, 20), date(2026, 1, 23)) == 1.0
+        # 窗口只含基準日、不含除息日 → 不計
+        assert _get_benchmark_dividends_between(db_session, date(2026, 1, 25), date(2026, 1, 30)) == 0.0

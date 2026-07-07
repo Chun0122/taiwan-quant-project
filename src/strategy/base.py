@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.data.database import get_session
 from src.data.schema import DailyPrice, Dividend, TechnicalIndicator
@@ -181,15 +181,22 @@ class Strategy(ABC):
     # ------------------------------------------------------------------ #
 
     def _load_dividends(self) -> pd.DataFrame:
-        """載入除權息資料。"""
+        """載入除權息資料（index = 實際除息交易日，fallback 基準日）。
+
+        A3 修正（2026-07-07）：FinMind date 是除權息基準日，比價格跳空的
+        除息交易日晚 4-6 天；回溯調整須以除息交易日切分，否則因子套錯區間。
+        """
+        from src.portfolio.dividends import effective_ex_date
+
+        ex_col = func.coalesce(Dividend.cash_ex_dividend_date, Dividend.stock_ex_dividend_date, Dividend.date)
         with get_session() as session:
             rows = (
                 session.execute(
                     select(Dividend)
                     .where(Dividend.stock_id == self.stock_id)
-                    .where(Dividend.date >= self.start_date)
-                    .where(Dividend.date <= self.end_date)
-                    .order_by(Dividend.date)
+                    .where(ex_col >= self.start_date)
+                    .where(ex_col <= self.end_date)
+                    .order_by(ex_col)
                 )
                 .scalars()
                 .all()
@@ -200,7 +207,7 @@ class Strategy(ABC):
         df = pd.DataFrame(
             [
                 {
-                    "date": r.date,
+                    "date": effective_ex_date(r),
                     "cash_dividend": r.cash_dividend or 0.0,
                     "stock_dividend": r.stock_dividend or 0.0,
                 }
