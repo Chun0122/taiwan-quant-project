@@ -99,7 +99,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 外部介面 | TWSE/TPEX `verify=False` 刻意；MOPS 備援站、DJ Big5 regex——脆弱面，改版風險常在 | 常態，靠對帳+告警圍堵 |
 | API 速率 | FinMind 0.5s、TWSE/TPEX 3s——morning-routine 時長的硬下限 | 常態 |
 | 交易階段 | Paper only；**實盤須過 §9 六條 Gate** | Gate 通過 |
-| 裁決凍結 | A2+A3 完成前，凍結基於現有數字的策略裁決 | A2+A3 完成 |
+| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）：新數字（T+1 成交 + 股利入帳 + total return benchmark）起可裁決；R1 歷史裁決重審可啟動 | 已解除 |
 | 已死資料欄 | TW_VIX（FinMind 移除）、SBL sbl_change 三欄恆 NULL、DJ 分點無均價（close 代理） | 各自替代方案落地 |
 
 ---
@@ -124,9 +124,9 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 
 | # | 項目 | 工期 | 內容 / 驗收 |
 |---|------|:---:|------------|
-| 8 | **A5 決策可重放** | 3 天 | `DiscoveryRecord` 加 `git_commit`/`settings_hash` 欄位；`settings.yaml` 拆為 `secrets.yaml`（gitignored）+ `quant_params.yaml`（**進版控**）。副作用：strategy_events 的 settings diff 功能復活（現因 settings.yaml 不在 git 永遠回空） |
-| 9 | **A2 Live T+1 Pending-Order** | 2 週 | 依 `docs/design/live_t1_pending_order.md` 實作 `RotationPendingOrder` + decide/fill 兩段式。交付 parity 報告：量化「close 成交 vs T+1 open」的 alpha 差距 |
-| 10 | **A3 股利會計** | 1.5 週 | rotation live+backtest：持倉除息日現金入帳 + 停損價除息調整；benchmark 0050 還原或標注。**時效**：正值除息季。完成後啟動 R1 歷史裁決重審 |
+| 8 | **A5 決策可重放** ✅2026-07-06 | 3 天 | `DiscoveryRecord` 加 `git_commit`/`settings_hash` 欄位；`settings.yaml` 拆為 `secrets.yaml`（gitignored）+ `quant_params.yaml`（**進版控**）。副作用：strategy_events 的 settings diff 功能復活（現因 settings.yaml 不在 git 永遠回空） |
+| 9 | **A2 Live T+1 Pending-Order** ✅2026-07-06 | 2 週 | 依 `docs/design/live_t1_pending_order.md` 實作 `RotationPendingOrder` + decide/fill 兩段式。交付 parity 報告：量化「close 成交 vs T+1 open」的 alpha 差距 |
+| 10 | **A3 股利會計** ✅2026-07-07 | 1.5 週 | rotation live+backtest：持倉除息日現金入帳 + 停損價除息調整；benchmark 0050 還原或標注。**時效**：正值除息季。完成後啟動 R1 歷史裁決重審 |
 | 11 | **A4 交易現實化** | 1 週 | 股數整張化（1000 股）+ 零股策略決定、最低手續費 20 元、滑價加入 participation-based impact 項（現模型與下單量無關）。完成後 baseline 重錨 |
 
 ---
@@ -191,7 +191,7 @@ Broker 層 + 對帳 → 風險引擎 → RotationContext → 停損現實化 →
 實盤校準（滑價實測 vs 模型）→ 資金階梯（每季檢視）→ 風險引擎獲 pre-trade 否決權 → B8/B9/C3 → 事件溯源級重放。**Institutional grade 指紀律，不是拓撲**：依然一個 repo、一台主機、SQLite。
 
 ### 研究議程（平台解鎖後，按序）
-R1 歷史裁決重審（A2+A3 後）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
+R1 歷史裁決重審（A2+A3 後，2026-07-07 起可啟動）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
 
 ---
 
@@ -204,7 +204,7 @@ R1 歷史裁決重審（A2+A3 後）→ R2 跨 regime 穩健性 2020–2026（B1
 | `backup_db()` 零呼叫者 | `database.py` | ✅ 2026-07-05 已接上 morning-routine Step 18 |
 | `_compute_backtest_metrics` 死碼 | `manager.py` 尾端 | 待 sweep |
 | `fetch_taiwan_vix` 永遠回空（dataset 已亡） | `fetcher.py` | 待替代（期交所 VIX）或移除 |
-| `_collect_settings_diffs` 永遠回空（settings.yaml 不在 git） | `strategy_events.py` | A5 修復後自動復活 |
+| `_collect_settings_diffs` 永遠回空（settings.yaml 不在 git） | `strategy_events.py` | ✅2026-07-06 A5 拆檔後已復活（改追 quant_params.yaml） |
 | SBL `sbl_change` 等三欄恆 NULL（API 改版） | schema + twse_fetcher | 記錄在案，因子已降級 |
 | `DailyReportEngine._compute_ml_score` 引用不存在的 `_last_proba` | `report/engine.py` | 永遠走 fallback，低優先 |
 
@@ -223,7 +223,7 @@ R1 歷史裁決重審（A2+A3 後）→ R2 跨 regime 穩健性 2020–2026（B1
 ### 統計/方法債
 - IC 建立在 top-N 截斷樣本、n≈20–30，驅動自動停用/翻轉 → B2+B11。
 - 全部閾值/權重為 in-sample 調參，跨 regime 未驗證 → R2/R3。
-- 停損只看收盤、無停利、live 成交=決策價 → A2+B12。
+- 停損只看收盤、無停利 → B12（live 成交=決策價已由 A2 T+1 解除，2026-07-06）。
 - Crisis 邏輯從未被歷史崩跌段檢驗 → R7。
 
 ---

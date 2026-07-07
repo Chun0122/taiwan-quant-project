@@ -289,7 +289,12 @@ class FinMindFetcher(DataFetcher):
         """抓取股利資料。
 
         回傳欄位: date, stock_id, year, cash_dividend, stock_dividend,
-                  cash_payment_date, announcement_date
+                  cash_payment_date, announcement_date,
+                  cash_ex_dividend_date, stock_ex_dividend_date
+
+        注意：FinMind 的 date 是「除權息基準日」，實際除息/除權交易日
+        （價格跳空日）在 CashExDividendTradingDate / StockExDividendTradingDate，
+        通常早 4-6 天——除息入帳、停損調整一律用 ex_dividend_date。
         """
         if end is None:
             end = date.today().isoformat()
@@ -303,6 +308,8 @@ class FinMindFetcher(DataFetcher):
             "StockEarningsDistribution": "stock_dividend",
             "CashDividendPaymentDate": "cash_payment_date",
             "AnnouncementDate": "announcement_date",
+            "CashExDividendTradingDate": "cash_ex_dividend_date",
+            "StockExDividendTradingDate": "stock_ex_dividend_date",
         }
         df = df.rename(columns=rename_map)
 
@@ -314,11 +321,13 @@ class FinMindFetcher(DataFetcher):
             "stock_dividend",
             "cash_payment_date",
             "announcement_date",
+            "cash_ex_dividend_date",
+            "stock_ex_dividend_date",
         ]
         df = df[[c for c in keep if c in df.columns]]
 
         _standardize_date_column(df)
-        for col in ("cash_payment_date", "announcement_date"):
+        for col in ("cash_payment_date", "announcement_date", "cash_ex_dividend_date", "stock_ex_dividend_date"):
             if col in df.columns:
                 # 先轉換為 datetime，將 NaT 處理為 None，再轉 .date
                 # 注意：必須先處理 NaT 再呼叫 .dt.date，否則 NaT 可能變為無效日期

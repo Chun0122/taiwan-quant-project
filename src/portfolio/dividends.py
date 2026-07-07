@@ -6,10 +6,13 @@
   - 除權息調整因子（與 Strategy._apply_dividend_adjustment 同式，SSOT）
   - 持倉現金入帳與停損價調整
 
-使用約定（裁決 2026-07-05）：
-  - 入帳時點 = ``Dividend.date``（除權息基準日/除息交易日，已抽樣驗證：
-    2330 2025-12-17 ex-date 跳空恰等於現金股利 5 元），非 cash_payment_date
+使用約定（裁決 2026-07-05；除息日語意修正 2026-07-07）：
+  - 入帳時點 = **實際除息/除權交易日**（``Dividend.cash_ex_dividend_date`` /
+    ``stock_ex_dividend_date``，缺值 fallback ``date``），非 cash_payment_date
     ——消除假性回撤優先；應收股利精緻化列實盤前 follow-up。
+    注意：FinMind 的 ``date`` 是除權息「基準日」，比價格跳空的除息交易日
+    **晚約 4-6 天**（2330 2025-12：基準日 12-17、除息日 12-11；0050 基準日
+    甚至可落在週日）——早期版本誤用 date 對日，已修正。
   - 第一版：現金股利入帳完整實作；股票股利僅用於停損價因子調整，
     **持倉股數不調**（記 warning，配股股數/畸零股列 follow-up）。
   - 除息處理必須在每日迴圈最前（執行 pending 成交之前）：D 日 open 已是
@@ -26,7 +29,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.data.schema import Dividend
 
@@ -52,42 +55,54 @@ class DividendEvent:
         return self.cash_dividend > 0 or self.stock_dividend > 0
 
 
+def effective_ex_date(row: Dividend) -> date:
+    """單列 Dividend 的有效除息交易日：cash_ex → stock_ex → date（基準日 fallback）。
+
+    fallback 供舊資料（ex 欄位未回填）向後相容；基準日比除息日晚 4-6 天，
+    回填後即不再走 fallback。
+    """
+    return row.cash_ex_dividend_date or row.stock_ex_dividend_date or row.date
+
+
 def load_dividend_events(
     session,
     stock_ids: list[str],
     start: date,
     end: date,
 ) -> dict[date, dict[str, DividendEvent]]:
-    """載入區間內除息事件，依 {ex_date: {stock_id: event}} 分組（供每日迴圈）。
+    """載入區間內除息事件，依 {除息交易日: {stock_id: event}} 分組（供每日迴圈）。
 
-    空 payout（cash=stock=0）的列直接略過。
+    以 coalesce(cash_ex_dividend_date, stock_ex_dividend_date, date) 為事件日
+    過濾與分組。空 payout（cash=stock=0）的列直接略過。
     """
     if not stock_ids:
         return {}
+    ex_col = func.coalesce(Dividend.cash_ex_dividend_date, Dividend.stock_ex_dividend_date, Dividend.date)
     rows = (
         session.execute(
             select(Dividend)
             .where(
                 Dividend.stock_id.in_(stock_ids),
-                Dividend.date >= start,
-                Dividend.date <= end,
+                ex_col >= start,
+                ex_col <= end,
             )
-            .order_by(Dividend.date)
+            .order_by(ex_col)
         )
         .scalars()
         .all()
     )
     out: dict[date, dict[str, DividendEvent]] = {}
     for r in rows:
+        ex_d = effective_ex_date(r)
         ev = DividendEvent(
             stock_id=r.stock_id,
-            ex_date=r.date,
+            ex_date=ex_d,
             cash_dividend=r.cash_dividend or 0.0,
             stock_dividend=r.stock_dividend or 0.0,
         )
         if not ev.has_payout:
             continue
-        out.setdefault(r.date, {})[r.stock_id] = ev
+        out.setdefault(ex_d, {})[r.stock_id] = ev
     return out
 
 

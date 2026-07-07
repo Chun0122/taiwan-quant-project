@@ -87,6 +87,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # 但 A2-1 已在部分環境建過無此二欄的版本，需 ALTER 補齊）
     ("rotation_pending_order", "allocated_capital", "REAL"),
     ("rotation_pending_order", "days_held", "INTEGER"),
+    # A3 修正（2026-07-07）：FinMind date=除權息基準日（比除息交易日晚 4-6 天），
+    # 入帳/停損調整須用實際除息交易日；既有列以 scripts/backfill_ex_dividend_dates.py 回填
+    ("dividend", "cash_ex_dividend_date", "DATE"),
+    ("dividend", "stock_ex_dividend_date", "DATE"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

@@ -158,12 +158,17 @@ class Dividend(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    # 注意：FinMind TaiwanStockDividend 的 date 是「除權息基準日」，
+    # 比實際除息交易日（價格跳空日）晚約 4-6 天；除息入帳/停損調整
+    # 一律用 cash/stock_ex_dividend_date（A3 修正，2026-07-07）
     date: Mapped[date] = mapped_column(Date, nullable=False, index=True)  # 除權息基準日
     year: Mapped[int] = mapped_column(Integer, nullable=False)  # 股利所屬年度
     cash_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 現金股利
     stock_dividend: Mapped[float | None] = mapped_column(Float, nullable=True)  # 股票股利
     cash_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 現金發放日
     announcement_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 公告日
+    cash_ex_dividend_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 現金股利除息交易日
+    stock_ex_dividend_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # 股票股利除權交易日
 
     def __repr__(self) -> str:
         return f"<Dividend {self.stock_id} {self.date} cash={self.cash_dividend}>"
