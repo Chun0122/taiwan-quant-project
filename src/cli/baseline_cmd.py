@@ -19,7 +19,6 @@ import json
 import logging
 import math
 import statistics
-import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -288,17 +287,10 @@ def save_baseline(
 
 
 def _try_git_head() -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return result.stdout.strip() or None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+    # A5 後統一走 src/provenance.py 的實作（消第三份 copy）
+    from src.provenance import try_git_head
+
+    return try_git_head()
 
 
 # ---------------------------------------------------------------------------

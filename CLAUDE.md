@@ -21,7 +21,7 @@
 | **回測成本** | 手續費 0.1425%、交易稅 0.3%（賣出）、滑價 0.05% |
 | **Session** | `with get_session() as session:`；批次寫入 `sqlite_upsert().on_conflict_do_nothing()` |
 | **常數** | 全系統共用常數集中於 `src/constants.py`，勿在各模組硬編碼 |
-| **設定** | `config/settings.yaml` → `src/config.py` Pydantic 載入（4 子模型 + 啟動驗證） |
+| **設定** | `config/quant_params.yaml`（量化參數，**進版控**）+ `config/secrets.yaml`（機密，gitignored）→ `src/config.py` deep-merge 載入（A5 拆檔；legacy `settings.yaml` 存在時照舊+警告）；機密勿寫入 quant_params |
 | **資料來源優先序** | ①TWSE/TPEX 官方（免費，全市場）→ ②FinMind 批次（付費）→ ③FinMind 逐股（免費備援） |
 
 ### 提交前必執行
@@ -59,9 +59,9 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `data/fetcher.py` | FinMind API（逐股/批次/財報 EAV pivot）、US VIX（yfinance） |
 | `data/twse_fetcher.py` | TWSE/TPEX 全市場免費資料、SBL（TWT96U）、DJ 分點（Big5 HTML）、TDCC |
-| `data/pipeline.py` | ETL 調度 + DB 寫入、OHLCV 品質閘門（值域 + OHLC 一致性 `low≤close≤high`）、close-to-close 跳動哨兵（`_detect_price_jumps` WARN，門檻 `PRICE_JUMP_WARN_THRESHOLD`=11%）、DailyFeature 計算、Broker Bootstrap |
+| `data/pipeline.py` | ETL 調度 + DB 寫入、OHLCV 品質閘門（值域 + OHLC 一致性 `low≤close≤high`）、close-to-close 跳動哨兵（`_detect_price_jumps` WARN，門檻 `PRICE_JUMP_WARN_THRESHOLD`=11%）、DailyFeature 計算、Broker Bootstrap、`sync_dividends_for_stocks`（rotation 標的股利補抓，morning Step 11b） |
 | `data/mops_fetcher.py` | MOPS 重大訊息 + 月營收、事件分類（7 類）、情緒分類 |
-| `data/schema.py` | 28 張 ORM 表（含 `RotationActionLog`：每日輪動操作明細，dashboard `today_actions` 來源） |
+| `data/schema.py` | 29 張 ORM 表（含 `RotationActionLog`：每日輪動操作明細，dashboard `today_actions` 來源；`RotationPendingOrder`：live T+1 待成交意圖，A2） |
 | `data/validator.py` | 7 個品質檢查純函數 |
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
@@ -90,7 +90,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
-| `discovery/strategy_events.py` | 策略調整事件抽取（git log + settings.yaml diff，供 dashboard 事件流） |
+| `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
 | `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機 |
 | `industry/analyzer.py` | 產業輪動、同業相對強度（±3%） |
@@ -103,7 +103,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 |------|------|
 | `entry_exit.py` | 共用純函數：ATR 止損止利、進場觸發、時機評估（Discover/Suggest/Watch 三系統共用） |
 | `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR） |
-| `portfolio/manager.py` | RotationManager：每日更新 / Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`，僅回測用、live 不受影響） |
+| `portfolio/manager.py` | RotationManager：每日更新（A2 T+1 兩段式：`decide`/`fill_pending`/`update` wrapper + `_build_decision_context` 共用組裝）/ Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`/`t1_execution`/`save_result`，僅回測用、live 不受影響）。A3 股利會計：live `fill_pending` 開頭與 backtest 迴圈頂端同構呼叫除息處理（現金入帳 + 停損調整，ActionLog `dividend` 型為冪等標記） |
+| `portfolio/dividends.py` | 股利會計純函數（A3）：`load_dividend_events` / `dividend_adjustment_factor`（與 Strategy Layer 1 同式）/ `adjust_stop_loss_for_dividend` / `dividend_cash_for_position`；入帳時點=`Dividend.date`（除息日）；配股第一版僅調停損不調股數 |
 | `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；股數定價/滑價/流動性/漲跌停留各 caller |
 | `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_composite_rankings / 進場理由 breakdown），manager.py 抽出。**Composite mode**（`constants.COMPOSITE_MODES` + `is_composite_mode`）：'all'（五模式）與 'mom_growth'（動量+成長雙引擎，2026-06-20 取代結構性失敗的 'all'）共用 avg-score + per_mode_max 配額 resolver |
 | `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark），manager.py 抽出 |
@@ -135,12 +136,12 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **策略註冊** | `STRATEGY_REGISTRY`（`src/strategy/__init__.py`）；9 策略；新策略繼承 `Strategy`，實作 `generate_signals(data) → Series[1/-1/0]` |
 | **EAV 指標** | `TechnicalIndicator`（stock_id, date, name, value），`load_data()` pivot 為寬表 |
 | **除權息** | Layer 1 回溯調整 OHLC + 重算指標（保留 `raw_*`）；Layer 2 原始價格交易 + 股利入帳；預設關閉，`--adjust-dividend` 啟用 |
-| **Watchlist** | `get_effective_watchlist()`：DB 優先，`settings.yaml` fallback，全模組統一呼叫 |
+| **Watchlist** | `get_effective_watchlist()`：DB 優先，`quant_params.yaml` fallback，全模組統一呼叫 |
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
-| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測**一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交（買/賣/止損/危機一律 open[D+1]）。live update() 尚未 T+1（夜間決策時未知 D+1 開盤，待 pending-order 機制） |
+| **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日、風控賣單停牌以 ref_price 成交不凍結 |
 | **動態滑價** | 三因子模型（`compute_dynamic_slippage`）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
 
 ---
@@ -182,13 +183,14 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | [`docs/testing_guide.md`](docs/testing_guide.md) | 45 個測試檔對照表、Fixtures、覆蓋率指引 |
 | [`docs/project_history.md`](docs/project_history.md) | 85 項已完成任務歷史（Phase 1~2） |
 | `usage.md` | 使用者導向操作手冊 |
-| `config/settings.yaml` | 執行期設定（`.gitignore` 已排除） |
+| `config/quant_params.yaml` | 量化參數與非機密設定（進版控，A5） |
+| `config/secrets.yaml` | 機密設定（`.gitignore` 已排除） |
 
 ---
 
 ## 8. 已確認事項（規劃時勿重複提出）
 
-- `config/settings.yaml` 已在 `.gitignore`，token 從未進入 Git
+- `config/secrets.yaml`（及 legacy `settings.yaml`）已在 `.gitignore`，token 從未進入 Git；A5 拆檔後量化參數（`quant_params.yaml`）進版控
 - TWSE/TPEX `verify=False`：刻意設計（Windows 憑證問題）
 - `src/notification/line_notify.py`：歷史遺留檔名，實為 Discord Webhook，不需重命名
 - `datetime.utcnow()` DeprecationWarning：SQLAlchemy schema default，低優先級不影響功能

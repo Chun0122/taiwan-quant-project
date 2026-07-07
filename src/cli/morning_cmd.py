@@ -808,6 +808,53 @@ def _sync_full_market() -> None:
     )
 
 
+def _sync_rotation_dividends() -> None:
+    """補抓 rotation 持倉 + pending 標的的股利資料（A3：除息入帳的資料前提）。
+
+    dividend 表原僅隨 watchlist 逐股同步；rotation 標的來自全市場 discover，
+    除息日入帳需要當日除息事件已在庫。標的數少（active 組合持倉 + 待成交），
+    逐股 FinMind 補抓成本可控（~20 檔 × 0.5s，7 天內抓過者跳過）。
+    """
+    from sqlalchemy import select
+
+    from src.data.database import get_session
+    from src.data.pipeline import sync_dividends_for_stocks
+    from src.data.schema import RotationPendingOrder, RotationPortfolio, RotationPosition
+
+    with get_session() as session:
+        actives = session.execute(
+            select(RotationPortfolio.id, RotationPortfolio.name).where(RotationPortfolio.status == "active")
+        ).all()
+        active_ids = [r[0] for r in actives]
+        active_names = [r[1] for r in actives]
+        if not active_ids:
+            print("  無 active rotation 組合，跳過")
+            return
+        pos_sids = {
+            r[0]
+            for r in session.execute(
+                select(RotationPosition.stock_id).where(
+                    RotationPosition.portfolio_id.in_(active_ids), RotationPosition.status == "open"
+                )
+            )
+        }
+        pending_sids = {
+            r[0]
+            for r in session.execute(
+                select(RotationPendingOrder.stock_id).where(
+                    RotationPendingOrder.portfolio_name.in_(active_names),
+                    RotationPendingOrder.status == "pending",
+                )
+            )
+        }
+    sids = sorted(pos_sids | pending_sids)
+    if not sids:
+        print("  無持倉/pending 標的，跳過")
+        return
+    n = sync_dividends_for_stocks(sids)
+    print(f"  股利補抓：{len(sids)} 檔標的，寫入 {n} 筆")
+
+
 def _verify_data_freshness(today_str: str) -> dict:
     """驗證關鍵資料表的新鮮度（sync 完成後、discover 前執行）。
 
@@ -954,6 +1001,7 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
       Step 9b sync-broker         補抓 discover 候選股分點資料（使用今日 DiscoveryRecord）
       Step 10 alert-check         MOPS 重大事件警報（近3日）
       Step 11 watch update-status 批次更新持倉止損/止利/過期狀態
+      Step 11b sync-dividends     補抓 rotation 持倉/pending 標的股利（除息入帳前提，A3）
       Step 12 rotation update     輪動組合每日更新（所有 active portfolio）
       Step 13 revenue-scan        高成長掃描（YoY≥10%，Top 5）
       Step 14 anomaly-scan        籌碼異動掃描
@@ -1246,6 +1294,12 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             lambda: cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False)),
         ),
         (11, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
+        (
+            "11b",
+            "補抓 rotation 標的股利資料（除息入帳前提，A3）",
+            {"dry_run", "skip_sync"},
+            _sync_rotation_dividends,
+        ),
         (12, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all(regime=regime_now)),
         (
             13,

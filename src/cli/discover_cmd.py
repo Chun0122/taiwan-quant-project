@@ -574,14 +574,18 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
 
 def _save_discovery_records(result, mode: str, scanner) -> None:
     """將 discover 推薦結果存入 DB（供歷史追蹤用）。"""
+    from src.config import settings
     from src.data.database import get_session
     from src.data.schema import DiscoveryRecord
+    from src.provenance import current_provenance
 
     if result.rankings.empty:
         return
 
     regime = getattr(scanner, "regime", "sideways")
     scan_date = result.scan_date
+    # A5 決策可重放：本次 run 的版本戳，蓋章到每一筆記錄
+    git_commit, settings_hash = current_provenance(settings)
 
     records = []
     for _, row in result.rankings.iterrows():
@@ -615,6 +619,8 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
                 else None,
                 daytrade_tags=str(row.get("daytrade_tags", "")) or None,
                 chip_tier_change=str(row.get("chip_tier_change", "")) or None,
+                git_commit=git_commit,
+                settings_hash=settings_hash,
             )
         )
 

@@ -1,14 +1,17 @@
 """RotationActionLog 落庫 + export today_actions 測試（v4 — 「今天各 Rotation 做了什麼」）。
 
+A2 T+1（2026-07-06）後 update() = fill_pending + decide 兩段式：
+決策日 buy/sell 寫 pending_buy/pending_sell（明日預定），成交日才寫 open/close。
+
 涵蓋：
-  AL-A  update() cold start → 3 筆 open 落庫
+  AL-A  update() cold start → 3 筆 pending_buy 落庫（明日預定買入）
   AL-B  dry_run=True 不寫 action log
   AL-C  同日重跑冪等（delete-then-insert，不重複）
-  AL-D  stop_loss 平倉 → action_type=close, is_risk_exit=True
-  AL-E  同日非風控賣出 + 買入 → switch_group 標記（換股）
-  AL-F  drawdown 熔斷 → max_drawdown_liquidation 落庫且 is_risk_exit=True
+  AL-D  stop_loss 觸發 → action_type=pending_sell, is_risk_exit=True
+  AL-E  同日非風控預定賣出 + 預定買入 → switch_group 標記（換股）
+  AL-F  drawdown 熔斷 → 即時清倉 close 落庫且 is_risk_exit=True（不走 T+1）
   AL-G  _serialize_action_log_row 純序列化欄位
-  AL-H  _build_today_actions 依日期撈 + 排序（open→close→renew→hold）
+  AL-H  _build_today_actions 依日期撈 + 排序（open→close→pending→renew→hold）
   AL-I  _build_rotations 帶出 today_actions
 """
 
@@ -143,7 +146,7 @@ def _log_rows(session, name="al_test"):
 
 
 class TestUpdateWritesActionLog:
-    def test_cold_start_writes_three_opens(self, patch_session):
+    def test_cold_start_writes_three_pending_buys(self, patch_session):
         today = date(2026, 6, 1)
         _seed_universe(patch_session, today)
         _make_portfolio(patch_session)
@@ -151,13 +154,15 @@ class TestUpdateWritesActionLog:
         RotationManager("al_test").update(today=today, regime="bull")
 
         rows = _log_rows(patch_session)
-        opens = [r for r in rows if r.action_type == "open"]
-        assert len(opens) == 3
-        assert {r.stock_id for r in opens} == {"2330", "2317", "2454"}
-        assert all(r.action_date == today for r in opens)
-        assert all(r.reason is None and r.is_risk_exit is False for r in opens)
+        pending = [r for r in rows if r.action_type == "pending_buy"]
+        assert len(pending) == 3, "T+1：決策日寫 pending_buy，成交日才寫 open"
+        assert {r.stock_id for r in pending} == {"2330", "2317", "2454"}
+        assert all(r.action_date == today for r in pending)
+        assert all(r.reason is None and r.is_risk_exit is False for r in pending)
         # cold start 無賣出 → 非換股日，switch_group 全為 None
-        assert all(r.switch_group is None for r in opens)
+        assert all(r.switch_group is None for r in pending)
+        # 決策日不產生 open（明日 fill 才有）
+        assert not any(r.action_type == "open" for r in rows)
 
     def test_dry_run_writes_nothing(self, patch_session):
         today = date(2026, 6, 1)
@@ -179,7 +184,7 @@ class TestUpdateWritesActionLog:
         mgr.update(today=today, regime="bull")
         second = len(_log_rows(patch_session))
 
-        assert first == second == 3, "同日重跑應覆寫而非累加"
+        assert first == second == 3, "同日重跑應被 guard 短路，不累加"
 
     def test_stop_loss_marks_risk_exit(self, patch_session):
         today = date(2026, 6, 1)
@@ -191,9 +196,9 @@ class TestUpdateWritesActionLog:
         RotationManager("al_test").update(today=today, regime="bull")
 
         rows = _log_rows(patch_session)
-        closes = [r for r in rows if r.action_type == "close"]
-        assert len(closes) == 1
-        c = closes[0]
+        sells = [r for r in rows if r.action_type == "pending_sell"]
+        assert len(sells) == 1
+        c = sells[0]
         assert c.stock_id == "1111"
         assert c.reason == "stop_loss"
         assert c.is_risk_exit is True
@@ -209,13 +214,13 @@ class TestUpdateWritesActionLog:
         RotationManager("al_test").update(today=today, regime="bull")
 
         rows = _log_rows(patch_session)
-        close = next(r for r in rows if r.action_type == "close")
-        opens = [r for r in rows if r.action_type == "open"]
-        assert close.reason == "holding_expired"
-        assert close.is_risk_exit is False
-        # 同日非風控賣出 + 買入 → 同一 switch_group
-        assert close.switch_group is not None
-        assert opens and all(o.switch_group == close.switch_group for o in opens)
+        sell = next(r for r in rows if r.action_type == "pending_sell")
+        buys = [r for r in rows if r.action_type == "pending_buy"]
+        assert sell.reason == "holding_expired"
+        assert sell.is_risk_exit is False
+        # 同日非風控預定賣出 + 預定買入 → 同一 switch_group
+        assert sell.switch_group is not None
+        assert buys and all(b.switch_group == sell.switch_group for b in buys)
 
     def test_drawdown_liquidation_logged_as_risk_exit(self, patch_session, monkeypatch):
         today = date(2026, 6, 1)
@@ -307,7 +312,7 @@ class TestSerializeAndExport:
         block = rots[0]
         assert "today_actions" in block
         assert len(block["today_actions"]) == 3
-        assert all(a["action_type"] == "open" for a in block["today_actions"])
+        assert all(a["action_type"] == "pending_buy" for a in block["today_actions"])
 
     def test_build_rotations_empty_actions_when_none(self, patch_session):
         today = date(2026, 6, 1)
@@ -392,10 +397,10 @@ class TestUpdateEntryGuard:
         first = mgr.update(today=today, regime="bull")
         assert first is not None and len(first.to_sell) == 1
 
-        # 熔斷後組合 status="liquidated"，第二次會先被 status 檢查擋掉；
-        # 這裡強制改回 active 以驗證 guard 本身（僅 ActionLog、無 snapshot 的情境）
-        p.status = "active"
-        patch_session.commit()
-
+        # A2 T+1 後熔斷日防重跑由 status="liquidated" 承擔（decide/fill 皆先檢查 status）
+        assert p.status == "liquidated"
         second = mgr.update(today=today, regime="bull")
-        assert second is None, "熔斷日（無 snapshot）第二次 update 仍應被 ActionLog guard 攔住"
+        assert second is None, "熔斷日第二次 update 應被 status=liquidated 擋下"
+        # 持倉維持已平倉，不會二次交易
+        closed = patch_session.execute(select(RotationPosition)).scalars().all()
+        assert all(pos.status == "closed" for pos in closed)

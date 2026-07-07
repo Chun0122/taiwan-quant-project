@@ -2,7 +2,9 @@
 
 最簡版（v1）只做兩件事：
   1. git_commit：抓最近 N 天的 commits，主旨開頭為 feat/fix/refactor 範圍才算
-  2. settings_diff：偵測這些 commits 中 config/settings.yaml 的變動
+  2. settings_diff：偵測這些 commits 中 config/quant_params.yaml 的變動
+     （A5 拆檔後量化參數進版控，本功能自此有 git 歷史可查；
+      拆檔前指向 gitignored 的 settings.yaml，永遠回空）
 
 之後可擴充 ic_auto_adjust / kill_switch（v2）。
 """
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 # 主旨開頭過濾（避免 commit message lint / docs / chore 雜訊）
 _INCLUDED_PREFIX = re.compile(r"^(feat|fix|refactor|perf)(\(|:|\!)", re.IGNORECASE)
 
-_SETTINGS_FILE = "config/settings.yaml"
+_SETTINGS_FILE = "config/quant_params.yaml"
 
 
 @dataclass
@@ -104,9 +106,9 @@ def _collect_git_commits(repo_root: Path, since: date) -> list[StrategyEvent]:
 
 
 def _collect_settings_diffs(repo_root: Path, since: date) -> list[StrategyEvent]:
-    """抓 since 至今 config/settings.yaml 有變動的 commits 摘要。
+    """抓 since 至今 config/quant_params.yaml 有變動的 commits 摘要。
 
-    僅標記「該 commit 動到 settings.yaml」，不解析具體欄位 diff（v1 簡化）。
+    僅標記「該 commit 動到量化參數檔」，不解析具體欄位 diff（v1 簡化）。
     """
     events: list[StrategyEvent] = []
     settings_path = repo_root / _SETTINGS_FILE
@@ -144,7 +146,7 @@ def _collect_settings_diffs(repo_root: Path, since: date) -> list[StrategyEvent]
             StrategyEvent(
                 date=commit_date,
                 type="settings_diff",
-                summary=f"config/settings.yaml 變動：{subject.strip()}",
+                summary=f"{_SETTINGS_FILE} 變動：{subject.strip()}",
                 ref=sha.strip(),
                 details={"file": _SETTINGS_FILE},
                 _sort_ts=ts_iso,
