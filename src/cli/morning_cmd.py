@@ -847,12 +847,12 @@ def _sync_rotation_dividends() -> None:
                 )
             )
         }
-    sids = sorted(pos_sids | pending_sids)
-    if not sids:
-        print("  無持倉/pending 標的，跳過")
-        return
+    from src.portfolio.market_data import SNAPSHOT_BENCHMARK_STOCK_ID
+
+    # benchmark 0050 一併補抓（A3-4 total return 還原的資料前提）
+    sids = sorted(pos_sids | pending_sids | {SNAPSHOT_BENCHMARK_STOCK_ID})
     n = sync_dividends_for_stocks(sids)
-    print(f"  股利補抓：{len(sids)} 檔標的，寫入 {n} 筆")
+    print(f"  股利補抓：{len(sids)} 檔標的（含 benchmark 0050），寫入 {n} 筆")
 
 
 def _verify_data_freshness(today_str: str) -> dict:

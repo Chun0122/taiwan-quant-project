@@ -215,3 +215,25 @@ def _get_benchmark_close_on_or_before(session, target_date: date, lookback_days:
     )
     row = session.execute(stmt).first()
     return float(row[0]) if row else None
+
+
+def _get_benchmark_dividends_between(session, start_exclusive: date, end_inclusive: date) -> float:
+    """0050 每股現金股利在 (start_exclusive, end_inclusive] 窗口的加總（A3-4）。
+
+    供 total return benchmark 加法式還原：cum return =
+    (close + Σ現金股利 − base_close) / base_close。0050 為 ETF 無股票股利，
+    僅加總 cash_dividend；dividend 表未同步 0050 時回 0.0（退化為
+    price return，與 morning Step 11b 的 0050 股利補抓搭配消除）。
+    """
+    if start_exclusive >= end_inclusive:
+        return 0.0
+    from src.data.schema import Dividend
+
+    total = session.execute(
+        select(func.coalesce(func.sum(Dividend.cash_dividend), 0.0)).where(
+            Dividend.stock_id == SNAPSHOT_BENCHMARK_STOCK_ID,
+            Dividend.date > start_exclusive,
+            Dividend.date <= end_inclusive,
+        )
+    ).scalar_one()
+    return float(total or 0.0)

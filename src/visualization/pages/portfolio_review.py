@@ -66,11 +66,11 @@ def _render_rotation_alpha_section(lookback_days: int = 90) -> None:
                 name=name,
             )
         )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="0050 基準")
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="0050 基準（含息）")
     fig.update_layout(
         height=380,
         xaxis_title="日期",
-        yaxis_title="累積 Alpha vs 0050 (%)",
+        yaxis_title="累積 Alpha vs 0050 含息 (%)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=20, r=20, t=40, b=20),
     )
@@ -83,6 +83,7 @@ def render() -> None:
     # ── v3 schema 新增：輪動組合 alpha vs 0050 走勢 ─────────────────────
     with st.container(border=True):
         st.subheader("📈 輪動組合 vs 0050 Alpha 走勢")
+        st.caption("benchmark 為 0050 total return（A3-4 起現金股利加法還原，除息缺口不再灌水 alpha）")
         _render_rotation_alpha_section(lookback_days=90)
     st.divider()
 
