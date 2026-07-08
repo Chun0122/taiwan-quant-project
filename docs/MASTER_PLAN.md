@@ -99,7 +99,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 外部介面 | TWSE/TPEX `verify=False` 刻意；MOPS 備援站、DJ Big5 regex——脆弱面，改版風險常在 | 常態，靠對帳+告警圍堵 |
 | API 速率 | FinMind 0.5s、TWSE/TPEX 3s——morning-routine 時長的硬下限 | 常態 |
 | 交易階段 | Paper only；**實盤須過 §9 六條 Gate** | Gate 通過 |
-| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）：新數字（T+1 成交 + 股利入帳 + total return benchmark）起可裁決；R1 歷史裁決重審可啟動 | 已解除 |
+| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）；**R1 歷史裁決重審 ✅2026-07-08 完成**（`logs/r1_20260708/REPORT.md`）：6/20 全部裁決無翻案；副產物=修復 FinMind year=NaN 股利斷流 bug；swing5_3d 升級暫停候選（7/18 終裁） | 已解除 |
 | 已死資料欄 | TW_VIX（FinMind 移除）、SBL sbl_change 三欄恆 NULL、DJ 分點無均價（close 代理） | 各自替代方案落地 |
 
 ---
@@ -191,7 +191,7 @@ Broker 層 + 對帳 → 風險引擎 → RotationContext → 停損現實化 →
 實盤校準（滑價實測 vs 模型）→ 資金階梯（每季檢視）→ 風險引擎獲 pre-trade 否決權 → B8/B9/C3 → 事件溯源級重放。**Institutional grade 指紀律，不是拓撲**：依然一個 repo、一台主機、SQLite。
 
 ### 研究議程（平台解鎖後，按序）
-R1 歷史裁決重審（A2+A3 後，2026-07-07 起可啟動）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
+R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPORT.md`）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
 
 ---
 
