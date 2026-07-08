@@ -261,13 +261,18 @@ def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
 
 
 def _upsert_dividend(df: pd.DataFrame) -> int:
-    """將股利 DataFrame 寫入 dividend 表。"""
+    """將股利 DataFrame 寫入 dividend 表。
+
+    R1 重審發現（2026-07-08）：FinMind 新資料的 year 欄一律 NaN，舊版
+    `dropna(subset=["year"])` 會把**全部**新股利列丟棄 → Step 11b 每日執行
+    但寫入恆為 0，A3 除息入帳自上線起實際斷流（dividend 表停在 2026-01-28）。
+    year 僅為屬性欄（dedup key 是 stock_id+date），改以 date 年份回填。
+    """
     if df.empty:
         return 0
-    # 移除 year 為 NaN 的行（year 是 nullable=False，不能為空）
-    df = df.dropna(subset=["year"])
-    if df.empty:
-        return 0
+    # year 是 nullable=False：NaN 以 date 年份回填（勿丟行——FinMind 新資料 year 恆 NaN）
+    df = df.copy()
+    df["year"] = df["year"].fillna(df["date"].astype(str).str[:4])
     return _upsert_batch(Dividend, df, ["stock_id", "date"])
 
 
