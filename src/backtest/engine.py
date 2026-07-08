@@ -13,6 +13,7 @@ from src.backtest.metrics import compute_metrics
 from src.constants import (
     COMMISSION_RATE,
     LIMIT_DETECT_THRESHOLD,
+    PARTICIPATION_IMPACT_COEFF,
     REGIME_POSITION_MULTIPLIERS,
     SELL_SLIPPAGE_MULTIPLIER,
     SLIPPAGE_IMPACT_COEFF,
@@ -42,6 +43,9 @@ class BacktestConfig:
     liquidity_limit: float | None = None  # 流動性約束（單筆 ≤ 當日量 × 此比例，None=不限制）
     signal_delay: int = 1  # 訊號延遲（1=T+1 執行，消除 look-ahead bias；0=同日執行，僅供向後相容）
     limit_price_check: bool = False  # 啟用漲跌停模擬（漲停跳過買入，跌停以跌停價賣出）
+    # A4 交易現實化（引擎預設關以維持向後相容；`backtest` CLI 預設開）
+    min_commission: bool = False  # 混合單手續費：整張/零股單各計最低手續費 20/1 元 + 零股滑價 premium
+    participation_impact: bool = False  # 滑價加下單量衝擊項 c×√(order/volume)（與 dynamic_slippage 獨立）
 
 
 @dataclass
@@ -240,16 +244,16 @@ class BacktestEngine:
             if risk_exit and position > 0:
                 daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
                 sell_price = raw_close * (
-                    1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                    1
+                    - self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell", order_shares=position)
                 )
                 # 跌停日以跌停價成交（更差的價格）
                 if is_limit_down and prev_raw_close is not None:
                     limit_down_price = prev_raw_close * (1 - LIMIT_DETECT_THRESHOLD)
                     sell_price = min(sell_price, limit_down_price)
                 revenue = position * sell_price
-                commission = revenue * self.config.commission_rate
-                tax = revenue * self.config.tax_rate
-                net_revenue = revenue - commission - tax
+                commission, tax, odd_premium = self._trade_costs(sell_price, position, side="sell")
+                net_revenue = revenue - commission - tax - odd_premium
                 capital += net_revenue
 
                 pnl = net_revenue - position * entry_price
@@ -289,12 +293,13 @@ class BacktestEngine:
                 if partial_shares > 0:
                     tp_sell_price = partial_tp_price  # 以觸發價成交
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                    slip = self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                    slip = self._get_slippage(
+                        daily_volume, raw_high, raw_low, raw_close, side="sell", order_shares=partial_shares
+                    )
                     tp_sell_price = tp_sell_price * (1 - slip)
                     revenue = partial_shares * tp_sell_price
-                    commission = revenue * self.config.commission_rate
-                    tax = revenue * self.config.tax_rate
-                    net_revenue = revenue - commission - tax
+                    commission, tax, odd_premium = self._trade_costs(tp_sell_price, partial_shares, side="sell")
+                    net_revenue = revenue - commission - tax - odd_premium
                     capital += net_revenue
 
                     pnl = net_revenue - partial_shares * entry_price
@@ -326,12 +331,26 @@ class BacktestEngine:
                 # --- 買入 ---
                 if signal == 1 and position == 0 and not is_limit_up:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
-                    slip = self._get_slippage(daily_volume, raw_high, raw_low, raw_close)
+                    # participation impact 下單量以 capital/raw_close 估算（all_in 上界）
+                    slip = self._get_slippage(
+                        daily_volume,
+                        raw_high,
+                        raw_low,
+                        raw_close,
+                        order_shares=(capital / raw_close if raw_close > 0 else None),
+                    )
                     buy_price = raw_close * (1 + slip)
                     shares = self._calculate_shares(capital, buy_price, data, dt, trades)
                     shares = self._apply_liquidity_limit(shares, daily_volume)
+                    # A4 可負擔性收斂：最低手續費為固定成本，比例式預留可能不足
+                    cost = 0.0
+                    while shares > 0:
+                        buy_commission, _, buy_odd_premium = self._trade_costs(buy_price, shares, side="buy")
+                        cost = shares * buy_price + buy_commission + buy_odd_premium
+                        if cost <= capital:
+                            break
+                        shares -= 1
                     if shares > 0:
-                        cost = shares * buy_price + shares * buy_price * self.config.commission_rate
                         capital -= cost
                         position = shares
                         entry_price = buy_price
@@ -368,16 +387,18 @@ class BacktestEngine:
                 elif signal == -1 and position > 0:
                     daily_volume = float(data.loc[dt, "volume"]) if "volume" in data.columns else 0.0
                     sell_price = raw_close * (
-                        1 - self._get_slippage(daily_volume, raw_high, raw_low, raw_close, side="sell")
+                        1
+                        - self._get_slippage(
+                            daily_volume, raw_high, raw_low, raw_close, side="sell", order_shares=position
+                        )
                     )
                     # 跌停日以跌停價成交
                     if is_limit_down and prev_raw_close is not None:
                         limit_down_price = prev_raw_close * (1 - LIMIT_DETECT_THRESHOLD)
                         sell_price = min(sell_price, limit_down_price)
                     revenue = position * sell_price
-                    commission = revenue * self.config.commission_rate
-                    tax = revenue * self.config.tax_rate
-                    net_revenue = revenue - commission - tax
+                    commission, tax, odd_premium = self._trade_costs(sell_price, position, side="sell")
+                    net_revenue = revenue - commission - tax - odd_premium
                     capital += net_revenue
 
                     pnl = net_revenue - position * entry_price
@@ -418,12 +439,11 @@ class BacktestEngine:
             last_low = data.iloc[-1]["raw_low"] if has_raw else data.iloc[-1]["low"]
             last_volume = float(data.iloc[-1]["volume"]) if "volume" in data.columns else 0.0
             sell_price = last_close * (
-                1 - self._get_slippage(last_volume, last_high, last_low, last_close, side="sell")
+                1 - self._get_slippage(last_volume, last_high, last_low, last_close, side="sell", order_shares=position)
             )
             revenue = position * sell_price
-            commission = revenue * self.config.commission_rate
-            tax = revenue * self.config.tax_rate
-            net_revenue = revenue - commission - tax
+            commission, tax, odd_premium = self._trade_costs(sell_price, position, side="sell")
+            net_revenue = revenue - commission - tax - odd_premium
             capital += net_revenue
 
             pnl = net_revenue - position * entry_price
@@ -517,7 +537,13 @@ class BacktestEngine:
     # ------------------------------------------------------------------ #
 
     def _get_slippage(
-        self, volume: float, high: float = 0.0, low: float = 0.0, close: float = 0.0, side: str = "buy"
+        self,
+        volume: float,
+        high: float = 0.0,
+        low: float = 0.0,
+        close: float = 0.0,
+        side: str = "buy",
+        order_shares: float | None = None,
     ) -> float:
         """計算滑價比率。
 
@@ -525,6 +551,8 @@ class BacktestEngine:
           1. 基底滑價 base（0.05%）
           2. 成交量衝擊 k / sqrt(volume) — 低量股懲罰
           3. OHLC spread 估算 (high-low)/close × weight — 隱含 bid-ask spread
+        A4 participation impact（獨立旗標）：加下單量衝擊 c×√(order_shares/volume)，
+        同一檔買越多滑價越高；volume 或 order_shares 缺失時跳過。
         最終取 min(計算值, slippage_max) 防止極端值。
 
         賣出時乘以 sell_slippage_multiplier（預設 1.3），反映恐慌拋售的額外滑價。
@@ -541,9 +569,38 @@ class BacktestEngine:
                 impact = max(impact, spread_proxy)
             base_slip = min(impact, self.config.slippage_max)
 
+        if self.config.participation_impact and order_shares is not None and order_shares > 0 and volume > 0:
+            participation = PARTICIPATION_IMPACT_COEFF * np.sqrt(min(order_shares / volume, 1.0))
+            base_slip = min(base_slip + participation, self.config.slippage_max)
+
         if side == "sell":
             return min(base_slip * self.config.sell_slippage_multiplier, self.config.slippage_max)
         return base_slip
+
+    def _trade_costs(self, price: float, shares: int, side: str = "buy") -> tuple[float, float, float]:
+        """單筆交易的（手續費, 交易稅, 零股滑價 premium）——未捨入。
+
+        min_commission 旗標開啟時走 A4 混合單模型（trade_cost_amounts，與 rotation
+        同源；費率帶入 config 覆蓋值，基底滑價已含在成交價中故 slippage=0，回傳的
+        第三項僅剩零股 premium）；關閉時為舊純比例式（數字與 2026-07 前 bit-for-bit）。
+        """
+        if shares <= 0 or price <= 0:
+            return 0.0, 0.0, 0.0
+        notional = price * shares
+        tax = notional * self.config.tax_rate if side == "sell" else 0.0
+        if not self.config.min_commission:
+            return notional * self.config.commission_rate, tax, 0.0
+        from src.portfolio.rotation import trade_cost_amounts
+
+        commission, tax, odd_premium = trade_cost_amounts(
+            price,
+            shares,
+            0.0,
+            side,
+            commission_rate=self.config.commission_rate,
+            tax_rate=self.config.tax_rate,
+        )
+        return commission, tax, odd_premium
 
     def _apply_liquidity_limit(self, shares: int, daily_volume: float) -> int:
         """流動性約束：限制單筆交易量不超過當日成交量的指定比例。"""

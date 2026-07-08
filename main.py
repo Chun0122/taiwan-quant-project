@@ -202,6 +202,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp_bt.add_argument(
         "--adjust-dividend", action="store_true", default=False, help="啟用除權息還原（回溯調整價格 + 股利入帳）"
     )
+    # A4 交易現實化（2026-07-07）：單股回測 CLI 預設開啟，--no-* 可關（引擎預設關以維持向後相容）
+    sp_bt.add_argument(
+        "--min-commission",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="混合單手續費模型：整張/零股單各計最低手續費 20/1 元 + 零股滑價 premium（僅單股回測；預設啟用）",
+    )
+    sp_bt.add_argument(
+        "--participation-impact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="滑價加下單量衝擊項 c×√(下單股數/當日量)（僅單股回測；預設啟用）",
+    )
     sp_bt.add_argument("--attribution", action="store_true", default=False, help="回測結束後計算五因子歸因分析")
     sp_bt.add_argument("--export-trades", default=None, help="匯出交易明細 CSV 路徑")
     sp_bt.add_argument("--shap", action="store_true", default=False, help="ML 策略回測時輸出 SHAP 特徵重要性 Top-10")

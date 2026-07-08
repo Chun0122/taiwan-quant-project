@@ -301,6 +301,12 @@ python main.py backtest --stock 2330 --strategy sma_cross --attribution
 
 # 匯出交易明細 CSV（含持倉天數、出場原因、止損/目標價）
 python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades.csv
+
+# A4 交易現實化（2026-07-08 起單股回測預設開啟）：
+#   最低手續費（混合單：整張單 20 元 / 盤中零股單 1 元，零股部分加 0.1% 滑價 premium）
+#   participation impact（滑價隨下單量增加：c×√(下單股數/當日量)）
+# 需要舊行為可單獨關閉：
+python main.py backtest --stock 2330 --strategy sma_cross --no-min-commission --no-participation-impact
 ```
 
 可用策略：

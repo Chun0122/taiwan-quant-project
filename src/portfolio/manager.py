@@ -799,7 +799,12 @@ class RotationManager:
                 exit_price = ohlcv.get("open") or order.ref_price
                 sell_slip = (
                     compute_dynamic_slippage(
-                        ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), exit_price, side="sell"
+                        ohlcv.get("volume", 0),
+                        ohlcv.get("high", 0),
+                        ohlcv.get("low", 0),
+                        exit_price,
+                        side="sell",
+                        order_shares=order.shares,
                     )
                     if ohlcv
                     else SLIPPAGE_RATE
@@ -850,12 +855,19 @@ class RotationManager:
                         deferred += 1
                     continue
 
-                buy_slip = compute_dynamic_slippage(
-                    ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), open_price, side="buy"
-                )
                 # 股數以決策時分配資金對 open 重算（與 backtest 同式）；
                 # 舊單無 allocated_capital 時以 ref_price × 規劃股數近似
                 alloc = order.allocated_capital or (order.ref_price * order.shares)
+                # A4 participation impact：下單量以 alloc/open 一次估算（與最終股數的
+                # 差僅來自費率項，對滑價為二階誤差）
+                buy_slip = compute_dynamic_slippage(
+                    ohlcv.get("volume", 0),
+                    ohlcv.get("high", 0),
+                    ohlcv.get("low", 0),
+                    open_price,
+                    side="buy",
+                    order_shares=(alloc / open_price if open_price > 0 else None),
+                )
                 shares = compute_shares(
                     alloc,
                     open_price,
@@ -1837,7 +1849,12 @@ class RotationManager:
 
                     if dynamic_slippage:
                         sell_slip = compute_dynamic_slippage(
-                            ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), exit_price, side="sell"
+                            ohlcv.get("volume", 0),
+                            ohlcv.get("high", 0),
+                            ohlcv.get("low", 0),
+                            exit_price,
+                            side="sell",
+                            order_shares=shares,
                         )
                     else:
                         sell_slip = SLIPPAGE_RATE
@@ -1918,8 +1935,14 @@ class RotationManager:
                                 continue
 
                     if dynamic_slippage:
+                        # A4 participation impact：下單量以 alloc/price 一次估算
                         buy_slip = compute_dynamic_slippage(
-                            ohlcv.get("volume", 0), ohlcv.get("high", 0), ohlcv.get("low", 0), price, side="buy"
+                            ohlcv.get("volume", 0),
+                            ohlcv.get("high", 0),
+                            ohlcv.get("low", 0),
+                            price,
+                            side="buy",
+                            order_shares=(alloc / price if price > 0 else None),
                         )
                     else:
                         buy_slip = SLIPPAGE_RATE
@@ -2252,6 +2275,7 @@ class RotationManager:
                             ohlcv.get("low", 0),
                             exit_p,
                             side="sell",
+                            order_shares=pos["shares"],
                         )
                     else:
                         sell_slip = SLIPPAGE_RATE

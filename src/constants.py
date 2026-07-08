@@ -6,6 +6,15 @@ from __future__ import annotations
 COMMISSION_RATE = 0.001425  # 手續費 0.1425%
 TAX_RATE = 0.003  # 交易稅 0.3%（賣出時）
 SLIPPAGE_RATE = 0.0005  # 滑價 0.05%
+
+# ── A4 交易現實化：混合單成本模型 ─────────────────────────────────────
+# 每筆委託拆成「整張單（一般市場）+ 盤中零股單」兩筆，各自計最低手續費；
+# 股數計算不整張化（sizing 不變），僅成本模型反映兩個市場的現實。
+LOT_SIZE = 1000  # 台股一張 = 1000 股
+MIN_COMMISSION_LOT = 20.0  # 整股單最低手續費（元/筆）
+MIN_COMMISSION_ODD = 1.0  # 盤中零股單最低手續費（元/筆，券商電子下單實況）
+ODD_LOT_SLIPPAGE_PREMIUM = 0.001  # 零股部分額外滑價 0.1%（盤中零股 spread 較寬、集合競價撮合）
+PARTICIPATION_IMPACT_COEFF = 0.01  # 下單量衝擊係數 c：impact = c×√(order_shares/volume)；5% 參與率時 ≈ +0.22%
 SLIPPAGE_IMPACT_COEFF = 0.5  # 動態滑價衝擊係數 k（slippage = base + k / sqrt(volume)）
 SLIPPAGE_MAX_PCT = 0.01  # 滑價上限 1%（防止低流動性股票滑價爆炸）
 SLIPPAGE_SPREAD_WEIGHT = 0.5  # OHLC spread 估算權重（spread proxy = (high-low)/close × weight）

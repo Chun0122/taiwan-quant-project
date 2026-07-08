@@ -121,6 +121,10 @@ python main.py ablation-test --mode momentum --skip-sync --export ablation.csv
 python main.py backtest --stock 2330 --strategy sma_cross
 python main.py backtest --stock 2330 --strategy sma_cross --attribution
 python main.py backtest --stock 2330 --strategy sma_cross --export-trades trades.csv
+
+# A4 交易現實化旗標（單股回測預設開啟；報告 header 印成本假設）
+python main.py backtest --stock 2330 --strategy sma_cross --no-min-commission      # 關閉最低手續費（整張 20 / 零股 1 元 + 零股滑價 premium）
+python main.py backtest --stock 2330 --strategy sma_cross --no-participation-impact  # 關閉下單量滑價衝擊項
 ```
 
 ---
