@@ -1,7 +1,7 @@
 {
   "metadata": {
-    "created_at": "2026-06-20 10:47:38",
-    "git_commit": "dace4a3",
+    "created_at": "2026-07-08 19:42:39",
+    "git_commit": "24272f2",
     "tolerance_deltas": {
       "sharpe_ratio": 0.2,
       "max_drawdown_pct": 2.0,
@@ -12,30 +12,39 @@
   "portfolios": {
     "mom5_10d": {
       "portfolio_name": "mom5_10d",
-      "as_of": "2026-06-20",
-      "snapshot_count": 28,
-      "sharpe_ratio": 5.5676,
+      "as_of": "2026-07-08",
+      "snapshot_count": 39,
+      "sharpe_ratio": 4.1104,
       "max_drawdown_pct": 5.43,
-      "win_rate_pct": 62.96,
-      "alpha_cum_pct": 0.064997
+      "win_rate_pct": 57.89,
+      "alpha_cum_pct": 0.042906
     },
     "swing5_3d": {
       "portfolio_name": "swing5_3d",
-      "as_of": "2026-06-20",
-      "snapshot_count": 31,
-      "sharpe_ratio": 4.8826,
+      "as_of": "2026-07-08",
+      "snapshot_count": 42,
+      "sharpe_ratio": 3.8513,
       "max_drawdown_pct": 9.21,
-      "win_rate_pct": 56.67,
-      "alpha_cum_pct": 0.113428
+      "win_rate_pct": 56.1,
+      "alpha_cum_pct": 0.116398
     },
     "mom3_20d": {
       "portfolio_name": "mom3_20d",
-      "as_of": "2026-06-20",
-      "snapshot_count": 31,
-      "sharpe_ratio": 1.6141,
+      "as_of": "2026-07-08",
+      "snapshot_count": 42,
+      "sharpe_ratio": 1.3309,
       "max_drawdown_pct": 13.98,
-      "win_rate_pct": 56.67,
-      "alpha_cum_pct": 0.005969
+      "win_rate_pct": 53.66,
+      "alpha_cum_pct": -0.007355
+    },
+    "mg5_20d": {
+      "portfolio_name": "mg5_20d",
+      "as_of": "2026-07-08",
+      "snapshot_count": 11,
+      "sharpe_ratio": 0.2392,
+      "max_drawdown_pct": 10.61,
+      "win_rate_pct": 40.0,
+      "alpha_cum_pct": 0.046772
     }
   }
 }
