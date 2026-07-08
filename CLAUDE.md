@@ -18,7 +18,7 @@
 | **DB 寫入** | `_upsert_batch()`，batch_size=80（SQLite 變數上限） |
 | **API 速率** | FinMind 0.5 秒/次；TWSE/TPEX 3 秒/次 |
 | **日期格式** | FinMind `YYYY-MM-DD`；TWSE `YYYYMMDD`；TPEX 民國曆 `YYY/MM/DD`（年 = 西元 - 1911） |
-| **回測成本** | 手續費 0.1425%、交易稅 0.3%（賣出）、滑價 0.05% |
+| **回測成本** | 手續費 0.1425%（A4 混合單：整張/零股單各計最低 20/1 元）、交易稅 0.3%（賣出）、滑價 0.05%（零股部分 +0.1% premium）；成本 SSOT = `rotation.trade_cost_amounts` |
 | **Session** | `with get_session() as session:`；批次寫入 `sqlite_upsert().on_conflict_do_nothing()` |
 | **常數** | 全系統共用常數集中於 `src/constants.py`，勿在各模組硬編碼 |
 | **設定** | `config/quant_params.yaml`（量化參數，**進版控**）+ `config/secrets.yaml`（機密，gitignored）→ `src/config.py` deep-merge 載入（A5 拆檔；legacy `settings.yaml` 存在時照舊+警告）；機密勿寫入 quant_params |
@@ -105,7 +105,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR） |
 | `portfolio/manager.py` | RotationManager：每日更新（A2 T+1 兩段式：`decide`/`fill_pending`/`update` wrapper + `_build_decision_context` 共用組裝）/ Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`/`t1_execution`/`save_result`，僅回測用、live 不受影響）。A3 股利會計：live `fill_pending` 開頭與 backtest 迴圈頂端同構呼叫除息處理（現金入帳 + 停損調整，ActionLog `dividend` 型為冪等標記） |
 | `portfolio/dividends.py` | 股利會計純函數（A3）：`load_dividend_events` / `dividend_adjustment_factor`（與 Strategy Layer 1 同式）/ `adjust_stop_loss_for_dividend` / `dividend_cash_for_position`；入帳時點=`Dividend.date`（除息日）；配股第一版僅調停損不調股數 |
-| `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；股數定價/滑價/流動性/漲跌停留各 caller |
+| `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；A4 起金額由 `rotation.trade_cost_amounts`（混合單成本 SSOT）導出；股數定價/滑價/流動性/漲跌停留各 caller |
 | `portfolio/rankings.py` | 排名解析（resolve_rankings / _resolve_composite_rankings / 進場理由 breakdown），manager.py 抽出。**Composite mode**（`constants.COMPOSITE_MODES` + `is_composite_mode`）：'all'（五模式）與 'mom_growth'（動量+成長雙引擎，2026-06-20 取代結構性失敗的 'all'）共用 avg-score + per_mode_max 配額 resolver |
 | `portfolio/market_data.py` | 市場資料查詢（交易日曆 / 收盤價 / OHLCV / TAIEX / 0050 benchmark + `_get_benchmark_dividends_between` 股利窗口加總），manager.py 抽出 |
 | `portfolio/metrics.py` | 純計算指標（compute_cost_metrics / compute_benchmark_alpha_fields——A3-4 起支援 0050 total return 加法還原，`div_since_prev/base` 參數），manager.py 抽出 |
@@ -142,7 +142,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
 | **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日、風控賣單停牌以 ref_price 成交不凍結 |
-| **動態滑價** | 三因子模型（`compute_dynamic_slippage`）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
+| **動態滑價** | 三因子模型 + A4 participation impact（`compute_dynamic_slippage`，傳 `order_shares` 時加 c×√(下單量/當日量)）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
+| **A4 交易現實化** | 混合單成本模型（2026-07-08）：委託拆整張單+盤中零股單，各計最低手續費 20/1 元、零股 notional 加 0.1% 滑價 premium；**股數計算不整張化**（sizing 不變，僅成本真實化）。成本 SSOT=`rotation.trade_cost_amounts`（未捨入），rotation live+backtest 恆開；BacktestEngine 走 `BacktestConfig.min_commission`/`participation_impact` 旗標（引擎預設關、`backtest` CLI 預設開，`--no-*` 可關） |
 
 ---
 

@@ -77,6 +77,26 @@ class TestParserSmoke:
         args = build_parser().parse_args([])
         assert args.command is None
 
+    def test_backtest_a4_flags(self):
+        """A4 交易現實化旗標：預設開、--no-* 可關。"""
+        parser = build_parser()
+        args = parser.parse_args(["backtest", "--stock", "2330", "--strategy", "sma_cross"])
+        assert args.min_commission is True
+        assert args.participation_impact is True
+        args = parser.parse_args(
+            [
+                "backtest",
+                "--stock",
+                "2330",
+                "--strategy",
+                "sma_cross",
+                "--no-min-commission",
+                "--no-participation-impact",
+            ]
+        )
+        assert args.min_commission is False
+        assert args.participation_impact is False
+
 
 # ====================================================================== #
 # Handler 層 smoke：sync-concepts --from-mops（title→subject 回歸測試）

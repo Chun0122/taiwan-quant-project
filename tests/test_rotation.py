@@ -39,6 +39,7 @@ from src.portfolio.rotation import (
     detect_limit_price,
     find_high_correlation_pairs,
     get_trading_dates_from_prices,
+    trade_cost_amounts,
 )
 
 # ---------------------------------------------------------------------------
@@ -168,8 +169,13 @@ class TestComputeShares:
     def test_basic(self):
         shares = compute_shares(100000, 100.0)
         effective_price = 100 * (1 + COMMISSION_RATE + SLIPPAGE_RATE)
-        expected = int(100000 / effective_price)
-        assert shares == expected
+        # A4 可負擔性收斂：998 股（比例式反推）含零股 premium 後買不起 → 997
+        assert shares <= int(100000 / effective_price)
+        # 真實成本下必買得起，且再多一股就買不起（無過度縮減）
+        c, t, s = trade_cost_amounts(100.0, shares, SLIPPAGE_RATE, side="buy")
+        assert 100.0 * shares + c + t + s <= 100000
+        c2, t2, s2 = trade_cost_amounts(100.0, shares + 1, SLIPPAGE_RATE, side="buy")
+        assert 100.0 * (shares + 1) + c2 + t2 + s2 > 100000
 
     def test_zero_price(self):
         assert compute_shares(100000, 0) == 0
@@ -1966,17 +1972,21 @@ class TestPositionPnlSlippageParams:
 class TestComputeSharesEnhanced:
     """測試 compute_shares() 新增流動性約束參數。"""
 
-    def test_default_same_as_before(self):
-        """不帶新參數時行為不變。"""
+    def test_default_affordable(self):
+        """預設參數：比例式反推後經 A4 可負擔性收斂（≤ 舊值、真實成本買得起）。"""
         shares = compute_shares(100_000, 100)
-        expected = int(100_000 / (100 * (1 + COMMISSION_RATE + SLIPPAGE_RATE)))
-        assert shares == expected
+        upper = int(100_000 / (100 * (1 + COMMISSION_RATE + SLIPPAGE_RATE)))
+        assert 0 < shares <= upper
+        c, t, s = trade_cost_amounts(100, shares, SLIPPAGE_RATE, side="buy")
+        assert 100 * shares + c + t + s <= 100_000
 
     def test_with_slippage_override(self):
-        """自訂滑價。"""
+        """自訂滑價：以該滑價反推 + 可負擔性收斂。"""
         shares = compute_shares(100_000, 100, slippage=0.01)
-        expected = int(100_000 / (100 * (1 + COMMISSION_RATE + 0.01)))
-        assert shares == expected
+        upper = int(100_000 / (100 * (1 + COMMISSION_RATE + 0.01)))
+        assert 0 < shares <= upper
+        c, t, s = trade_cost_amounts(100, shares, 0.01, side="buy")
+        assert 100 * shares + c + t + s <= 100_000
 
     def test_with_liquidity_cap(self):
         """流動性約束裁切。"""

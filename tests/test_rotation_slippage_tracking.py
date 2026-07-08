@@ -11,7 +11,7 @@ from datetime import date
 import pytest
 from sqlalchemy import select
 
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import COMMISSION_RATE, ODD_LOT_SLIPPAGE_PREMIUM, SLIPPAGE_RATE, TAX_RATE
 from src.data.schema import RotationPortfolio, RotationPosition
 from src.portfolio.manager import RotationManager
 
@@ -114,7 +114,7 @@ class TestExecuteBuyTracksSlippage:
         loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
         assert loaded.buy_slippage == pytest.approx(SLIPPAGE_RATE)
         # trade_cost 進場端 = price * shares * (COMMISSION_RATE + SLIPPAGE_RATE)
-        expected = 600.0 * 100 * (COMMISSION_RATE + SLIPPAGE_RATE)
+        expected = 600.0 * 100 * (COMMISSION_RATE + SLIPPAGE_RATE + ODD_LOT_SLIPPAGE_PREMIUM)
         assert loaded.trade_cost == pytest.approx(expected, abs=0.01)
         # sell 還未發生
         assert loaded.sell_slippage is None
@@ -148,8 +148,8 @@ class TestExecuteSellAccumulatesTradeCost:
         assert loaded.sell_slippage == pytest.approx(SLIPPAGE_RATE)
         assert loaded.buy_slippage == pytest.approx(SLIPPAGE_RATE)
         # trade_cost = buy 端 + sell 端
-        buy_cost = 600.0 * 100 * (COMMISSION_RATE + SLIPPAGE_RATE)
-        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + SLIPPAGE_RATE)
+        buy_cost = 600.0 * 100 * (COMMISSION_RATE + SLIPPAGE_RATE + ODD_LOT_SLIPPAGE_PREMIUM)
+        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + SLIPPAGE_RATE + ODD_LOT_SLIPPAGE_PREMIUM)
         assert loaded.trade_cost == pytest.approx(round(buy_cost, 2) + round(sell_cost, 2), abs=0.05)
         # 狀態
         assert loaded.status == "closed"
@@ -183,7 +183,7 @@ class TestExecuteSellAccumulatesTradeCost:
 
         loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
         # sell_slippage + trade_cost（只有 sell 端，因為 buy 端是 None=0）
-        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + SLIPPAGE_RATE)
+        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + SLIPPAGE_RATE + ODD_LOT_SLIPPAGE_PREMIUM)
         assert loaded.sell_slippage == pytest.approx(SLIPPAGE_RATE)
         assert loaded.trade_cost == pytest.approx(round(sell_cost, 2), abs=0.05)
 
@@ -223,7 +223,7 @@ class TestExecuteDynamicSlippage:
         assert loaded.buy_slippage == pytest.approx(0.004)
         assert loaded.buy_slippage != pytest.approx(SLIPPAGE_RATE)
         # trade_cost 用動態滑價計
-        expected = 600.0 * 100 * (COMMISSION_RATE + 0.004)
+        expected = 600.0 * 100 * (COMMISSION_RATE + 0.004 + ODD_LOT_SLIPPAGE_PREMIUM)
         assert loaded.trade_cost == pytest.approx(expected, abs=0.01)
 
     def test_buy_applies_liquidity_limit(self, db_session):
@@ -253,8 +253,8 @@ class TestExecuteDynamicSlippage:
         db_session.flush()
         loaded = db_session.execute(select(RotationPosition).where(RotationPosition.stock_id == "2330")).scalar_one()
         assert loaded.sell_slippage == pytest.approx(0.006)
-        buy_cost = 600.0 * 100 * (COMMISSION_RATE + 0.002)
-        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + 0.006)
+        buy_cost = 600.0 * 100 * (COMMISSION_RATE + 0.002 + ODD_LOT_SLIPPAGE_PREMIUM)
+        sell_cost = 650.0 * 100 * (COMMISSION_RATE + TAX_RATE + 0.006 + ODD_LOT_SLIPPAGE_PREMIUM)
         assert loaded.trade_cost == pytest.approx(round(buy_cost, 2) + round(sell_cost, 2), abs=0.05)
 
 

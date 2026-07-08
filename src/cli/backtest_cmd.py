@@ -98,7 +98,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """執行回測（單股或投資組合）。"""
     from datetime import date
 
-    from src.backtest.engine import BacktestEngine
+    from src.backtest.engine import BacktestConfig, BacktestEngine
     from src.data.pipeline import save_backtest_result, save_portfolio_result
     from src.strategy import STRATEGY_REGISTRY
 
@@ -196,7 +196,17 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 
     strategy = strategy_cls(stock_id=args.stock, start_date=start, end_date=end, adjust_dividend=adj_div, **ml_kwargs)
 
-    engine = BacktestEngine(strategy, risk_config=risk_config)
+    # A4 交易現實化：CLI 層預設開啟（引擎預設關），--no-min-commission / --no-participation-impact 可關
+    bt_config = BacktestConfig(
+        min_commission=getattr(args, "min_commission", True),
+        participation_impact=getattr(args, "participation_impact", True),
+    )
+    engine = BacktestEngine(strategy, config=bt_config, risk_config=risk_config)
+    print(
+        f"  成本假設: 最低手續費 {'開' if bt_config.min_commission else '關'}"
+        f"（整張 20 元/零股 1 元 + 零股滑價 premium）| "
+        f"participation impact {'開' if bt_config.participation_impact else '關'}"
+    )
     result = engine.run()
 
     # 存入 DB

@@ -14,7 +14,7 @@ from datetime import date
 
 import pytest
 
-from src.constants import COMMISSION_RATE, SLIPPAGE_RATE, TAX_RATE
+from src.constants import COMMISSION_RATE, ODD_LOT_SLIPPAGE_PREMIUM, SLIPPAGE_RATE, TAX_RATE
 from src.data.schema import RotationPortfolio, RotationPosition
 from src.portfolio.manager import RotationManager
 from src.portfolio.rotation import (
@@ -90,7 +90,8 @@ class TestComputePositionsCostAttributionPure:
 
         assert r.tax == 0.0  # 賣端未發生
         assert r.commission == pytest.approx(100.0 * 500 * COMMISSION_RATE, abs=0.5)
-        assert r.slippage == pytest.approx(100.0 * 500 * 0.001, abs=0.5)
+        # A4 混合單：500 股全為零股 → 滑價含零股 premium（+notional×0.001）
+        assert r.slippage == pytest.approx(100.0 * 500 * (0.001 + ODD_LOT_SLIPPAGE_PREMIUM), abs=0.5)
         assert r.notional_traded == pytest.approx(50_000.0)
         assert r.n_positions_open == 1
         assert r.n_positions_closed == 0
@@ -398,5 +399,7 @@ class TestGetCostAttributionDB:
         r = mgr.get_cost_attribution()
         assert r.n_buy_slippage_estimated == 3
         assert r.n_sell_slippage_estimated == 3
-        # 滑價 ≈ (100+105) × 100 × SLIPPAGE_RATE × 3 = 30.75
-        assert r.slippage == pytest.approx((100.0 + 105.0) * 100 * SLIPPAGE_RATE * 3, abs=0.5)
+        # 滑價 ≈ (100+105) × 100 × (SLIPPAGE_RATE + 零股 premium，100 股全為零股) × 3
+        assert r.slippage == pytest.approx(
+            (100.0 + 105.0) * 100 * (SLIPPAGE_RATE + ODD_LOT_SLIPPAGE_PREMIUM) * 3, abs=0.5
+        )

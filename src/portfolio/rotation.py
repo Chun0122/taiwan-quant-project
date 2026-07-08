@@ -19,8 +19,13 @@ from src.constants import (
     CORRELATION_THRESHOLD,
     LIMIT_DETECT_THRESHOLD,
     LIQUIDITY_PARTICIPATION_LIMIT,
+    LOT_SIZE,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
     MAX_PORTFOLIO_HEAT,
+    MIN_COMMISSION_LOT,
+    MIN_COMMISSION_ODD,
+    ODD_LOT_SLIPPAGE_PREMIUM,
+    PARTICIPATION_IMPACT_COEFF,
     PER_POSITION_RISK_CAP,
     SELL_SLIPPAGE_MULTIPLIER,
     SLIPPAGE_IMPACT_COEFF,
@@ -119,6 +124,59 @@ def count_trading_days_held(
 
 
 # ---------------------------------------------------------------------------
+# 成本核心（A4 交易現實化：混合單 = 整張單 + 盤中零股單）
+# ---------------------------------------------------------------------------
+
+
+def split_lot_odd(shares: int, lot_size: int = LOT_SIZE) -> tuple[int, int]:
+    """把股數拆成（整張部分股數, 零股部分股數）。
+
+    混合單模型：整張走一般市場、零股尾數走盤中零股市場，兩筆委託各自計費。
+    """
+    if shares <= 0:
+        return 0, 0
+    lot_shares = (shares // lot_size) * lot_size
+    return lot_shares, shares - lot_shares
+
+
+def trade_cost_amounts(
+    price: float,
+    shares: int,
+    slippage: float,
+    side: str = "buy",
+    *,
+    lot_size: int = LOT_SIZE,
+    min_commission_lot: float = MIN_COMMISSION_LOT,
+    min_commission_odd: float = MIN_COMMISSION_ODD,
+    odd_lot_premium: float = ODD_LOT_SLIPPAGE_PREMIUM,
+    commission_rate: float = COMMISSION_RATE,
+    tax_rate: float = TAX_RATE,
+) -> tuple[float, float, float]:
+    """單筆交易的（手續費, 交易稅, 滑價成本）——未捨入，全系統成本單一真相源。
+
+    混合單模型：委託拆成整張單 + 零股單，各自套用最低手續費；
+    零股部分另加 odd_lot_premium 滑價（盤中零股 spread 較寬）。
+    交易稅（賣出）整張/零股稅率相同，不拆。
+
+    execution_core.simulate_buy/simulate_sell 與 compute_position_pnl 皆由此
+    導出金額，保證 live / backtest 數字守恆；BacktestEngine（min_commission 旗標）
+    以 commission_rate/tax_rate 覆蓋沿用同一模型。
+    """
+    if shares <= 0 or price <= 0:
+        return 0.0, 0.0, 0.0
+    lot_shares, odd_shares = split_lot_odd(shares, lot_size)
+    notional = price * shares
+    commission = 0.0
+    if lot_shares > 0:
+        commission += max(price * lot_shares * commission_rate, min_commission_lot)
+    if odd_shares > 0:
+        commission += max(price * odd_shares * commission_rate, min_commission_odd)
+    tax = notional * tax_rate if side == "sell" else 0.0
+    slippage_cost = notional * slippage + price * odd_shares * odd_lot_premium
+    return commission, tax, slippage_cost
+
+
+# ---------------------------------------------------------------------------
 # 損益計算
 # ---------------------------------------------------------------------------
 
@@ -132,8 +190,9 @@ def compute_position_pnl(
 ) -> tuple[float, float]:
     """計算單筆部位的已實現損益（含交易成本）。
 
-    買入成本 = entry_price × shares × (1 + 手續費 + buy_slippage)
-    賣出收入 = exit_price × shares × (1 - 手續費 - 交易稅 - sell_slippage)
+    買入成本 = entry_price × shares + 買端成本（手續費含最低費 + 滑價含零股 premium）
+    賣出收入 = exit_price × shares − 賣端成本（手續費 + 交易稅 + 滑價）
+    成本一律由 trade_cost_amounts 導出（A4 混合單模型），與 execution_core 同源。
 
     Parameters
     ----------
@@ -148,8 +207,10 @@ def compute_position_pnl(
         pnl = 賣出收入 - 買入成本（新台幣）。
         return_pct = pnl / 買入成本（小數，如 0.05 表示 5%）。
     """
-    buy_cost = entry_price * shares * (1 + COMMISSION_RATE + buy_slippage)
-    sell_proceeds = exit_price * shares * (1 - COMMISSION_RATE - TAX_RATE - sell_slippage)
+    buy_c, buy_t, buy_s = trade_cost_amounts(entry_price, shares, buy_slippage, side="buy")
+    buy_cost = entry_price * shares + buy_c + buy_t + buy_s
+    sell_c, sell_t, sell_s = trade_cost_amounts(exit_price, shares, sell_slippage, side="sell")
+    sell_proceeds = exit_price * shares - (sell_c + sell_t + sell_s)
     pnl = sell_proceeds - buy_cost
     return_pct = pnl / buy_cost if buy_cost > 0 else 0.0
     return round(pnl, 2), round(return_pct, 6)
@@ -187,6 +248,13 @@ def compute_shares(
     shares = int(capital / effective_price)
     if daily_volume is not None:
         shares = apply_liquidity_limit(shares, daily_volume, participation_limit)
+    # A4 可負擔性收斂：最低手續費 / 零股 premium 是固定成本，effective_price 反推
+    # 可能超買（現金轉負最多 ~20 元），以真實成本遞減至買得起為止（至多數次迭代）。
+    while shares > 0:
+        c, t, s = trade_cost_amounts(price, shares, slip, side="buy")
+        if price * shares + c + t + s <= capital:
+            break
+        shares -= 1
     return shares
 
 
@@ -206,13 +274,18 @@ def compute_dynamic_slippage(
     spread_weight: float = SLIPPAGE_SPREAD_WEIGHT,
     max_pct: float = SLIPPAGE_MAX_PCT,
     sell_multiplier: float = SELL_SLIPPAGE_MULTIPLIER,
+    order_shares: float | None = None,
+    participation_coeff: float = PARTICIPATION_IMPACT_COEFF,
 ) -> float:
-    """計算動態滑價比率（三因子模型，從 BacktestEngine._get_slippage 提取）。
+    """計算動態滑價比率（三因子模型 + A4 participation impact）。
 
     三因子：
       1. 基底滑價 base（0.05%）
       2. 成交量衝擊 k / sqrt(volume) — 低量股懲罰
       3. OHLC spread 估算 (high-low)/close × weight — 隱含 bid-ask spread
+    A4 第四項（order_shares 提供時）：
+      4. 下單量衝擊 c × sqrt(order_shares / volume) — square-root impact，
+         同一檔股票買越多滑價越高；未傳 order_shares 時行為與舊模型完全相同。
 
     Parameters
     ----------
@@ -232,6 +305,10 @@ def compute_dynamic_slippage(
         滑價上限。
     sell_multiplier : float
         賣出滑價放大係數。
+    order_shares : float | None
+        本筆委託股數（買入可用 allocated_capital/price 估算；賣出用持倉股數）。
+    participation_coeff : float
+        下單量衝擊係數 c。
 
     Returns
     -------
@@ -246,6 +323,9 @@ def compute_dynamic_slippage(
         if close > 0 and high > low:
             spread_proxy = (high - low) / close * spread_weight
             impact = max(impact, spread_proxy)
+        # A4 participation impact：與下單量正相關（spread max 之後、cap 之前加項）
+        if order_shares is not None and order_shares > 0:
+            impact += participation_coeff * math.sqrt(min(order_shares / volume, 1.0))
         base_slip = min(impact, max_pct)
 
     if side == "sell":
@@ -403,14 +483,16 @@ def compute_positions_cost_attribution(
         if entry_price <= 0 or shares <= 0:
             continue
 
-        # 買端：所有 position 都有
+        # 買端：所有 position 都有（成本走 trade_cost_amounts，與成交記錄的
+        # trade_cost 同一混合單模型：最低手續費 + 零股 premium）
         buy_slip = p.get("buy_slippage")
         if buy_slip is None:
             buy_slip = default_slippage_rate
             n_buy_est += 1
         buy_notional = entry_price * shares
-        commission_total += buy_notional * COMMISSION_RATE
-        slippage_total += buy_notional * buy_slip
+        buy_c, _, buy_s = trade_cost_amounts(entry_price, shares, buy_slip, side="buy")
+        commission_total += buy_c
+        slippage_total += buy_s
         notional_total += buy_notional
 
         if p.get("status") == "closed" and p.get("exit_price") is not None:
@@ -421,9 +503,10 @@ def compute_positions_cost_attribution(
             if sell_slip is None:
                 sell_slip = default_slippage_rate
                 n_sell_est += 1
-            commission_total += sell_notional * COMMISSION_RATE
-            tax_total += sell_notional * TAX_RATE
-            slippage_total += sell_notional * sell_slip
+            sell_c, sell_t, sell_s = trade_cost_amounts(exit_price, shares, sell_slip, side="sell")
+            commission_total += sell_c
+            tax_total += sell_t
+            slippage_total += sell_s
             notional_total += sell_notional
         else:
             n_open += 1
@@ -468,12 +551,10 @@ def compute_trade_costs(
     Returns
     -------
     TradeCostBreakdown
-        含 commission, tax, slippage_cost, total。
+        含 commission, tax, slippage_cost, total（trade_cost_amounts 的 round 後檢視，
+        A4 混合單模型：最低手續費 20/1 元 + 零股滑價 premium）。
     """
-    notional = price * shares
-    commission = notional * COMMISSION_RATE
-    tax = notional * TAX_RATE if side == "sell" else 0.0
-    slippage_cost = notional * slippage
+    commission, tax, slippage_cost = trade_cost_amounts(price, shares, slippage, side)
     return TradeCostBreakdown(
         commission=round(commission, 2),
         tax=round(tax, 2),
