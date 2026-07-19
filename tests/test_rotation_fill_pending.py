@@ -255,6 +255,87 @@ class TestFillPendingBuys:
         assert patch_session.execute(select(RotationPortfolio)).scalar_one().current_cash == 1_000_000.0
 
 
+def _add_buy_order(db_session, name="fp_test", sid="2330", decision_date=D, ref_price=100.0, alloc=100_000.0):
+    db_session.add(
+        RotationPendingOrder(
+            portfolio_name=name,
+            decision_date=decision_date,
+            side="buy",
+            stock_id=sid,
+            stock_name=f"name_{sid}",
+            shares=1000,
+            ref_price=ref_price,
+            allocated_capital=alloc,
+            entry_rank=1,
+            entry_score=0.9,
+            stop_loss=95.0,
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+
+class TestFillPendingDuplicateGuard:
+    """2026-07-13 事故回歸：停牌順延 + decide 重複開單 → 復牌日雙成交 UNIQUE 炸鍋。"""
+
+    def test_duplicate_orders_same_stock_fill_once_cancel_rest(self, patch_session):
+        """同股兩張 pending 買單（不同決策日）復牌日只成交一張，第二張取消。"""
+        _seed(patch_session, d1_open=105.0)
+        _make_portfolio(patch_session)
+        _add_buy_order(patch_session, sid="2330", decision_date=D - timedelta(days=1))
+        _add_buy_order(patch_session, sid="2330", decision_date=D)
+
+        result = RotationManager("fp_test").fill_pending(exec_day=D1)
+
+        assert result["filled"] == 1
+        assert result["cancelled"] == 1
+        positions = patch_session.execute(select(RotationPosition)).scalars().all()
+        assert len(positions) == 1  # 不觸發 UNIQUE(portfolio, stock, entry_date)
+        statuses = sorted(o.status for o in _orders(patch_session))
+        assert statuses == ["cancelled", "filled"]
+
+    def test_buy_for_already_held_stock_is_cancelled(self, patch_session):
+        """已持倉股票的 stale 買單直接取消，不重複建倉。"""
+        _seed(patch_session, d1_open=105.0)
+        p = _make_portfolio(patch_session)
+        _add_position(patch_session, p.id, sid="2330")
+        _add_buy_order(patch_session, sid="2330", decision_date=D)
+
+        result = RotationManager("fp_test").fill_pending(exec_day=D1)
+
+        assert result == {"filled": 0, "cancelled": 1, "deferred": 0, "dividends": 0}
+        open_pos = (
+            patch_session.execute(select(RotationPosition).where(RotationPosition.status == "open")).scalars().all()
+        )
+        assert len(open_pos) == 1
+
+    def test_expired_buy_cancelled_even_with_quote(self, patch_session):
+        """TTL 逾期買單即使當日有報價也取消（決策已過期），不得成交。"""
+        _seed(patch_session, d1_open=105.0)
+        _make_portfolio(patch_session)
+        _add_buy_order(patch_session, sid="2330", decision_date=D - timedelta(days=3))  # 4 個交易日前
+
+        result = RotationManager("fp_test").fill_pending(exec_day=D1)
+
+        assert result == {"filled": 0, "cancelled": 1, "deferred": 0, "dividends": 0}
+        assert patch_session.execute(select(RotationPosition)).scalars().all() == []
+
+    def test_decide_skips_stock_with_outstanding_pending_buy(self, patch_session):
+        """decide：排名選中已有在途買單的股票時不重複開單。"""
+        _seed(patch_session)
+        _make_portfolio(patch_session)
+        _add_buy_order(patch_session, sid="2330", decision_date=D - timedelta(days=1))
+
+        RotationManager("fp_test").decide(today=D, regime="bull")
+
+        new_orders = [
+            o for o in _orders(patch_session) if o.decision_date == D and o.side == "buy" and o.stock_id == "2330"
+        ]
+        assert new_orders == [], "2330 已有在途買單，decide 不得再開"
+        other_buys = {o.stock_id for o in _orders(patch_session) if o.decision_date == D and o.side == "buy"}
+        assert other_buys == {"2317", "2454"}
+
+
 class TestFillPendingSells:
     def test_sell_fills_at_open_and_closes_position(self, patch_session):
         _seed(patch_session, d1_open=105.0)
@@ -322,6 +403,40 @@ class TestFillPendingSells:
             select(RotationPosition).where(RotationPosition.stock_id == "2330")
         ).scalar_one()
         assert buy_pos.status == "open" and buy_pos.shares > 0
+
+
+class TestRotationUpdateAllIsolation:
+    """update --all per-portfolio 隔離：單一組合失敗不阻擋其餘組合（2026-07-13 事故教訓）。"""
+
+    def test_one_portfolio_failure_does_not_block_others(self, monkeypatch):
+        from src.cli import rotation_cmd
+        from src.portfolio import manager as mgr_module
+
+        calls: list[str] = []
+
+        class FakeMgr:
+            def __init__(self, name):
+                self.name = name
+
+            def update(self, regime=None, force=False):
+                calls.append(self.name)
+                if self.name == "bad":
+                    raise RuntimeError("boom")
+                return None
+
+            @staticmethod
+            def list_portfolios():
+                return [
+                    {"name": "bad", "status": "active", "mode": "swing", "max_positions": 5, "holding_days": 3},
+                    {"name": "good", "status": "active", "mode": "momentum", "max_positions": 5, "holding_days": 10},
+                ]
+
+        monkeypatch.setattr(mgr_module, "RotationManager", FakeMgr)
+
+        with pytest.raises(RuntimeError, match="bad"):
+            rotation_cmd._rotation_update_all()
+
+        assert calls == ["bad", "good"], "bad 失敗後 good 仍須被更新"
 
 
 class TestConservation:
