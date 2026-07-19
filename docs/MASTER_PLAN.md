@@ -134,7 +134,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | # | 項目 | 內容 / 驗收 |
 |---|------|------------|
 | 12 | **pending 重複買單 UNIQUE 炸鍋** | ✅ 2026-07-19 已修（分支 `fix-pending-order-duplicate-crash` 待 PR）：7/10 假交易日→3617 順延→decide 重複開單→7/13 雙成交 UNIQUE 違反→Step 12 連炸 5 天（7/13–17 swing5_3d/mg5_20d/mom3_20d 未更新、停損凍結、snapshot 永久缺口）。三層防護：decide 在途去重 / fill TTL 提前+同股防護 / update --all per-portfolio 隔離。+5 回歸測試 |
-| 13 | **rankings stale fallback 架空 M2 停用** | 🔴 未修，**mg5_20d 二審前必修**。`_find_latest_rankings` 無時效上限：momentum 6/17 被 IC 反向停用後，mom5_10d/mg5_20d 整個七月用 6/16 舊排名交易。composite 分支加倍錯誤（fallback 不過濾 mode）。**設計決策待定**：模式停用時組合應凍結新買入（僅風控賣出）vs 舊排名時效上限（如 ≤3 交易日）。與 B11（IC 治理）連動 |
+| 13 | **rankings stale fallback 架空 M2 停用** | ✅ 2026-07-19 已修（分支 `fix-rankings-stale-fallback`）：fallback 設時效上限 `RANKINGS_FALLBACK_MAX_TRADING_DAYS=3`——逾期回空排名 → 組合凍結新買入、僅走風控賣出/到期路徑；composite 分支只在含 member mode 記錄的掃描日中找。live 驗證：mom5_10d preview 正確凍結（momentum stale 21 交易日）。+5 測試。後續與 B11（IC 治理：自動停用降級為告警）連動 |
 | 14 | **行事曆假交易日哨兵** | 🔴 未修。2026-07-10 行事曆標交易日但市場實際休市（全市場 daily_price 僅 US_VIX 1 筆，疑颱風假）——事故 #12 的觸發源。①修正 `data/calendar.py` 該日；②pipeline 加「同步後全市場 0 筆 → 判定臨時休市」哨兵告警 |
 
 ---
