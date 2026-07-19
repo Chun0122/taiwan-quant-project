@@ -8,25 +8,41 @@ from src.cli.helpers import init_db
 from src.cli.helpers import safe_print as print
 
 
-def _rotation_update_all(regime: str | None = None) -> None:
-    """更新所有 active 的輪動組合（供 morning-routine 呼叫）。
+def _rotation_update_all(regime: str | None = None, force: bool = False) -> None:
+    """更新所有 active 的輪動組合（供 morning-routine 與 CLI update --all 呼叫）。
+
+    單一組合失敗不阻擋其餘組合（per-portfolio 隔離；2026-07-13 事故教訓：
+    swing5_3d 炸掉導致 mg5_20d/mom3_20d 一週未更新）；全部跑完後若有失敗
+    再拋彙總例外，讓 morning-routine Step 12 仍標記失敗。
 
     Parameters
     ----------
     regime : str | None
         目前市場狀態，傳遞給 RotationManager.update() 用於 Crisis 硬阻擋。
+    force : bool
+        繞過同日冪等保護，強制重跑今日 update。
     """
+    import logging
+
     from src.portfolio.manager import RotationManager
 
+    logger = logging.getLogger(__name__)
     portfolios = RotationManager.list_portfolios()
     active = [p for p in portfolios if p["status"] == "active"]
     if not active:
         print("  無 active 的輪動組合，跳過。")
         return
+    failed: list[str] = []
     for p in active:
         print(f"\n  ── 更新 [{p['name']}] ({p['mode']}, N={p['max_positions']}, {p['holding_days']}d) ──")
-        mgr = RotationManager(p["name"])
-        actions = mgr.update(regime=regime)
+        try:
+            mgr = RotationManager(p["name"])
+            actions = mgr.update(regime=regime, force=force)
+        except Exception:
+            logger.exception("[%s] 輪動更新失敗，跳過此組合繼續", p["name"])
+            print(f"    !! [{p['name']}] 更新失敗，跳過此組合繼續")
+            failed.append(p["name"])
+            continue
         if actions:
             sold = len(actions.to_sell)
             bought = len(actions.to_buy)
@@ -35,6 +51,8 @@ def _rotation_update_all(regime: str | None = None) -> None:
             print(f"    賣出={sold}, 買入={bought}, 續持={renewed}, 保持={held}")
         else:
             print("    無動作（無排名資料或已暫停）")
+    if failed:
+        raise RuntimeError(f"輪動組合更新失敗：{', '.join(failed)}（其餘組合已正常更新）")
 
 
 def cmd_rotation(args: argparse.Namespace) -> None:
@@ -81,17 +99,10 @@ def cmd_rotation(args: argparse.Namespace) -> None:
         force = getattr(args, "force", False)
 
         if update_all:
-            portfolios = RotationManager.list_portfolios()
-            active = [p for p in portfolios if p["status"] == "active"]
-            if not active:
-                print("無 active 的輪動組合")
-                return
-            for p in active:
-                print(f"\n── 更新 [{p['name']}] ──")
-                mgr = RotationManager(p["name"])
-                actions = mgr.update(force=force)
-                if actions:
-                    _print_rotation_actions(p["name"], actions)
+            try:
+                _rotation_update_all(force=force)
+            except RuntimeError as e:
+                print(f"錯誤: {e}")
         elif name:
             mgr = RotationManager(name)
             actions = mgr.update(force=force)

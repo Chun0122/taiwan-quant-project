@@ -542,6 +542,30 @@ class RotationManager:
                 weekly_swaps_used=ctx.weekly_swaps_used,
             )
 
+            # ── 在途買單去重：同一股票僅允許一張在途買單 ──
+            # 停牌順延的前日買單仍 pending 時，今日排名再選中同股不得重複開單
+            # （否則復牌日雙成交 → rotation_position UNIQUE 違反，2026-07-13 事故）
+            outstanding_buys = set(
+                session.execute(
+                    select(RotationPendingOrder.stock_id).where(
+                        RotationPendingOrder.portfolio_name == self.portfolio_name,
+                        RotationPendingOrder.status == PENDING_STATUS_PENDING,
+                        RotationPendingOrder.side == "buy",
+                        RotationPendingOrder.decision_date < today,
+                    )
+                ).scalars()
+            )
+            if outstanding_buys:
+                dupes = [b["stock_id"] for b in actions.to_buy if b["stock_id"] in outstanding_buys]
+                if dupes:
+                    actions.to_buy = [b for b in actions.to_buy if b["stock_id"] not in outstanding_buys]
+                    logger.info(
+                        "[%s] 排除 %d 檔已有在途買單的重複買入決策：%s",
+                        self.portfolio_name,
+                        len(dupes),
+                        ", ".join(dupes),
+                    )
+
             if dry_run:
                 logger.info(
                     "[%s] DRY RUN 決策預覽: 明日預定賣出=%d, 續持=%d, 明日預定買入=%d, 保持=%d",
@@ -735,8 +759,10 @@ class RotationManager:
         - 賣單無報價（停牌）時 fallback 以 ref_price（決策日 close）成交——與
           backtest 的 fallback 一致，風控賣單絕不凍結。
         - 買單無報價時順延（保持 pending）；跨逾 PENDING_BUY_TTL_TRADING_DAYS
-          個交易日未成交即 cancelled（決策已過期）。此為與 backtest 的刻意差異
-          （backtest 無視停牌 fallback 買進；live 買不到就是買不到）。
+          個交易日未成交即 cancelled（決策已過期，**不論當日有無報價**）。此為與
+          backtest 的刻意差異（backtest 無視停牌 fallback 買進；live 買不到就是買不到）。
+        - 重複防護：同股已持倉或本輪已成交的買單直接取消（UNIQUE(portfolio,
+          stock, entry_date) 防線；正常流程由 decide 端在途買單去重擋住）。
         - 買單股數以 allocated_capital 對 open[exec_day] 重算（compute_shares，
           與 backtest 同式）；資金不足由 _execute_buy 內建 reshrink 縮股。
         - 部分成交不轉次日（流動性縮股後 fill 多少算多少，order 仍標 filled）。
@@ -835,24 +861,39 @@ class RotationManager:
                 )
 
             # ── 買單 ──
+            # 重複防護：UNIQUE(portfolio, stock, entry_date) — 同股已持倉或本輪已成交
+            # 的重複買單一律取消（停牌順延期間 decide 重複開單的歷史資料防線）
+            held_sids = {p["stock_id"] for p in self._load_open_positions(session, portfolio.id)}
+            bought_today: set[str] = set()
             for order in buys:
+                # TTL：逾期買單一律取消（決策已過期），不論當日是否有報價
+                elapsed_tds = sum(1 for d in trading_cal if order.decision_date < d <= exec_day)
+                if elapsed_tds > PENDING_BUY_TTL_TRADING_DAYS:
+                    if not dry_run:
+                        order.status = PENDING_STATUS_CANCELLED
+                    cancelled += 1
+                    logger.info(
+                        "[%s] pending 買單 %s 逾 %d 交易日未成交，取消",
+                        self.portfolio_name,
+                        order.stock_id,
+                        PENDING_BUY_TTL_TRADING_DAYS,
+                    )
+                    continue
+                if order.stock_id in held_sids or order.stock_id in bought_today:
+                    if not dry_run:
+                        order.status = PENDING_STATUS_CANCELLED
+                    cancelled += 1
+                    logger.warning(
+                        "[%s] pending 買單 %s 與既有持倉/本日已成交重複，取消",
+                        self.portfolio_name,
+                        order.stock_id,
+                    )
+                    continue
                 ohlcv = exec_ohlcv.get(order.stock_id) or {}
                 open_price = ohlcv.get("open")
                 if not open_price:
-                    # 無報價：TTL 內順延，逾期 cancel（買單決策已過期）
-                    elapsed_tds = sum(1 for d in trading_cal if order.decision_date < d <= exec_day)
-                    if elapsed_tds > PENDING_BUY_TTL_TRADING_DAYS:
-                        if not dry_run:
-                            order.status = PENDING_STATUS_CANCELLED
-                        cancelled += 1
-                        logger.info(
-                            "[%s] pending 買單 %s 逾 %d 交易日無報價，取消",
-                            self.portfolio_name,
-                            order.stock_id,
-                            PENDING_BUY_TTL_TRADING_DAYS,
-                        )
-                    else:
-                        deferred += 1
+                    # 無報價：TTL 內順延（保持 pending）
+                    deferred += 1
                     continue
 
                 # 股數以決策時分配資金對 open 重算（與 backtest 同式）；
@@ -881,6 +922,7 @@ class RotationManager:
                     cancelled += 1
                     continue
                 if dry_run:
+                    bought_today.add(order.stock_id)
                     filled += 1
                     continue
 
@@ -922,6 +964,7 @@ class RotationManager:
                 cash = cash_after
                 order.status = PENDING_STATUS_FILLED
                 order.exec_date = exec_day
+                bought_today.add(order.stock_id)
                 filled += 1
                 fill_rows.append(
                     {
