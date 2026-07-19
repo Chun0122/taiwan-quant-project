@@ -223,6 +223,14 @@ def is_composite_mode(mode: str | None) -> bool:
 # cancel；風控賣單（stop_loss/crisis 等）不設 TTL，必須出場，順延至有報價為止。
 PENDING_BUY_TTL_TRADING_DAYS: int = 2
 
+# ── Rankings stale fallback 時效上限（P0 #13，2026-07-19 事故重審）───────────
+# decide 當日無 discover 排名時允許 fallback 至最近掃描日，但逾此交易日數即
+# 視為訊號斷糧：回空排名 → 組合凍結新買入、僅走風控賣出/到期路徑。
+# 背景：momentum 被 M2 IC 反向停用後，無上限 fallback 使 mom5_10d/mg5_20d
+# 以月餘舊排名（6/16）持續交易——scanner 層安全機制被 rotation 層架空。
+# 3 = 容忍長週末 + 單日掃描失敗；模式停用超過 3 個交易日即凍結新買入。
+RANKINGS_FALLBACK_MAX_TRADING_DAYS: int = 3
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

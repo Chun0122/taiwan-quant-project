@@ -27,6 +27,7 @@ from src.constants import (
     PENDING_STATUS_CANCELLED,
     PENDING_STATUS_FILLED,
     PENDING_STATUS_PENDING,
+    RANKINGS_FALLBACK_MAX_TRADING_DAYS,
     REGIME_FALLBACK_DEFAULT,
     SLIPPAGE_RATE,
     TAX_RATE,
@@ -2693,11 +2694,23 @@ class RotationManager:
         ]
 
     def _find_latest_rankings(self, session, mode: str, before_date: date) -> list[dict]:
-        """找最近的 scan_date 排名（當日無 discover 結果時使用）。"""
+        """找最近的 scan_date 排名（當日無 discover 結果時使用）。
+
+        P0 #13（2026-07-19 事故重審）：
+        - fallback 設時效上限 RANKINGS_FALLBACK_MAX_TRADING_DAYS——逾期視為
+          訊號斷糧（如模式被 M2 IC 反向停用），回空 → 組合凍結新買入，僅走
+          風控賣出/到期路徑（scanner 層停用不再被 rotation 層 fallback 架空）。
+        - composite 模式只在含 member mode 記錄的掃描日中找（原本任何模式的
+          掃描日都會被取用，resolve 出空/殘缺排名）。
+        """
         if is_composite_mode(mode):
+            members = COMPOSITE_MODES[mode]["members"]
             stmt = (
                 select(DiscoveryRecord.scan_date)
-                .where(DiscoveryRecord.scan_date < before_date)
+                .where(
+                    DiscoveryRecord.scan_date < before_date,
+                    DiscoveryRecord.mode.in_(members),
+                )
                 .order_by(DiscoveryRecord.scan_date.desc())
                 .limit(1)
             )
@@ -2709,9 +2722,24 @@ class RotationManager:
                 .limit(1)
             )
         row = session.execute(stmt).first()
-        if row:
-            return resolve_rankings(mode, row[0], session)
-        return []
+        if not row:
+            return []
+        scan_date = row[0]
+        trading_cal = _get_trading_calendar(session, scan_date, before_date)
+        elapsed_tds = sum(1 for d in trading_cal if scan_date < d <= before_date)
+        if elapsed_tds > RANKINGS_FALLBACK_MAX_TRADING_DAYS:
+            logger.warning(
+                "[%s] %s 模式最近排名停留在 %s（距 %s 已 %d 個交易日 > 上限 %d）"
+                "——視為訊號斷糧，凍結新買入（僅風控賣出/到期路徑）",
+                self.portfolio_name,
+                mode,
+                scan_date,
+                before_date,
+                elapsed_tds,
+                RANKINGS_FALLBACK_MAX_TRADING_DAYS,
+            )
+            return []
+        return resolve_rankings(mode, scan_date, session)
 
     def _execute_sell(
         self, session, portfolio_id: int, sell: dict, today: date, cash: float, slippage: float = SLIPPAGE_RATE
