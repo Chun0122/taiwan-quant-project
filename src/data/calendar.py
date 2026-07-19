@@ -73,6 +73,16 @@ _TWSE_HOLIDAYS: dict[int, frozenset[date]] = {
     ),
 }
 
+# ── 臨時休市日（非公告的全市場休市：颱風假等；P0 #14，2026-07-19）──
+# 與 _TWSE_HOLIDAYS 分開維護：這些日子行事曆原標為交易日，但市場實際未開盤。
+# 偵測依據：該日全市場 daily_price 為 0 筆（morning-routine 哨兵會告警，
+# 確認後手動加入此表）。
+_UNSCHEDULED_CLOSURES: frozenset[date] = frozenset(
+    [
+        date(2026, 7, 10),  # 全市場無成交（僅 US_VIX 1 筆），疑颱風假——2026-07-13 事故鏈觸發源
+    ]
+)
+
 # W3 audit fix：缺資料的年份只 log 一次（避免 morning-routine 全程刷屏）
 _LOGGED_MISSING_YEARS: set[int] = set()
 
@@ -101,12 +111,19 @@ def is_twse_holiday(d: date) -> bool:
     return d in year_holidays
 
 
+def is_unscheduled_closure(d: date) -> bool:
+    """判斷是否為臨時休市日（颱風假等非公告休市）。"""
+    return d in _UNSCHEDULED_CLOSURES
+
+
 def is_trading_day(d: date) -> bool:
     """判斷是否為 TWSE 交易日。
 
-    交易日 = 非週末 AND 非 TWSE 公告休市日。
+    交易日 = 非週末 AND 非 TWSE 公告休市日 AND 非臨時休市日（颱風假等）。
     """
     if is_weekend(d):
+        return False
+    if is_unscheduled_closure(d):
         return False
     return not is_twse_holiday(d)
 

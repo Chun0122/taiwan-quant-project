@@ -108,3 +108,31 @@ class TestHasCalendarData:
 
     def test_2030_not_exists(self):
         assert has_calendar_data(2030) is False
+
+
+class TestUnscheduledClosure:
+    """臨時休市日（颱風假等；P0 #14）。2026-07-10 為週五、非公告假日，但全市場休市。"""
+
+    def test_typhoon_day_20260710_not_trading_day(self):
+        from src.data.calendar import is_unscheduled_closure
+
+        assert is_unscheduled_closure(date(2026, 7, 10)) is True
+        assert is_trading_day(date(2026, 7, 10)) is False
+
+    def test_regular_day_not_closure(self):
+        from src.data.calendar import is_unscheduled_closure
+
+        assert is_unscheduled_closure(date(2026, 7, 9)) is False
+        assert is_trading_day(date(2026, 7, 9)) is True
+
+    def test_next_trading_day_skips_closure(self):
+        """7/9（四）的下一交易日應跳過 7/10 颱風假直達 7/13（一）。"""
+        assert next_trading_day(date(2026, 7, 9)) == date(2026, 7, 13)
+
+    def test_prev_trading_day_skips_closure(self):
+        assert prev_trading_day(date(2026, 7, 13)) == date(2026, 7, 9)
+
+    def test_get_trading_days_excludes_closure(self):
+        days = get_trading_days(date(2026, 7, 6), date(2026, 7, 13))
+        assert date(2026, 7, 10) not in days
+        assert len(days) == 5  # 7/6~7/9 + 7/13
