@@ -135,7 +135,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 |---|------|------------|
 | 12 | **pending 重複買單 UNIQUE 炸鍋** | ✅ 2026-07-19 已修（分支 `fix-pending-order-duplicate-crash` 待 PR）：7/10 假交易日→3617 順延→decide 重複開單→7/13 雙成交 UNIQUE 違反→Step 12 連炸 5 天（7/13–17 swing5_3d/mg5_20d/mom3_20d 未更新、停損凍結、snapshot 永久缺口）。三層防護：decide 在途去重 / fill TTL 提前+同股防護 / update --all per-portfolio 隔離。+5 回歸測試 |
 | 13 | **rankings stale fallback 架空 M2 停用** | ✅ 2026-07-19 已修（分支 `fix-rankings-stale-fallback`）：fallback 設時效上限 `RANKINGS_FALLBACK_MAX_TRADING_DAYS=3`——逾期回空排名 → 組合凍結新買入、僅走風控賣出/到期路徑；composite 分支只在含 member mode 記錄的掃描日中找。live 驗證：mom5_10d preview 正確凍結（momentum stale 21 交易日）。+5 測試。後續與 B11（IC 治理：自動停用降級為告警）連動 |
-| 14 | **行事曆假交易日哨兵** | 🔴 未修。2026-07-10 行事曆標交易日但市場實際休市（全市場 daily_price 僅 US_VIX 1 筆，疑颱風假）——事故 #12 的觸發源。①修正 `data/calendar.py` 該日；②pipeline 加「同步後全市場 0 筆 → 判定臨時休市」哨兵告警 |
+| 14 | **行事曆假交易日哨兵** | ✅ 2026-07-19 已修（分支 `fix-calendar-phantom-trading-day`）：①`calendar.py` 新增 `_UNSCHEDULED_CLOSURES`（含 2026-07-10）+ `is_unscheduled_closure()`，`is_trading_day` 排除；②`_verify_data_freshness` 加臨時休市哨兵（`PHANTOM_TRADING_DAY_MIN_ROWS=100`）：行事曆交易日但同步後全市場當日 <100 筆 → 凍結 Step 9 discover + Step 12 rotation update（T+1 佇列自然順延），Discord banner 告警；--skip-sync 跳過哨兵（未同步必為 0 筆會誤判，e2e 測試路徑）。+9 測試 |
 
 ---
 

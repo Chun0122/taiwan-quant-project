@@ -231,6 +231,12 @@ PENDING_BUY_TTL_TRADING_DAYS: int = 2
 # 3 = 容忍長週末 + 單日掃描失敗；模式停用超過 3 個交易日即凍結新買入。
 RANKINGS_FALLBACK_MAX_TRADING_DAYS: int = 3
 
+# ── 臨時休市哨兵（P0 #14，2026-07-19 事故重審）─────────────────────────────
+# 行事曆標為交易日但同步後全市場當日 daily_price 筆數低於此門檻 → 判定疑似
+# 臨時休市（颱風假等），凍結 discover 與 rotation update（T+1 佇列自然順延）。
+# 正常交易日全市場 ~6,000+ 筆；2026-07-10 颱風假僅 1 筆（US_VIX）。
+PHANTOM_TRADING_DAY_MIN_ROWS: int = 100
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

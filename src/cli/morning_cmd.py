@@ -855,16 +855,24 @@ def _sync_rotation_dividends() -> None:
     print(f"  股利補抓：{len(sids)} 檔標的（含 benchmark 0050），寫入 {n} 筆")
 
 
-def _verify_data_freshness(today_str: str) -> dict:
+def _verify_data_freshness(today_str: str, check_phantom: bool = True) -> dict:
     """驗證關鍵資料表的新鮮度（sync 完成後、discover 前執行）。
 
     檢查 DailyPrice (TAIEX) 最新日期是否為今日或昨日（考慮假日）。
+
+    臨時休市哨兵（P0 #14）：行事曆標今日為交易日、但同步後全市場當日筆數
+    低於 PHANTOM_TRADING_DAY_MIN_ROWS → 判定疑似臨時休市（颱風假等），
+    後續 Step 9 discover / Step 12 rotation update 據此凍結（2026-07-10
+    假交易日以陳舊 close 決策，是 7/13 重複買單事故鏈的觸發源）。
+    check_phantom=False（--skip-sync 時傳入）跳過此哨兵——未同步時當日
+    筆數必然為 0，會誤判。
 
     Returns:
         dict: {
             "is_stale": bool,      # True 表示資料過時
             "latest": date | None, # TAIEX 最新日期
             "gap_days": int,       # 今天與最新日期差距
+            "phantom": bool,       # True 表示疑似臨時休市（颱風假等）
             "message": str,        # 顯示訊息
         }
     """
@@ -872,16 +880,36 @@ def _verify_data_freshness(today_str: str) -> dict:
 
     from sqlalchemy import func, select
 
+    from src.constants import PHANTOM_TRADING_DAY_MIN_ROWS
+    from src.data.calendar import is_trading_day
     from src.data.database import get_session
     from src.data.schema import DailyPrice
 
     today = datetime.date.fromisoformat(today_str)
     max_stale_days = 3  # 允許最大落後天數（考慮假日/長週末）
-    result: dict = {"is_stale": False, "latest": None, "gap_days": 0, "message": ""}
+    result: dict = {"is_stale": False, "latest": None, "gap_days": 0, "phantom": False, "message": ""}
 
     try:
         with get_session() as session:
             latest = session.execute(select(func.max(DailyPrice.date)).where(DailyPrice.stock_id == "TAIEX")).scalar()
+            n_today = (
+                session.execute(select(func.count()).select_from(DailyPrice).where(DailyPrice.date == today)).scalar()
+                or 0
+            )
+
+        # ── 臨時休市哨兵：交易日但全市場無今日資料 ──
+        if check_phantom and is_trading_day(today) and n_today < PHANTOM_TRADING_DAY_MIN_ROWS:
+            msg = (
+                f"今日 {today} 行事曆為交易日，但全市場僅 {n_today} 筆"
+                f"（< {PHANTOM_TRADING_DAY_MIN_ROWS}）——疑似臨時休市（颱風假？）。"
+                "已凍結 discover 與 rotation update；確認後請將該日加入 "
+                "src/data/calendar.py:_UNSCHEDULED_CLOSURES"
+            )
+            print(f"  🚨 臨時休市哨兵：{msg}")
+            result["phantom"] = True
+            result["is_stale"] = True
+            result["message"] = msg
+            return result
 
         if latest is None:
             msg = "DailyPrice 無 TAIEX 資料"
@@ -1180,7 +1208,14 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             print("  無反向模式需停用。")
 
     def _step_9_discover() -> None:
-        """Step 9：discover all；M1 資料過期硬阻擋；M2 停用反向模式。"""
+        """Step 9：discover all；臨時休市/M1 資料過期硬阻擋；M2 停用反向模式。"""
+        # P0 #14：臨時休市哨兵（行事曆交易日但全市場無今日資料）
+        if freshness.get("phantom"):
+            discover_blocked_state["blocked"] = True
+            discover_blocked_state["reason"] = "疑似臨時休市（行事曆交易日但全市場無今日資料）"
+            print(f"  !! Discover 已阻擋：{discover_blocked_state['reason']}")
+            return
+
         # M1：資料過期硬阻擋
         gap = freshness.get("gap_days", 0) or 0
         if freshness.get("is_stale") and gap > MAX_STALE_HARD_BLOCK_DAYS:
@@ -1209,6 +1244,13 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
                 precomputed_ic_by_mode=ic_df_by_mode,  # 項目 E
             )
         )
+
+    def _step_12_rotation_update() -> None:
+        """Step 12：rotation update --all；臨時休市時凍結（T+1 佇列順延至次一真實交易日）。"""
+        if freshness.get("phantom"):
+            print("  !! 疑似臨時休市（行事曆交易日但全市場無今日資料）——跳過輪動更新，避免以陳舊 close 決策")
+            return
+        _rotation_update_all(regime=regime_now)
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
     _steps = [
@@ -1300,7 +1342,7 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run", "skip_sync"},
             _sync_rotation_dividends,
         ),
-        (12, "輪動組合更新（rotation update --all）", {"dry_run"}, lambda: _rotation_update_all(regime=regime_now)),
+        (12, "輪動組合更新（rotation update --all）", {"dry_run"}, _step_12_rotation_update),
         (
             13,
             "高成長掃描（revenue-scan --min-yoy 10 --top 5）",
@@ -1377,9 +1419,10 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
                 step_results.append((num, title, "failed"))
 
         # ── 資料新鮮度檢查：在 sync 位置後、discover 前驗證 ──
-        # 即使 --skip-sync 也執行（讓使用者誤用 skip-sync 在過期資料上時，M1 硬阻擋仍生效）
+        # 即使 --skip-sync 也執行（讓使用者誤用 skip-sync 在過期資料上時，M1 硬阻擋仍生效）；
+        # 但臨時休市哨兵在 --skip-sync 時跳過（未同步時當日筆數必然為 0，會誤判）
         if num == "8b" and not dry_run:
-            freshness = _verify_data_freshness(today_str)
+            freshness = _verify_data_freshness(today_str, check_phantom=not skip_sync)
 
     # ── 完成提示（含失敗步驟摘要）──────────────────────────────
     failed_steps = [(n, t) for n, t, s in step_results if s == "failed"]

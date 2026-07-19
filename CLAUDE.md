@@ -63,7 +63,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/mops_fetcher.py` | MOPS 重大訊息 + 月營收、事件分類（7 類）、情緒分類 |
 | `data/schema.py` | 29 張 ORM 表（含 `RotationActionLog`：每日輪動操作明細，dashboard `today_actions` 來源；`RotationPendingOrder`：live T+1 待成交意圖，A2） |
 | `data/validator.py` | 7 個品質檢查純函數 |
-| `data/calendar.py` | TWSE 交易日行事曆（2025-2026） |
+| `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
