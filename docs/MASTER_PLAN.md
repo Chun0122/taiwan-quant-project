@@ -42,7 +42,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 
 ### 2.3 Live 狀態（2026-07 實查）
 
-- 13 個 rotation 組合，4 active：`mom5_10d`、`swing5_3d`、`mom3_20d`、`mg5_20d`（mom_growth 雙引擎）；9 paused。
+- 13 個 rotation 組合，3 active：`mom5_10d`、`mom3_20d`、`mg5_20d`（mom_growth 雙引擎，**警戒**）；10 paused（swing5_3d 2026-07-19 終裁暫停）。
 - DailyPrice 97.4 萬筆 / 20,393 檔 / 至 2026-07-03；個股全市場歷史僅自 **2025-01-02**。
 - DiscoveryRecord 5,685 筆，自 **2026-02-27**（單一多頭 regime）。
 - 0050 benchmark 僅自 2025-11-19；**TW_VIX 零筆**（crisis 訊號實際 6/7 可用）。
@@ -99,7 +99,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 外部介面 | TWSE/TPEX `verify=False` 刻意；MOPS 備援站、DJ Big5 regex——脆弱面，改版風險常在 | 常態，靠對帳+告警圍堵 |
 | API 速率 | FinMind 0.5s、TWSE/TPEX 3s——morning-routine 時長的硬下限 | 常態 |
 | 交易階段 | Paper only；**實盤須過 §9 六條 Gate** | Gate 通過 |
-| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）；**R1 歷史裁決重審 ✅2026-07-08 完成**（`logs/r1_20260708/REPORT.md`）：6/20 全部裁決無翻案；副產物=修復 FinMind year=NaN 股利斷流 bug；swing5_3d 升級暫停候選（7/18 終裁） | 已解除 |
+| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）；**R1 歷史裁決重審 ✅2026-07-08 完成**（`logs/r1_20260708/REPORT.md`）：6/20 全部裁決無翻案；副產物=修復 FinMind year=NaN 股利斷流 bug；**7/19 終裁**（`logs/audit_mg5_20d_20260718/REPORT.md`）：swing5_3d 🔴暫停（live B期 1/13 勝、alpha −5.13pp）；mg5_20d 首審=維持但降級警戒（MtM alpha −7.6%，惟窗口被事故+訊號斷糧+7/17 崩盤三重污染，N=2），二審 gate 在 P0 訊號斷糧修復 | 已解除 |
 | 已死資料欄 | TW_VIX（FinMind 移除）、SBL sbl_change 三欄恆 NULL、DJ 分點無均價（close 代理） | 各自替代方案落地 |
 
 ---
@@ -128,6 +128,14 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 9 | **A2 Live T+1 Pending-Order** ✅2026-07-06 | 2 週 | 依 `docs/design/live_t1_pending_order.md` 實作 `RotationPendingOrder` + decide/fill 兩段式。交付 parity 報告：量化「close 成交 vs T+1 open」的 alpha 差距 |
 | 10 | **A3 股利會計** ✅2026-07-07 | 1.5 週 | rotation live+backtest：持倉除息日現金入帳 + 停損價除息調整；benchmark 0050 還原或標注。**時效**：正值除息季。完成後啟動 R1 歷史裁決重審 |
 | 11 | **A4 交易現實化** ✅2026-07-08 | 1 週 | 零股策略裁決=**混合單**（sizing 不整張化；成本模型拆整張單+盤中零股單，各計最低手續費 20/1 元、零股 notional 加 0.1% 滑價 premium）；滑價加 participation impact（c×√(下單量/當日量)，c=0.01）。成本 SSOT=`rotation.trade_cost_amounts`，rotation live+backtest 恆開、BacktestEngine 旗標化（引擎預設關、`backtest` CLI 預設開）。baseline 重錨 ✅2026-07-08（4 portfolio 重新凍結，validate-baseline 全綠） |
+
+### 6.3 二次止血包（2026-07-19 事故重審新增；詳 `logs/audit_mg5_20d_20260718/REPORT.md` §3）
+
+| # | 項目 | 內容 / 驗收 |
+|---|------|------------|
+| 12 | **pending 重複買單 UNIQUE 炸鍋** | ✅ 2026-07-19 已修（分支 `fix-pending-order-duplicate-crash` 待 PR）：7/10 假交易日→3617 順延→decide 重複開單→7/13 雙成交 UNIQUE 違反→Step 12 連炸 5 天（7/13–17 swing5_3d/mg5_20d/mom3_20d 未更新、停損凍結、snapshot 永久缺口）。三層防護：decide 在途去重 / fill TTL 提前+同股防護 / update --all per-portfolio 隔離。+5 回歸測試 |
+| 13 | **rankings stale fallback 架空 M2 停用** | 🔴 未修，**mg5_20d 二審前必修**。`_find_latest_rankings` 無時效上限：momentum 6/17 被 IC 反向停用後，mom5_10d/mg5_20d 整個七月用 6/16 舊排名交易。composite 分支加倍錯誤（fallback 不過濾 mode）。**設計決策待定**：模式停用時組合應凍結新買入（僅風控賣出）vs 舊排名時效上限（如 ≤3 交易日）。與 B11（IC 治理）連動 |
+| 14 | **行事曆假交易日哨兵** | 🔴 未修。2026-07-10 行事曆標交易日但市場實際休市（全市場 daily_price 僅 US_VIX 1 筆，疑颱風假）——事故 #12 的觸發源。①修正 `data/calendar.py` 該日；②pipeline 加「同步後全市場 0 筆 → 判定臨時休市」哨兵告警 |
 
 ---
 
@@ -191,7 +199,7 @@ Broker 層 + 對帳 → 風險引擎 → RotationContext → 停損現實化 →
 實盤校準（滑價實測 vs 模型）→ 資金階梯（每季檢視）→ 風險引擎獲 pre-trade 否決權 → B8/B9/C3 → 事件溯源級重放。**Institutional grade 指紀律，不是拓撲**：依然一個 repo、一台主機、SQLite。
 
 ### 研究議程（平台解鎖後，按序）
-R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPORT.md`）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
+R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPORT.md`）→ R1b 7/19 終裁 ✅（swing5_3d 暫停；mg5_20d 首審降級警戒，二審 gate=P0 #13 修復＋事故污染排除，非固定日期）→ R2 跨 regime 穩健性 2020–2026（B1 後）→ R3 全池 IC 重建 + REGIME_WEIGHTS 重估（B2 後）→ R4 成本敏感度曲面 → R5 滑價模型實測校準（實盤 3 個月後）→ R6 多組合配置 → R7 Crisis 引擎歷史回放驗證（2020/03、2022、2024/08）。
 
 ---
 
