@@ -99,7 +99,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | 外部介面 | TWSE/TPEX `verify=False` 刻意；MOPS 備援站、DJ Big5 regex——脆弱面，改版風險常在 | 常態，靠對帳+告警圍堵 |
 | API 速率 | FinMind 0.5s、TWSE/TPEX 3s——morning-routine 時長的硬下限 | 常態 |
 | 交易階段 | Paper only；**實盤須過 §9 六條 Gate** | Gate 通過 |
-| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）；**R1 歷史裁決重審 ✅2026-07-08 完成**（`logs/r1_20260708/REPORT.md`）：6/20 全部裁決無翻案；副產物=修復 FinMind year=NaN 股利斷流 bug；**7/19 終裁**（`logs/audit_mg5_20d_20260718/REPORT.md`）：swing5_3d 🔴暫停（live B期 1/13 勝、alpha −5.13pp）；mg5_20d 首審=維持但降級警戒（MtM alpha −7.6%，惟窗口被事故+訊號斷糧+7/17 崩盤三重污染，N=2），二審 gate 在 P0 訊號斷糧修復；**7/30 二審＝No-Verdict 不可評估**（`logs/audit_mg5_20d_20260730/REPORT.md`）：gate 形式條件已成立但修復後 8 交易日新進場 **0 筆**，forward OOS 樣本為空；原訂 8/8 判點取消、改掛 B11 條件（詳 §7 #3） | 已解除 |
+| 裁決凍結 | ✅已解除（2026-07-07 A2+A3 完成）；**R1 歷史裁決重審 ✅2026-07-08 完成**（`logs/r1_20260708/REPORT.md`）：6/20 全部裁決無翻案；副產物=修復 FinMind year=NaN 股利斷流 bug；**7/19 終裁**（`logs/audit_mg5_20d_20260718/REPORT.md`）：swing5_3d 🔴暫停（live B期 1/13 勝、alpha −5.13pp）；mg5_20d 首審=維持但降級警戒（MtM alpha −7.6%，惟窗口被事故+訊號斷糧+7/17 崩盤三重污染，N=2），二審 gate 在 P0 訊號斷糧修復；**7/30 二審＝No-Verdict 不可評估**（`logs/audit_mg5_20d_20260730/REPORT.md`）：gate 形式條件已成立但修復後 8 交易日新進場 **0 筆**，forward OOS 樣本為空；原訂 8/8 判點取消、改掛 B11 條件（詳 §7 #3）；mg5_20d 已 pause。**連帶盤點**：僅存 active 組合 mom5_10d／mom3_20d 皆 momentum 模式、7/31 起 100% 現金，且其歷史績效受 renewal 污染（§10 結構債）——兩者正式重審待污染量化後另辦 | 已解除 |
 | 已死資料欄 | TW_VIX（FinMind 移除）、SBL sbl_change 三欄恆 NULL、DJ 分點無均價（close 代理） | 各自替代方案落地 |
 
 ---
@@ -147,7 +147,7 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 |---|------|:---:|------------|
 | 1 | **B1 Point-in-Time 研究環境** | 4–6 週 | 全 roadmap 最大單一效益。①全市場歷史回補至 2020（含下市股）；②DailyFeature 全歷史化；③scanner 注入 `as_of` + offline mode；④PIT 回測 CLI。解鎖：跨 regime 驗證（R2）、scanner 改動當日見真章 |
 | 2 | **B2 全候選池因子落庫** | 1 週 | 掃描時將粗篩後全部候選（非只 top-N）因子值落新表。IC 體系擺脫截斷樣本偏差 |
-| 3 | **B11 IC 治理改革** 🔺**2026-07-30 升為 P1 最優先** | 1 週 | 樣本門檻 ≥100 且跨 ≥3 掃描週；「自動停用模式」降級為告警+人工確認；以 B2 資料重建 IC。拆除噪音驅動的自動開關（歷史多次誤殺 swing/value/dividend 的根因）。**升順位理由（mg5_20d 二審）**：現行 M2 停用的是**掃描**而非**下單**（`morning_cmd.py:1201` → Step 9 skip），停用後不再產生 `discovery_record` → IC 無從重算 → **模式無法自證恢復，形成自鎖**。實測：momentum 6/16 停用後中斷 29 個交易日（至 7/29 才有 7 筆部分掃描）、growth 7/16 起停用至今。後果＝雙引擎組合 mg5_20d 訊號歸零、forward 驗證無樣本可取。**修法方向：停用時照常掃描並落庫，僅在 rotation 層阻擋新買入**，使 IC 可續算、模式具自動恢復路徑。此項未落地前，mom_growth／momentum 系組合的任何 forward 裁決都不成案 |
+| 3 | **B11 IC 治理改革** 🔺**2026-07-30 升為 P1 最優先** | 1 週 | 樣本門檻 ≥100 且跨 ≥3 掃描週；「自動停用模式」降級為告警+人工確認；以 B2 資料重建 IC。拆除噪音驅動的自動開關（歷史多次誤殺 swing/value/dividend 的根因）。**升順位理由（mg5_20d 二審）**：現行 M2 停用的是**掃描**而非**下單**（`morning_cmd.py:1201` → Step 9 skip），停用後不再產生 `discovery_record` → IC 無從重算 → **模式無法自證恢復，形成自鎖**。實測：momentum 6/16 停用後中斷 29 個交易日（至 7/29 才有 7 筆部分掃描）、growth 7/16 起停用至今。後果＝雙引擎組合 mg5_20d 訊號歸零、forward 驗證無樣本可取。**修法方向：停用時照常掃描並落庫，僅在 rotation 層阻擋新買入**，使 IC 可續算、模式具自動恢復路徑。此項未落地前，mom_growth／momentum 系組合的任何 forward 裁決都不成案。**影響範圍＝全系統**（2026-07-30 盤點，報告 §6）：mg5_20d pause 後僅存的 active 組合 mom5_10d／mom3_20d 皆為 momentum 模式，7/31 起雙雙 100% 現金、momentum 7/29 排名 8/4 逾期；momentum 過去 30 個交易日僅掃描 1 天（7/29 放行、7/30 又停用），M2 呈「停用→樣本歸零→判 insufficient→放行一天→再停用」振盪。後果＝**crisis 解除後全系統無可用訊號重新進場** |
 | 4 | **B5 Always-on 運行環境** | 1 週 | Mac mini 或 VPS 常駐 + 容器化部署腳本；launchd → systemd/cron。消除筆電 SPOF |
 | 5 | **B10 告警分級** | 3 天 | critical/warning/info 三管道，critical 需 ack；absence 告警全覆蓋 |
 | 6 | **B3 Broker 抽象層 + Shioaji** | 4–6 週 | `Broker` interface（place/cancel/query/positions/fills）+ PaperBroker 重寫 + 永豐 Shioaji sandbox。實盤前提；PaperBroker 順帶統一 fill 模擬 |
@@ -227,6 +227,7 @@ R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPOR
 - 逐股 Python 迴圈效能地雷（150 候選安全，1,500 不安全）→ Low #9。
 - conftest session-scope engine + get_session monkeypatch 的污染陷阱（曾污染 dev DB）→ Low #10。
 - Fallback 疊加路徑（資料延遲 + 模式停用 + 前日排名 + 5 日前價格）無測試覆蓋 → 隨 B7 的 parity 套件補。
+- **renewal 訊號污染（2026-07-30 發現）**：續持依賴當前排名（`rotation.py:841` `if allow_renewal and sid in ranked_ids`），P0 #13 修復前的 stale fallback 使部位靠過期排名**無限續持**——mom5_10d 1303（hold=10，實持 6/16–7/21、+62.78%）、mom3_20d 2890/5871（hold=20，實持 6/09–7/21）等多筆遠超名目天數，並於 7/21 修復後首次 update 集體到期。含意：①mom5_10d／mom3_20d 的 +12%／+11% 生涯績效部分係 bug 行為所得，與 post-fix 行為**不同質**；②`data/baseline_metrics.json`（2026-07-08 A4 重錨）凍結區間涵蓋污染期，其 sharpe/win/alpha 門檻對 post-fix 行為未必適用 → **B11 落地後應重評是否再次重錨**；③兩組合正式重審須待污染量化後辦理。
 
 ### 統計/方法債
 - IC 建立在 top-N 截斷樣本、n≈20–30，驅動自動停用/翻轉 → B2+B11。
