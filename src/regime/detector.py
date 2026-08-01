@@ -348,7 +348,40 @@ class RegimeState:
     regime_since: str  # ISO date
     confirmation_count: int
     pending_transition: str | None
-    last_updated: str  # ISO date
+    last_updated: str  # ISO date（掛鐘日：最後一次寫入的日期）
+    # 本次判定依據的最新 TAIEX 資料日（ISO date）；狀態機的冪等鍵，見
+    # RegimeStateMachine.update() 的「冪等閘門」註解。舊資料為 None（未知）。
+    data_date: str | None = None
+
+
+def resolve_data_date(closes: pd.Series) -> str | None:
+    """從價格序列末端取出「本次判定所依據的最新資料日」（ISO 字串）。
+
+    此值是 regime 狀態機的**冪等鍵**：同一份資料重複呼叫不得再次推進遲滯計數。
+
+    為什麼不用 `date.today()`：morning-routine 的 Step 0 宏觀壓力預檢在資料同步
+    （Step 1~8）**之前**執行，若以掛鐘日為鍵，當天第一次呼叫會把「尚未同步、
+    僅到昨日」的判定結果鎖定為當日結論，regime 將永久落後一個交易日。改用資料日
+    後，Step 0 與昨日結論一致（不推進），同步完成後的第一次呼叫才推進一次。
+
+    Args:
+        closes: TAIEX 收盤價序列，index 預期為 date / datetime / ISO 字串。
+
+    Returns:
+        ISO date 字串；index 型別無法解析（如測試常用的整數 index）時回傳 None，
+        呼叫端據此退回「每次呼叫都推進」的舊行為（不影響既有純函數測試）。
+    """
+    if closes is None or len(closes) == 0:
+        return None
+    last = closes.index[-1]
+    # 注意順序：datetime 是 date 的子類別，pd.Timestamp 又是 datetime 的子類別
+    if isinstance(last, datetime.datetime):
+        return last.date().isoformat()
+    if isinstance(last, datetime.date):
+        return last.isoformat()
+    if isinstance(last, str):
+        return last[:10] or None
+    return None
 
 
 class RegimeStateMachine:
@@ -359,7 +392,10 @@ class RegimeStateMachine:
     JSON 檔案模式（向後相容測試與 legacy 用法）。Cold start 時（無資料或損壞）
     使用 detect_from_series() 的 raw regime 作為初始狀態。
 
-    同一天重複呼叫時回傳快取結果（不重複累加 confirmation_count）。
+    **冪等保證（P0 #15，2026-08-01）**：以「本次判定所依據的最新 TAIEX 資料日」
+    （`RegimeState.data_date`）為鍵，同一份資料無論被呼叫幾次、由幾個實例呼叫，
+    都回傳同一結論且**不推進 hysteresis、不寫狀態 log**。此保證跨實例與跨行程成立
+    （狀態存於 DB / JSON），因此呼叫端無須自行共用 detector 實例。
 
     Args:
         state_path: JSON 狀態檔路徑；**傳入即啟用 JSON 模式**（legacy/test 用）。
@@ -402,15 +438,14 @@ class RegimeStateMachine:
 
         Returns:
             dict: 與 detect_from_series() 相同 schema + 額外 hysteresis 欄位
+                + `state_advanced`（bool，本次呼叫是否推進了狀態機）
         """
         today_str = datetime.date.today().isoformat()
+        data_date = resolve_data_date(closes)
 
-        # 同日重複呼叫 → 回傳快取
         state = self._load_state()
-        if state is not None and state.last_updated == today_str and self._cached_result is not None:
-            return self._cached_result
 
-        # 取 raw regime
+        # raw 判定為純函數、無副作用，兩條路徑共用（冪等路徑也需要它的訊號欄位）
         raw_result = detect_from_series(
             closes,
             volumes=volumes,
@@ -421,6 +456,36 @@ class RegimeStateMachine:
             return_window=self.return_window,
             breadth_below_ma20_pct=breadth_below_ma20_pct,
         )
+
+        # ── 冪等閘門（P0 #15，2026-08-01）────────────────────────────────
+        # 舊版條件為 `state.last_updated == today_str and self._cached_result is not None`，
+        # 而 `_cached_result` 是 **per-instance**，所有呼叫端都寫成
+        # `MarketRegimeDetector().detect()`（全新實例）→ 快取從未命中 →
+        # 每次呼叫都重跑 apply_hysteresis() 並 append 一筆 RegimeStateLog。
+        # 實測每日 4~15 次呼叫，造成三個後果：
+        #   ① 同一批 discover 掃描中各模式看到不同 regime（門檻/權重/universe/
+        #      REGIME_MODE_BLOCK 全部分歧，2026-07-24 實測 sideways↔bear 來回 3 次）
+        #   ② 模式當天跑不跑，取決於它剛好排在第幾個呼叫
+        #   ③ hysteresis 確認計數按「呼叫次數」而非「天數」消耗，遲滯機制被架空
+        # 改以資料日為鍵（理由見 resolve_data_date docstring）：同一份 TAIEX 資料
+        # 無論被呼叫幾次都回傳同一結論，不推進狀態機、不寫 log。
+        # data_date 為 None（index 無法解析，如純函數測試的整數 index）或既有狀態
+        # 尚未帶此欄（migration 前的舊資料）時，退回舊行為推進一次。
+        if state is not None and data_date is not None and state.data_date == data_date:
+            result = self._build_result(
+                raw_result,
+                final_regime=state.regime,
+                transition_info={
+                    "raw_regime": raw_result["regime"],
+                    "prev_regime": state.regime,
+                    "transition_blocked": state.regime != raw_result["regime"],
+                    "pending_transition": state.pending_transition,
+                    "reason": "idempotent_same_data_date",
+                },
+                state_advanced=False,
+            )
+            self._cached_result = result
+            return result
 
         prev_regime = state.regime if state else None
         prev_count = state.confirmation_count if state else 0
@@ -453,17 +518,37 @@ class RegimeStateMachine:
             confirmation_count=new_count,
             pending_transition=transition_info.get("pending_transition"),
             last_updated=today_str,
+            data_date=data_date,
         )
         self._save_state(new_state)
 
-        # 建構回傳 dict（superset of detect_from_series）
+        result = self._build_result(
+            raw_result,
+            final_regime=final_regime,
+            transition_info=transition_info,
+            state_advanced=True,
+        )
+        self._cached_result = result
+        return result
+
+    @staticmethod
+    def _build_result(
+        raw_result: dict,
+        final_regime: str,
+        transition_info: dict,
+        state_advanced: bool,
+    ) -> dict:
+        """組裝回傳 dict（superset of detect_from_series），推進與冪等兩條路徑共用。
+
+        `state_advanced` 供呼叫端與測試判斷本次是否真的推進了狀態機
+        （§3 原則 8：graceful degradation 但不靜默——冪等短路須留下可觀測痕跡）。
+        """
         result = {**raw_result}
         result["regime"] = final_regime
         result["hysteresis_applied"] = final_regime != raw_result["regime"]
         result["raw_regime"] = raw_result["regime"]
         result["transition_info"] = transition_info
-
-        self._cached_result = result
+        result["state_advanced"] = state_advanced
         return result
 
     def _load_state(self) -> RegimeState | None:
@@ -503,6 +588,8 @@ class RegimeStateMachine:
                         confirmation_count=row.confirmation_count,
                         pending_transition=row.pending_transition,
                         last_updated=row.last_updated,
+                        # migration 前的舊列無此欄 → None（冪等閘門不成立，重新判定一次）
+                        data_date=getattr(row, "data_date", None),
                     )
         except Exception:
             logger.debug("RegimeStateLog 讀取失敗，cold start", exc_info=True)
@@ -529,6 +616,7 @@ class RegimeStateMachine:
                         confirmation_count=state.confirmation_count,
                         pending_transition=state.pending_transition,
                         last_updated=state.last_updated,
+                        data_date=state.data_date,
                     )
                 )
                 session.commit()
@@ -550,6 +638,7 @@ class RegimeStateMachine:
                     confirmation_count=data.get("confirmation_count", 0),
                     pending_transition=data.get("pending_transition"),
                     last_updated=data.get("last_updated", ""),
+                    data_date=data.get("data_date"),
                 )
         except Exception:
             logger.debug("regime_state.json 讀取失敗，cold start")
@@ -995,6 +1084,7 @@ class MarketRegimeDetector:
                 "hysteresis_applied": False,
                 "raw_regime": None,
                 "transition_info": None,
+                "state_advanced": False,
             }
 
         closes = pd.Series([r[1] for r in rows], index=[r[0] for r in rows])
@@ -1047,6 +1137,7 @@ class MarketRegimeDetector:
             result["hysteresis_applied"] = False
             result["raw_regime"] = None
             result["transition_info"] = None
+            result["state_advanced"] = False  # 未走狀態機，無狀態可推進
 
         # ── Logging ──
         if result.get("breadth_downgraded"):

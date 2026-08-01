@@ -91,6 +91,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # 入帳/停損調整須用實際除息交易日；既有列以 tools/backfill_ex_dividend_dates.py 回填
     ("dividend", "cash_ex_dividend_date", "DATE"),
     ("dividend", "stock_ex_dividend_date", "DATE"),
+    # P0 #15（2026-08-01）：regime 狀態機冪等鍵 = 本次判定依據的最新 TAIEX 資料日。
+    # 舊列為 NULL（未知）→ 首次執行會重新判定一次並寫入，之後同資料日不再推進。
+    ("regime_state_log", "data_date", "VARCHAR(10)"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

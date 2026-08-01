@@ -92,7 +92,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
-| `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機 |
+| `regime/detector.py` | 市場狀態（bull/bear/sideways/crisis）、Hysteresis 狀態機（**冪等**：以 `data_date`＝最新 TAIEX 資料日為鍵，同一份資料重複呼叫不推進狀態、不寫 log） |
 | `industry/analyzer.py` | 產業輪動、同業相對強度（±3%） |
 | `industry/concept_analyzer.py` | 概念股輪動、Percentile Rank（±5% 加成） |
 | `screener/` | 多因子篩選引擎（8 因子，watchlist 內掃描） |
@@ -139,6 +139,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Watchlist** | `get_effective_watchlist()`：DB 優先，`quant_params.yaml` fallback，全模組統一呼叫 |
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
+| **Regime 冪等（P0 #15）** | `MarketRegimeDetector().detect()` 對**同一 TAIEX 資料日**恆等：呼叫端可自由 `MarketRegimeDetector()` 新建實例（現況 10+ 處），跨實例/跨行程都拿到同一 regime，hysteresis 每個資料日只推進一次。**勿**改回以 `date.today()` 為鍵——morning-routine Step 0 在同步前執行，會把 regime 凍結在前一交易日。回傳 `state_advanced` 標示本次是否推進 |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
 | **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日（逾期不論有無報價一律取消）、同股僅允許一張在途買單（decide 去重 + fill 端 UNIQUE 防護）、風控賣單停牌以 ref_price 成交不凍結；`update --all` per-portfolio 隔離 |
@@ -159,7 +160,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 ### CLI 設計原則
 
 - 入口：`python main.py <子命令>`（49 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
-- 每日例行：`morning-routine`（Step 0~15+8b，含全市場同步 + discover + 風控 + 通知）
+- 每日例行：`morning-routine`（Step 0~18 + 子步驟 8b/8c/8d/8e/9b/11b，含全市場同步 + discover + 風控 + 通知）
+  - Step 8e「同步後 regime 重解」：Step 0 宏觀預檢在同步**之前**執行，其 regime 只到前一交易日；Step 12 輪動須用同步後的判定（`resolve_regime_after_sync()`，dry_run/skip_sync 跳過）
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
 - 完整指令參考見 [`docs/cli_commands.md`](docs/cli_commands.md)
 
@@ -169,7 +171,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2417 測試 / 83 檔）
+- **執行**：`pytest -v`（2630 測試 / 100 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

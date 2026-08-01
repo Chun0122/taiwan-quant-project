@@ -798,6 +798,37 @@ def _inverse_modes_from_ic_status(ic_status: list[dict]) -> list[str]:
     return [s["mode_key"] for s in ic_status if s.get("level") == "inverse"]
 
 
+def resolve_regime_after_sync(previous: str | None) -> str | None:
+    """同步完成後重解 regime（morning-routine Step 8e，P0 #15）。
+
+    Step 0 宏觀壓力預檢在資料同步（Step 1~8）**之前**執行，其 regime 只反映
+    「昨日收盤為止」的資料；而 Step 9 掃描與 Step 12 輪動都在同步之後，若沿用
+    Step 0 的結果，rotation 會永遠比 discover 慢一個交易日。此函數以同步後的
+    資料重解一次。
+
+    狀態機自 P0 #15 起具冪等性（同一 `data_date` 不重複推進 hysteresis），
+    故此處重解不會產生副作用，也不會與 Step 9 各 scanner 的判定分歧。
+
+    Args:
+        previous: Step 0 取得的 regime（可能為 None＝預檢失敗）。
+
+    Returns:
+        重解後的 regime；重解失敗或結果為空時回傳 `previous`（沿用 Step 0）。
+    """
+    try:
+        from src.regime.detector import MarketRegimeDetector
+
+        refreshed = MarketRegimeDetector().detect().get("regime")
+    except Exception as exc:
+        logger.warning("同步後 regime 重解失敗，沿用 Step 0 結果: %s", exc, exc_info=True)
+        return previous
+    if not refreshed:
+        return previous
+    if refreshed != previous:
+        print(f"  市場狀態（同步後重解）: {(previous or 'unknown').upper()} → {refreshed.upper()}")
+    return refreshed
+
+
 def _sync_full_market() -> None:
     """同步全市場 TWSE/TPEX 日K線（確保 rotation 持倉等非 watchlist 股票有最新價格）。"""
     from src.data.pipeline import sync_market_data
@@ -1185,6 +1216,19 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
     MAX_STALE_HARD_BLOCK_DAYS = 7  # 超過 7 天資料過期直接阻擋 Step 9（M1）
     # Step 17 baseline regression — Step 17 寫入，Discord summary 讀取
     baseline_state: dict = {"regressions": [], "missing": False}
+    # P0 #15：Step 0 的 regime 取自**同步前**的資料（Step 0 在 Step 1~8 之前），
+    # 故只代表「昨日收盤為止」的判定。Step 9 掃描與 Step 12 輪動都發生在同步後，
+    # 必須以同步後的資料重解一次，否則 rotation 永遠比 discover 慢一個交易日。
+    # 狀態機已具冪等性（同一 data_date 不重複推進），此處重解無副作用。
+    regime_state: dict = {"regime": regime_now}
+
+    def _refresh_regime_after_sync() -> None:
+        """同步完成後重解 regime，供 Step 12 輪動使用（P0 #15）。
+
+        skip_sync / dry_run 由 _steps 的 skip 集合負責跳過（未同步時 Step 0
+        的判定已是最新可得資料，無須重解）。
+        """
+        regime_state["regime"] = resolve_regime_after_sync(regime_state["regime"])
 
     def _step_8c_ic_precheck() -> None:
         """Step 8c：在 Step 9 discover 前檢查關鍵因子 IC，反向模式自動停用（M2）。
@@ -1250,7 +1294,7 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
         if freshness.get("phantom"):
             print("  !! 疑似臨時休市（行事曆交易日但全市場無今日資料）——跳過輪動更新，避免以陳舊 close 決策")
             return
-        _rotation_update_all(regime=regime_now)
+        _rotation_update_all(regime=regime_state["regime"])
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
     _steps = [
@@ -1310,6 +1354,12 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             "計算 DailyFeature（sync-features --days 90，全市場資料就緒後）",
             {"dry_run", "skip_sync"},
             lambda: cmd_sync_features(argparse.Namespace(days=90)),
+        ),
+        (
+            "8e",
+            "同步後 regime 重解（Step 0 為同步前判定，P0 #15）",
+            {"dry_run", "skip_sync"},
+            _refresh_regime_after_sync,
         ),
         (
             "8c",
