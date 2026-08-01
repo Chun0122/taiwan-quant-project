@@ -35,6 +35,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_mops.py` | `mops_fetcher.py` + scanner 消息面 | 純函數+SQLite |
 | `test_regime.py` | `regime/detector.py` | 純函數 |
 | `test_regime_idempotence.py` | `regime/detector.py` 冪等閘門（P0 #15）+ morning `resolve_regime_after_sync` | 純函數+SQLite |
+| `test_ic_governance.py` | `discovery/ic_governance.py` 三道閘門（P0 #16）+ `rankings.exclude_modes` + rotation 阻擋 | 純函數+SQLite |
 | `test_fetcher.py` | `data/fetcher.py` | mock HTTP |
 | `test_config.py` | `config.py` | tmp_path |
 | `test_charts.py` | `visualization/charts.py` | 純函數 |

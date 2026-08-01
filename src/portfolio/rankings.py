@@ -20,6 +20,7 @@ def resolve_rankings(
     session,
     top_n: int = 50,
     per_mode_max: int | None = None,
+    exclude_modes: set[str] | None = None,
 ) -> list[dict]:
     """從 DiscoveryRecord 解析指定日期的排名。
 
@@ -35,6 +36,10 @@ def resolve_rankings(
     per_mode_max : int | None
         僅對 mode='all' 生效；每個 primary_mode 最多 N 檔（避免單 mode 集中爆雷）。
         None = 取 constants.ROTATION_ALL_MODE_PER_MODE_MAX 預設；0 或負值 = 不限制。
+    exclude_modes : set[str] | None
+        排除的 scanner 模式（P0 #16：IC 反向且達執法門檻者）。單一模式命中即回空
+        （＝凍結新買入）；composite 模式則濾掉被排除的成員，成員全數被排除時回空。
+        **只影響新買入**——賣出/停損/到期路徑不經此函數，故不受影響。
 
     Returns
     -------
@@ -43,12 +48,20 @@ def resolve_rankings(
         {stock_id, stock_name, rank, score, close, stop_loss}
         （mode='all' 時額外含 primary_mode）
     """
+    excluded = exclude_modes or set()
+
     if is_composite_mode(mode):
         spec = COMPOSITE_MODES[mode]
         pmm = per_mode_max if per_mode_max is not None else spec["per_mode_max"]
+        members = tuple(m for m in spec["members"] if m not in excluded)
+        if not members:
+            return []
         return _resolve_composite_rankings(
-            scan_date, session, top_n, members=spec["members"], per_mode_max=pmm, source_mode=mode
+            scan_date, session, top_n, members=members, per_mode_max=pmm, source_mode=mode
         )
+
+    if mode in excluded:
+        return []
 
     stmt = (
         select(DiscoveryRecord)

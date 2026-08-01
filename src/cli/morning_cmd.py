@@ -594,6 +594,29 @@ _MODE_LABELS: dict[str, str] = {
 }
 
 
+def _ic_level_from_verdict(verdict) -> str:
+    """ICVerdict → 顯示用 level（P0 #16）。
+
+    **不可執法一律不得回 "inverse"**——這是 B11 最小切口的核心：過期窗口、
+    窗口數不足、樣本不足時只能告警，不能停用模式。原因碼直接當 level 用，
+    使 log 說出真正的理由（舊版全部塞進 "insufficient"，見 §6.4 #18）。
+    """
+    from src.discovery.ic_governance import REASON_OK
+
+    if verdict.reason != REASON_OK:
+        return verdict.reason  # stale_window / insufficient_windows / insufficient_samples / no_windows
+    ic = verdict.ic
+    if ic is None:
+        return "no_windows"
+    if ic < -0.05:
+        return "inverse"
+    if ic < 0.05:
+        return "weak"
+    if ic < 0.10:
+        return "decay"
+    return "normal"
+
+
 def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], dict[str, "pd.DataFrame"]]:
     """為每個 discover 模式計算 IC：rolling IC（level 判定）+ scanner 用 IC（項目 E）。
 
@@ -631,6 +654,7 @@ def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], di
 
     from src.data.database import get_session
     from src.data.schema import DailyPrice, DiscoveryRecord
+    from src.discovery.ic_governance import select_enforceable_ic
     from src.discovery.scanner._functions import compute_factor_ic, compute_rolling_ic
 
     if today is None:
@@ -667,6 +691,9 @@ def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], di
                 )
                 rows = session.execute(stmt).all()
                 if len(rows) < 20:
+                    # §6.4 #18：此處才是真正的「樣本不足」；窗口算不出來的情況
+                    # 另有 level="no_windows"，不再共用同一標籤（舊版兩者都印
+                    # 「樣本不足（n=260，需 ≥20）」這種自相矛盾的訊息）。
                     entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
                     results.append(entry)
                     continue
@@ -690,7 +717,7 @@ def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], di
                     )
                 ).all()
                 if not price_rows:
-                    entry.update({"ic": None, "level": "insufficient", "sample_count": 0})
+                    entry.update({"ic": None, "level": "no_prices", "sample_count": len(rows)})
                     results.append(entry)
                     continue
                 df_prices = pd.DataFrame(price_rows, columns=["stock_id", "date", "close"])
@@ -710,27 +737,24 @@ def _compute_factor_ic_status(today: date | None = None) -> tuple[list[dict], di
             except Exception:
                 logger.warning("scanner 用 static IC 計算失敗 mode=%s（不影響 level 判定）", mode, exc_info=True)
 
-            if rolling_df.empty:
-                entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
-                results.append(entry)
-                continue
-
-            factor_df = rolling_df[rolling_df["factor"] == key_factor].sort_values("window_end")
-            if factor_df.empty:
-                entry.update({"ic": None, "level": "insufficient", "sample_count": len(rows)})
-                results.append(entry)
-                continue
-
-            latest_ic = float(factor_df["ic"].iloc[-1])
-            if latest_ic < -0.05:
-                level = "inverse"
-            elif latest_ic < 0.05:
-                level = "weak"
-            elif latest_ic < 0.10:
-                level = "decay"
-            else:
-                level = "normal"
-            entry.update({"ic": latest_ic, "level": level, "sample_count": len(rows)})
+            # P0 #16：三道執法閘門（時效 / 窗口數 / 樣本）統一由 ic_governance 判定。
+            # 舊版直接取 factor_df["ic"].iloc[-1] 執法，導致模式停掃後窗口凍結、
+            # 每天重讀同一份過期 IC（實測 34 天前、n=40）→ 模式無法自證恢復。
+            verdict = select_enforceable_ic(rolling_df, key_factor, as_of=today, holding_days=holding_days, mode=mode)
+            entry.update(
+                {
+                    "ic": verdict.ic,
+                    "sample_count": len(rows),
+                    "verdict": verdict,
+                    "enforceable": verdict.enforceable,
+                    "reason": verdict.reason,
+                    "window_end": verdict.window_end,
+                    "staleness_days": verdict.staleness_days,
+                    "window_count": verdict.window_count,
+                    "min_sample_count": verdict.min_sample_count,
+                }
+            )
+            entry["level"] = _ic_level_from_verdict(verdict)
             results.append(entry)
         except Exception as exc:
             # C1 修復：明確記錄失敗而非靜默 continue
@@ -760,6 +784,7 @@ def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
 
     has_decay = False
     failed_modes: list[str] = []
+    unenforceable: list[str] = []
     for s in ic_status:
         label = s.get("mode", "?")
         factor = s.get("factor", "?")
@@ -771,7 +796,16 @@ def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
             continue
         if level == "insufficient":
             n = s.get("sample_count", 0)
-            print(f"  {label} 關鍵因子 {factor}：樣本不足（n={n}，需 ≥20），跳過")
+            print(f"  {label} 關鍵因子 {factor}：推薦記錄不足（n={n}，需 ≥20），跳過")
+            continue
+        if level == "no_prices":
+            print(f"  {label} 關鍵因子 {factor}：無對應價格資料，跳過")
+            continue
+        # P0 #16：可觀測但不可執法——印出 IC 供人判讀，並明說為何不執法
+        verdict = s.get("verdict")
+        if verdict is not None and not verdict.enforceable:
+            unenforceable.append(label)
+            print(f"  ⚠ {label} 關鍵因子 {verdict.describe()}")
             continue
         if level == "inverse":
             has_decay = True
@@ -787,14 +821,23 @@ def _check_factor_ic_decay(ic_status: list[dict] | None = None) -> list[dict]:
 
     if failed_modes:
         print(f"  ⚠ {len(failed_modes)} 個模式 IC 計算失敗：{', '.join(failed_modes)}（請檢查 log）")
-    elif not has_decay:
+    elif not has_decay and not unenforceable:
         print("  所有模式關鍵因子 IC 正常。")
+    if unenforceable:
+        print(f"  ℹ {len(unenforceable)} 個模式 IC 未達執法門檻（樣本/窗口/時效），僅告警：{', '.join(unenforceable)}")
 
     return ic_status
 
 
 def _inverse_modes_from_ic_status(ic_status: list[dict]) -> list[str]:
-    """從 IC 狀態抽出反向模式的 mode_key 列表（M2 用）。"""
+    """從 IC 狀態抽出「反向**且可執法**」模式的 mode_key 列表（M2 用）。
+
+    P0 #16：`level == "inverse"` 只在 `ICVerdict.enforceable` 為真時才會產生
+    （見 `_ic_level_from_verdict`），故此處等同於「通過時效/窗口/樣本三道閘門
+    後仍判定反向」。**這些模式照常掃描並落庫**，僅由 rotation 層阻擋新買入
+    （`portfolio/manager._build_decision_context`），使 IC 得以續算、模式具備
+    自動恢復路徑——這正是修復自鎖迴路的關鍵。
+    """
     return [s["mode_key"] for s in ic_status if s.get("level") == "inverse"]
 
 
@@ -1247,12 +1290,20 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
         ic_status_state["disabled_modes"] = disabled
         if disabled:
             labels = [_MODE_LABELS.get(m, m) for m in disabled]
-            print(f"  ⚠ 將於 Step 9 自動停用 {len(disabled)} 個反向模式：{', '.join(labels)}")
+            # P0 #16：不再跳過掃描。停用只作用在 rotation 層（阻擋新買入），
+            # 掃描照跑並落庫 → IC 可續算 → 模式具備自證恢復路徑（拆自鎖迴路）。
+            print(f"  ⚠ {len(disabled)} 個模式 IC 反向且達執法門檻：{', '.join(labels)}")
+            print("     → 仍照常掃描落庫（供 IC 續算）；由 rotation 層阻擋新買入")
         else:
-            print("  無反向模式需停用。")
+            print("  無模式達到 IC 反向執法門檻。")
 
     def _step_9_discover() -> None:
-        """Step 9：discover all；臨時休市/M1 資料過期硬阻擋；M2 停用反向模式。"""
+        """Step 9：discover all；臨時休市/M1 資料過期硬阻擋。
+
+        P0 #16：**不再因 IC 反向跳過任何模式的掃描**。IC 反向的處置移至
+        rotation 層（阻擋新買入），此處五模式恆掃、恆落庫，否則停用的模式
+        永遠產不出新 `discovery_record`，IC 無從重算而自鎖。
+        """
         # P0 #14：臨時休市哨兵（行事曆交易日但全市場無今日資料）
         if freshness.get("phantom"):
             discover_blocked_state["blocked"] = True
@@ -1269,7 +1320,6 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             print("     請先執行完整 sync 後重跑，或確認非預期的資料斷層。")
             return
 
-        disabled_modes = ic_status_state.get("disabled_modes", [])
         ic_df_by_mode = ic_status_state.get("ic_df_by_mode", {}) or {}
         _cmd_discover_all(
             argparse.Namespace(
@@ -1284,7 +1334,9 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
                 export=None,
                 notify=False,
                 use_ic_adjustment=True,
-                disabled_modes=disabled_modes,
+                # P0 #16：恆為空——IC 反向不再跳過掃描（處置移至 rotation 層）。
+                # 參數保留是為了 `discover all --disable-mode` 之類的人工介入場景。
+                disabled_modes=[],
                 precomputed_ic_by_mode=ic_df_by_mode,  # 項目 E
             )
         )

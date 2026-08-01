@@ -447,12 +447,14 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     # 項目 A 預熱：避免 5 scanner 同時對 FinMind 0.5s/req 速率打擊
     _prewarm_stage_25(shared, top_n=200)
 
-    # 篩出實際要跑的 mode（依 disabled_modes 過濾），保留原順序供結果渲染
+    # 篩出實際要跑的 mode（依 disabled_modes 過濾），保留原順序供結果渲染。
+    # P0 #16 起 morning-routine 恆傳空集合——IC 反向不再跳過掃描（否則模式產不出
+    # 新 discovery_record，IC 無從重算而自鎖）；此參數僅保留給人工介入場景。
     active_modes = [m for m in scanner_classes if m not in disabled_modes]
-    skipped_summaries = [f"  {mode_labels[m]:<4} 已停用（IC 反向）" for m in disabled_modes if m in scanner_classes]
+    skipped_summaries = [f"  {mode_labels[m]:<4} 已停用（人工指定）" for m in disabled_modes if m in scanner_classes]
     for m in disabled_modes:
         if m in scanner_classes:
-            print(f"  [{mode_labels[m]}] 已停用（IC 反向）— 跳過掃描")
+            print(f"  [{mode_labels[m]}] 已停用（人工指定）— 跳過掃描")
 
     # 項目 A：5 scanner 並行（依賴項目 B 的 shared 資料注入避免重複 DB I/O）
     max_workers = _resolve_max_workers(default=min(5, len(active_modes) or 1))
