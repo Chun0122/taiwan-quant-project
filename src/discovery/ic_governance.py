@@ -300,6 +300,75 @@ def compute_mode_ic_verdict(session, mode: str, as_of: date) -> ICVerdict:
     return select_enforceable_ic(rolling, factor, as_of=as_of, holding_days=holding_days, mode=mode)
 
 
+def load_candidate_factor_records(
+    session,
+    mode: str,
+    since: date,
+    *,
+    selected_only: bool = False,
+) -> pd.DataFrame:
+    """讀取 `CandidateFactorLog` 為 IC 計算可直接使用的形狀（B2）。
+
+    回傳欄位與 `compute_factor_ic()` / `compute_rolling_ic()` 期望的
+    `df_records` 相同（scan_date / stock_id / close / 各維度 score），因此 B11
+    要把 IC 改算在全候選池上時，只需把取數來源由 `DiscoveryRecord` 換成本函數。
+
+    為什麼這是必要的（`logs/audit_discover_20260731/REPORT.md` §7.3）：
+    `DiscoveryRecord` 只有最終 top-20，在其上算 IC 屬 range restriction——
+    被評分的 ~150 檔只留分數最高的 20 檔，因子變異被人為壓縮。
+
+    ⚠ 本表自 2026-08-01 起累積，**無法回補**（歷史候選池從未落庫）。因此
+    B11 切換取數來源前，需先累積足夠掃描日。
+
+    Args:
+        session: SQLAlchemy Session。
+        mode: scanner 模式。
+        since: 起始 scan_date（含）。
+        selected_only: True 時只取進入 top-N 者——用於與舊 `DiscoveryRecord`
+            路徑做對照，量化截斷偏差的大小。
+
+    Returns:
+        DataFrame；無資料時為具正確欄位的空表。
+    """
+    from sqlalchemy import select
+
+    from src.data.schema import CandidateFactorLog
+
+    cols = [
+        "scan_date",
+        "stock_id",
+        "close",
+        "technical_score",
+        "chip_score",
+        "fundamental_score",
+        "news_score",
+        "valuation_score",
+        "dividend_score",
+        "composite_score",
+        "selected",
+    ]
+    stmt = select(
+        CandidateFactorLog.scan_date,
+        CandidateFactorLog.stock_id,
+        CandidateFactorLog.close,
+        CandidateFactorLog.technical_score,
+        CandidateFactorLog.chip_score,
+        CandidateFactorLog.fundamental_score,
+        CandidateFactorLog.news_score,
+        CandidateFactorLog.valuation_score,
+        CandidateFactorLog.dividend_score,
+        CandidateFactorLog.composite_score,
+        CandidateFactorLog.selected,
+    ).where(CandidateFactorLog.mode == mode, CandidateFactorLog.scan_date >= since)
+    if selected_only:
+        stmt = stmt.where(CandidateFactorLog.selected.is_(True))
+
+    rows = session.execute(stmt).all()
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=cols)
+
+
 def blocked_modes(session, modes: list[str], as_of: date) -> dict[str, ICVerdict]:
     """回傳 `modes` 中「IC 反向且可執法」者的裁定（供 rotation 阻擋新買入）。
 

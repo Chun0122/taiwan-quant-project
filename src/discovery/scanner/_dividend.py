@@ -260,8 +260,15 @@ class DividendScanner(MarketScanner):
         return [self._compute_dividend_scores(stock_ids)]
 
     def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """用 technical_score 欄位存殖利率分數（供 _rank_and_enrich 顯示用）。"""
+        """用 technical_score 欄位存殖利率分數（供 _rank_and_enrich 顯示用）。
+
+        ⚠ 顯示用別名，發生在 composite 加權**之後**（composite 用 `dividend_score`，
+        權重鍵 `dividend`，正確）。副作用同 ValueScanner._post_score 的說明。
+
+        B2（2026-08-01）：覆寫前先保留真正的技術面分數到 `technical_score_raw`。
+        """
         if "dividend_score" in candidates.columns:
+            candidates["technical_score_raw"] = candidates["technical_score"]
             candidates["technical_score"] = candidates["dividend_score"]
         return candidates
 

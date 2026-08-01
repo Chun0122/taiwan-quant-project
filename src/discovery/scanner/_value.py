@@ -256,8 +256,18 @@ class ValueScanner(MarketScanner):
         return [self._compute_valuation_scores(stock_ids)]
 
     def _post_score(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """用 technical_score 欄位存估值分數（供 _rank_and_enrich 顯示用）。"""
+        """用 technical_score 欄位存估值分數（供 _rank_and_enrich 顯示用）。
+
+        ⚠ 這是**顯示用別名**，發生在 composite 加權**之後**（composite 用的是
+        `valuation_score`，權重鍵為 `valuation`，正確）。副作用是
+        `DiscoveryRecord.technical_score` 對本模式其實是估值分數，IC 管線因而
+        把估值維度標記成 technical，而被加權的 `valuation` 鍵找不到對應 IC。
+
+        B2（2026-08-01）：覆寫前先保留真正的技術面分數到 `technical_score_raw`，
+        供 `CandidateFactorLog` 以真實語意落庫（顯示行為維持不變）。
+        """
         if "valuation_score" in candidates.columns:
+            candidates["technical_score_raw"] = candidates["technical_score"]
             candidates["technical_score"] = candidates["valuation_score"]
         return candidates
 

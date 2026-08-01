@@ -180,6 +180,7 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
     # 儲存推薦記錄到 DB
     _save_discovery_records(result, mode, scanner)
+    _save_candidate_pool(result, mode, scanner)  # B2 全候選池
 
     # 歷史比較
     if args.compare:
@@ -397,6 +398,10 @@ def _run_scanner_worker(
             _save_discovery_records(result, mode_key, scanner)
         except Exception:
             logger.warning("[%s] _save_discovery_records 失敗，繼續", mode_key, exc_info=True)
+        try:
+            _save_candidate_pool(result, mode_key, scanner)  # B2 全候選池
+        except Exception:
+            logger.warning("[%s] _save_candidate_pool 失敗，繼續", mode_key, exc_info=True)
         summary = f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → Top {actual}"
     else:
         summary = f"  {label:<4} 掃描 {result.total_stocks:,} 支 → 粗篩 {result.after_coarse} 支 → 0 筆"
@@ -648,6 +653,68 @@ def _save_discovery_records(result, mode: str, scanner) -> None:
         session.commit()
 
     print(f"\n推薦記錄已存入 DB（{len(records)} 筆，{scan_date} {mode}）")
+
+
+def _save_candidate_pool(result, mode: str, scanner) -> None:
+    """B2 — 將**全候選池**因子快照存入 `CandidateFactorLog`。
+
+    與 `_save_discovery_records` 的關鍵差異：
+
+    1. **不因 rankings 為空而跳過**。模式被硬閘門清空（如 swing 2026-07-28 剔除
+       88 支後落庫 0 筆）正是最需要留下樣本的情況——沒有這批資料，IC 就再也算不
+       出來，也就是 M2 自鎖的資料面成因。
+    2. 存的是硬風控**之前**的 ~150 檔，而非 top-20，藉此解除 IC 的 range restriction。
+
+    同 `_save_discovery_records` 採「先刪同日同模式再寫入」，使重跑可覆蓋。
+    """
+    from src.config import settings
+    from src.data.database import get_session
+    from src.data.schema import CandidateFactorLog
+    from src.provenance import current_provenance
+
+    pool = getattr(result, "candidate_pool_df", None)
+    if pool is None or pool.empty:
+        return
+
+    scan_date = result.scan_date
+    git_commit, settings_hash = current_provenance(settings)
+
+    def _f(row, col):
+        val = row.get(col)
+        return None if val is None or pd.isna(val) else float(val)
+
+    records = [
+        CandidateFactorLog(
+            scan_date=scan_date,
+            mode=mode,
+            stock_id=str(row["stock_id"]),
+            close=_f(row, "close"),
+            regime=getattr(scanner, "regime", None),
+            technical_score=_f(row, "technical_score"),
+            chip_score=_f(row, "chip_score"),
+            fundamental_score=_f(row, "fundamental_score"),
+            news_score=_f(row, "news_score"),
+            valuation_score=_f(row, "valuation_score"),
+            dividend_score=_f(row, "dividend_score"),
+            composite_score=_f(row, "composite_score"),
+            pool_rank=int(row["pool_rank"]) if not pd.isna(row.get("pool_rank")) else None,
+            selected=bool(row.get("selected", False)),
+            git_commit=git_commit,
+            settings_hash=settings_hash,
+        )
+        for _, row in pool.iterrows()
+    ]
+
+    with get_session() as session:
+        session.query(CandidateFactorLog).filter(
+            CandidateFactorLog.scan_date == scan_date,
+            CandidateFactorLog.mode == mode,
+        ).delete()
+        session.add_all(records)
+        session.commit()
+
+    n_sel = int(pool["selected"].sum()) if "selected" in pool.columns else 0
+    print(f"候選池因子已存入 DB（{len(records)} 筆，其中 {n_sel} 筆入選，{scan_date} {mode}）")
 
 
 def _show_discovery_comparison(mode: str, current_result) -> None:
