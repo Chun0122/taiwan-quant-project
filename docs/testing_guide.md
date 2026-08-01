@@ -10,7 +10,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 
 ## 測試統計
 
-- **2417 個測試**，83 個測試檔
+- **2688 個測試**，103 個測試檔
 - Fixtures：`tests/conftest.py`（`in_memory_engine` / `db_session` / `sample_ohlcv`）
 - 共用建構函數：`tests/scanner_helpers.py`
 
@@ -37,6 +37,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_regime_idempotence.py` | `regime/detector.py` 冪等閘門（P0 #15）+ morning `resolve_regime_after_sync` | 純函數+SQLite |
 | `test_ic_governance.py` | `discovery/ic_governance.py` 三道閘門（P0 #16）+ `rankings.exclude_modes` + rotation 阻擋 | 純函數+SQLite |
 | `test_ic_freeze.py` | E2b/E2c 凍結（P0 #17）：`_score_candidates` 套用點 + config 契約 + 開啟對照組 | monkeypatch |
+| `test_scanner_pipeline_parity.py` | N2 單一漏斗：五模式 × 三 regime 選股階段序列 parity + 無 `run()` 覆寫契約 | monkeypatch |
 | `test_fetcher.py` | `data/fetcher.py` | mock HTTP |
 | `test_config.py` | `config.py` | tmp_path |
 | `test_charts.py` | `visualization/charts.py` | 純函數 |

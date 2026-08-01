@@ -18,9 +18,8 @@ from src.data.schema import (
     MarginTrading,
     MonthlyRevenue,
 )
-from src.discovery.scanner._base import MarketScanner
+from src.discovery.scanner._base import MarketScanner, StageConfig
 from src.discovery.scanner._functions import (
-    DiscoveryResult,
     compute_broker_score,
 )
 from src.discovery.universe import UniverseConfig
@@ -39,6 +38,26 @@ class GrowthScanner(MarketScanner):
 
     mode_name = "growth"
     _COARSE_WEIGHTS: dict[str, float] = {"yoy_rank": 0.40, "vol_rank": 0.30, "inst_rank": 0.30}
+    _candidate_revenue_months = 4  # Stage 2.5 補抓後載入 4 個月營收（算 YoY 加速度）
+
+    # N2（2026-08-01）：本模式**不跑**的漏斗階段。
+    # ⚠ 現況存檔，非設計主張——源於舊 `run()` 覆寫漏掉這些階段，無實證依據。
+    # 開啟任一項都會改變選股行為，須逐項拿數據評估。詳 MASTER_PLAN §7 #3b。
+    _STAGES = StageConfig(
+        overlap_bonus=False,
+        peer_fundamental_ranking=False,
+        momentum_decay=False,
+        institutional_acceleration=False,
+        chip_macd=False,
+        key_player_cost=False,
+        negative_news_gate=False,
+        volume_price_divergence=False,
+        multi_timeframe_alignment=False,
+        score_threshold=False,
+        sector_diversification=False,
+        drawdown_adjusted_top_n=False,
+        chip_tier_audit=False,
+    )
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 80)  # 共用動能技術面評分，F3 季線突破需 60 交易日（80 曆日）
@@ -54,38 +73,11 @@ class GrowthScanner(MarketScanner):
         )
         super().__init__(**kwargs)
 
-    def run(self, shared=None, precomputed_ic=None) -> DiscoveryResult:
-        """覆寫 run()：粗篩前自動同步 MOPS 全市場月營收。
+    def _prepare_before_load(self) -> None:
+        """Stage 0.5：月營收覆蓋率不足時，自動從 MOPS 補抓全市場月營收。
 
-        Args:
-            shared: 項目 B — 由 `_cmd_discover_all` 預載入的全市場資料；
-                傳入時 `_load_market_data` 以 in-memory 過濾取代 DB 查詢。
-            precomputed_ic: 項目 E — Step 8c 預算的 static IC DataFrame，
-                供 `_apply_ic_weight_adjustment` / `_log_factor_effectiveness` 短路。
+        growth 的粗篩主因子是營收 YoY，覆蓋率不足會直接讓候選池失真。
         """
-        self._shared = shared
-        self._precomputed_ic = precomputed_ic
-        # Stage 0: Regime 偵測
-        try:
-            from src.regime.detector import MarketRegimeDetector
-
-            regime_info = MarketRegimeDetector().detect()
-            self.regime = regime_info["regime"]
-            logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
-        except Exception:
-            self.regime = "sideways"
-            logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
-
-        # Stage 0.1: Regime gate（與 MarketScanner.run() 共用邏輯）
-        if self._is_regime_blocked():
-            logger.warning(
-                "Stage 0.1: %s 模式在 %s 市場暫停掃描（歷史績效不佳）",
-                self.mode_name,
-                self.regime,
-            )
-            return DiscoveryResult(rankings=pd.DataFrame(), total_stocks=0, after_coarse=0, mode=self.mode_name)
-
-        # Stage 0.5: 檢查月營收覆蓋率，不足時自動從 MOPS 補抓
         try:
             from sqlalchemy import func as sa_func
 
@@ -104,84 +96,19 @@ class GrowthScanner(MarketScanner):
         except Exception:
             logger.warning("Stage 0.5: MOPS 月營收自動同步失敗，使用既有資料")
 
-        # Stage 1: 載入資料
-        df_price, df_inst, df_margin, df_revenue = self._load_market_data()
-        if df_price.empty:
-            logger.warning("無市場資料可供掃描")
-            return DiscoveryResult(rankings=pd.DataFrame(), total_stocks=0, after_coarse=0, mode=self.mode_name)
+    def _after_market_data_loaded(self, df_revenue: pd.DataFrame) -> None:
+        """預填充 `_coarse_revenue`，避免 `_coarse_filter()` 重複查詢 DB。
 
-        total_stocks = df_price["stock_id"].nunique()
-        logger.info("Stage 1: 載入 %d 支股票的市場資料", total_stocks)
-
-        # 預填充 _coarse_revenue，避免 _coarse_filter() 重複查詢 DB（Problem 4 修正）
-        # _load_market_data() 已載入 4 個月營收，直接重用，無需再次查詢
+        `_load_market_data()` 已載入 4 個月營收，直接重用。
+        """
         self._coarse_revenue = df_revenue
 
-        # Stage 2: 粗篩
-        candidates = self._coarse_filter(df_price, df_inst)
-        after_coarse = len(candidates)
-        logger.info("Stage 2: 粗篩後剩 %d 支候選股", after_coarse)
+    def _sync_candidate_valuation(self, candidate_ids: list[str]) -> None:
+        """Stage 2.5：補抓候選股估值（本模式不重新載入到記憶體，與重構前一致）。"""
+        from src.data.pipeline import sync_valuation_for_stocks
 
-        if candidates.empty:
-            return DiscoveryResult(
-                rankings=pd.DataFrame(), total_stocks=total_stocks, after_coarse=0, mode=self.mode_name
-            )
-
-        # Stage 2.5: 補抓月營收 + 估值資料
-        candidate_ids = candidates["stock_id"].tolist()
-        try:
-            from src.data.pipeline import sync_revenue_for_stocks, sync_valuation_for_stocks
-
-            logger.info("Stage 2.5: 補抓 %d 支候選股月營收 + 估值...", len(candidate_ids))
-            rev_count = sync_revenue_for_stocks(candidate_ids)
-            val_count = sync_valuation_for_stocks(candidate_ids)
-            logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收, %d 筆估值", rev_count, val_count)
-            df_revenue = self._load_revenue_data(candidate_ids, months=4)
-        except Exception:
-            logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
-
-        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
-        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
-        if not df_ann.empty:
-            logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
-        else:
-            logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
-
-        # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
-        logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
-
-        # Stage 3.3: 產業加成
-        scored = self._apply_sector_bonus(scored)
-
-        # Stage 3.3a: 產業同儕相對強度加成
-        scored = self._apply_sector_relative_strength(scored)
-
-        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
-        scored = self._apply_concept_bonus(scored)
-
-        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
-        if self.weekly_confirm:
-            scored = self._apply_weekly_trend_bonus(scored)
-
-        # Stage 3.5: 風險過濾
-        scored = self._apply_risk_filter(scored, df_price)
-
-        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
-        scored = self._apply_crisis_filter(scored, df_price)
-
-        # Stage 4
-        rankings = self._rank_and_enrich(scored)
-        sector_summary = self._compute_sector_summary(rankings)
-        logger.info("Stage 4: 輸出 Top %d", min(self.top_n_results, len(rankings)))
-
-        return DiscoveryResult(
-            rankings=rankings.head(self.top_n_results),
-            total_stocks=total_stocks,
-            after_coarse=after_coarse,
-            sector_summary=sector_summary,
-            mode=self.mode_name,
-        )
+        val_count = sync_valuation_for_stocks(candidate_ids)
+        logger.info("Stage 2.5: 估值補抓完成，新增 %d 筆", val_count)
 
     def _load_market_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """覆寫：growth 模式載入 4 個月營收資料（算加速度）。

@@ -19,9 +19,8 @@ from src.data.schema import (
     StockInfo,
     StockValuation,
 )
-from src.discovery.scanner._base import MarketScanner
+from src.discovery.scanner._base import MarketScanner, StageConfig
 from src.discovery.scanner._functions import (
-    DiscoveryResult,
     compute_broker_score,
     compute_earnings_quality,
     compute_relative_pe_thresholds,
@@ -42,6 +41,30 @@ class ValueScanner(MarketScanner):
 
     mode_name = "value"
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.50, "inst_rank": 0.50}
+    _candidate_revenue_months = 2  # Stage 2.5 補抓後載入 2 個月營收
+
+    # N2（2026-08-01）：本模式**不跑**的漏斗階段。
+    # ⚠ 這些 False 是 2026-08-01 重構前的**現況存檔**，不是設計主張——它們源於
+    # 舊 `run()` 覆寫（複製貼上版）漏掉這些階段，而非任何實證依據。
+    # 開啟任一項都會改變選股行為（實測僅 score_threshold 一項，crisis 日
+    # value 落庫可由 20 筆掉到 3 筆），須逐項拿數據評估。詳 MASTER_PLAN §7 #3b。
+    # 觀測類階段（audit_trail / sub_factor / factor_effectiveness_log）已於 N2
+    # 一併補齊至五模式——純記錄不影響選股。
+    _STAGES = StageConfig(
+        overlap_bonus=False,
+        peer_fundamental_ranking=False,
+        momentum_decay=False,
+        institutional_acceleration=False,
+        chip_macd=False,
+        key_player_cost=False,
+        negative_news_gate=False,
+        volume_price_divergence=False,
+        multi_timeframe_alignment=False,
+        score_threshold=False,
+        sector_diversification=False,
+        drawdown_adjusted_top_n=False,
+        chip_tier_audit=False,
+    )
 
     def __init__(self, **kwargs) -> None:
         kwargs.setdefault("lookback_days", 130)  # 支援 SMA120 + 120日低點計算
@@ -165,106 +188,20 @@ class ValueScanner(MarketScanner):
 
         return df_price, df_inst, df_margin, df_revenue
 
-    def run(self, shared=None, precomputed_ic=None) -> DiscoveryResult:
-        """覆寫 run()：在 Stage 0.5 自動補抓估值、Stage 2.5 補抓候選股估值。
-
-        Args:
-            shared: 項目 B — 由 `_cmd_discover_all` 預載入的全市場資料；
-                `_load_market_data` 會優先以此過濾產生 4 張共用 DataFrame。
-            precomputed_ic: 項目 E — Step 8c 預算的 static IC DataFrame。
-        """
-        self._shared = shared
-        self._precomputed_ic = precomputed_ic
-        # Stage 0: Regime 偵測
-        try:
-            from src.regime.detector import MarketRegimeDetector
-
-            regime_info = MarketRegimeDetector().detect()
-            self.regime = regime_info["regime"]
-            logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
-        except Exception:
-            self.regime = "sideways"
-            logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
-
-        # Stage 0.5: 估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值
+    def _prepare_before_load(self) -> None:
+        """Stage 0.5：估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值。"""
         self._maybe_sync_valuation()
 
-        # Stage 1
-        df_price, df_inst, df_margin, df_revenue = self._load_market_data()
-        if df_price.empty:
-            logger.warning("無市場資料可供掃描")
-            return DiscoveryResult(rankings=pd.DataFrame(), total_stocks=0, after_coarse=0, mode=self.mode_name)
+    def _sync_candidate_valuation(self, candidate_ids: list[str]) -> None:
+        """Stage 2.5：補抓候選股估值（PE/PB/殖利率）。"""
+        from src.data.pipeline import sync_valuation_for_stocks
 
-        total_stocks = df_price["stock_id"].nunique()
-        logger.info("Stage 1: 載入 %d 支股票的市場資料", total_stocks)
+        val_count = sync_valuation_for_stocks(candidate_ids)
+        logger.info("Stage 2.5: 估值補抓完成，新增 %d 筆", val_count)
 
-        # Stage 2: 粗篩
-        candidates = self._coarse_filter(df_price, df_inst)
-        after_coarse = len(candidates)
-        logger.info("Stage 2: 粗篩後剩 %d 支候選股", after_coarse)
-
-        if candidates.empty:
-            return DiscoveryResult(
-                rankings=pd.DataFrame(), total_stocks=total_stocks, after_coarse=0, mode=self.mode_name
-            )
-
-        # Stage 2.5: 補抓月營收 + 估值資料
-        candidate_ids = candidates["stock_id"].tolist()
-        try:
-            from src.data.pipeline import sync_revenue_for_stocks, sync_valuation_for_stocks
-
-            logger.info("Stage 2.5: 補抓 %d 支候選股月營收 + 估值...", len(candidate_ids))
-            rev_count = sync_revenue_for_stocks(candidate_ids)
-            val_count = sync_valuation_for_stocks(candidate_ids)
-            logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收, %d 筆估值", rev_count, val_count)
-            df_revenue = self._load_revenue_data(candidate_ids, months=2)
-            # 重新載入估值
-            self._reload_valuation(candidate_ids)
-        except Exception:
-            logger.warning("Stage 2.5: 資料補抓失敗（可能無 FinMind token），使用既有資料")
-
-        # Stage 2.7: 載入候選股近期 MOPS 公告（含基準期歷史供異常率計算）
-        df_ann, df_ann_history = self._load_announcement_data(candidate_ids)
-        if not df_ann.empty:
-            logger.info("Stage 2.7: 載入 %d 筆 MOPS 公告", len(df_ann))
-        else:
-            logger.info("Stage 2.7: 無 MOPS 公告資料（消息面分數預設 0.5）")
-
-        # Stage 3: 細評
-        scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
-        logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
-
-        # Stage 3.3: 產業加成
-        scored = self._apply_sector_bonus(scored)
-
-        # Stage 3.3a: 產業同儕相對強度加成
-        scored = self._apply_sector_relative_strength(scored)
-
-        # Stage 3.3b: 概念熱度加成（±5%，sector+concept ≤ ±8%）
-        scored = self._apply_concept_bonus(scored)
-
-        # Stage 3.4: 週線趨勢加成（若 weekly_confirm=True）
-        if self.weekly_confirm:
-            scored = self._apply_weekly_trend_bonus(scored)
-
-        # Stage 3.5: 風險過濾
-        scored = self._apply_risk_filter(scored, df_price)
-
-        # Stage 3.5b: Crisis 模式相對強度過濾（僅 crisis regime 執行）
-        scored = self._apply_crisis_filter(scored, df_price)
-
-        # Stage 4
-        rankings = self._rank_and_enrich(scored)
-        sector_summary = self._compute_sector_summary(rankings)
-        logger.info("Stage 4: 輸出 Top %d", min(self.top_n_results, len(rankings)))
-
-        return DiscoveryResult(
-            rankings=rankings.head(self.top_n_results),
-            total_stocks=total_stocks,
-            after_coarse=after_coarse,
-            sector_summary=sector_summary,
-            mode=self.mode_name,
-        )
+    def _reload_candidate_valuation(self, candidate_ids: list[str]) -> None:
+        """Stage 2.5：補抓後重新載入估值到記憶體。"""
+        self._reload_valuation(candidate_ids)
 
     def _coarse_filter(self, df_price: pd.DataFrame, df_inst: pd.DataFrame) -> pd.DataFrame:
         """價值模式粗篩：基本過濾 + PE/殖利率門檻。"""
