@@ -161,15 +161,7 @@ def slice_revenue_raw(
     Returns:
         每支股票一列的 DataFrame（欄位依 months 變動）。
     """
-    # 依 months 決定回傳欄位
-    base_cols = ["stock_id", "yoy_growth", "mom_growth"]
-    if months <= 1:
-        empty_cols = base_cols
-    elif months < 4:
-        empty_cols = base_cols + ["prev_yoy_growth", "prev_mom_growth"]
-    else:
-        empty_cols = base_cols + ["prev_yoy_growth", "prev_mom_growth", "yoy_3m_ago"]
-
+    empty_cols = revenue_pivot_columns(months)
     if df_revenue.empty:
         return pd.DataFrame(columns=empty_cols)
 
@@ -182,11 +174,41 @@ def slice_revenue_raw(
     if months <= 1:
         # 每支股票取 date 最新一筆
         idx = df.groupby("stock_id")["date"].idxmax()
-        latest = df.loc[idx, ["stock_id", "yoy_growth", "mom_growth"]].reset_index(drop=True)
-        return latest
+        return df.loc[idx, ["stock_id", "yoy_growth", "mom_growth"]].reset_index(drop=True)
 
-    # months >= 2：每支股票取最近 N 筆（date desc），計算 prev_*
-    sorted_df = df.sort_values(["stock_id", "date"], ascending=[True, False])
+    return pivot_revenue_rows(df, months)
+
+
+def revenue_pivot_columns(months: int) -> list[str]:
+    """月營收 pivot 結果的欄位清單（依 months 變動）。"""
+    cols = ["stock_id", "yoy_growth", "mom_growth"]
+    if months <= 1:
+        return cols
+    cols += ["prev_yoy_growth", "prev_mom_growth"]
+    if months >= 4:
+        cols.append("yoy_3m_ago")
+    return cols
+
+
+def pivot_revenue_rows(df_all: pd.DataFrame, months: int) -> pd.DataFrame:
+    """月營收 raw rows → 每股一列（含 prev_* / yoy_3m_ago）的純函數。
+
+    N2 SSOT：此推導原本在 `MarketScanner._load_revenue_data`（SQL 路徑）與
+    `slice_revenue_raw`（shared in-memory 路徑）各有一份**逐字相同**的實作，
+    兩邊漂移即造成 DB 路徑與 shared 路徑選股不一致。現收斂為單一實作。
+
+    Args:
+        df_all: 含 stock_id / date / yoy_growth / mom_growth 的 raw rows。
+        months: 每股取最近幾筆（>=2 才有 prev_*；>=4 才有 yoy_3m_ago）。
+
+    Returns:
+        每支股票一列的 DataFrame。
+    """
+    cols = revenue_pivot_columns(months)
+    if df_all.empty:
+        return pd.DataFrame(columns=cols)
+
+    sorted_df = df_all.sort_values(["stock_id", "date"], ascending=[True, False])
     result_rows = []
     for sid, grp in sorted_df.groupby("stock_id", sort=False):
         grp = grp.head(months)
@@ -202,4 +224,4 @@ def slice_revenue_raw(
             row["yoy_3m_ago"] = grp.iloc[3]["yoy_growth"] if len(grp) >= 4 else None
         result_rows.append(row)
 
-    return pd.DataFrame(result_rows, columns=empty_cols)
+    return pd.DataFrame(result_rows, columns=cols)

@@ -85,7 +85,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 | 模組 | 職責 |
 |------|------|
-| `discovery/scanner/` | 五模式選股（Momentum/Swing/Value/Dividend/Growth）、四維度評分、Regime 動態權重 |
+| `discovery/scanner/` | 五模式選股（Momentum/Swing/Value/Dividend/Growth）、四維度評分、Regime 動態權重；**單一 `run()`**（N2）＋ 宣告式 `StageConfig` |
 | `discovery/universe.py` | Universe 三層漏斗（SQL→流動性→趨勢）+ Candidate Memory |
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
@@ -144,6 +144,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **IC 執法治理（P0 #16）** | 任何「因 IC 而自動行動」一律先過 `ic_governance.select_enforceable_ic()`：不可執法時只告警。**IC 反向不再跳過掃描**——五模式恆掃恆落庫（否則模式產不出 `discovery_record`，IC 無從重算而自鎖），停用只作用在 rotation 層（`resolve_rankings(exclude_modes=...)` 阻擋新買入，賣出/停損/到期不受影響）。backtest 路徑**刻意不套用**（今日裁定套到歷史日＝look-ahead）。新增 IC 驅動開關時務必沿用此模組，勿再自行 `iloc[-1]` |
 | **E2b/E2c 凍結中（P0 #17）** | IC 自動調權（E2b）與分數翻轉/中性化（E2c）**預設不生效**，開關在 `quant.ic_governance`（兩者 false）。凍結只在唯一套用點 `_score_candidates`——底層純函數與 `_apply_ic_weight_adjustment` 行為不變，**仍照常計算並記錄** would-be 動作（log 標【凍結中，未生效】）。`_ic_actions` 凍結時留空，避免 CLI 的 (N)/(F)/(D) 誤示為已套用。**解凍前提**：B2 落地 + `valuation`/`dividend` 維度納入落庫 + 改用標準誤顯著性判定，詳 `config.py:ICGovernanceConfig` |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
+| **單一漏斗（N2）** | **`run()` 只有 `MarketScanner` 一份實作，子類禁止覆寫**（`tests/test_scanner_pipeline_parity.py` 有契約測試守門）。模式差異只能透過：①`_STAGES = StageConfig(...)` 宣告不跑哪些階段；②4 個 hook（`_prepare_before_load` / `_after_market_data_loaded` / `_sync_candidate_valuation` / `_reload_candidate_valuation`）；③`_coarse_filter` / `_compute_*_scores` / `_compute_extra_scores`。<br>⚠ value/dividend/growth 的 `_STAGES` 多數 False 是**現況存檔非設計主張**（源自舊複製貼上），改動任一旗標都會改變選股——先看 MASTER_PLAN §7 #3b 的實測影響表 |
 | **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
 | **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日（逾期不論有無報價一律取消）、同股僅允許一張在途買單（decide 去重 + fill 端 UNIQUE 防護）、風控賣單停牌以 ref_price 成交不凍結；`update --all` per-portfolio 隔離 |
 | **動態滑價** | 三因子模型 + A4 participation impact（`compute_dynamic_slippage`，傳 `order_shares` 時加 c×√(下單量/當日量)）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
@@ -174,7 +175,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2666 測試 / 102 檔）
+- **執行**：`pytest -v`（2688 測試 / 103 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

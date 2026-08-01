@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import numpy as np
@@ -56,11 +57,62 @@ from src.discovery.scanner._functions import (
     detect_chip_tier_changes,
     score_key_player_cost,
 )
-from src.discovery.scanner._shared_load import SharedMarketData, slice_revenue_raw
+from src.discovery.scanner._shared_load import SharedMarketData, pivot_revenue_rows, slice_revenue_raw
 from src.discovery.universe import UniverseConfig, UniverseFilter
 from src.entry_exit import REGIME_ATR_PARAMS, compute_atr_stops, compute_entry_trigger
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StageConfig:
+    """漏斗**可選階段**的宣告表（N2，2026-08-01）。
+
+    在此之前 `value`/`growth`/`dividend` 各自覆寫 `run()`（複製貼上版），
+    「哪些階段會跑」藏在 3 份 ~100 行的流程碼裡，實際上五個 scanner 不是同一條
+    pipeline——`logs/audit_discover_20260731/REPORT.md` §5 證實 momentum/swing 走
+    24 個階段，value/dividend 只走 11 個、growth 只走 9 個。後果是
+    「value/dividend 天天穩定 20 筆、momentum/swing 常態 0 筆」被誤讀為模式強弱，
+    實際上是**閘門覆蓋率差異**，使跨模式 IC 比較與模式級裁決全部失去基礎。
+
+    本表把差異從「程式碼」搬到「一張可審查的宣告」。**預設值＝重構前 momentum/swing
+    的完整流程**；value/growth/dividend 以類別屬性 `_STAGES` 明確關閉自己不跑的階段，
+    差異因此一眼可見、可 diff、可逐項評估要不要打開。
+
+    ⚠ 這些旗標是**現況存檔，不是設計主張**。多數 False 並無實證依據，只是歷史
+    複製貼上的結果。開啟任一項都會改變選股行為——實測（2026-08-01）僅 Stage 3.7
+    一項套用到 value/dividend/growth，7/20 以來落庫就會由 406 筆掉到 206 筆
+    （crisis 日 dividend 20→1），故必須逐項拿實測數據決定，不可整批打開。
+    對應 MASTER_PLAN §7 #3b 與研究議程。
+    """
+
+    # ── 軟加成（只調分不剔除）──
+    overlap_bonus: bool = True  # 3.2 前次掃描重疊（降換手）
+    sector_bonus: bool = True  # 3.3 產業輪動
+    sector_relative_strength: bool = True  # 3.3a 同業相對強度
+    concept_bonus: bool = True  # 3.3b 概念熱度
+    peer_fundamental_ranking: bool = True  # 3.3c 同業基本面排名
+    weekly_trend_bonus: bool = True  # 3.4 週線確認（另受 weekly_confirm 控制）
+    momentum_decay: bool = True  # 3.5c RSI 背離 / MACD 柱縮
+    institutional_acceleration: bool = True  # 3.5d 法人買超加速
+    chip_macd: bool = True  # 3.5f 法人淨買超 MACD
+    key_player_cost: bool = True  # 3.5g 現價 vs 主力成本
+    negative_news_gate: bool = True  # 3.5h 高負面消息降分
+    volume_price_divergence: bool = True  # 3.6 量價背離
+
+    # ── 硬風控（通過或剔除）──
+    risk_filter: bool = True  # 3.5 ATR / 波動率百分位
+    crisis_filter: bool = True  # 3.5b Crisis 相對強度 + 絕對趨勢
+    multi_timeframe_alignment: bool = True  # 3.5e 日多週空強制排除
+    score_threshold: bool = True  # 3.7 Regime 動態分數門檻
+    sector_diversification: bool = True  # 4.1 同產業 25% 上限
+    drawdown_adjusted_top_n: bool = True  # 4.2 TAIEX 回撤縮表
+
+    # ── 觀測 / 稽核（不影響選股）──
+    factor_effectiveness_log: bool = True  # E2 因子 IC 日誌
+    chip_tier_audit: bool = True  # 4.3 籌碼層級降級稽核
+    audit_trail: bool = True  # ScanAuditTrail 全程記錄
+    sub_factor_collection: bool = True  # 子因子 rank 收集（IC 診斷）
 
 
 class MarketScanner:
@@ -82,6 +134,11 @@ class MarketScanner:
     _revenue_months: int = 1  # 子類可設為 4 以啟用「本月 YoY - 3 個月前 YoY」加速度因子
     _COARSE_WEIGHTS: dict[str, float] = {"vol_rank": 0.30, "inst_rank": 0.40, "mom_rank": 0.30}
     _blocked_regimes: set[str] = set()  # 子類可覆寫以阻擋特定市場狀態
+    # N2：漏斗可選階段宣告；預設＝完整流程（momentum/swing）。
+    # 子類覆寫以宣告自己**不跑**哪些階段——差異只准出現在這裡，不准再覆寫 run()。
+    _STAGES: StageConfig = StageConfig()
+    # Stage 2.5 補抓候選股月營收時使用的月數（value/dividend=2、growth=4）
+    _candidate_revenue_months: int = 1
 
     def __init__(
         self,
@@ -154,8 +211,9 @@ class MarketScanner:
         self._shared = shared
         self._precomputed_ic = precomputed_ic
         self.scan_date = date.today()
+        stages = self._STAGES
         audit = ScanAuditTrail()
-        self._audit_trail = audit
+        self._audit_trail = audit if stages.audit_trail else None
 
         # ============================================================ #
         #  區塊 1: 資料準備（Stage 0 ~ 2.7）
@@ -187,6 +245,9 @@ class MarketScanner:
                 audit_trail=audit,
             )
 
+        # Stage 0.5: 模式專屬的前置資料補抓（value/dividend 估值、growth 月營收覆蓋率）
+        self._prepare_before_load()
+
         # Stage 1: 載入資料
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
         if df_price.empty:
@@ -202,6 +263,9 @@ class MarketScanner:
         total_stocks = df_price["stock_id"].nunique()
         logger.info("Stage 1: 載入 %d 支股票的市場資料", total_stocks)
 
+        # 模式專屬的載入後處理（growth 預填 _coarse_revenue 避免粗篩重複查 DB）
+        self._after_market_data_loaded(df_revenue)
+
         # Stage 2: 粗篩
         candidates = self._coarse_filter(df_price, df_inst)
         after_coarse = len(candidates)
@@ -216,7 +280,7 @@ class MarketScanner:
                 audit_trail=audit,
             )
 
-        # Stage 2.5: 補抓候選股月營收（從 FinMind 逐股取得）
+        # Stage 2.5: 補抓候選股月營收（從 FinMind 逐股取得）+ 模式專屬補抓（估值）
         candidate_ids = candidates["stock_id"].tolist()
         try:
             from src.data.pipeline import sync_revenue_for_stocks
@@ -224,8 +288,10 @@ class MarketScanner:
             logger.info("Stage 2.5: 補抓 %d 支候選股月營收...", len(candidate_ids))
             rev_count = sync_revenue_for_stocks(candidate_ids)
             logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收", rev_count)
-            # 重新載入營收資料（補抓後 DB 已更新）
-            df_revenue = self._load_revenue_data(candidate_ids)
+            self._sync_candidate_valuation(candidate_ids)
+            # 重新載入營收資料（補抓後 DB 已更新）；月數由模式宣告
+            df_revenue = self._load_revenue_data(candidate_ids, months=self._candidate_revenue_months)
+            self._reload_candidate_valuation(candidate_ids)
         except Exception:
             logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
 
@@ -256,94 +322,122 @@ class MarketScanner:
         scored = self._score_candidates(candidates, df_price, df_inst, df_margin, df_revenue, df_ann, df_ann_history)
         logger.info("Stage 3: 完成 %d 支候選股評分", len(scored))
 
-        # --- 軟加成：前次掃描重疊（降低換手率）---
-        scored = self._apply_overlap_bonus(scored)
-        if "overlap_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column("3.2 前次重疊", scored, "overlap_bonus", "前次掃描重疊加成")
-
-        # --- 軟加成：產業 / 概念 / 同業 ---
-        scored = self._apply_sector_bonus(scored)
-        audit.record_score_adjustments_from_column("3.3 產業輪動", scored, "sector_bonus", "產業輪動加成")
-
-        scored = self._apply_sector_relative_strength(scored)
-        if "relative_strength_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column(
-                "3.3a 同業強度", scored, "relative_strength_bonus", "同業相對強度"
-            )
-
-        scored = self._apply_concept_bonus(scored)
-        if "concept_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column("3.3b 概念熱度", scored, "concept_bonus", "概念股輪動加成")
-
-        scored = self._apply_peer_fundamental_ranking(scored)
-        if "peer_rank_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column("3.3c 同業基本面", scored, "peer_rank_bonus", "同業基本面排名")
-
-        # --- 軟加成：週線趨勢 ---
-        if self.weekly_confirm:
-            scored = self._apply_weekly_trend_bonus(scored)
-            if "weekly_bonus" in scored.columns:
-                audit.record_score_adjustments_from_column("3.4 週線確認", scored, "weekly_bonus", "週線多時框確認")
-
-        # --- 軟加成：動量衰減 ---
-        scored = self._apply_momentum_decay(scored, df_price)
-        if "momentum_decay" in scored.columns:
-            audit.record_score_adjustments_from_column("3.5c 動量衰減", scored, "momentum_decay", "RSI背離/MACD柱縮")
-
-        # --- 軟加成：籌碼加速度 ---
-        scored = self._apply_institutional_acceleration(scored, df_inst)
-        if "inst_accel_bonus" in scored.columns:
-            audit.record_score_adjustments_from_column("3.5d 籌碼加速", scored, "inst_accel_bonus", "法人買超加速")
-
-        # --- 軟加成：籌碼 MACD ---
-        scored = self._apply_chip_macd(scored, df_inst)
-        if "chip_macd_adj" in scored.columns:
-            audit.record_score_adjustments_from_column("3.5f 籌碼MACD", scored, "chip_macd_adj", "法人淨買超MACD")
-
-        # --- 軟加成：主力成本 ---
-        scored = self._apply_key_player_cost(scored, df_price)
-        if "kp_adj" in scored.columns:
-            audit.record_score_adjustments_from_column("3.5g 主力成本", scored, "kp_adj", "現價vs主力成本")
-
-        # --- 軟加成：消息面負面閘門（過濾壞消息股）---
-        scored = self._apply_negative_news_gate(scored)
-        if "neg_news_gate" in scored.columns:
-            audit.record_score_adjustments_from_column("3.5h 負面消息閘門", scored, "neg_news_gate", "高負面消息股降分")
-
-        # --- 軟加成：量價背離 ---
-        scored = self._apply_volume_price_divergence(scored, df_price)
-        if "vp_divergence" in scored.columns:
-            audit.record_score_adjustments_from_column("3.6 量價背離", scored, "vp_divergence", "量價背離調整")
+        # --- 軟加成（只調分不剔除）：依 _STAGES 宣告逐項套用 ---
+        # (旗標, 套用函數, 調分欄位, 審計階段名, 審計說明)
+        soft_stages: list[tuple[bool, object, str, str, str]] = [
+            (stages.overlap_bonus, self._apply_overlap_bonus, "overlap_bonus", "3.2 前次重疊", "前次掃描重疊加成"),
+            (stages.sector_bonus, self._apply_sector_bonus, "sector_bonus", "3.3 產業輪動", "產業輪動加成"),
+            (
+                stages.sector_relative_strength,
+                self._apply_sector_relative_strength,
+                "relative_strength_bonus",
+                "3.3a 同業強度",
+                "同業相對強度",
+            ),
+            (stages.concept_bonus, self._apply_concept_bonus, "concept_bonus", "3.3b 概念熱度", "概念股輪動加成"),
+            (
+                stages.peer_fundamental_ranking,
+                self._apply_peer_fundamental_ranking,
+                "peer_rank_bonus",
+                "3.3c 同業基本面",
+                "同業基本面排名",
+            ),
+            # 週線確認另受建構參數 weekly_confirm 控制
+            (
+                stages.weekly_trend_bonus and self.weekly_confirm,
+                self._apply_weekly_trend_bonus,
+                "weekly_bonus",
+                "3.4 週線確認",
+                "週線多時框確認",
+            ),
+            (
+                stages.momentum_decay,
+                lambda s: self._apply_momentum_decay(s, df_price),
+                "momentum_decay",
+                "3.5c 動量衰減",
+                "RSI背離/MACD柱縮",
+            ),
+            (
+                stages.institutional_acceleration,
+                lambda s: self._apply_institutional_acceleration(s, df_inst),
+                "inst_accel_bonus",
+                "3.5d 籌碼加速",
+                "法人買超加速",
+            ),
+            (
+                stages.chip_macd,
+                lambda s: self._apply_chip_macd(s, df_inst),
+                "chip_macd_adj",
+                "3.5f 籌碼MACD",
+                "法人淨買超MACD",
+            ),
+            (
+                stages.key_player_cost,
+                lambda s: self._apply_key_player_cost(s, df_price),
+                "kp_adj",
+                "3.5g 主力成本",
+                "現價vs主力成本",
+            ),
+            (
+                stages.negative_news_gate,
+                self._apply_negative_news_gate,
+                "neg_news_gate",
+                "3.5h 負面消息閘門",
+                "高負面消息股降分",
+            ),
+            (
+                stages.volume_price_divergence,
+                lambda s: self._apply_volume_price_divergence(s, df_price),
+                "vp_divergence",
+                "3.6 量價背離",
+                "量價背離調整",
+            ),
+        ]
+        for enabled, fn, col, label, desc in soft_stages:
+            if not enabled:
+                continue
+            scored = fn(scored)
+            audit.record_score_adjustments_from_column(label, scored, col, desc)
 
         # ============================================================ #
         #  區塊 3: 硬風控（Hard Filters — 通過或剔除）
         # ============================================================ #
 
-        # 硬風控 1: 風險過濾（ATR/波動率百分位）
-        ids_before = set(scored["stock_id"])
-        scored = self._apply_risk_filter(scored, df_price)
-        audit.record_hard_filter("3.5 風險過濾", ids_before, set(scored["stock_id"]), "ATR/波動率超過百分位門檻")
-
-        # 硬風控 2: Crisis 相對強度 + 絕對趨勢
-        ids_before = set(scored["stock_id"])
-        scored = self._apply_crisis_filter(scored, df_price)
-        audit.record_hard_filter("3.5b Crisis過濾", ids_before, set(scored["stock_id"]), "跑輸TAIEX或跌破MA60")
-
-        # 硬風控 3: 多時框強制排除（momentum/growth 日多週空）
-        ids_before = set(scored["stock_id"])
-        scored = self._apply_multi_timeframe_alignment(scored)
-        audit.record_hard_filter("3.5e 多時框共振", ids_before, set(scored["stock_id"]), "日線多頭+週線空頭矛盾")
-        if "mtf_alignment" in scored.columns:
-            # 未被排除的仍有調分（±4%），記錄到軟加成
-            audit.record_score_adjustments_from_column("3.5e 多時框共振", scored, "mtf_alignment", "日週一致性調分")
-
-        # 硬風控 4: 動態評分門檻（Regime + 勝率回饋）
-        ids_before = set(scored["stock_id"])
-        scored = self._apply_score_threshold(scored)
-        audit.record_hard_filter("3.7 分數門檻", ids_before, set(scored["stock_id"]), "composite_score低於Regime門檻")
+        # (旗標, 套用函數, 審計階段名, 剔除原因)
+        hard_stages: list[tuple[bool, object, str, str]] = [
+            (
+                stages.risk_filter,
+                lambda s: self._apply_risk_filter(s, df_price),
+                "3.5 風險過濾",
+                "ATR/波動率超過百分位門檻",
+            ),
+            (
+                stages.crisis_filter,
+                lambda s: self._apply_crisis_filter(s, df_price),
+                "3.5b Crisis過濾",
+                "跑輸TAIEX或跌破MA60",
+            ),
+            (
+                stages.multi_timeframe_alignment,
+                self._apply_multi_timeframe_alignment,
+                "3.5e 多時框共振",
+                "日線多頭+週線空頭矛盾",
+            ),
+            (stages.score_threshold, self._apply_score_threshold, "3.7 分數門檻", "composite_score低於Regime門檻"),
+        ]
+        for enabled, fn, label, reason in hard_stages:
+            if not enabled:
+                continue
+            ids_before = set(scored["stock_id"])
+            scored = fn(scored)
+            audit.record_hard_filter(label, ids_before, set(scored["stock_id"]), reason)
+            if label.startswith("3.5e"):
+                # 未被排除的仍有調分（±4%），記錄到軟加成
+                audit.record_score_adjustments_from_column(label, scored, "mtf_alignment", "日週一致性調分")
 
         # E2: 因子有效性日誌（不影響評分，僅記錄 IC 供參考）
-        self._log_factor_effectiveness()
+        if stages.factor_effectiveness_log:
+            self._log_factor_effectiveness()
 
         # ============================================================ #
         #  區塊 4: 排名 + 結構化輸出
@@ -353,33 +447,37 @@ class MarketScanner:
         rankings = self._rank_and_enrich(scored)
 
         # 硬風控 5: 同產業分散化（區分「因產業上限剔除」與「Top-N*2 pool 外截斷」）
-        ids_before = set(rankings["stock_id"])
-        rankings, sector_capped_ids, pool_ids = self._apply_sector_diversification(rankings)
-        ids_after = set(rankings["stock_id"])
-        # (a) 僅記錄真正因產業上限而被剔除的股票
-        audit.record_hard_filter(
-            "4.1 產業分散",
-            sector_capped_ids | ids_after,
-            ids_after,
-            "同產業超過25%上限",
-        )
-        # (b) 另記錄 Top-N*2 pool 外、排名過低未納入考量的截斷（避免與產業分散混淆）
-        pool_truncated = ids_before - pool_ids
-        if pool_truncated:
+        if stages.sector_diversification:
+            ids_before = set(rankings["stock_id"])
+            rankings, sector_capped_ids, pool_ids = self._apply_sector_diversification(rankings)
+            ids_after = set(rankings["stock_id"])
+            # (a) 僅記錄真正因產業上限而被剔除的股票
             audit.record_hard_filter(
-                "4.1b Top-N*2 截斷",
-                ids_before,
-                pool_ids,
-                "排名超出分散化考量範圍（top_n×2）",
+                "4.1 產業分散",
+                sector_capped_ids | ids_after,
+                ids_after,
+                "同產業超過25%上限",
             )
+            # (b) 另記錄 Top-N*2 pool 外、排名過低未納入考量的截斷（避免與產業分散混淆）
+            pool_truncated = ids_before - pool_ids
+            if pool_truncated:
+                audit.record_hard_filter(
+                    "4.1b Top-N*2 截斷",
+                    ids_before,
+                    pool_ids,
+                    "排名超出分散化考量範圍（top_n×2）",
+                )
 
-        # 硬風控 6: 回撤降頻
-        effective_top_n = self._compute_drawdown_adjusted_top_n(df_price)
+        # 硬風控 6: 回撤降頻（關閉時等同固定 top_n_results）
+        effective_top_n = (
+            self._compute_drawdown_adjusted_top_n(df_price) if stages.drawdown_adjusted_top_n else self.top_n_results
+        )
         sector_summary = self._compute_sector_summary(rankings)
         logger.info("Stage 4: 輸出 Top %d（原始 Top %d）", min(effective_top_n, len(rankings)), self.top_n_results)
 
         # Stage 4.3: 籌碼層級降級稽核（比對前次掃描 chip_tier，記錄升降級）
-        rankings = self._audit_chip_tier_changes(rankings)
+        if stages.chip_tier_audit:
+            rankings = self._audit_chip_tier_changes(rankings)
 
         # 記錄被 top_n 截斷的股票
         final_rankings = rankings.head(effective_top_n)
@@ -399,7 +497,7 @@ class MarketScanner:
             )
 
         # 收集子因子 rank（供因子診斷使用）
-        sub_factors = self.get_sub_factor_df()
+        sub_factors = self.get_sub_factor_df() if stages.sub_factor_collection else pd.DataFrame()
 
         return DiscoveryResult(
             rankings=final_rankings,
@@ -407,10 +505,32 @@ class MarketScanner:
             after_coarse=after_coarse,
             sector_summary=sector_summary,
             mode=self.mode_name,
-            audit_trail=audit,
+            audit_trail=audit if stages.audit_trail else None,
             sub_factor_df=sub_factors if not sub_factors.empty else None,
             ic_actions=dict(self._ic_actions),
         )
+
+    # ------------------------------------------------------------------ #
+    #  模式專屬 hook（N2）：取代原本三份 run() 覆寫中的流程差異
+    # ------------------------------------------------------------------ #
+
+    def _prepare_before_load(self) -> None:
+        """Stage 0.5 — Stage 1 載入資料**前**的模式專屬補抓。預設無動作。
+
+        value/dividend：估值覆蓋率不足時自動補抓；growth：月營收覆蓋率檢查。
+        """
+
+    def _after_market_data_loaded(self, df_revenue: pd.DataFrame) -> None:
+        """Stage 1 載入完成後、Stage 2 粗篩前的模式專屬處理。預設無動作。
+
+        growth：預填 `_coarse_revenue`，避免 `_coarse_filter()` 重複查 DB。
+        """
+
+    def _sync_candidate_valuation(self, candidate_ids: list[str]) -> None:
+        """Stage 2.5 — 補抓候選股估值。預設無動作（value/dividend/growth 覆寫）。"""
+
+    def _reload_candidate_valuation(self, candidate_ids: list[str]) -> None:
+        """Stage 2.5 — 補抓後重新載入估值到記憶體。預設無動作（value/dividend 覆寫）。"""
 
     # ------------------------------------------------------------------ #
     #  Stage 1: 載入資料
@@ -636,29 +756,8 @@ class MarketScanner:
             rows,
             columns=["stock_id", "date", "yoy_growth", "mom_growth"],
         )
-        if df_all.empty:
-            cols = ["stock_id", "yoy_growth", "mom_growth", "prev_yoy_growth", "prev_mom_growth"]
-            if months >= 4:
-                cols.append("yoy_3m_ago")
-            return pd.DataFrame(columns=cols)
-
-        # 每支股票取最近 months 筆
-        result_rows = []
-        for sid, grp in df_all.groupby("stock_id"):
-            grp = grp.sort_values("date", ascending=False).head(months)
-            latest = grp.iloc[0]
-            row = {
-                "stock_id": sid,
-                "yoy_growth": latest["yoy_growth"],
-                "mom_growth": latest["mom_growth"],
-                "prev_yoy_growth": grp.iloc[1]["yoy_growth"] if len(grp) >= 2 else None,
-                "prev_mom_growth": grp.iloc[1]["mom_growth"] if len(grp) >= 2 else None,
-            }
-            if months >= 4:
-                row["yoy_3m_ago"] = grp.iloc[3]["yoy_growth"] if len(grp) >= 4 else None
-            result_rows.append(row)
-
-        return pd.DataFrame(result_rows)
+        # N2 SSOT：推導邏輯與 shared in-memory 路徑共用單一實作，避免兩路徑漂移
+        return pivot_revenue_rows(df_all, months)
 
     def _load_financial_data(self, stock_ids: list[str], quarters: int = 5) -> pd.DataFrame:
         """從 DB 查詢最近 N 季財務資料。
