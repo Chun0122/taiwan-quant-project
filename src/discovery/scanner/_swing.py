@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from datetime import date, timedelta
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -61,7 +61,7 @@ class SwingScanner(MarketScanner):
         取代 DB 查詢，month=2 透過 `revenue_months` 參數顯式對齊原行為。
         """
         universe_ids = self._get_universe_ids()
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
 
         shared = getattr(self, "_shared", None)
         if shared is not None:
@@ -77,7 +77,7 @@ class SwingScanner(MarketScanner):
                 DailyPrice.close,
                 DailyPrice.volume,
                 DailyPrice.turnover,
-            ).where(DailyPrice.date >= cutoff)
+            ).where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
             if universe_ids:
                 price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
             rows = session.execute(price_query).all()
@@ -91,7 +91,7 @@ class SwingScanner(MarketScanner):
                 InstitutionalInvestor.date,
                 InstitutionalInvestor.name,
                 InstitutionalInvestor.net,
-            ).where(InstitutionalInvestor.date >= cutoff)
+            ).where(InstitutionalInvestor.date >= cutoff, InstitutionalInvestor.date <= self._as_of())
             if universe_ids:
                 inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
             rows = session.execute(inst_query).all()
@@ -102,7 +102,7 @@ class SwingScanner(MarketScanner):
                 MarginTrading.date,
                 MarginTrading.margin_balance,
                 MarginTrading.short_balance,
-            ).where(MarginTrading.date >= cutoff)
+            ).where(MarginTrading.date >= cutoff, MarginTrading.date <= self._as_of())
             if universe_ids:
                 margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
             rows = session.execute(margin_query).all()
@@ -462,7 +462,7 @@ class SwingScanner(MarketScanner):
 
     def _load_holding_data(self, stock_ids: list[str]) -> pd.DataFrame:
         """從 DB 載入最近 2 週的大戶持股分級資料（波段模式）。"""
-        cutoff = date.today() - timedelta(days=21)
+        cutoff = self._as_of() - timedelta(days=21)
         try:
             with get_session() as session:
                 rows = session.execute(

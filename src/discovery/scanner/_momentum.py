@@ -9,7 +9,7 @@ technical 子因子仍計算並寫入 DiscoveryRecord（供 IC 監控），但�
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -583,7 +583,7 @@ class MomentumScanner(MarketScanner):
         try:
             from src.data.schema import DailyPrice, DiscoveryRecord
 
-            cutoff = date.today() - timedelta(days=35)
+            cutoff = self._as_of() - timedelta(days=35)
             with get_session() as session:
                 stmt = select(
                     DiscoveryRecord.scan_date,

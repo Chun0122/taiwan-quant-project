@@ -65,6 +65,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/validator.py` | 7 個品質檢查純函數 |
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
+| `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
 
@@ -141,6 +142,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Regime 冪等（P0 #15）** | `MarketRegimeDetector().detect()` 對**同一 TAIEX 資料日**恆等：呼叫端可自由 `MarketRegimeDetector()` 新建實例（現況 10+ 處），跨實例/跨行程都拿到同一 regime，hysteresis 每個資料日只推進一次。**勿**改回以 `date.today()` 為鍵——morning-routine Step 0 在同步前執行，會把 regime 凍結在前一交易日。回傳 `state_advanced` 標示本次是否推進 |
+| **PIT 時間注入（B1）** | `MarketScanner.run(as_of=...)` 是唯一注入點；引擎層一律用 `self._as_of()`，**禁止裸 `date.today()`**（`tests/test_pit.py` 靜態守門，純函數則須加 `as_of` 參數）。查詢一律加時間上界；基本面另套公布時滯（`data/pit.py`）——`MonthlyRevenue.date` 是營收月份不是公布日，直接用 `<= as_of` 會漏未來。`as_of` 為歷史日時自動 offline，禁止一切外部補抓。shared 與 DB 兩路徑須套**相同**上界 |
 | **IC 執法治理（P0 #16）** | 任何「因 IC 而自動行動」一律先過 `ic_governance.select_enforceable_ic()`：不可執法時只告警。**IC 反向不再跳過掃描**——五模式恆掃恆落庫（否則模式產不出 `discovery_record`，IC 無從重算而自鎖），停用只作用在 rotation 層（`resolve_rankings(exclude_modes=...)` 阻擋新買入，賣出/停損/到期不受影響）。backtest 路徑**刻意不套用**（今日裁定套到歷史日＝look-ahead）。新增 IC 驅動開關時務必沿用此模組，勿再自行 `iloc[-1]` |
 | **E2b/E2c 凍結中（P0 #17）** | IC 自動調權（E2b）與分數翻轉/中性化（E2c）**預設不生效**，開關在 `quant.ic_governance`（兩者 false）。凍結只在唯一套用點 `_score_candidates`——底層純函數與 `_apply_ic_weight_adjustment` 行為不變，**仍照常計算並記錄** would-be 動作（log 標【凍結中，未生效】）。`_ic_actions` 凍結時留空，避免 CLI 的 (N)/(F)/(D) 誤示為已套用。**解凍前提**：B2 落地 + `valuation`/`dividend` 維度納入落庫 + 改用標準誤顯著性判定，詳 `config.py:ICGovernanceConfig` |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
@@ -175,7 +177,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2704 測試 / 104 檔）
+- **執行**：`pytest -v`（2727 測試 / 105 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

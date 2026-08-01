@@ -58,6 +58,7 @@ class SharedMarketData:
 def load_shared_market_data(
     price_lookback_days: int = 80,
     revenue_days: int = 180,
+    as_of: date | None = None,
 ) -> SharedMarketData:
     """一次性載入全市場資料，供 5 個 scanner 共用。
 
@@ -65,6 +66,9 @@ def load_shared_market_data(
         price_lookback_days: 價量資料回溯天數（scanner `lookback_days` 的最大值，預設 80）。
             內部會再加 10 天 buffer 對齊 `_load_market_data` 原行為。
         revenue_days: 月營收回溯天數（預設 180，涵蓋 Momentum `_revenue_months=4` 所需）。
+        as_of: B1 PIT 基準日；None＝今日（行為與注入前相同）。歷史重放時必須傳入，
+            否則預載窗口會錨在真實今日。上界過濾仍由 scanner 端
+            `_slice_shared_market_data` 依 `self._as_of()` 執行。
 
     Returns:
         `SharedMarketData`：全市場四張表的 DataFrame + cutoff 日期 + 載入時戳。
@@ -73,7 +77,9 @@ def load_shared_market_data(
         - 不做任何 universe 過濾，scanner 內再以 `.isin(universe_ids)` 二次篩選。
         - 日期欄已轉為 Python `date`（SQLAlchemy `Date` 欄預設）。
     """
-    today = date.today()
+    # B1 PIT：as_of 未傳入時＝今日掃描（行為不變）；歷史重放須顯式傳入，
+    # 否則預載窗口會錨在真實今日，PIT 就從這裡漏未來資料。
+    today = as_of or date.today()
     price_cutoff = today - timedelta(days=price_lookback_days + 10)
     revenue_cutoff = today - timedelta(days=revenue_days)
 

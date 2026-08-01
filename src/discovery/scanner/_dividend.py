@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pandas as pd
 from sqlalchemy import select
 
 from src.data.database import get_session
+from src.data.pit import financial_visible_cutoff
 from src.data.schema import (
     DailyPrice,
     FinancialStatement,
@@ -80,7 +81,7 @@ class DividendScanner(MarketScanner):
         取代 DB 查詢 4 張共用表；估值與 EPS 財報仍走 DB 查詢（未在 shared 中）。
         """
         universe_ids = self._get_universe_ids()
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
 
         shared = getattr(self, "_shared", None)
         if shared is not None:
@@ -95,7 +96,7 @@ class DividendScanner(MarketScanner):
                     StockValuation.pe_ratio,
                     StockValuation.pb_ratio,
                     StockValuation.dividend_yield,
-                ).where(StockValuation.date >= cutoff)
+                ).where(StockValuation.date >= cutoff, StockValuation.date <= self._as_of())
                 if universe_ids:
                     val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
                 rows = session.execute(val_query).all()
@@ -104,12 +105,14 @@ class DividendScanner(MarketScanner):
                     columns=["stock_id", "date", "pe_ratio", "pb_ratio", "dividend_yield"],
                 )
 
-                eps_cutoff = date.today() - timedelta(days=400)
+                eps_cutoff = self._as_of() - timedelta(days=400)
+                # B1 PIT：季報上界＝當時已依法申報者（季後 45 日／年報次年 3/31）
+                eps_upper = financial_visible_cutoff(self._as_of())
                 eps_query = select(
                     FinancialStatement.stock_id,
                     FinancialStatement.date,
                     FinancialStatement.eps,
-                ).where(FinancialStatement.date >= eps_cutoff)
+                ).where(FinancialStatement.date >= eps_cutoff, FinancialStatement.date <= eps_upper)
                 if universe_ids:
                     eps_query = eps_query.where(FinancialStatement.stock_id.in_(universe_ids))
                 eps_rows = session.execute(eps_query).all()
@@ -126,7 +129,7 @@ class DividendScanner(MarketScanner):
                 DailyPrice.close,
                 DailyPrice.volume,
                 DailyPrice.turnover,
-            ).where(DailyPrice.date >= cutoff)
+            ).where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
             if universe_ids:
                 price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
             rows = session.execute(price_query).all()
@@ -140,7 +143,7 @@ class DividendScanner(MarketScanner):
                 InstitutionalInvestor.date,
                 InstitutionalInvestor.name,
                 InstitutionalInvestor.net,
-            ).where(InstitutionalInvestor.date >= cutoff)
+            ).where(InstitutionalInvestor.date >= cutoff, InstitutionalInvestor.date <= self._as_of())
             if universe_ids:
                 inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
             rows = session.execute(inst_query).all()
@@ -151,7 +154,7 @@ class DividendScanner(MarketScanner):
                 MarginTrading.date,
                 MarginTrading.margin_balance,
                 MarginTrading.short_balance,
-            ).where(MarginTrading.date >= cutoff)
+            ).where(MarginTrading.date >= cutoff, MarginTrading.date <= self._as_of())
             if universe_ids:
                 margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
             rows = session.execute(margin_query).all()
@@ -164,7 +167,7 @@ class DividendScanner(MarketScanner):
                 StockValuation.pe_ratio,
                 StockValuation.pb_ratio,
                 StockValuation.dividend_yield,
-            ).where(StockValuation.date >= cutoff)
+            ).where(StockValuation.date >= cutoff, StockValuation.date <= self._as_of())
             if universe_ids:
                 val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
             rows = session.execute(val_query).all()
@@ -174,12 +177,14 @@ class DividendScanner(MarketScanner):
             )
 
             # 載入近 4 季 EPS（供 _coarse_filter 配息連續性篩選）
-            eps_cutoff = date.today() - timedelta(days=400)  # 4 季 ≈ 400 天
+            eps_cutoff = self._as_of() - timedelta(days=400)  # 4 季 ≈ 400 天
+            # B1 PIT：季報上界＝當時已依法申報者
+            eps_upper = financial_visible_cutoff(self._as_of())
             eps_query = select(
                 FinancialStatement.stock_id,
                 FinancialStatement.date,
                 FinancialStatement.eps,
-            ).where(FinancialStatement.date >= eps_cutoff)
+            ).where(FinancialStatement.date >= eps_cutoff, FinancialStatement.date <= eps_upper)
             if universe_ids:
                 eps_query = eps_query.where(FinancialStatement.stock_id.in_(universe_ids))
             eps_rows = session.execute(eps_query).all()

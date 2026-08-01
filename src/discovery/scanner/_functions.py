@@ -70,6 +70,7 @@ def compute_abnormal_announcement_rate(
     stock_ids: list[str],
     recent_days: int = 10,
     baseline_days: int = 180,
+    as_of: date | None = None,
 ) -> pd.Series:
     """計算各股公告頻率異常 Z-Score（近 recent_days 與過去 baseline_days 基準比較）。
 
@@ -94,7 +95,8 @@ def compute_abnormal_announcement_rate(
     if df_ann_history.empty or "stock_id" not in df_ann_history.columns:
         return pd.Series(0.0, index=pd.Index(stock_ids))
 
-    today = date.today()
+    # B1 PIT：基準窗口須錨在 as_of，否則歷史重放會用「今天」的視窗
+    today = as_of or date.today()
     recent_cutoff = today - timedelta(days=recent_days)
     baseline_start = today - timedelta(days=baseline_days)
 
