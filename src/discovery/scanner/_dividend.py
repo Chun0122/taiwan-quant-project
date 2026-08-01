@@ -59,7 +59,9 @@ class DividendScanner(MarketScanner):
         multi_timeframe_alignment=False,
         score_threshold=False,
         sector_diversification=False,
-        drawdown_adjusted_top_n=False,
+        # 2026-08-01：4.2 回撤縮表已開啟（N2 閘門政策第一項）。
+        # 對本模式實際等同無作用——`_DEFENSIVE_MODES` 已豁免 value/dividend，
+        # 任何回撤幅度都維持原 top_n；開啟是為了讓五模式漏斗一致、差異可審查。
         chip_tier_audit=False,
     )
 
