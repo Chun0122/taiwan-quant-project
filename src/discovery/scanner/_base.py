@@ -2755,15 +2755,22 @@ class MarketScanner:
         return 35 + self._get_ic_holding_days()
 
     def _compute_ic_decay_adjustment(self) -> float:
-        """IC 衰退門檻調整：關鍵因子 IC 連續 2 窗口 < 0.05 時回傳 +0.05。
+        """IC 衰退門檻調整：關鍵因子 IC 低於 0.05 且**達執法門檻**時回傳 +0.05。
 
         holding_days 由 mode 對應的 KEY_FACTOR 兌現週期決定（DISCOVERY_IC_HOLDING_DAYS_MAP）。
         例：value/dividend/growth 用 20 天（fundamental 中長期），momentum 用 5 天（chip 短期）。
+
+        P0 #16（2026-08-01）：本函數原本直接取 `factor_df["ic"].tail(2)`，**與 M2 停用
+        犯同一個錯**——模式停掃後窗口凍結，過期 IC 每天重複把門檻推高。實測 2026-07-28
+        swing 因此疊到 0.70（crisis 0.60 + 勝率回饋 0.05 + 本項 0.05），當日剔除 88 支、
+        落庫 0 筆。改為與 M2 共用 `ic_governance.select_enforceable_ic` 的三道閘門
+        （時效 / 窗口數 / 樣本數），不可執法時一律不加成。
         """
         key_factor = self._KEY_FACTOR_MAP.get(self.mode_name)
         if not key_factor:
             return 0.0
         try:
+            from src.discovery.ic_governance import select_enforceable_ic
             from src.discovery.scanner._functions import compute_rolling_ic
 
             holding_days = self._get_ic_holding_days()
@@ -2811,22 +2818,28 @@ class MarketScanner:
             rolling_df = compute_rolling_ic(
                 df_records, df_prices, holding_days=holding_days, window_days=14, step_days=7
             )
-            if rolling_df.empty:
-                return 0.0
 
-            # 取關鍵因子的 IC 時間序列
-            factor_df = rolling_df[rolling_df["factor"] == key_factor].sort_values("window_end")
-            if len(factor_df) < 2:
-                return 0.0
-
-            # 檢查最近 2 個窗口是否都 < 0.05
-            last_two = factor_df["ic"].tail(2).tolist()
-            if all(ic < 0.05 for ic in last_two):
-                logger.warning(
-                    "IC-Decay: %s 模式關鍵因子 %s 連續 2 窗口 IC < 0.05（%s），啟動門檻提升",
+            as_of = getattr(self, "scan_date", None) or date.today()
+            verdict = select_enforceable_ic(
+                rolling_df, key_factor, as_of=as_of, holding_days=holding_days, mode=self.mode_name
+            )
+            if not verdict.enforceable:
+                logger.info(
+                    "IC-Decay: %s 模式 %s — 不加成（%s）",
                     self.mode_name,
                     key_factor,
-                    [f"{v:+.4f}" for v in last_two],
+                    verdict.describe(),
+                )
+                return 0.0
+
+            if verdict.ic is not None and verdict.ic < 0.05:
+                logger.warning(
+                    "IC-Decay: %s 模式關鍵因子 %s 近 %d 窗平均 IC=%+.4f < 0.05（n≥%s），啟動門檻提升",
+                    self.mode_name,
+                    key_factor,
+                    verdict.window_count,
+                    verdict.ic,
+                    verdict.min_sample_count,
                 )
                 return 0.05
             return 0.0

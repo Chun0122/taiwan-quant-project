@@ -1709,6 +1709,7 @@ python main.py morning-routine --top 30 --notify
 | Step 8 | `sync-broker`（watchlist + discover） | 同步 watchlist 分點資料（5日）+ 補抓 discover 推薦的非 watchlist 股票 |
 | Step 8b | `sync_market_data`（TWSE/TPEX 全市場） | 同步全市場日K線+法人+融資融券（6 次 API），確保 rotation 持倉等非 watchlist 股票有最新價格 |
 | Step 8e | 同步後 regime 重解 | Step 0 的 regime 取自**同步前**資料（只到前一交易日）；此步以同步後資料重解一次，供 Step 12 輪動使用，消除 discover 與 rotation 差一個交易日的落差。`--dry-run` / `--skip-sync` 自動跳過 |
+| Step 8c | 關鍵因子 IC 預檢 | 計算五模式關鍵因子的 rolling IC，並過三道執法閘門（窗口時效 / 窗口數 ≥3 / 最小樣本 ≥100）。**未達門檻只告警不行動**；達門檻且 IC < −0.05 者**仍照常掃描落庫**，僅由 Step 12 輪動阻擋新買入（不阻擋賣出/停損/到期）。訊息會直接說明未執法原因，如「最新窗口已過期（距今 32 天 > 上限 19）」 |
 | Step 9 | `discover all --skip-sync --top N` | 五模式全市場掃描（不重複同步市場資料） |
 | Step 10 | `alert-check --days 3` | MOPS 近3日重大事件警報 |
 | Step 11 | `watch update-status` | 批次更新持倉止損/止利/過期狀態 |

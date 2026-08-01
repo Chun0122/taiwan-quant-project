@@ -1,6 +1,6 @@
 # 專案主計畫（Master Plan）— Single Source of Truth
 
-> 版本：v1.1（2026-07-31；v1.0 為 2026-07-05 定稿）
+> 版本：v1.2（2026-08-01；v1.1 為 2026-07-31、v1.0 為 2026-07-05）
 > 來源：完整 repository 探索 + 深度工程審計 + CTO Roadmap 三輪分析的整併定稿；v1.1 併入 discover 選股邏輯全鏈路審計（`logs/audit_discover_20260731/REPORT.md`）。
 > 定位：本文件是策略與工程決策的**單一真相來源**。與 `CLAUDE.md`（開發規則）、`docs/project_history.md`（歷史）互補，不重複。
 > 維護規則：任何 P0/P1 事項完成或推翻，須更新本文件對應條目並註記日期。
@@ -14,7 +14,7 @@
 1. **帳本不可信**：live 以「夜間決策、當日收盤成交」模擬（該價格拿不到）；rotation 全面忽略股利（除息跳空計為虧損）；Drawdown Kill Switch 的 peak 來自 realized-only 序列（回撤低估）。三者疊加 → 現有 alpha/baseline/歷史裁決全部帶系統性偏差。→ **Phase A 三部曲已完成（A2/A3/A4/A5）**
 2. **研究迴路是斷的**：無 point-in-time 能力。回測只能重播已落庫的 DiscoveryRecord（2026-02-27 起、單一多頭 regime、歷代版本混雜）。改 scanner 後無法歷史驗證，只能 forward test 等數週。
 3. **執行層為零**：無 broker 抽象，實盤路徑 L0。
-4. ★ **訊號引擎已停產**（2026-07-31 discover 審計新增，`logs/audit_discover_20260731/REPORT.md`）：7/17–7/31 共 11 個交易日中 momentum 掃出 1 天、swing 1 天、growth 0 天；僅存的兩個 active 組合皆 momentum 模式且**持倉 0 筆、100% 現金**。**停產原因與因子好壞無關**，是治理機制自身的三重缺陷：①M2 以 34 天前 n=40 的**凍結 IC** 執法（放行/停用取決於 rolling 窗口的可計算性）；②~~regime 同日被偵測 4–15 次~~ ✅2026-08-01 已修（§6.4 #15）；③五個 scanner 非同一條 pipeline，三個模式繞過分數門檻使跨模式全不可比。→ **止血包三（§6.4）+ B11/B2/N2**；訊號恢復的關鍵仍在 §6.4 #16（B11 最小切口）尚未落地
+4. ★ **訊號引擎曾全面停產**（2026-07-31 discover 審計，`logs/audit_discover_20260731/REPORT.md`）：7/17–7/31 共 11 個交易日中 momentum 掃出 1 天、swing 1 天、growth 0 天；僅存的兩個 active 組合皆 momentum 模式且**持倉 0 筆、100% 現金**。**停產原因與因子好壞無關**，是治理機制自身的三重缺陷：①~~M2 以 34 天前 n=40 的凍結 IC 執法~~ ✅2026-08-01 已修（§6.4 #16，五模式恢復掃描）；②~~regime 同日被偵測 4–15 次~~ ✅2026-08-01 已修（§6.4 #15）；③**五個 scanner 非同一條 pipeline，三個模式繞過分數門檻使跨模式全不可比——仍未修**（N2，§7 #3b）。**現況**：訊號產能已恢復，但模式級比較仍不可信；下一關鍵為 §6.4 #17（凍結 E2b/E2c）與 N2/B2
 
 **核心裁決（凍結令）**：在 T+1（A2）與股利會計（A3）完成前，**凍結所有基於現有數字的策略裁決與資金決策**。過去的裁決（dividend「純因子弱」、all10_5d 結構性失敗、停損研究）須在 A2+A3 後重審（研究議程 R1）。
 
@@ -145,9 +145,9 @@ Step 0 宏觀壓力預檢（VIX+crisis）→ 1–8d 資料同步 + DailyFeature 
 | # | 項目 | 內容 / 驗收 |
 |---|------|------------|
 | 15 | **regime 同日多次偵測（P0，新）** | ✅ **2026-08-01 已修**（分支 `fix-regime-same-day-redetect`）。**病因**：`MarketRegimeDetector` 的同日快取是 `self._cached_result`（**per-instance**，`detector.py:409`），而每個 scanner 的 Stage 0 各建新實例 → 快取**從未命中** → 每次呼叫重跑 `apply_hysteresis()` 並 append 一筆 `RegimeStateLog`。實測每日 **4–15 次**呼叫；2026-07-24 一次 morning-routine 內出現 `sideways→sideways→bear→sideways→bear→bear`，`universe_stat_log` 顯示同批掃描 value=sideways／dividend=bear／swing=bear（時間戳相隔 <1 秒）。**三重後果**：①同日各模式在不同 regime 下評分（門檻 0.50 vs 0.55、權重、universe 乘數、`REGIME_MODE_BLOCK` 全部分歧）；②模式當天跑不跑取決於排在第幾個呼叫；③**hysteresis 確認計數按「呼叫次數」而非「天數」消耗**，遲滯機制（防 regime 抖動的唯一保護）被架空。<br>**修法（採無狀態冪等鍵，非「注入單一實例」）**：新增 `RegimeState.data_date` / `regime_state_log.data_date` = 本次判定依據的**最新 TAIEX 資料日**，作為狀態機冪等鍵；同一 `data_date` 無論被呼叫幾次、由幾個實例／行程呼叫，都回傳同一結論且不推進 hysteresis、不寫 log。**不採用日曆日為鍵**——morning-routine Step 0 在資料同步（Step 1~8）**之前**執行，以日曆日為鍵會把 regime 永久凍結在前一交易日資料上。回傳 dict 新增 `state_advanced` 供觀測（§3 原則 8）。<br>**附帶修復**：Step 0 的 regime 為同步前判定，Step 12 輪動卻在同步後執行 → 新增 **Step 8e**「同步後 regime 重解」（`resolve_regime_after_sync()`，dry_run/skip_sync 自動跳過），消除 discover 與 rotation 差一個交易日的落差。<br>**驗收**：`python main.py migrate` 已執行（新增 1 欄）；live 實測 7 次全新實例呼叫 → 新增 **1** 筆 log、regime 全部一致、`state_advanced` 僅第 1 次為 True。新增 `tests/test_regime_idempotence.py` **21 測試**（含核心回歸：同日 3 次呼叫不得湊滿 sideways→bull 的 3 天確認）；停用冪等閘門可複現 6 個失敗。全測試 2,630 passed |
-| 16 | **M2 凍結 IC 執法（P0，B11 前置最小切口）** | 詳見 §7 #3 更新後之描述與 §10「統計/方法債」。**修法**：①rolling 窗口時效上限（`window_end` 逾期即視為無 IC，不得執法）；②停用改為「照常掃描落庫、僅在 rotation 層阻擋新買入」；③執行 §3 原則 6 的 n≥100／跨 ≥3 窗口門檻。工期 1–2 天。**驗收**：momentum/growth 恢復連續掃描且 IC 可續算 |
+| 16 | **M2 凍結 IC 執法（P0，B11 前置最小切口）** | ✅ **2026-08-01 已修**（分支 `fix-ic-governance-min-cut`）。病因詳見 §7 #3 與 §10「統計/方法債」。**修法**：新增 `src/discovery/ic_governance.py` 作為「IC 可不可以拿來行動」的**單一實作**，三個執法點（M2 停用 / scanner 門檻 +0.05 加成 / rotation 阻擋買入）共用同一套三道閘門：<br>　①**時效**：最新 `window_end` 距 `as_of` 不得超過 `holding_days + 14`（與 holding 掛鉤——rolling 窗口需 forward 報酬，天生落後約 holding_days；momentum 19 天、value/dividend/growth 34 天）<br>　②**窗口數** ≥3（step_days=7，≈§3 原則 6 的「跨 3 個掃描週」）<br>　③**樣本**：決策窗口中**最小** `evaluable_count` ≥100（§3 原則 6）<br>決策 IC 改取**最近 3 窗平均**而非單一最新窗（實測 swing 最新窗 −0.0933/n=140 但前三窗 +0.005，3 窗平均 −0.0479 未達門檻＝單窗判定屬小樣本漂移）。<br>**②停用語意改變**：`_step_9_discover` 恆傳 `disabled_modes=[]`——**五模式恆掃恆落庫**，IC 反向改由 `manager._build_decision_context` 經 `resolve_rankings(exclude_modes=...)` 在 rotation 層阻擋新買入（賣出/停損/到期/風控路徑不受影響）。composite 模式只濾掉被擋成員，全數被擋才回空。rotation 端**即時重算**而非讀取 Step 8c 結果（`rotation update` 可單獨執行，且天然無「治理資料本身過期」問題）；backtest 路徑**刻意不套用**（今日裁定套到歷史掃描日＝look-ahead，留待 B1 PIT）。<br>**驗收（live 實測 2026-08-01）**：momentum「最新窗口已過期（2026-06-30，距今 32 天 > 上限 19）」→ 僅告警不執法；value/growth「樣本不足（n=60 < 100）」；dividend「窗口數不足（1 < 3）」；swing 可執法但 3 窗平均 −0.0479 未達 −0.05 → 放行。**五個模式全數恢復掃描，自鎖迴路解除**。新增 `tests/test_ic_governance.py` 24 測試（停用閘門可複現 8 個失敗）；全測試 2,654 passed |
 | 17 | **凍結 IC 驅動的自動調權與翻轉（P1，暫時性）** | E2b `_apply_ic_weight_adjustment` 與 E2c `compute_ic_aware_score_transform` 改為**只記錄不生效**，直到 B2 落地。理由見 §7 #3 更新說明（權重被搬給未量測維度 + ±0.02 翻轉門檻深埋雜訊帶）。工期 0.5 天，改 flag 即可 |
-| 18 | **`ScoreThresholdConfig` 接線 + `insufficient` 分支拆分（P2）** | ①`src/config.py:84-90` 定義了 bull/sideways/bear/crisis 門檻但**零消費者**，scanner 讀死的 `_functions.py:1196 MIN_SCORE_THRESHOLDS` → 使用者改 `quant_params.yaml` **靜默無效**（違反 §3 原則 2 SSOT）；②`morning_cmd.py:669/693/714/720` 四種情況共用 `level="insufficient"`，導致 log 印出「樣本不足（n=106，需 ≥20）」「（n=260，需 ≥20）」等自相矛盾訊息，掩蓋停用真因，並使 dividend（holding=20，最新窗口恆無 forward 報酬）**從未受過 M2 管轄**而無人察覺。工期 0.5 天 |
+| 18 | **`ScoreThresholdConfig` 接線 + `insufficient` 分支拆分（P2）** | ①`src/config.py:84-90` 定義了 bull/sideways/bear/crisis 門檻但**零消費者**，scanner 讀死的 `_functions.py:1196 MIN_SCORE_THRESHOLDS` → 使用者改 `quant_params.yaml` **靜默無效**（違反 §3 原則 2 SSOT）—— **尚未修**；②`insufficient` 分支語意混淆 ✅**2026-08-01 隨 #16 一併修**：`level` 現分為 `insufficient`（推薦記錄 <20，訊息改為「推薦記錄不足」）/ `no_prices` / `no_windows` / `stale_window` / `insufficient_windows` / `insufficient_samples`，各自說出真正原因，不再印「樣本不足（n=260，需 ≥20）」這種自相矛盾訊息。dividend 之所以「從未受 M2 管轄」的真因（holding=20 使窗口數常為 1）現由 `窗口數不足（1 < 3）` 明確顯示 |
 
 ---
 
@@ -249,11 +249,11 @@ R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPOR
 
 ### 統計/方法債
 - IC 建立在 top-N 截斷樣本、n≈20–30，驅動自動停用/翻轉 → B2+B11。**2026-07-31 量化**：漏斗 `1,857 →(流動性) 659 →(粗篩) 150 →(落庫) 20`，IC 只算在 top-20 上（range restriction）。
-- **M2 自動停用自鎖迴路**（2026-07-30 mg5_20d 二審實證）：停用作用在掃描層 → 無新 `discovery_record` → IC 無從重算 → 模式無法自證恢復。momentum 因此中斷 29 個交易日、growth 中斷至今，連帶使 mom_growth 組合訊號歸零、forward 驗證取不到樣本 → B11（已升 P1 最優先）。**2026-07-31 修正機制描述**：不只「無從重算」——`compute_rolling_ic` 窗口錨在記錄日期範圍，`iloc[-1]` 取最後一個有資料的窗口，故停掃後**每天重讀同一份凍結 IC 執法**（7/31 停用 momentum 用的是 `window_end=2026-06-27`、n=40、34 天前的值，7/30 與 7/31 完全相同）；而「放行」發生在窗口生不出來時的 fail-open。**開關的實際判準是「rolling IC 算不算得出來」，與因子有效性無關。**
-- **§3 原則 6 未被任何程式執行**（2026-07-31 量化）：原則要求自動開關 n≥100 且跨 ≥3 掃描週，M2 實際跑在 n=40／單一窗口／34 天前；E2c 分數翻轉門檻 `±0.02` 在 n=50–100（SE≈0.10–0.14）下等同隨機翻轉方向 → B11 修法須包含門檻的**程式化執行**，而非僅寫在文件。
+- ~~**M2 自動停用自鎖迴路**~~ ✅**2026-08-01 已解除**（§6.4 #16）。歷史記錄：停用作用在掃描層 → 無新 `discovery_record` → IC 無從重算 → 模式無法自證恢復；momentum 中斷 29 個交易日、growth 中斷至今。真正機制是 `compute_rolling_ic` 窗口錨在記錄日期範圍、`iloc[-1]` 取最後一個有資料的窗口 → 停掃後**每天重讀同一份凍結 IC 執法**（7/31 用的是 `window_end=2026-06-27`、n=40、34 天前，7/30 與 7/31 完全相同）；「放行」則是窗口生不出來時的 fail-open。**開關的實際判準是「rolling IC 算不算得出來」，與因子有效性無關。** 現由 `src/discovery/ic_governance.py` 的時效閘門阻擋過期執法，且停用改為只作用在 rotation 層（掃描照常）。
+- **§3 原則 6 的程式化執行**：✅**M2 與 scanner 門檻加成已於 2026-08-01 落地**（n≥100、窗口 ≥3、時效上限，見 §6.4 #16）。**仍未執行者**：E2c 分數翻轉門檻 `±0.02` 在 n=50–100（SE≈0.10–0.14）下等同隨機翻轉方向、E2b 權重調整同樣無樣本門檻 → 屬 §6.4 #17（凍結 E2b/E2c）與 B11 完整版範圍。
 - **IC 調權把權重搬給未量測維度**（2026-07-31）：`valuation`／`dividend` 維度不落庫 → 恆 `IC=N/A` → `_apply_ic_weight_adjustment` 的歸一化使其被動吸收被打壓維度釋出的權重（value 7/31：0.150→0.338，2.25×）。淨效果＝IC 治理越積極，決策權越集中到唯一沒被檢驗的維度 → B11+B2。
 - **分數鑑別力不足**（2026-07-31）：`news_score` 63–81% 恰為 `fillna(0.5)` 填補值卻佔權重 0.20 且每日參與 IC 與調權；momentum 的 `fundamental_score` 73.9%／`technical_score` 45.8% 為填補值。單日 top-20 內 composite 全距僅 0.10–0.15，與 `signal_jaccard_mean` 0.17–0.24（growth/swing）相互印證 → B2 後重估。
-- **門檻疊加正回饋**（2026-07-31）：`_apply_score_threshold` = regime 基礎 + 勝率回饋 +0.05 + IC 衰退 +0.05，三個加項全由「近期表現差」驅動，構成「表現差→門檻升→樣本少→統計更不穩→更易判定為差」閉環；`strategy_decay_log` 顯示五個模式全部 `is_decaying=1`，此加壓為常態。實測 7/28 swing 門檻 0.70 → 剔除 88 支 → 落庫 0 筆 → B11 一併處理。
+- **門檻疊加正回饋**（2026-07-31）：`_apply_score_threshold` = regime 基礎 + 勝率回饋 +0.05 + IC 衰退 +0.05，三個加項全由「近期表現差」驅動，構成「表現差→門檻升→樣本少→統計更不穩→更易判定為差」閉環；`strategy_decay_log` 顯示五個模式全部 `is_decaying=1`，此加壓為常態。實測 7/28 swing 門檻 0.70 → 剔除 88 支 → 落庫 0 筆。**部分緩解**：IC 衰退加成已於 2026-08-01 納入三道閘門（§6.4 #16），過期/小樣本 IC 不再推高門檻；**勝率回饋 +0.05 仍無樣本門檻**，閉環未完全拆除 → 留待 B11 完整版。
 - 全部閾值/權重為 in-sample 調參，跨 regime 未驗證 → R2/R3。
 - 停損只看收盤、無停利 → B12（live 成交=決策價已由 A2 T+1 解除，2026-07-06）。
 - Crisis 邏輯從未被歷史崩跌段檢驗 → R7。
@@ -302,3 +302,5 @@ R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPOR
 *本文件由三輪分析（2026-07-04 探索/審計/Roadmap）整併定稿。衝突解決原則：審計發現的嚴重度 + Roadmap 的執行順序 = 本文件的優先級；重複建議已合併至單一條目。*
 
 *v1.1（2026-07-31）：併入 discover 選股邏輯全鏈路審計。異動摘要——§1 斷柱由三根增為四根（訊號引擎停產）；§5 裁決凍結對「模式級比較」部分重新凍結；新增 §6.4 三次止血包（#15 regime 同日多次偵測 P0、#16 M2 凍結 IC、#17 凍結 E2b/E2c、#18 死設定與 log 語意）；§7 B2 與 B11 綁為同一批交付、B11 範圍擴大至 E2b/E2c、N2 由 P2 升 P1 為 §7 #3b；§9 研究議程新增前置條件；§10 新增 3 筆確認 bug、5 筆統計/方法債，並重新定性 scanner 重複為「跨模式不可比」。*
+
+*v1.2（2026-08-01）：止血包三之 #15、#16 落地。異動摘要——§6.4 #15（regime 同日多次偵測）與 #16（M2 凍結 IC 執法）標記完成並補上修法與 live 驗收；#18 的 `insufficient` 分支拆分隨 #16 一併完成（`ScoreThresholdConfig` 接線仍待辦）；§1 斷柱 4 的三項成因兩項劃除，現況改為「訊號產能已恢復，模式級比較仍不可信」；§10 M2 自鎖迴路標記解除、§3 原則 6 的程式化執行區分「已落地（M2＋scanner 門檻）」與「仍未執行（E2b/E2c、勝率回饋）」。**新增模組** `src/discovery/ic_governance.py`＝IC 可執法性的單一實作。*

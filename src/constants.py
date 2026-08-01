@@ -165,6 +165,30 @@ DISCOVERY_IC_HOLDING_DAYS_MAP: dict[str, int] = {
     "growth": 20,
 }
 
+# ── IC 執法門檻（P0 #16 / B11 最小切口，2026-08-01）──────────────────────────
+# 背景（logs/audit_discover_20260731/REPORT.md §2）：M2 自動停用曾以
+# window_end=2026-06-27、n=40、距今 34 天的**凍結 IC** 每日重複執法，而 momentum
+# 停掃後該窗口永遠不再更新 → 模式無法自證恢復（自鎖）。同時 §3 原則 6 要求
+# 「樣本 <100 或未跨 3 個獨立掃描週時只能告警不能行動」，但程式無一處執行。
+# 以下三個門檻由 src/discovery/ic_governance.py 統一執行（M2 停用 +
+# scanner IC 衰退門檻加成共用），任一不滿足即「可觀測但不可執法」。
+#
+# 窗口時效預算 = holding_days + BUFFER。為何與 holding 掛鉤：rolling 窗口需要
+# 記錄日之後 holding_days 的 forward 報酬才可評估，故最新「有資料」的窗口本來
+# 就落後約 holding_days；再加 step_days(7) + 假日寬限(7) = BUFFER 14。
+# 實測（2026-08-01）：momentum 落後 32 天 > 5+14=19 → 正確判定過期；
+# value/growth 落後 18 天 < 20+14=34 → 正常；swing 落後 11 天 < 10+14=24 → 正常。
+DISCOVERY_IC_WINDOW_STALE_BUFFER_DAYS: int = 14
+
+# 決策所依據的窗口數；rolling 窗口 step_days=7，故 3 窗 ≈ §3 原則 6 的「跨 3 個掃描週」。
+# 決策 IC 取最近 N 窗的平均，而非單一最新窗——實測 swing 最新窗 IC=-0.0933(n=140)
+# 但前三窗為 +0.005，3 窗平均 -0.0479 未達 -0.05，單窗判定屬小樣本漂移。
+DISCOVERY_IC_MIN_WINDOWS: int = 3
+
+# 決策窗口的最低可評估樣本數（取最近 N 窗的**最小值**，最保守）。
+# 對應 §3 原則 6 的「樣本 <100 只能告警」。實測 value/growth 最新窗僅 60 → 不可執法。
+DISCOVERY_IC_MIN_SAMPLES: int = 100
+
 # ── 過熱反轉懲罰閘門（2026-05-15 audit：5/7-5/8 三連停損根因修復） ────────
 # 證據：6224 (+30%/5d, +45%/10d)、6108 (+21%/5d, +33%/10d)、5864 (+25%/5d, +36%/10d)
 #       均為進場後 1-2 日跳空崩跌的追高型；

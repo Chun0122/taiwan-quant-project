@@ -112,7 +112,10 @@ class TestCheckFactorICDecayNotSilent:
         assert "反向" in out and "Swing" in out
         assert "衰減" in out or "decay" in out.lower()
         assert "弱" in out or "weak" in out.lower()
-        assert "樣本不足" in out
+        # P0 #16 / §6.4 #18：level="insufficient" 現在專指「推薦記錄 < 20」。
+        # 「窗口算不出來」已改用獨立 level（no_windows / stale_window 等），
+        # 不再與此共用「樣本不足」字樣（舊版會印出「樣本不足（n=260，需 ≥20）」）。
+        assert "推薦記錄不足" in out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -172,7 +175,13 @@ class TestDiscordSummaryParams:
 
 
 class TestDiscoverAllDisabledModes:
-    """_cmd_discover_all 應跳過 disabled_modes 中的 scanner。"""
+    """_cmd_discover_all 應跳過 disabled_modes 中的 scanner。
+
+    P0 #16（2026-08-01）：此參數的**語意已改變**。morning-routine 不再因 IC 反向
+    傳入停用模式（恆傳空集合）——IC 反向的處置移至 rotation 層阻擋新買入，掃描
+    照常進行以免模式產不出 discovery_record 而自鎖。本參數僅保留給人工介入場景，
+    機制本身（傳入即跳過）不變，故本測試續存。
+    """
 
     def test_disabled_modes_skipped(self, capsys):
         """disabled_modes=['swing','growth'] → swing 與 growth 不呼叫 scanner.run()。"""
@@ -258,7 +267,7 @@ class TestDiscoverAllDisabledModes:
         assert "dividend" in called_modes
 
         out = capsys.readouterr().out
-        assert "已停用（IC 反向）" in out
+        assert "已停用（人工指定）" in out
 
 
 # ═══════════════════════════════════════════════════════════════════════════

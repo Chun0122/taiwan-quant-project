@@ -150,6 +150,9 @@ class RotationManager:
 
     def __init__(self, portfolio_name: str):
         self.portfolio_name = portfolio_name
+        # P0 #16：(mode, as_of) → 被 IC 阻擋的模式集合。decide/update 同一決策日
+        # 可能多次解析排名，避免重複計算 rolling IC。
+        self._ic_block_cache: dict[tuple[str, date], set[str]] = {}
 
     # ── 建立 ──
 
@@ -251,8 +254,14 @@ class RotationManager:
         # 載入 open positions
         open_positions = self._load_open_positions(session, portfolio.id)
 
+        # P0 #16：IC 反向且達執法門檻的模式 → 阻擋新買入（但掃描照常進行，
+        # 使 IC 得以續算、模式具備自證恢復路徑）。取代舊的「scanner 層跳過掃描」。
+        _ic_excluded = self._resolve_ic_blocked_modes(session, portfolio.mode, today)
+
         # 載入今日排名
-        rankings = resolve_rankings(portfolio.mode, today, session, top_n=portfolio.max_positions * 3)
+        rankings = resolve_rankings(
+            portfolio.mode, today, session, top_n=portfolio.max_positions * 3, exclude_modes=_ic_excluded
+        )
         # 若掃描器因 regime 封鎖回傳空結果，不拉取前日排名（避免用不同 regime 的名單買入）
         # regime 變數稍後才解析，這裡先預讀一次（若失敗視為未封鎖，由 fallback 處理）
         _regime_for_gate = regime
@@ -265,15 +274,18 @@ class RotationManager:
                 _regime_for_gate = None
         from src.constants import REGIME_MODE_BLOCK as _RMB
 
-        _mode_blocked_today = bool(
+        _regime_blocked = bool(
             _regime_for_gate
             and not is_composite_mode(portfolio.mode)
             and portfolio.mode in _RMB.get(_regime_for_gate, frozenset())
         )
+        # IC 阻擋與 regime 封鎖同語意：不得 fallback 至前日排名（否則以舊名單繞過封鎖，
+        # 正是 P0 #13 事故的形態）
+        _mode_blocked_today = _regime_blocked or bool(_ic_excluded)
         if not rankings and not _mode_blocked_today:
             # 嘗試找最近的 scan_date（未被 regime 封鎖時才 fallback）
             rankings = self._find_latest_rankings(session, portfolio.mode, today)
-        elif not rankings and _mode_blocked_today:
+        elif not rankings and _regime_blocked:
             logger.info(
                 "Rotation: %s 模式在 %s 被封鎖 — 跳過新買入，僅處理止損/到期/風控",
                 portfolio.mode,
@@ -1761,6 +1773,9 @@ class RotationManager:
             scan_dates = {row[0] for row in session.execute(stmt).all()}
 
             for sd in scan_dates:
+                # 刻意不傳 exclude_modes：IC 阻擋是「今日」的裁定，套用到歷史掃描日
+                # 等於 look-ahead bias（用未來才知道的因子失效去修改過去的決策）。
+                # backtest 若要重現 IC 治理，須逐日以 as_of=sd 重算——留待 B1 PIT。
                 all_rankings[sd] = resolve_rankings(mode, sd, session, top_n=max_positions * 3)
 
             # 逐日歷史 regime（取自 DiscoveryRecord，與當日 discover 計算一致 → 無 look-ahead）。
@@ -2692,6 +2707,52 @@ class RotationManager:
             }
             for p in positions
         ]
+
+    def _resolve_ic_blocked_modes(self, session, mode: str, as_of: date) -> set[str]:
+        """回傳因 IC 反向而應阻擋新買入的 scanner 模式（P0 #16 / B11 最小切口）。
+
+        取代舊設計「M2 在 scanner 層跳過掃描」——那使被停用的模式產不出新
+        `discovery_record`，IC 因而無從重算、模式無法自證恢復（自鎖迴路，
+        實測 momentum 中斷 29 個交易日）。改為：**掃描照跑、落庫照做**，只在
+        此處攔下新買入。賣出/停損/到期/風控路徑不經過排名解析，完全不受影響。
+
+        判定一律走 `discovery/ic_governance`，與 morning Step 8c 同一套三道閘門
+        （窗口時效 / 窗口數 / 樣本數），確保兩處結論一致。此處**即時重算**而非
+        讀取 Step 8c 的結果，因為 `rotation update` 也可能單獨執行——重算成本
+        僅一次 DB 查詢 + rolling IC，且天然不會有「治理資料本身過期」的問題。
+
+        Args:
+            session: SQLAlchemy Session。
+            mode: portfolio 模式（composite 會展開為成員模式）。
+            as_of: 決策日。
+
+        Returns:
+            應排除的模式集合；任何例外一律回空集合（fail-open，不阻擋交易）。
+        """
+        cache_key = (mode, as_of)
+        cached = self._ic_block_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            from src.discovery.ic_governance import blocked_modes
+
+            targets = list(COMPOSITE_MODES[mode]["members"]) if is_composite_mode(mode) else [mode]
+            verdicts = blocked_modes(session, targets, as_of)
+            excluded = set(verdicts)
+            for m, v in verdicts.items():
+                logger.warning(
+                    "[%s] %s 模式 IC 反向且達執法門檻（%s）— 阻擋新買入，僅走風控賣出/到期路徑",
+                    self.portfolio_name,
+                    m,
+                    v.describe(),
+                )
+        except Exception:
+            logger.warning("[%s] IC 阻擋判定失敗，不阻擋交易（fail-open）", self.portfolio_name, exc_info=True)
+            excluded = set()
+
+        self._ic_block_cache[cache_key] = excluded
+        return excluded
 
     def _find_latest_rankings(self, session, mode: str, before_date: date) -> list[dict]:
         """找最近的 scan_date 排名（當日無 discover 結果時使用）。
