@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
-from src.constants import PRICE_JUMP_WARN_THRESHOLD, UPSERT_BATCH_SIZE
+from src.constants import BACKFILL_FULL_COVERAGE_MIN_ROWS, PRICE_JUMP_WARN_THRESHOLD, UPSERT_BATCH_SIZE
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
@@ -1042,6 +1042,199 @@ def _classify_security_type(stock_id: str, stock_name: str = "") -> str:
     if "特" in (stock_name or ""):
         return "preferred"
     return "stock"
+
+
+def backfill_market_history(
+    start: date,
+    end: date | None = None,
+    *,
+    datasets: tuple[str, ...] = ("price", "institutional", "margin"),
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """以 TWSE/TPEX 每日全市場端點回補歷史資料（B1①）。
+
+    ## 為什麼走 TWSE/TPEX 而非 FinMind 逐股
+
+    每日全市場端點回傳的是**當日實際掛牌交易的所有股票**，因此 2020 年的檔案
+    自然含有當時在市、如今已下市的標的——倖存者偏差在資料源頭就被解掉，
+    不需要另外逐股補抓下市股（下市清單仍需同步，見 `sync_delisting_info`，
+    那是為了知道「何時下市」以供 PIT 判定可交易性）。
+
+    另一個理由是量：逐股回補 3,000+ 檔 × 5 年 × 3 個 dataset 在 FinMind
+    0.5s/次 下不可行；每日端點是 1,225 個交易日 × 3s。
+
+    ## 續跑
+
+    **不另外維護進度檔**——直接以 DB 現況為準：某日 `daily_price` 筆數達
+    `BACKFILL_FULL_COVERAGE_MIN_ROWS` 即視為已回補而跳過。中斷後重跑會自動
+    從缺口續行，且重跑安全（upsert）。
+
+    ⚠ 判定用的是**當日筆數**而非「該日是否有資料」：實測 2020~2024 每個交易日
+    都已有 `daily_price`，但只有 6 檔（watchlist + TAIEX）。若以「日期存在」
+    為準，整整 5 年會被靜默跳過、回補什麼都不做。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。範圍內已達全市場覆蓋的日期會自動跳過，
+            因此預設值可安全地涵蓋全部歷史（同時補中間的任何缺口）。
+        datasets: 要回補的資料集子集。
+        dry_run: 只列出將回補的日期與預估時間，不實際抓取。
+        progress_every: 每 N 個交易日輸出一次進度。
+        stop_flag: 可選的中止判定函數；回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"trading_days": N, "daily_price": M, "institutional": K, "margin": J, "skipped": S}
+    """
+    from src.data.twse_fetcher import (
+        fetch_market_daily_prices,
+        fetch_market_institutional,
+        fetch_market_margin,
+    )
+
+    init_db()
+    result = {"trading_days": 0, "daily_price": 0, "institutional": 0, "margin": 0, "skipped": 0}
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # 已達「全市場覆蓋」的日期（見 docstring：不能只看該日是否有資料）
+    with get_session() as session:
+        covered = {
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                .group_by(DailyPrice.date)
+                .having(func.count(DailyPrice.id) >= BACKFILL_FULL_COVERAGE_MIN_ROWS)
+            ).all()
+        }
+
+    # 待補的候選日（排除週末與已覆蓋者）；實際是否為交易日由 API 回空判定
+    pending = [
+        d
+        for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
+        if d.weekday() < 5 and d not in covered
+    ]
+    result["skipped"] = (end - start).days + 1 - len(pending)
+
+    n_ds = len([d for d in datasets if d in ("price", "institutional", "margin")])
+    est_sec = len(pending) * 3 * max(1, n_ds)
+    logger.info(
+        "[回補] %s ~ %s：待補 %d 個平日（已跳過 %d 日），dataset=%s，預估 %.1f 小時",
+        start,
+        end,
+        len(pending),
+        result["skipped"],
+        ",".join(datasets),
+        est_sec / 3600,
+    )
+    if dry_run:
+        return result
+
+    for i, d in enumerate(pending, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[回補] 收到中止訊號，已完成 %d/%d 日", i - 1, len(pending))
+            break
+
+        df_price = fetch_market_daily_prices(d) if "price" in datasets else pd.DataFrame()
+        if df_price.empty:
+            # 假日或該日無資料——不是錯誤
+            continue
+
+        result["trading_days"] += 1
+        result["daily_price"] += _upsert_daily_price(df_price)
+
+        if "institutional" in datasets:
+            df_inst = fetch_market_institutional(d)
+            if not df_inst.empty:
+                result["institutional"] += _upsert_institutional(df_inst)
+        if "margin" in datasets:
+            df_margin = fetch_market_margin(d)
+            if not df_margin.empty:
+                result["margin"] += _upsert_margin(df_margin)
+
+        if result["trading_days"] % progress_every == 0:
+            logger.info(
+                "[回補] 進度 %d/%d 平日（%s）— 交易日 %d, 日K %d 筆",
+                i,
+                len(pending),
+                d.isoformat(),
+                result["trading_days"],
+                result["daily_price"],
+            )
+
+    logger.info(
+        "[回補] 完成 — 交易日 %d, 日K %d 筆, 法人 %d 筆, 融資融券 %d 筆",
+        result["trading_days"],
+        result["daily_price"],
+        result["institutional"],
+        result["margin"],
+    )
+    return result
+
+
+def sync_delisting_info(fetcher: FinMindFetcher | None = None) -> int:
+    """同步下市清單至 `stock_info.delisted_date`（B1① 倖存者偏差修正）。
+
+    為什麼需要：`stock_info` 原本只描述「今天還在市」的股票，歷史重放會自動
+    排除當時在市、後來下市的標的——而下市股往往正是表現最差的那批，排除它們
+    會讓歷史績效系統性偏高。有了 `delisted_date`，PIT 才能判定
+    「該股於 as_of 當時是否可交易」。
+
+    行為：
+      - 下市股若不在 `stock_info` 中（已從現行清單消失）→ **新增**一列，
+        `security_type='stock'` 讓它能通過 universe SQL 過濾
+      - 已存在者 → 僅補 `delisted_date`，不動既有產業分類
+      - 取得失敗（空 DataFrame）→ 回傳 0 且**不修改任何資料**，避免把全部
+        股票誤標為未下市
+
+    Returns:
+        寫入/更新的筆數。
+    """
+    init_db()
+    f = fetcher or FinMindFetcher()
+    df = f.fetch_delisting_list()
+    if df.empty or "stock_id" not in df.columns:
+        logger.warning("下市清單為空，跳過（維持 stock_info 現狀）")
+        return 0
+
+    updated = 0
+    with get_session() as session:
+        for _, row in df.iterrows():
+            sid = str(row["stock_id"]).strip()
+            if not sid:
+                continue
+            try:
+                dl_date = pd.to_datetime(row["date"]).date()
+            except Exception:
+                continue
+
+            existing = session.execute(select(StockInfo).where(StockInfo.stock_id == sid)).scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    StockInfo(
+                        stock_id=sid,
+                        stock_name=str(row.get("stock_name") or "") or None,
+                        industry_category=None,
+                        # 讓 UniverseFilter 的 SQL 過濾不會直接排除它；
+                        # 實際可交易性由 delisted_date + 當日有無報價決定
+                        security_type="stock",
+                        delisted_date=dl_date,
+                    )
+                )
+                updated += 1
+            elif existing.delisted_date != dl_date:
+                existing.delisted_date = dl_date
+                updated += 1
+        session.commit()
+
+    logger.info("下市清單同步完成：%d 筆 stock_info 更新（清單共 %d 筆）", updated, len(df))
+    return updated
 
 
 def sync_stock_info(force_refresh: bool = False) -> int:

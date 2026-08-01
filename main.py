@@ -120,6 +120,7 @@ from src.cli.discover_cmd import (
 from src.cli.export_dashboard_cmd import cmd_export_dashboard
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
+    cmd_backfill_history,
     cmd_dashboard,
     cmd_export,
     cmd_import_data,
@@ -825,6 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate 子命令
     subparsers.add_parser("migrate", help="執行資料庫 schema 遷移")
 
+    # backfill-history 子命令（B1① PIT 歷史回補）
+    sp_bf = subparsers.add_parser(
+        "backfill-history",
+        help="回補歷史全市場資料（TWSE/TPEX 每日端點；可中斷續跑）",
+    )
+    sp_bf.add_argument("--start", default="2020-01-01", help="起始日 YYYY-MM-DD（預設 2020-01-01）")
+    sp_bf.add_argument("--end", default=None, help="結束日 YYYY-MM-DD；省略＝補到接上現有資料")
+    sp_bf.add_argument(
+        "--datasets",
+        default="price,institutional,margin",
+        help="要回補的資料集（逗號分隔：price/institutional/margin）",
+    )
+    sp_bf.add_argument("--skip-delisting", action="store_true", help="跳過下市清單同步")
+    sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
+
     # rotation 子命令（輪動組合部位控制）
     sp_rot = subparsers.add_parser("rotation", help="輪動組合部位控制（建立/更新/狀態/回測/管理）")
     sp_rot.set_defaults(_subparser=sp_rot)
@@ -1029,6 +1045,8 @@ def main() -> None:
         cmd_revenue_scan(args)
     elif args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "backfill-history":
+        cmd_backfill_history(args)
     elif args.command == "export":
         cmd_export(args)
     elif args.command == "import-data":

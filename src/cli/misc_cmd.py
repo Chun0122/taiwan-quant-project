@@ -391,6 +391,44 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         print("資料庫已是最新，無需遷移")
 
 
+def cmd_backfill_history(args: argparse.Namespace) -> None:
+    """回補歷史全市場資料（B1① PIT 研究環境的資料前提）。
+
+    長時間作業（2020 起約 1,200 個平日、數小時）。可隨時 Ctrl-C 中止，
+    重跑會自動從缺口續行——進度以 DB 現況判定，不另存進度檔。
+    """
+    from datetime import date as _date
+
+    from src.data.pipeline import backfill_market_history, sync_delisting_info
+
+    start = _date.fromisoformat(args.start)
+    end = _date.fromisoformat(args.end) if getattr(args, "end", None) else None
+    datasets = tuple(s.strip() for s in (args.datasets or "price,institutional,margin").split(",") if s.strip())
+
+    # 先同步下市清單：倖存者偏差修正的前提（知道哪些股票何時下市）
+    if not args.skip_delisting:
+        print("同步下市清單（倖存者偏差修正）...")
+        n = sync_delisting_info()
+        print(f"  stock_info 更新 {n} 筆\n")
+
+    print(f"回補範圍：{start} ~ {end or '今日'}　dataset={','.join(datasets)}")
+    print("  （已達全市場覆蓋的日期會自動跳過；中斷後重跑會從缺口續行）")
+    if args.dry_run:
+        print("[dry-run] 僅估算，不實際抓取\n")
+
+    result = backfill_market_history(start, end, datasets=datasets, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("dry-run 結束——上方 log 已列出待補日數與預估時間")
+        return
+    print("\n回補完成：")
+    print(f"  交易日     {result['trading_days']:>6}")
+    print(f"  日K線     {result['daily_price']:>6} 筆")
+    print(f"  三大法人   {result['institutional']:>6} 筆")
+    print(f"  融資融券   {result['margin']:>6} 筆")
+    print(f"  已跳過     {result['skipped']:>6} 日（DB 已有 / 週末）")
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     """執行資料品質檢查。"""
     from src.data.validator import export_issues_csv, print_validation_report, run_validation

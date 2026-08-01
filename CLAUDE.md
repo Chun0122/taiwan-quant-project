@@ -65,6 +65,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/validator.py` | 7 個品質檢查純函數 |
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
+| `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日筆數 ≥ `BACKFILL_FULL_COVERAGE_MIN_ROWS`」而非「該日有無資料」**（2020~2024 每日皆已有 6 檔 watchlist 資料，只看日期會靜默跳過 5 年） |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
@@ -165,7 +166,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 ### CLI 設計原則
 
-- 入口：`python main.py <子命令>`（49 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
+- 入口：`python main.py <子命令>`（50 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
 - 每日例行：`morning-routine`（Step 0~18 + 子步驟 8b/8c/8d/8e/9b/11b，含全市場同步 + discover + 風控 + 通知）
   - Step 8e「同步後 regime 重解」：Step 0 宏觀預檢在同步**之前**執行，其 regime 只到前一交易日；Step 12 輪動須用同步後的判定（`resolve_regime_after_sync()`，dry_run/skip_sync 跳過）
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
@@ -177,7 +178,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2739 測試 / 105 檔）
+- **執行**：`pytest -v`（2759 測試 / 106 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

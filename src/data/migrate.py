@@ -94,6 +94,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # P0 #15（2026-08-01）：regime 狀態機冪等鍵 = 本次判定依據的最新 TAIEX 資料日。
     # 舊列為 NULL（未知）→ 首次執行會重新判定一次並寫入，之後同資料日不再推進。
     ("regime_state_log", "data_date", "VARCHAR(10)"),
+    # B1①（2026-08-01）：下市日，倖存者偏差修正的關鍵欄位。
+    # NULL ＝仍在市；PIT 判定可交易性＝ delisted_date is None or delisted_date > as_of。
+    ("stock_info", "delisted_date", "DATE"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

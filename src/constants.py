@@ -261,6 +261,13 @@ RANKINGS_FALLBACK_MAX_TRADING_DAYS: int = 3
 # 正常交易日全市場 ~6,000+ 筆；2026-07-10 颱風假僅 1 筆（US_VIX）。
 PHANTOM_TRADING_DAY_MIN_ROWS: int = 100
 
+# ── 歷史回補的「全市場覆蓋」判定門檻（B1①，2026-08-01）────────────────────
+# backfill 以此判斷某日是否已回補過。**不能只看「該日有無資料」**——
+# 實測 2020~2024 每個交易日都已有 daily_price，但只有 6 檔（watchlist + TAIEX），
+# 若以「日期存在」為準會把整整 5 年全部跳過，回補靜默地什麼都不做。
+# 正常交易日全市場 5,700~6,800 檔；500 可乾淨分離「僅 watchlist」與「全市場」。
+BACKFILL_FULL_COVERAGE_MIN_ROWS: int = 500
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

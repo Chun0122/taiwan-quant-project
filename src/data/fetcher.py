@@ -146,6 +146,41 @@ class FinMindFetcher(DataFetcher):
     #  公開介面
     # ------------------------------------------------------------------ #
 
+    def fetch_delisting_list(self) -> pd.DataFrame:
+        """抓取台股下市清單（`TaiwanStockDelisting`，B1① 倖存者偏差修正）。
+
+        此 dataset 不需 `data_id` 也不需日期範圍，一次回傳全部（實測 340 筆，
+        涵蓋 2001-01-20 ~ 今；其中普通股 264 檔、2020 年後下市普通股 54 檔）。
+
+        免費帳號可用（實測 status=200）。回傳空 DataFrame 表示取得失敗，
+        呼叫端應維持既有 `stock_info` 不動，而非把全部股票標記為未下市。
+
+        Returns:
+            DataFrame(date, stock_id, stock_name)；失敗時為空。
+        """
+        params: dict[str, str] = {"dataset": "TaiwanStockDelisting"}
+        if self.api_token:
+            params["token"] = self.api_token
+
+        logger.info("抓取台股下市清單 TaiwanStockDelisting")
+        try:
+            resp = self._session.get(self.api_url, params=params, timeout=60)
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("msg") != "success":
+                logger.warning("下市清單取得失敗: %s", payload.get("msg"))
+                return pd.DataFrame()
+            df = pd.DataFrame(payload.get("data", []))
+        except Exception as exc:
+            logger.warning("下市清單抓取失敗: %s", exc)
+            return pd.DataFrame()
+        finally:
+            time.sleep(0.5)  # FinMind 速率限制
+
+        if not df.empty:
+            logger.info("下市清單取得 %d 筆", len(df))
+        return df
+
     def fetch_daily_price(self, stock_id: str, start: str, end: str | None = None) -> pd.DataFrame:
         """抓取日K線資料。
 

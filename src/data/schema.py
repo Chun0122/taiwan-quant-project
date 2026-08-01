@@ -421,7 +421,19 @@ class PortfolioBacktestResult(Base):
 
 
 class StockInfo(Base):
-    """股票基本資料（產業分類 + 有價證券類型）。"""
+    """股票基本資料（產業分類 + 有價證券類型 + 下市日）。
+
+    B1①（2026-08-01）新增 `delisted_date`＝**倖存者偏差修正的關鍵欄位**。
+
+    沒有它，`stock_info` 只描述「今天還在市的股票」，任何歷史重放都會自動排除
+    當時在市、後來下市的標的——而下市股往往正是表現最差的那批，排除它們會讓
+    歷史績效系統性偏高。FinMind `TaiwanStockDelisting` 提供 2001 年起的下市清單
+    （2020 年後普通股 54 檔），其歷史股價亦仍可取得（實測 3454 晶睿可回溯至
+    2020-01-02 直到下市前最後交易日）。
+
+    語意：`delisted_date is None` ＝仍在市；有值＝該日起不再交易。PIT 判定
+    「某股於 as_of 當時是否可交易」＝ `delisted_date is None or delisted_date > as_of`。
+    """
 
     __tablename__ = "stock_info"
     __table_args__ = (UniqueConstraint("stock_id", name="uq_stock_info"),)
@@ -434,6 +446,8 @@ class StockInfo(Base):
     security_type: Mapped[str | None] = mapped_column(
         String(20), nullable=True, index=True
     )  # stock / etf / etn / warrant / preferred / None（未填入時不過濾）
+    # 下市日；None ＝仍在市。見 class docstring 的倖存者偏差說明。
+    delisted_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:
