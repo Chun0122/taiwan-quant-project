@@ -55,7 +55,9 @@ class GrowthScanner(MarketScanner):
         multi_timeframe_alignment=False,
         score_threshold=False,
         sector_diversification=False,
-        drawdown_adjusted_top_n=False,
+        # 2026-08-01：4.2 回撤縮表已開啟（N2 閘門政策第一項）。
+        # growth 非防禦型：TAIEX 20 日回撤 <-10% 砍半、<-15% 砍至 1/3。
+        # 實測 2026-05 以來 43 個交易日中 5 天會觸發。
         chip_tier_audit=False,
     )
 

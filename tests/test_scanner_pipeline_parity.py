@@ -168,7 +168,14 @@ def trace_stages(scanner_cls, monkeypatch, regime: str = "crisis") -> list[str]:
 
 # ══════════════════════════════════════════════════════════════════════ #
 # 重構前擷取的基準序列（ground truth）——重構後必須完全相同
-# 擷取時間：2026-08-01，重構前的 HEAD
+# 擷取時間：2026-08-01，N2 重構前的 HEAD
+#
+# ── 基準異動紀錄（每次移動都必須寫明原因）────────────────────────────
+# 2026-08-01：value / dividend / growth 新增 `_compute_drawdown_adjusted_top_n`
+#   ——N2 閘門政策第一項「開啟 4.2 回撤縮表」的**刻意**行為變更，非重構漂移。
+#   已逐一比對確認 delta 僅此一個階段、且無任何階段被移除。
+#   value/dividend 屬 `_DEFENSIVE_MODES` 故實際輸出不變；growth 於 TAIEX
+#   20 日回撤 <-10% 時 top_n 砍半、<-15% 砍至 1/3。
 # ══════════════════════════════════════════════════════════════════════ #
 
 # 涵蓋三個 regime：bull（全模式正常路徑）、sideways（momentum/growth 被 REGIME_MODE_BLOCK
@@ -317,8 +324,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("value", "sideways"): [
         "_maybe_sync_valuation",
@@ -330,8 +340,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("value", "crisis"): [
         "_maybe_sync_valuation",
@@ -343,8 +356,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("dividend", "bull"): [
         "_maybe_sync_valuation",
@@ -356,8 +372,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("dividend", "sideways"): [
         "_maybe_sync_valuation",
@@ -369,8 +388,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("dividend", "crisis"): [
         "_maybe_sync_valuation",
@@ -382,8 +404,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("growth", "bull"): [
         "_coarse_filter",
@@ -393,8 +418,11 @@ _EXPECTED: dict[tuple[str, str], list[str]] = {
         "_apply_concept_bonus",
         "_apply_risk_filter",
         "_apply_crisis_filter",
+        "_log_factor_effectiveness",
         "_rank_and_enrich",
+        "_compute_drawdown_adjusted_top_n",
         "_compute_sector_summary",
+        "get_sub_factor_df",
     ],
     ("growth", "sideways"): [],  # Stage 0.1 REGIME_MODE_BLOCK 封鎖
     ("growth", "crisis"): [],  # Stage 0.1 REGIME_MODE_BLOCK 封鎖
@@ -469,3 +497,99 @@ if __name__ == "__main__":  # pragma: no cover - 基準擷取工具
             finally:
                 _mp.undo()
     pprint.pp(captured, width=100, sort_dicts=False)
+
+
+# ══════════════════════════════════════════════════════════════════════ #
+# Stage 4.2 回撤縮表（N2 閘門政策第一項，2026-08-01 開啟）
+# ══════════════════════════════════════════════════════════════════════ #
+
+
+class TestDrawdownAdjustedTopN:
+    """4.2 的 TAIEX 取數修復 + 各模式行為。
+
+    修復前 `_compute_drawdown_adjusted_top_n` 從 `df_price` 撈 TAIEX，但 TAIEX
+    不在任何 scanner 的 universe 內，而 momentum/swing/value/dividend 的
+    `_load_market_data` 都以 `stock_id.in_(universe_ids)` 過濾 → `taiex.empty`
+    恆成立 → **這道風控從未實際觸發過**。改為 df_price 缺 TAIEX 時直接查 DB。
+    """
+
+    @staticmethod
+    def _taiex_df(closes: list[float]) -> pd.DataFrame:
+        base = date(2026, 6, 1)
+        return pd.DataFrame(
+            [{"stock_id": "TAIEX", "date": base + timedelta(days=i), "close": c} for i, c in enumerate(closes)]
+        )
+
+    def _seed_taiex(self, session, closes: list[float], end: date):
+        from src.data.schema import DailyPrice
+
+        for i, c in enumerate(reversed(closes)):
+            d = end - timedelta(days=i)
+            session.add(DailyPrice(stock_id="TAIEX", date=d, open=c, high=c, low=c, close=c, volume=0, turnover=0))
+        session.flush()
+
+    def test_uses_df_price_taiex_when_present(self):
+        """growth 走全市場載入時 df_price 內就有 TAIEX，應直接使用不查 DB。"""
+        s = GrowthScanner(min_volume=1, use_ic_adjustment=False)
+        s.scan_date = date(2026, 7, 1)
+        flat = self._taiex_df([100.0] * 19 + [80.0])  # 回撤 -20%
+        assert s._taiex_drawdown_20d(flat) == pytest.approx(-0.20)
+
+    def test_falls_back_to_db_when_universe_filtered_out(self, db_session, monkeypatch):
+        """**核心回歸**：df_price 無 TAIEX（universe 過濾掉）時仍須算得出回撤。"""
+        import src.data.database as db_mod
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        end = date(2026, 7, 1)
+        self._seed_taiex(db_session, [100.0] * 19 + [85.0], end)
+
+        s = MomentumScanner(min_volume=1, use_ic_adjustment=False)
+        s.scan_date = end
+        only_stocks = pd.DataFrame([{"stock_id": "1101", "date": end, "close": 50.0}])
+        assert s._taiex_drawdown_20d(only_stocks) == pytest.approx(-0.15)
+
+    def test_insufficient_history_returns_none(self, db_session, monkeypatch):
+        import src.data.database as db_mod
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        s = MomentumScanner(min_volume=1, use_ic_adjustment=False)
+        s.scan_date = date(2026, 7, 1)
+        assert s._taiex_drawdown_20d(pd.DataFrame()) is None
+
+    @pytest.mark.parametrize(
+        "mode_cls,drawdown,expected",
+        [
+            (MomentumScanner, -0.05, 20),  # 未觸發
+            (MomentumScanner, -0.12, 10),  # 中度 → 砍半
+            (MomentumScanner, -0.20, 6),  # 重度 → 1/3
+            (GrowthScanner, -0.12, 10),  # growth 非防禦型
+            (GrowthScanner, -0.20, 6),
+            (ValueScanner, -0.12, 20),  # 防禦型豁免
+            (ValueScanner, -0.20, 20),
+            (DividendScanner, -0.20, 20),
+        ],
+    )
+    def test_defensive_modes_exempt(self, mode_cls, drawdown, expected, monkeypatch):
+        s = mode_cls(min_volume=1, top_n_results=20, use_ic_adjustment=False)
+        s.scan_date = date(2026, 7, 1)
+        monkeypatch.setattr(type(s), "_taiex_drawdown_20d", lambda self, df: drawdown)
+        assert s._compute_drawdown_adjusted_top_n(pd.DataFrame()) == expected
+
+    def test_stage_enabled_for_all_five_modes(self):
+        """N2 閘門政策第一項：五模式一律開啟 4.2。"""
+        for name, cls in _SCANNERS.items():
+            assert cls._STAGES.drawdown_adjusted_top_n is True, f"{name} 未開啟 4.2"

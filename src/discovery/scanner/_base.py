@@ -3669,6 +3669,41 @@ class MarketScanner:
     # 防禦型模式：嚴重回撤時仍允許正常推薦
     _DEFENSIVE_MODES: set[str] = {"value", "dividend"}
 
+    def _taiex_drawdown_20d(self, df_price: pd.DataFrame) -> float | None:
+        """TAIEX 近 20 個交易日回撤（`(最新 close - 期間最高 close) / 期間最高`）。
+
+        取數優先序：
+          1. `df_price` 內若已有 TAIEX（growth 走全市場載入時會有）直接用，省一次查詢
+          2. 否則查 DB——**多數模式走這條**，因為 TAIEX 不在 UniverseFilter 的輸出裡
+
+        PIT：上界為 `self._as_of()`，歷史重放不會看到未來指數。
+
+        Returns:
+            回撤（負值）；資料不足 20 筆時回傳 None（呼叫端維持原 top_n）。
+        """
+        taiex = df_price[df_price["stock_id"] == "TAIEX"] if "stock_id" in df_price.columns else pd.DataFrame()
+        if not taiex.empty:
+            closes = taiex.sort_values("date")["close"].tolist()
+        else:
+            as_of = self._as_of()
+            with get_session() as session:
+                rows = session.execute(
+                    select(DailyPrice.close)
+                    .where(
+                        DailyPrice.stock_id == "TAIEX",
+                        DailyPrice.date <= as_of,
+                        DailyPrice.date >= as_of - timedelta(days=60),  # 20 交易日的日曆餘裕
+                    )
+                    .order_by(DailyPrice.date)
+                ).all()
+            closes = [float(r[0]) for r in rows if r[0] is not None]
+
+        if len(closes) < 20:
+            return None
+        window = closes[-20:]
+        high_20d = max(window)
+        return (window[-1] - high_20d) / high_20d if high_20d > 0 else 0.0
+
     def _compute_drawdown_adjusted_top_n(self, df_price: pd.DataFrame) -> int:
         """Stage 4.2 — 根據 TAIEX 20 日回撤幅度調整推薦數量。
 
@@ -3684,20 +3719,20 @@ class MarketScanner:
         original = self.top_n_results
 
         # 計算 TAIEX 20 日回撤
+        #
+        # ⚠ 2026-08-01 修復：原實作從 `df_price` 撈 TAIEX，但 TAIEX **不在任何
+        # scanner 的 universe** 內（UniverseFilter 只收個股），而 momentum/swing/
+        # value/dividend 的 `_load_market_data` 都以 `stock_id.in_(universe_ids)`
+        # 過濾 → `taiex.empty` 恆成立 → 直接 return original。
+        # 也就是說：這道風控自 UniverseFilter 上線以來**從未實際觸發過**，
+        # 只有 growth（全市場載入、含 TAIEX）例外，而 growth 又沒開這個階段。
+        # 改為直接查 DB，不再依賴呼叫端剛好把 TAIEX 帶進 df_price。
         try:
-            taiex = df_price[df_price["stock_id"] == "TAIEX"]
-            if taiex.empty:
-                return original
-
-            taiex_sorted = taiex.sort_values("date")
-            if len(taiex_sorted) < 20:
-                return original
-
-            recent_close = float(taiex_sorted["close"].iloc[-1])
-            high_20d = float(taiex_sorted["close"].iloc[-20:].max())
-            drawdown = (recent_close - high_20d) / high_20d if high_20d > 0 else 0.0
-
+            drawdown = self._taiex_drawdown_20d(df_price)
         except Exception:
+            logger.debug("Stage 4.2: TAIEX 回撤計算失敗，維持原 top_n")
+            return original
+        if drawdown is None:
             return original
 
         if drawdown > -0.10:
