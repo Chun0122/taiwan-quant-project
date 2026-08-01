@@ -3387,3 +3387,6 @@ class DiscoveryResult:
     # IC-aware 分數轉換動作 mapping（{factor_col: "kept"/"flipped"/"neutralized"}）
     # 供 CLI Top N 表格標記欄位狀態（N=neutralized, F=flipped）
     ic_actions: dict[str, str] = field(default_factory=dict)
+    # B2：全候選池因子快照（軟加成後、硬風控前），由 discover_cmd 落 CandidateFactorLog。
+    # rankings 只有 top-N，在其上算 IC 會有 range restriction——此欄是未截斷的取樣。
+    candidate_pool_df: pd.DataFrame | None = None

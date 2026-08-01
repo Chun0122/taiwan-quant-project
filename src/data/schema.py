@@ -953,6 +953,72 @@ class StrategyDecayLog(Base):
         return f"<StrategyDecayLog {self.scan_date} {self.mode} wr={self.recent_win_rate} n={self.recent_count}>"
 
 
+class CandidateFactorLog(Base):
+    """全候選池因子快照（B2，2026-08-01）— 解除 IC 的截斷樣本偏差。
+
+    ## 為什麼有此表
+
+    `logs/audit_discover_20260731/REPORT.md` §7.3 實測漏斗：
+    `1,857（SQL）→ 659（流動性）→ 150（粗篩）→ 20（DiscoveryRecord）`。
+    先前**只有最終 top-20 落庫**，於是所有 IC／因子診斷都算在 top-20 上——
+    這是典型的 range restriction：被評分的 150 檔裡只留下分數最高的 20 檔，
+    因子值的變異被人為壓縮，IC 天生被低估且極不穩定（實測單一窗口 IC 在
+    ±0.10 間擺盪，正是 n≈100 的標準誤量級）。
+
+    這個截斷是 B11（M2 自動停用）、E2b（權重調整）、E2c（分數翻轉）三處噪音
+    開關的**共同上游**——不修它，任何 IC 治理都只是在被截斷的樣本上調參。
+
+    ## 落庫內容與時點
+
+    擷取於「軟加成結束、硬風控開始前」：此時 composite 已含全部加成，且尚未被
+    分數門檻／產業分散／回撤縮表剔除，因此保有**完整候選池**（~150 檔/模式/日）。
+    `selected` 標記該檔是否進入最終 top-N（即是否也存在於 `DiscoveryRecord`），
+    使「入選 vs 未入選」的對比分析成為可能。
+
+    ## 維度以真實語意命名
+
+    ⚠ `DiscoveryRecord.technical_score` 對 value/dividend 而言**不是技術面分數**——
+    `_post_score()` 在 composite 算完後把它覆寫為 valuation/dividend 分數（顯示用
+    別名）。後果是 IC 管線把估值維度標記成 technical，而真正被加權的 `valuation`
+    鍵找不到對應 IC（恆 N/A），權重因而被歸一化殘差放大。本表**不沿用該別名**：
+    `technical_score` 存真正的技術面分數，估值/殖利率另存 `valuation_score` /
+    `dividend_score`，使六個維度都能被正確量測。
+    """
+
+    __tablename__ = "candidate_factor_log"
+    __table_args__ = (
+        UniqueConstraint("scan_date", "mode", "stock_id", name="uq_candidate_factor_log"),
+        Index("ix_candidate_factor_log_date_mode", "scan_date", "mode"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    stock_id: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)  # forward 報酬計算基準
+    regime: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # 六個評分維度（真實語意，非顯示別名）
+    technical_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    chip_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fundamental_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    valuation_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # value 模式
+    dividend_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # dividend 模式
+
+    composite_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pool_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 全候選池內 composite 名次
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # 是否進入最終 top-N
+
+    # A5 可重放（不 join DiscoveryRecord——模式落庫 0 筆時該表無列可 join）
+    git_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    settings_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<CandidateFactorLog {self.scan_date} {self.mode} {self.stock_id} sel={self.selected}>"
+
+
 class UniverseStatLog(Base):
     """UniverseFilter 三層漏斗每次 scan 統計紀錄（P1 任務 8）。
 

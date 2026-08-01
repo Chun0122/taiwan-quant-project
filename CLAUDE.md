@@ -61,7 +61,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/twse_fetcher.py` | TWSE/TPEX 全市場免費資料、SBL（TWT96U）、DJ 分點（Big5 HTML）、TDCC |
 | `data/pipeline.py` | ETL 調度 + DB 寫入、OHLCV 品質閘門（值域 + OHLC 一致性 `low≤close≤high`）、close-to-close 跳動哨兵（`_detect_price_jumps` WARN，門檻 `PRICE_JUMP_WARN_THRESHOLD`=11%）、DailyFeature 計算、Broker Bootstrap、`sync_dividends_for_stocks`（rotation 標的股利補抓，morning Step 11b） |
 | `data/mops_fetcher.py` | MOPS 重大訊息 + 月營收、事件分類（7 類）、情緒分類 |
-| `data/schema.py` | 29 張 ORM 表（含 `RotationActionLog`：每日輪動操作明細，dashboard `today_actions` 來源；`RotationPendingOrder`：live T+1 待成交意圖，A2） |
+| `data/schema.py` | 30 張 ORM 表（`RotationActionLog`：每日輪動操作明細，dashboard `today_actions` 來源；`RotationPendingOrder`：live T+1 待成交意圖，A2；`CandidateFactorLog`：B2 全候選池因子快照，軟加成後/硬風控前擷取，解除 IC 截斷樣本偏差） |
 | `data/validator.py` | 7 個品質檢查純函數 |
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
@@ -175,7 +175,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2688 測試 / 103 檔）
+- **執行**：`pytest -v`（2704 測試 / 104 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

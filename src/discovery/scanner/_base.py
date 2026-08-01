@@ -399,6 +399,12 @@ class MarketScanner:
             scored = fn(scored)
             audit.record_score_adjustments_from_column(label, scored, col, desc)
 
+        # B2：擷取**全候選池**快照（軟加成已套用、硬風控尚未剔除）。
+        # 這是 IC 唯一未被截斷的取樣點——之後的分數門檻/產業分散/回撤縮表會把
+        # ~150 檔砍到 top-20，在那之上算 IC 即 range restriction（詳
+        # CandidateFactorLog docstring）。
+        candidate_pool = self._snapshot_candidate_pool(scored)
+
         # ============================================================ #
         #  區塊 3: 硬風控（Hard Filters — 通過或剔除）
         # ============================================================ #
@@ -499,6 +505,11 @@ class MarketScanner:
         # 收集子因子 rank（供因子診斷使用）
         sub_factors = self.get_sub_factor_df() if stages.sub_factor_collection else pd.DataFrame()
 
+        # B2：標記候選池中哪些進入最終 top-N（供「入選 vs 未入選」對比分析）
+        if not candidate_pool.empty:
+            selected_ids = set(final_rankings["stock_id"]) if not final_rankings.empty else set()
+            candidate_pool["selected"] = candidate_pool["stock_id"].isin(selected_ids)
+
         return DiscoveryResult(
             rankings=final_rankings,
             total_stocks=total_stocks,
@@ -508,7 +519,40 @@ class MarketScanner:
             audit_trail=audit if stages.audit_trail else None,
             sub_factor_df=sub_factors if not sub_factors.empty else None,
             ic_actions=dict(self._ic_actions),
+            candidate_pool_df=candidate_pool if not candidate_pool.empty else None,
         )
+
+    def _snapshot_candidate_pool(self, scored: pd.DataFrame) -> pd.DataFrame:
+        """B2 — 擷取全候選池因子快照（供 `CandidateFactorLog` 落庫）。
+
+        維度以**真實語意**取值，不沿用 `_post_score()` 的顯示別名：value/dividend
+        的 `technical_score` 在 composite 之後被覆寫為估值/殖利率分數，本函數優先
+        取 `technical_score_raw`（覆寫前保留的真值），使六個維度都能被正確量測。
+
+        Args:
+            scored: 軟加成後、硬風控前的候選 DataFrame。
+
+        Returns:
+            每檔一列的快照（含 pool_rank）；輸入為空時回傳空 DataFrame。
+        """
+        if scored is None or scored.empty or "stock_id" not in scored.columns:
+            return pd.DataFrame()
+
+        out = pd.DataFrame({"stock_id": scored["stock_id"].astype(str)})
+        # technical 取真值：value/dividend 用 _post_score 保留的 raw，其餘用原欄位
+        tech_col = "technical_score_raw" if "technical_score_raw" in scored.columns else "technical_score"
+        out["technical_score"] = scored[tech_col] if tech_col in scored.columns else None
+        for col in ("chip_score", "fundamental_score", "news_score", "valuation_score", "dividend_score"):
+            out[col] = scored[col] if col in scored.columns else None
+        for col in ("close", "composite_score"):
+            out[col] = scored[col] if col in scored.columns else None
+
+        out["regime"] = getattr(self, "regime", None)
+        if "composite_score" in scored.columns:
+            out = out.sort_values("composite_score", ascending=False).reset_index(drop=True)
+        out["pool_rank"] = range(1, len(out) + 1)
+        out["selected"] = False  # run() 尾端依最終 rankings 覆寫
+        return out
 
     # ------------------------------------------------------------------ #
     #  模式專屬 hook（N2）：取代原本三份 run() 覆寫中的流程差異
