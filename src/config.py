@@ -150,6 +150,34 @@ class RotationCostConfig(BaseModel):
         )
 
 
+class ICGovernanceConfig(BaseModel):
+    """IC 驅動的自動調整開關（P0 #17，2026-08-01）。
+
+    **兩者預設關閉＝凍結**，直到 B2（全候選池因子落庫）落地後重新評估。
+    凍結期間 scanner 仍照常計算並記錄「原本會做的調整」，只是不套用。
+
+    凍結理由（`logs/audit_discover_20260731/REPORT.md` §6）：
+
+    - `auto_weight_adjust`（E2b `_apply_ic_weight_adjustment`）：歸一化會把被打壓
+      維度釋出的權重**全數塞給從未被量測的維度**。實測 2026-07-31 value 模式
+      `fundamental 0.550→0.313`（IC −0.1393）而 `valuation 0.150→0.338`
+      （**IC=N/A**——該維度不落庫 `DiscoveryRecord`，永遠算不出 IC），權重 2.25×。
+      淨效果＝IC 治理越積極，決策權越集中到唯一沒被檢驗的維度。
+      且依據本身不穩：value `fundamental` IC 四個交易日 `+0.155→+0.105→+0.034→−0.139`，
+      擺幅全在 n≈100 的標準誤（≈1/√n≈0.10）之內。
+    - `auto_score_transform`（E2c `compute_ic_aware_score_transform`）：翻轉/中性化
+      門檻 `|IC| ≤ 0.02`、`min_samples=50`，在 SE≈0.10–0.14 下等同**隨機翻轉維度方向**。
+      另 `news_score` 有 63–81% 恰為 `fillna(0.5)` 填補值，對七成是常數的變數算
+      秩相關本無意義，卻正在改變其他三個維度的相對權重。
+
+    解除條件：B2 落地（IC 擺脫 top-N 截斷樣本）＋ 未量測維度納入落庫 ＋ 調整幅度
+    改以標準誤為基準的顯著性判定。屬 B11 完整版範圍。
+    """
+
+    auto_weight_adjust: bool = False  # E2b：IC×影響力 四維度權重自動調整
+    auto_score_transform: bool = False  # E2c：IC-aware 分數翻轉 / 中性化 / dampen
+
+
 class QuantConfig(BaseModel):
     """量化參數外部化（D2）— 可在 settings.yaml 的 quant 區塊覆蓋預設值。"""
 
@@ -158,6 +186,7 @@ class QuantConfig(BaseModel):
     score_threshold: ScoreThresholdConfig = ScoreThresholdConfig()
     risk_budget: RiskBudgetConfig = RiskBudgetConfig()
     rotation_cost: RotationCostConfig = RotationCostConfig()
+    ic_governance: ICGovernanceConfig = ICGovernanceConfig()
 
 
 class DashboardConfig(BaseModel):

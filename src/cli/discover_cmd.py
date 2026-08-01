@@ -456,6 +456,18 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
         if m in scanner_classes:
             print(f"  [{mode_labels[m]}] 已停用（人工指定）— 跳過掃描")
 
+    # P0 #17：IC 自動調整凍結狀態——不生效就必須說出來（§3 原則 8：降級但不靜默）
+    from src.config import settings as _settings
+
+    _ic_cfg = _settings.quant.ic_governance
+    _frozen = [
+        name
+        for name, on in (("E2b 權重調整", _ic_cfg.auto_weight_adjust), ("E2c 分數翻轉", _ic_cfg.auto_score_transform))
+        if not on
+    ]
+    if _frozen:
+        print(f"  ℹ IC 自動調整凍結中（僅記錄不生效）：{', '.join(_frozen)}　※ quant.ic_governance")
+
     # 項目 A：5 scanner 並行（依賴項目 B 的 shared 資料注入避免重複 DB I/O）
     max_workers = _resolve_max_workers(default=min(5, len(active_modes) or 1))
     print(f"並行掃描 {len(active_modes)} 個模式（max_workers={max_workers}）...")
