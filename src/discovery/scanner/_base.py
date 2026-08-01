@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
+from src.config import settings
 from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP, DISCOVERY_KEY_FACTOR_MAP
 from src.data.database import get_session
 from src.data.schema import (
@@ -1559,12 +1560,31 @@ class MarketScanner:
         regime = getattr(self, "regime", "sideways")
         w = MarketRegimeDetector.get_weights(self.mode_name, regime)
 
-        # E2b: Factor IC 動態權重調整（資料充足時自動啟用）
-        # ≥20 筆歷史推薦即自動校準；use_ic_adjustment=False 可關閉（測試用）
-        if self.use_ic_adjustment:
-            w = self._apply_ic_weight_adjustment(w, scored_candidates=candidates)
+        # ── E2b / E2c：IC 驅動的自動調整（P0 #17 起預設**凍結**）─────────────
+        # 兩者仍照常計算並記錄「原本會做的調整」，只是不套用——凍結理由與解除
+        # 條件見 src/config.py:ICGovernanceConfig。開關在 quant_params.yaml
+        # 的 quant.ic_governance；use_ic_adjustment=False 則整段跳過（測試用）。
+        ic_cfg = settings.quant.ic_governance
 
-        # E2c: IC 感知分數翻轉（問題 3 修正）— 對 IC 反向的維度分數做 1 - score 翻轉
+        # E2b: Factor IC 動態權重調整（≥20 筆歷史推薦即可校準）
+        # 注意：即使凍結也要呼叫——它會設置 self._dimension_ic_df，供 E2c 觀測使用。
+        if self.use_ic_adjustment:
+            adjusted_w = self._apply_ic_weight_adjustment(w, scored_candidates=candidates)
+            if ic_cfg.auto_weight_adjust:
+                w = adjusted_w
+            else:
+                for key, base_v in w.items():
+                    new_v = adjusted_w.get(key, base_v)
+                    if abs(base_v - new_v) > 1e-6:
+                        logger.info(
+                            "E2b 權重調整【凍結中，未生效】: %s — %s %.3f → %.3f",
+                            self.mode_name,
+                            key,
+                            base_v,
+                            new_v,
+                        )
+
+        # E2c: IC 感知分數翻轉 — 對 IC 反向的維度分數做 1 - score 翻轉
         # 與 _apply_ic_weight_adjustment 共用 self._dimension_ic_df，不另打 DB
         # IC_DAMPEN=1（環境變數）啟用降權模式：弱 IC 因子保留分數但 weight×0.25，
         # 取代既有的「歸 0.5 中性化」策略。詳見 IC_DAMPEN_WEIGHT_MULT 註解。
@@ -1576,20 +1596,32 @@ class MarketScanner:
             df_flipped, actions = compute_ic_aware_score_transform(
                 df_for_flip, self._dimension_ic_df, dampen_mode=dampen_mode
             )
-            for col, action in actions.items():
-                if action in ("flipped", "neutralized") and col in df_flipped.columns:
-                    candidates[col] = df_flipped[col].values
-                    logger.info("E2c IC-aware 分數轉換: %s — %s → %s", self.mode_name, col, action)
-                elif action == "dampen":
-                    weight_mults[col] = IC_DAMPEN_WEIGHT_MULT
-                    logger.info(
-                        "E2c IC-aware 分數轉換: %s — %s → dampen (weight×%.2f)",
-                        self.mode_name,
-                        col,
-                        IC_DAMPEN_WEIGHT_MULT,
-                    )
-            # 持久化 actions 供 CLI 表格標記欄位狀態（N/F/D）
-            self._ic_actions = dict(actions)
+            if not ic_cfg.auto_score_transform:
+                for col, action in actions.items():
+                    if action in ("flipped", "neutralized", "dampen"):
+                        logger.info(
+                            "E2c IC-aware 分數轉換【凍結中，未生效】: %s — %s → would-be %s",
+                            self.mode_name,
+                            col,
+                            action,
+                        )
+                # 刻意留空：CLI 的 (N)/(F)/(D) 標記代表「已套用」，凍結期間標上去會誤導
+                self._ic_actions = {}
+            else:
+                for col, action in actions.items():
+                    if action in ("flipped", "neutralized") and col in df_flipped.columns:
+                        candidates[col] = df_flipped[col].values
+                        logger.info("E2c IC-aware 分數轉換: %s — %s → %s", self.mode_name, col, action)
+                    elif action == "dampen":
+                        weight_mults[col] = IC_DAMPEN_WEIGHT_MULT
+                        logger.info(
+                            "E2c IC-aware 分數轉換: %s — %s → dampen (weight×%.2f)",
+                            self.mode_name,
+                            col,
+                            IC_DAMPEN_WEIGHT_MULT,
+                        )
+                # 持久化 actions 供 CLI 表格標記欄位狀態（N/F/D）
+                self._ic_actions = dict(actions)
 
         # composite 加權：套 weight_mult，再歸一化回原始總和，避免 dampen 後量級下移
         # 觸發 Stage 3.7 動態門檻誤殺

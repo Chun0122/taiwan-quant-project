@@ -47,6 +47,16 @@ dashboard:
 # 主來源（隔離測 0.5%→59%），卻會勒死波段換手（swing 全開 35%→9%）。
 # 故全域沿用 momentum 校準，並以 per_mode 放寬 swing。
 quant:
+  # IC 驅動的自動調整開關（P0 #17，2026-08-01）
+  # 兩者「凍結中」= false，直到 B2（全候選池因子落庫）落地後重新評估。
+  # 凍結期間 scanner 仍計算並記錄「原本會做的調整」，只是不套用（log 標【凍結中】）。
+  # 理由摘要（詳 logs/audit_discover_20260731/REPORT.md §6 與 src/config.py 註解）：
+  #   - E2b 歸一化把權重全數塞給「從未被量測」的維度（value 的 valuation 2.25×，IC=N/A）
+  #   - E2c 翻轉門檻 |IC|<=0.02 在 SE~0.10-0.14 下等同隨機翻轉方向
+  ic_governance:
+    auto_weight_adjust: false    # E2b 四維度權重自動調整
+    auto_score_transform: false  # E2c 分數翻轉 / 中性化 / dampen
+
   rotation_cost:
     enabled: true        # 全域啟用三道成本閘門
     min_hold_days: 7     # holding_days 安全下限（拉高短期換手）
