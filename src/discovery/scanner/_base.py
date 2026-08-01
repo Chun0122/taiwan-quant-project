@@ -17,6 +17,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP, DISCOVERY_KEY_FACTOR_MAP
 from src.data.database import get_session
+from src.data.pit import financial_visible_cutoff, is_pit_replay, revenue_visible_cutoff
 from src.data.schema import (
     Announcement,
     BrokerTrade,
@@ -191,6 +192,7 @@ class MarketScanner:
         self,
         shared: SharedMarketData | None = None,
         precomputed_ic: pd.DataFrame | None = None,
+        as_of: date | None = None,
     ) -> DiscoveryResult:
         """執行四階段漏斗掃描。
 
@@ -207,10 +209,21 @@ class MarketScanner:
                 （項目 E）；傳入時 `_apply_ic_weight_adjustment` 與
                 `_log_factor_effectiveness` 直接使用，跳過 DB 查詢 + 重算 IC。
                 未傳入時維持原 DB 路徑。
+            as_of: **B1 PIT 注入點**。指定歷史日期即以「當日看得到的資料」重放
+                掃描：所有查詢加上 `<= as_of` 上界，基本面另套法定公布時滯
+                （`src/data/pit.py`），且自動進入 offline mode 禁止外部 API。
+                None（預設）＝今日掃描，行為與注入前完全相同。
+
+                注意：`date.today()` 只出現在此處與 CLI 入口（MASTER_PLAN §3
+                原則 4）；引擎內部一律使用 `self.scan_date`。
         """
         self._shared = shared
         self._precomputed_ic = precomputed_ic
-        self.scan_date = date.today()
+        self.scan_date = as_of or date.today()
+        # PIT 重放時禁止外部 API——否則會把「今天」的資料寫進歷史情境
+        self._offline = is_pit_replay(as_of)
+        if self._offline:
+            logger.info("PIT 重放模式：as_of=%s，已停用所有外部資料補抓", self.scan_date)
         stages = self._STAGES
         audit = ScanAuditTrail()
         self._audit_trail = audit if stages.audit_trail else None
@@ -246,7 +259,9 @@ class MarketScanner:
             )
 
         # Stage 0.5: 模式專屬的前置資料補抓（value/dividend 估值、growth 月營收覆蓋率）
-        self._prepare_before_load()
+        # B1 offline：PIT 重放時跳過（同 Stage 2.5 的理由）
+        if not self._is_offline():
+            self._prepare_before_load()
 
         # Stage 1: 載入資料
         df_price, df_inst, df_margin, df_revenue = self._load_market_data()
@@ -281,23 +296,29 @@ class MarketScanner:
             )
 
         # Stage 2.5: 補抓候選股月營收（從 FinMind 逐股取得）+ 模式專屬補抓（估值）
+        # B1 offline：PIT 重放時**不得**補抓——外部 API 只會回「今天」的資料，
+        # 寫進 DB 後既污染歷史情境，也讓重放結果不可複現。
         candidate_ids = candidates["stock_id"].tolist()
-        try:
-            from src.data.pipeline import sync_revenue_for_stocks
-
-            logger.info("Stage 2.5: 補抓 %d 支候選股月營收...", len(candidate_ids))
-            rev_count = sync_revenue_for_stocks(candidate_ids)
-            logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收", rev_count)
-            self._sync_candidate_valuation(candidate_ids)
-            # 重新載入營收資料（補抓後 DB 已更新）；月數由模式宣告
+        if self._is_offline():
+            logger.info("Stage 2.5: PIT 重放模式 — 跳過所有外部補抓，僅用 DB 既有資料")
             df_revenue = self._load_revenue_data(candidate_ids, months=self._candidate_revenue_months)
-            self._reload_candidate_valuation(candidate_ids)
-        except Exception:
-            logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
+        else:
+            try:
+                from src.data.pipeline import sync_revenue_for_stocks
+
+                logger.info("Stage 2.5: 補抓 %d 支候選股月營收...", len(candidate_ids))
+                rev_count = sync_revenue_for_stocks(candidate_ids)
+                logger.info("Stage 2.5: 補抓完成，新增 %d 筆月營收", rev_count)
+                self._sync_candidate_valuation(candidate_ids)
+                # 重新載入營收資料（補抓後 DB 已更新）；月數由模式宣告
+                df_revenue = self._load_revenue_data(candidate_ids, months=self._candidate_revenue_months)
+                self._reload_candidate_valuation(candidate_ids)
+            except Exception:
+                logger.warning("Stage 2.5: 月營收補抓失敗（可能無 FinMind token），使用既有資料")
 
         # Stage 2.5: 補抓候選股分點資料（僅 MomentumScanner 啟用）
         # 新出現的候選股（不在上次推薦或 watchlist 中）也能取得分點評分，避免因無資料而降級
-        if self._auto_sync_broker:
+        if self._auto_sync_broker and not self._is_offline():
             try:
                 from src.data.pipeline import sync_broker_for_stocks
 
@@ -558,6 +579,21 @@ class MarketScanner:
     #  模式專屬 hook（N2）：取代原本三份 run() 覆寫中的流程差異
     # ------------------------------------------------------------------ #
 
+    def _as_of(self) -> date:
+        """本次掃描的基準日（B1 PIT 的單一時間來源）。
+
+        引擎層**一律**用此方法取「今天」，不得直接呼叫 `date.today()`——否則
+        PIT 重放會混入真實今日，look-ahead 就從那個縫隙漏進來
+        （MASTER_PLAN §3 原則 4；`tests/test_pit.py` 有靜態守門測試）。
+
+        `run()` 尚未執行時（單元測試直接呼叫 helper）退回今日。
+        """
+        return getattr(self, "scan_date", None) or date.today()
+
+    def _is_offline(self) -> bool:
+        """是否為 PIT 重放（禁止呼叫外部 API）。"""
+        return bool(getattr(self, "_offline", False))
+
     def _prepare_before_load(self) -> None:
         """Stage 0.5 — Stage 1 載入資料**前**的模式專屬補抓。預設無動作。
 
@@ -600,7 +636,7 @@ class MarketScanner:
         from src.discovery.universe import log_universe_stats
 
         log_universe_stats(
-            scan_date=getattr(self, "scan_date", None) or date.today(),
+            scan_date=self._as_of(),
             mode=self.mode_name,
             stats=universe_stats,
             regime=getattr(self, "regime", None),
@@ -621,7 +657,7 @@ class MarketScanner:
         # Stage 0.5: Universe Filter — SQL 硬過濾 + 流動性 + 趨勢
         universe_ids = self._get_universe_ids()
 
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
 
         # 項目 B：共用資料注入路徑（避免重複 DB 讀取）
         shared = getattr(self, "_shared", None)
@@ -639,7 +675,7 @@ class MarketScanner:
                 DailyPrice.close,
                 DailyPrice.volume,
                 DailyPrice.turnover,
-            ).where(DailyPrice.date >= cutoff)
+            ).where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
 
             if universe_ids:
                 price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
@@ -656,7 +692,7 @@ class MarketScanner:
                 InstitutionalInvestor.date,
                 InstitutionalInvestor.name,
                 InstitutionalInvestor.net,
-            ).where(InstitutionalInvestor.date >= cutoff)
+            ).where(InstitutionalInvestor.date >= cutoff, InstitutionalInvestor.date <= self._as_of())
 
             if universe_ids:
                 inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
@@ -670,7 +706,7 @@ class MarketScanner:
                 MarginTrading.date,
                 MarginTrading.margin_balance,
                 MarginTrading.short_balance,
-            ).where(MarginTrading.date >= cutoff)
+            ).where(MarginTrading.date >= cutoff, MarginTrading.date <= self._as_of())
 
             if universe_ids:
                 margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
@@ -719,11 +755,17 @@ class MarketScanner:
             finally:
                 self._shared = shared
 
+        # B1 PIT：shared 路徑必須套用與 DB 路徑**完全相同**的時間上界，
+        # 否則兩條路徑在 PIT 重放下會選出不同股票（歷史上 live/backtest drift
+        # 已造成 3 次 P0，見 MASTER_PLAN §7 B7）。
+        as_of = self._as_of()
+        revenue_upper = revenue_visible_cutoff(as_of)
+
         def _filter(df: pd.DataFrame) -> pd.DataFrame:
             """按 date + universe 過濾共用 DF，並回傳 copy。"""
             if df.empty:
                 return df.copy()
-            mask = df["date"] >= cutoff
+            mask = (df["date"] >= cutoff) & (df["date"] <= as_of)
             if universe_ids:
                 mask &= df["stock_id"].isin(universe_ids)
             return df.loc[mask].copy()
@@ -733,8 +775,11 @@ class MarketScanner:
         df_margin = _filter(shared.df_margin)
 
         months = revenue_months if revenue_months is not None else self._revenue_months
+        df_rev_visible = shared.df_revenue
+        if not df_rev_visible.empty and "date" in df_rev_visible.columns:
+            df_rev_visible = df_rev_visible[df_rev_visible["date"] <= revenue_upper]
         df_revenue = slice_revenue_raw(
-            shared.df_revenue,
+            df_rev_visible,
             stock_ids=universe_ids if universe_ids else None,
             months=months,
         )
@@ -750,10 +795,14 @@ class MarketScanner:
         """
         from sqlalchemy import func
 
-        revenue_cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=180)
+        as_of = self._as_of()
+        revenue_cutoff = as_of - timedelta(days=180)
+        # B1 PIT：上界不是 as_of 而是「當時已依法公布」的最新營收月份——
+        # MonthlyRevenue.date 是營收月份而非公布日，直接用 as_of 會看到還沒公布的營收。
+        revenue_upper = revenue_visible_cutoff(as_of)
 
         with get_session() as session:
-            base_filter = MonthlyRevenue.date >= revenue_cutoff
+            base_filter = (MonthlyRevenue.date >= revenue_cutoff) & (MonthlyRevenue.date <= revenue_upper)
             if stock_ids:
                 base_filter = base_filter & MonthlyRevenue.stock_id.in_(stock_ids)
 
@@ -829,7 +878,7 @@ class MarketScanner:
             "operating_cf",
             "free_cf",
         ]
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=quarters * 100)
+        cutoff = self._as_of() - timedelta(days=quarters * 100)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -850,6 +899,8 @@ class MarketScanner:
                     .where(
                         FinancialStatement.stock_id.in_(stock_ids),
                         FinancialStatement.date >= cutoff,
+                        # B1 PIT：季報上界＝當時已依法申報者（季後 45 日／年報次年 3/31）
+                        FinancialStatement.date <= financial_visible_cutoff(self._as_of()),
                     )
                     .order_by(FinancialStatement.stock_id, FinancialStatement.date.desc())
                 ).all()
@@ -882,7 +933,7 @@ class MarketScanner:
 
         if days is None:
             days = NEWS_LOAD_WINDOW_DAYS
-        today = getattr(self, "scan_date", None) or date.today()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
+        today = self._as_of()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
         recent_cutoff = today - timedelta(days=days)
         baseline_cutoff = today - timedelta(days=baseline_days)
 
@@ -897,7 +948,7 @@ class MarketScanner:
                 Announcement.subject,
                 Announcement.sentiment,
                 Announcement.event_type,
-            ).where(Announcement.date >= recent_cutoff)
+            ).where(Announcement.date >= recent_cutoff, Announcement.date <= self._as_of())
 
             if stock_ids:
                 query = query.where(Announcement.stock_id.in_(stock_ids))
@@ -905,7 +956,9 @@ class MarketScanner:
             recent_rows = session.execute(query).all()
 
             # 基準期（僅需 stock_id + date）
-            hist_query = select(Announcement.stock_id, Announcement.date).where(Announcement.date >= baseline_cutoff)
+            hist_query = select(Announcement.stock_id, Announcement.date).where(
+                Announcement.date >= baseline_cutoff, Announcement.date <= self._as_of()
+            )
             if stock_ids:
                 hist_query = hist_query.where(Announcement.stock_id.in_(stock_ids))
 
@@ -969,7 +1022,7 @@ class MarketScanner:
         if ann.empty:
             return default
 
-        today = getattr(self, "scan_date", None) or date.today()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
+        today = self._as_of()  # C3 修復：跨午夜時與 scan_date 對齊（defensive）
         ann["days_ago"] = ann["date"].apply(lambda d: max(0, (today - d).days))
 
         # event_type 欄位相容（舊資料無此欄則預設 general）
@@ -998,7 +1051,7 @@ class MarketScanner:
 
         # 異常公告率乘數（僅在 history 有效時套用，同時放大兩邊）
         if df_ann_history is not None and not df_ann_history.empty:
-            z_series = compute_abnormal_announcement_rate(df_ann_history, stock_ids)
+            z_series = compute_abnormal_announcement_rate(df_ann_history, stock_ids, as_of=self._as_of())
 
             def _to_multiplier(z: float) -> float:
                 if z > 2.0:
@@ -1221,14 +1274,14 @@ class MarketScanner:
         default = pd.DataFrame({"stock_id": stock_ids, "weekly_bonus": [0.0] * len(stock_ids)})
 
         try:
-            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=90)
+            cutoff = self._as_of() - timedelta(days=90)
 
             with get_session() as session:
                 rows = (
                     session.execute(
                         select(DailyPrice)
                         .where(DailyPrice.stock_id.in_(stock_ids))
-                        .where(DailyPrice.date >= cutoff)
+                        .where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
                         .order_by(DailyPrice.stock_id, DailyPrice.date)
                     )
                     .scalars()
@@ -1338,13 +1391,13 @@ class MarketScanner:
         default = pd.DataFrame({"stock_id": stock_ids, "relative_strength_bonus": [0.0] * len(stock_ids)})
 
         try:
-            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=30)
+            cutoff = self._as_of() - timedelta(days=30)
 
             with get_session() as session:
                 price_rows = session.execute(
                     select(DailyPrice.stock_id, DailyPrice.date, DailyPrice.close)
                     .where(DailyPrice.stock_id.in_(stock_ids))
-                    .where(DailyPrice.date >= cutoff)
+                    .where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
                     .order_by(DailyPrice.stock_id, DailyPrice.date)
                 ).all()
 
@@ -1841,7 +1894,7 @@ class MarketScanner:
         Returns:
             DataFrame，index reset，欄位含 stock_id 及上述五欄
         """
-        scan_date = getattr(self, "scan_date", date.today())
+        scan_date = self._as_of()
         valid_until = (pd.Timestamp(scan_date) + pd.offsets.BDay(5)).date()
 
         # 預先 groupby 一次（O(N)），避免迴圈中反覆 boolean filter（O(N²)）
@@ -2868,7 +2921,7 @@ class MarketScanner:
             cfg = WIN_RATE_FEEDBACK_CONFIG
             lookback = cfg["lookback_days"]
             holding = cfg["holding_days"]
-            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=lookback + holding + 5)
+            cutoff = self._as_of() - timedelta(days=lookback + holding + 5)
 
             with get_session() as session:
                 # 載入推薦記錄
@@ -2949,7 +3002,7 @@ class MarketScanner:
             from src.discovery.scanner._functions import compute_rolling_ic
 
             holding_days = self._get_ic_holding_days()
-            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
+            cutoff = self._as_of() - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -2994,7 +3047,7 @@ class MarketScanner:
                 df_records, df_prices, holding_days=holding_days, window_days=14, step_days=7
             )
 
-            as_of = getattr(self, "scan_date", None) or date.today()
+            as_of = self._as_of()
             verdict = select_enforceable_ic(
                 rolling_df, key_factor, as_of=as_of, holding_days=holding_days, mode=self.mode_name
             )
@@ -3051,7 +3104,7 @@ class MarketScanner:
 
         try:
             holding_days = self._get_ic_holding_days()
-            cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
+            cutoff = self._as_of() - timedelta(days=self._get_ic_cutoff_days())
 
             with get_session() as session:
                 stmt = select(
@@ -3148,7 +3201,7 @@ class MarketScanner:
                 self._dimension_ic_df = ic_df
             else:
                 holding_days = self._get_ic_holding_days()
-                cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self._get_ic_cutoff_days())
+                cutoff = self._as_of() - timedelta(days=self._get_ic_cutoff_days())
 
                 with get_session() as session:
                     stmt = select(
@@ -3402,7 +3455,7 @@ class MarketScanner:
 
     def _reload_valuation(self, stock_ids: list[str]) -> None:
         """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
         with get_session() as session:
             rows = session.execute(
                 select(
@@ -3412,7 +3465,7 @@ class MarketScanner:
                     StockValuation.pb_ratio,
                     StockValuation.dividend_yield,
                 )
-                .where(StockValuation.date >= cutoff)
+                .where(StockValuation.date >= cutoff, StockValuation.date <= self._as_of())
                 .where(StockValuation.stock_id.in_(stock_ids))
             ).all()
             self._df_valuation = pd.DataFrame(
@@ -3422,8 +3475,13 @@ class MarketScanner:
 
     def _maybe_sync_valuation(self) -> None:
         """Stage 0.5：估值資料覆蓋不足時，自動從 TWSE/TPEX 補抓全市場估值。
-        供 ValueScanner / DividendScanner 的 run() 呼叫。
+        供 ValueScanner / DividendScanner 的 `_prepare_before_load()` 呼叫。
+
+        B1 offline：PIT 重放時直接返回（縱深防禦——`run()` 已擋一層，此處再擋，
+        避免日後有人直接呼叫本方法而繞過 offline 保護）。
         """
+        if self._is_offline():
+            return
         try:
             from sqlalchemy import func as sa_func
 
@@ -3695,7 +3753,7 @@ class MarketScanner:
         ValueScanner / GrowthScanner 的 _compute_chip_scores() 呼叫。
         若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
         """
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=7)
+        cutoff = self._as_of() - timedelta(days=7)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -3724,7 +3782,7 @@ class MarketScanner:
         _compute_chip_scores() 呼叫。
         若表不存在或無資料則回傳空 DataFrame，呼叫端自動降級。
         """
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=5)
+        cutoff = self._as_of() - timedelta(days=5)
         try:
             with get_session() as session:
                 rows = session.execute(
@@ -3762,7 +3820,7 @@ class MarketScanner:
           - 本函數自動以 DailyPrice.close 填補 NULL 均價（同日收盤價）
           - win_rate / PF 的意義：衡量分點「是否在漲前買、跌前賣」的擇時能力
         """
-        cutoff = (getattr(self, "scan_date", None) or date.today()) - timedelta(days=days)
+        cutoff = self._as_of() - timedelta(days=days)
         try:
             with get_session() as session:
                 rows = session.execute(

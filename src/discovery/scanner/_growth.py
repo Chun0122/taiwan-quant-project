@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pandas as pd
 from sqlalchemy import select
@@ -116,7 +116,7 @@ class GrowthScanner(MarketScanner):
         項目 B：若 `self._shared` 已由 `run(shared=...)` 注入，則以 in-memory 過濾
         取代 DB 查詢，month=4 透過 `revenue_months` 參數顯式對齊原行為。
         """
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
 
         shared = getattr(self, "_shared", None)
         if shared is not None:
@@ -133,7 +133,7 @@ class GrowthScanner(MarketScanner):
                     DailyPrice.low,
                     DailyPrice.close,
                     DailyPrice.volume,
-                ).where(DailyPrice.date >= cutoff)
+                ).where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
             ).all()
             df_price = pd.DataFrame(
                 rows,
@@ -146,7 +146,7 @@ class GrowthScanner(MarketScanner):
                     InstitutionalInvestor.date,
                     InstitutionalInvestor.name,
                     InstitutionalInvestor.net,
-                ).where(InstitutionalInvestor.date >= cutoff)
+                ).where(InstitutionalInvestor.date >= cutoff, InstitutionalInvestor.date <= self._as_of())
             ).all()
             df_inst = pd.DataFrame(
                 rows,
@@ -159,7 +159,7 @@ class GrowthScanner(MarketScanner):
                     MarginTrading.date,
                     MarginTrading.margin_balance,
                     MarginTrading.short_balance,
-                ).where(MarginTrading.date >= cutoff)
+                ).where(MarginTrading.date >= cutoff, MarginTrading.date <= self._as_of())
             ).all()
             df_margin = pd.DataFrame(
                 rows,

@@ -287,6 +287,9 @@ class TestMarketScannerIntegration:
                 self._universe_config = type("C", (), {"regime": None})()
 
             _get_universe_ids = MarketScanner._get_universe_ids
+            # B1：_get_universe_ids 改以 _as_of() 取基準日（PIT 單一時間來源），
+            # stub 需一併借用；此處 scan_date 已固定為 2026-05-17。
+            _as_of = MarketScanner._as_of
 
         # 由於 log_universe_stats 是在 _get_universe_ids 內 `from ... import` 拉進來的，
         # 我們需要 patch source module 而非 _base 模組

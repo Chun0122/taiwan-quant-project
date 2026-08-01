@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pandas as pd
 from sqlalchemy import select
@@ -84,7 +84,7 @@ class ValueScanner(MarketScanner):
         取代 DB 查詢 4 張共用表；估值與 stock_info 仍走 DB 查詢（未在 shared 中）。
         """
         universe_ids = self._get_universe_ids()
-        cutoff = date.today() - timedelta(days=self.lookback_days + 10)
+        cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)
 
         shared = getattr(self, "_shared", None)
         if shared is not None:
@@ -99,7 +99,7 @@ class ValueScanner(MarketScanner):
                     StockValuation.pe_ratio,
                     StockValuation.pb_ratio,
                     StockValuation.dividend_yield,
-                ).where(StockValuation.date >= cutoff)
+                ).where(StockValuation.date >= cutoff, StockValuation.date <= self._as_of())
                 if universe_ids:
                     val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
                 rows = session.execute(val_query).all()
@@ -127,7 +127,7 @@ class ValueScanner(MarketScanner):
                 DailyPrice.close,
                 DailyPrice.volume,
                 DailyPrice.turnover,
-            ).where(DailyPrice.date >= cutoff)
+            ).where(DailyPrice.date >= cutoff, DailyPrice.date <= self._as_of())
             if universe_ids:
                 price_query = price_query.where(DailyPrice.stock_id.in_(universe_ids))
             rows = session.execute(price_query).all()
@@ -141,7 +141,7 @@ class ValueScanner(MarketScanner):
                 InstitutionalInvestor.date,
                 InstitutionalInvestor.name,
                 InstitutionalInvestor.net,
-            ).where(InstitutionalInvestor.date >= cutoff)
+            ).where(InstitutionalInvestor.date >= cutoff, InstitutionalInvestor.date <= self._as_of())
             if universe_ids:
                 inst_query = inst_query.where(InstitutionalInvestor.stock_id.in_(universe_ids))
             rows = session.execute(inst_query).all()
@@ -152,7 +152,7 @@ class ValueScanner(MarketScanner):
                 MarginTrading.date,
                 MarginTrading.margin_balance,
                 MarginTrading.short_balance,
-            ).where(MarginTrading.date >= cutoff)
+            ).where(MarginTrading.date >= cutoff, MarginTrading.date <= self._as_of())
             if universe_ids:
                 margin_query = margin_query.where(MarginTrading.stock_id.in_(universe_ids))
             rows = session.execute(margin_query).all()
@@ -165,7 +165,7 @@ class ValueScanner(MarketScanner):
                 StockValuation.pe_ratio,
                 StockValuation.pb_ratio,
                 StockValuation.dividend_yield,
-            ).where(StockValuation.date >= cutoff)
+            ).where(StockValuation.date >= cutoff, StockValuation.date <= self._as_of())
             if universe_ids:
                 val_query = val_query.where(StockValuation.stock_id.in_(universe_ids))
             rows = session.execute(val_query).all()
