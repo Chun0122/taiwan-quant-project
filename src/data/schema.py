@@ -1020,11 +1020,16 @@ class ExperimentLog(Base):
 class RegimeStateLog(Base):
     """Regime 狀態歷史記錄表（P2 任務 12）— 取代 data/regime_state.json。
 
-    Append-only history：每次 RegimeStateMachine.update() 寫一筆新 row，
+    Append-only history：每次 RegimeStateMachine.update() **實際推進狀態機**時寫一筆新 row，
     保留完整 regime 轉換軌跡供 audit。`_load_state` 取最新一筆（依 created_at DESC）。
 
     動機（audit_20260509_v2 §10.7 S5）：JSON 檔 IO 易損；DB 持久化更穩定
     且自帶歷史軌跡（hysteresis transition_blocked 等資訊不再只在 in-memory dict）。
+
+    P0 #15（2026-08-01）：新增 `data_date` = 本次判定所依據的最新 TAIEX 資料日，
+    作為狀態機的冪等鍵。修復前同日重複呼叫會各寫一筆（實測 4~15 筆/日）並反覆
+    推進 hysteresis 計數；修復後同一 `data_date` 只推進一次，故本表恢復為
+    「每個交易日至多一筆」。舊資料此欄為 NULL（視為未知，會觸發一次重新判定）。
     """
 
     __tablename__ = "regime_state_log"
@@ -1034,7 +1039,9 @@ class RegimeStateLog(Base):
     regime_since: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO date string
     confirmation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     pending_transition: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    last_updated: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO date string
+    last_updated: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO date string（掛鐘日）
+    # 本次判定依據的最新 TAIEX 資料日（ISO date string）；冪等鍵，見 class docstring
+    data_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     def __repr__(self) -> str:
