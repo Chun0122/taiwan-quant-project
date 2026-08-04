@@ -11,7 +11,12 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
-from src.constants import BACKFILL_FULL_COVERAGE_MIN_ROWS, PRICE_JUMP_WARN_THRESHOLD, UPSERT_BATCH_SIZE
+from src.constants import (
+    BACKFILL_MIN_COMMON_STOCKS,
+    PRICE_JUMP_WARN_THRESHOLD,
+    SECONDS_PER_BACKFILL_DAY,
+    UPSERT_BATCH_SIZE,
+)
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
@@ -1067,13 +1072,12 @@ def backfill_market_history(
 
     ## 續跑
 
-    **不另外維護進度檔**——直接以 DB 現況為準：某日 `daily_price` 筆數達
-    `BACKFILL_FULL_COVERAGE_MIN_ROWS` 即視為已回補而跳過。中斷後重跑會自動
-    從缺口續行，且重跑安全（upsert）。
+    **不另外維護進度檔**——直接以 DB 現況為準：某日**普通股（4 碼）檔數**達
+    `BACKFILL_MIN_COMMON_STOCKS` 即視為已回補而跳過。中斷後重跑會自動從缺口
+    續行，且重跑安全（upsert）。
 
-    ⚠ 判定用的是**當日筆數**而非「該日是否有資料」：實測 2020~2024 每個交易日
-    都已有 `daily_price`，但只有 6 檔（watchlist + TAIEX）。若以「日期存在」
-    為準，整整 5 年會被靜默跳過、回補什麼都不做。
+    ⚠ 判定既不能用「該日是否有資料」也不能用「總筆數」——兩者都被實測打臉，
+    理由詳見 `constants.BACKFILL_MIN_COMMON_STOCKS` 的註解。
 
     Args:
         start: 起始日（含）。
@@ -1109,8 +1113,10 @@ def backfill_market_history(
             for r in session.execute(
                 select(DailyPrice.date)
                 .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                # 只數 4 碼普通股：權證/ETF 在崩盤日會整批無報價，用總筆數會誤判
+                .where(func.length(DailyPrice.stock_id) == 4)
                 .group_by(DailyPrice.date)
-                .having(func.count(DailyPrice.id) >= BACKFILL_FULL_COVERAGE_MIN_ROWS)
+                .having(func.count(DailyPrice.id) >= BACKFILL_MIN_COMMON_STOCKS)
             ).all()
         }
 
@@ -1122,8 +1128,11 @@ def backfill_market_history(
     ]
     result["skipped"] = (end - start).days + 1 - len(pending)
 
+    # 每個交易日的實際耗時：每個 dataset 都要 TWSE + TPEX（雖並行但各自 3 秒節流）
+    # 再加解析/寫入。實測 2026-08-03 全程 458 個交易日 / 3h45m ≈ 29 秒/日；
+    # 原估算用 3 秒/dataset 低估近 3 倍，改用實測值。
     n_ds = len([d for d in datasets if d in ("price", "institutional", "margin")])
-    est_sec = len(pending) * 3 * max(1, n_ds)
+    est_sec = len(pending) * SECONDS_PER_BACKFILL_DAY * max(1, n_ds) / 3
     logger.info(
         "[回補] %s ~ %s：待補 %d 個平日（已跳過 %d 日），dataset=%s，預估 %.1f 小時",
         start,
@@ -1176,6 +1185,51 @@ def backfill_market_history(
         result["margin"],
     )
     return result
+
+
+def clear_false_delistings(min_trading_days_after: int = 3) -> int:
+    """清除「下市後仍在交易」的 `delisted_date`（B1① 資料語意防線）。
+
+    FinMind `TaiwanStockDelisting` 收錄的是「**從該板終止**」，其中包含**轉板**
+    （如上櫃轉上市＝終止上櫃），並非全部都是真正停止交易。實測 2026-08-03：
+    30 檔有價量的下市股中，5236 凌陽創新於「下市日」2026-07-16 之後仍持續正常
+    交易（2026-08-03 成交 138,695 股）——它是轉板，不是下市。
+
+    誤判方向是**過度保守**（把還在交易的股票當成不可交易），比倖存者偏差安全，
+    但仍會讓 PIT universe 少掉真實可交易標的。
+
+    判定採「下市日之後仍有 >= N 個交易日的報價」，而非單日——避免單筆髒資料
+    就把真正的下市翻案。
+
+    Args:
+        min_trading_days_after: 下市日後需觀察到幾個交易日才判定為誤記。
+
+    Returns:
+        被清除 `delisted_date` 的股票數。
+    """
+    cleared = 0
+    with get_session() as session:
+        rows = session.execute(select(StockInfo).where(StockInfo.delisted_date.isnot(None))).scalars().all()
+        for info in rows:
+            n_after = session.execute(
+                select(func.count(func.distinct(DailyPrice.date))).where(
+                    DailyPrice.stock_id == info.stock_id,
+                    DailyPrice.date > info.delisted_date,
+                )
+            ).scalar()
+            if (n_after or 0) >= min_trading_days_after:
+                logger.warning(
+                    "疑似轉板而非下市：%s %s 於 %s 後仍有 %d 個交易日報價 — 清除 delisted_date",
+                    info.stock_id,
+                    info.stock_name or "",
+                    info.delisted_date,
+                    n_after,
+                )
+                info.delisted_date = None
+                cleared += 1
+        if cleared:
+            session.commit()
+    return cleared
 
 
 def sync_delisting_info(fetcher: FinMindFetcher | None = None) -> int:
@@ -1233,7 +1287,13 @@ def sync_delisting_info(fetcher: FinMindFetcher | None = None) -> int:
                 updated += 1
         session.commit()
 
-    logger.info("下市清單同步完成：%d 筆 stock_info 更新（清單共 %d 筆）", updated, len(df))
+    cleared = clear_false_delistings()
+    logger.info(
+        "下市清單同步完成：%d 筆 stock_info 更新（清單共 %d 筆，另清除 %d 筆疑似轉板）",
+        updated,
+        len(df),
+        cleared,
+    )
     return updated
 
 

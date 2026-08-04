@@ -262,11 +262,25 @@ RANKINGS_FALLBACK_MAX_TRADING_DAYS: int = 3
 PHANTOM_TRADING_DAY_MIN_ROWS: int = 100
 
 # ── 歷史回補的「全市場覆蓋」判定門檻（B1①，2026-08-01）────────────────────
-# backfill 以此判斷某日是否已回補過。**不能只看「該日有無資料」**——
-# 實測 2020~2024 每個交易日都已有 daily_price，但只有 6 檔（watchlist + TAIEX），
-# 若以「日期存在」為準會把整整 5 年全部跳過，回補靜默地什麼都不做。
-# 正常交易日全市場 5,700~6,800 檔；500 可乾淨分離「僅 watchlist」與「全市場」。
-BACKFILL_FULL_COVERAGE_MIN_ROWS: int = 500
+# backfill 以此判斷某日是否已回補過。**判定用「普通股（4 碼）檔數」而非總筆數**，
+# 這個選擇是被兩次實測逼出來的：
+#   1. 只看「該日有無資料」→ 2020~2024 每日皆有 6 檔（watchlist + TAIEX），
+#      整整 5 年會被靜默跳過、回補什麼都不做。
+#   2. 改看總筆數（門檻 3000）→ 仍有兩種誤判：
+#      • 偽陽性：2025-04-07 關稅崩盤日 TAIEX −9.7%、80% 普通股無量跌停，
+#        權證當日幾乎無報價 → 總筆數僅 2,922，但普通股 1,894 檔其實完整。
+#        以總筆數判定會讓崩盤日被永遠重抓。
+#      • 偽陰性：2026-03-03 總筆數 5,795（權證多）但普通股僅 879 檔＝半套，
+#        總筆數門檻放它過關。
+# 普通股檔數不受權證有無影響：實測完整日恆為 1,799~1,971 檔、假日 0 檔、
+# 半套日 879 檔——1500 可乾淨分離。
+BACKFILL_MIN_COMMON_STOCKS: int = 1500
+
+# 回補單一交易日（三個 dataset 全開）的實測耗時，用於 ETA 估算。
+# 實測 2026-08-03：458 個交易日耗時 3h45m ≈ 29.5 秒/日。
+# 原本以「3 秒 × dataset 數」估算低估近 3 倍——TWSE/TPEX 雖並行，但各自 3 秒
+# 節流、且每個 dataset 都要跑一輪，再加解析與 upsert。
+SECONDS_PER_BACKFILL_DAY: float = 29.5
 
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"

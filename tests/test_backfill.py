@@ -18,12 +18,12 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
 
-from src.constants import BACKFILL_FULL_COVERAGE_MIN_ROWS
+from src.constants import BACKFILL_MIN_COMMON_STOCKS
 from src.data.schema import DailyPrice, StockInfo
 
 
@@ -125,7 +125,7 @@ class TestCoverageBasedResume:
         from src.data.pipeline import backfill_market_history
 
         full_day = date(2024, 12, 2)
-        _seed_prices(db, full_day, BACKFILL_FULL_COVERAGE_MIN_ROWS + 10)
+        _seed_prices(db, full_day, BACKFILL_MIN_COMMON_STOCKS + 10)
         called = _stub_fetchers(monkeypatch, {full_day})
 
         res = backfill_market_history(full_day, full_day)
@@ -137,18 +137,59 @@ class TestCoverageBasedResume:
         from src.data.pipeline import backfill_market_history
 
         d = date(2024, 12, 2)
-        _seed_prices(db, d, BACKFILL_FULL_COVERAGE_MIN_ROWS)
+        _seed_prices(db, d, BACKFILL_MIN_COMMON_STOCKS)
         called = _stub_fetchers(monkeypatch, {d})
         backfill_market_history(d, d)
         assert called == []
+
+    def test_crash_day_not_refetched(self, db, monkeypatch):
+        """崩盤日總筆數少但普通股完整 → 不得重抓（否則永遠補不完）。
+
+        實測 2025-04-07 關稅崩盤：TAIEX −9.7%、80.3% 普通股無量跌停，權證當日
+        幾乎無報價 → 總筆數僅 2,922，但普通股 1,894 檔其實是完整的。
+        """
+        from src.data.pipeline import backfill_market_history
+
+        d = date(2025, 4, 7)
+        _seed_prices(db, d, BACKFILL_MIN_COMMON_STOCKS + 100)  # 普通股足量、無權證
+        called = _stub_fetchers(monkeypatch, {d})
+        backfill_market_history(d, d)
+        assert called == [], "崩盤日的普通股是完整的，不應被判為未回補"
+
+    def test_warrant_heavy_half_day_is_refetched(self, db, monkeypatch):
+        """權證多但普通股只有一半 → 必須重抓（總筆數門檻會漏掉這種）。
+
+        實測 2026-03-03：總筆數 5,795（權證多）但普通股僅 879 檔＝只有一個交易所。
+        """
+        from src.data.pipeline import backfill_market_history
+
+        d = date(2026, 3, 3)
+        _seed_prices(db, d, 879)  # 普通股不足
+        for i in range(5000):  # 大量權證（6 碼）
+            db.add(
+                DailyPrice(
+                    stock_id=f"7{i:05d}",
+                    date=d,
+                    open=1.0,
+                    high=1.0,
+                    low=1.0,
+                    close=1.0,
+                    volume=10,
+                    turnover=10,
+                )
+            )
+        db.flush()
+        called = _stub_fetchers(monkeypatch, {d})
+        backfill_market_history(d, d)
+        assert called == [d], "普通股不足即為半套，總筆數再多也要重抓"
 
     def test_fills_gap_in_middle(self, db, monkeypatch):
         """中間缺口也會被補（不只是往前延伸）。"""
         from src.data.pipeline import backfill_market_history
 
         days = [date(2024, 12, 2), date(2024, 12, 3), date(2024, 12, 4)]
-        _seed_prices(db, days[0], BACKFILL_FULL_COVERAGE_MIN_ROWS + 1)
-        _seed_prices(db, days[2], BACKFILL_FULL_COVERAGE_MIN_ROWS + 1)
+        _seed_prices(db, days[0], BACKFILL_MIN_COMMON_STOCKS + 1)
+        _seed_prices(db, days[2], BACKFILL_MIN_COMMON_STOCKS + 1)
         called = _stub_fetchers(monkeypatch, set(days))
 
         backfill_market_history(days[0], days[2])
@@ -303,8 +344,88 @@ class TestTradableAsOf:
         d = date(2024, 12, 2)
         db.add(StockInfo(stock_id="2000", stock_name="後來下市", delisted_date=date(2025, 6, 1)))
         db.flush()
-        _stub_fetchers(monkeypatch, {d}, n_rows=BACKFILL_FULL_COVERAGE_MIN_ROWS + 1)
+        _stub_fetchers(monkeypatch, {d}, n_rows=BACKFILL_MIN_COMMON_STOCKS + 1)
         backfill_market_history(d, d)
 
         got = db.query(DailyPrice).filter_by(stock_id="2000", date=d).one_or_none()
         assert got is not None, "回補的歷史日應含當時在市、如今已下市的股票"
+
+
+# ====================================================================== #
+# E. 轉板誤記為下市的防線
+# ====================================================================== #
+
+
+class TestClearFalseDelistings:
+    """FinMind `TaiwanStockDelisting` 收錄的是「從該板終止」，含**轉板**。
+
+    實測 2026-08-03：30 檔有價量的下市股中，5236 凌陽創新於「下市日」2026-07-16
+    之後仍持續正常交易（2026-08-03 成交 138,695 股）——它是上櫃轉上市，不是下市。
+    誤判方向是過度保守（把可交易股票當成不可交易），比倖存者偏差安全但仍是錯的。
+    """
+
+    def _seed(self, session, sid: str, delisted: date, trading_days_after: int):
+        session.add(StockInfo(stock_id=sid, stock_name=sid, delisted_date=delisted))
+        for i in range(1, trading_days_after + 1):
+            session.add(
+                DailyPrice(
+                    stock_id=sid,
+                    date=delisted + timedelta(days=i),
+                    open=10.0,
+                    high=11.0,
+                    low=9.0,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                )
+            )
+        session.flush()
+
+    def test_clears_when_still_trading(self, db):
+        from src.data.pipeline import clear_false_delistings
+
+        self._seed(db, "5236", date(2026, 7, 16), trading_days_after=12)
+        assert clear_false_delistings() == 1
+        assert db.query(StockInfo).filter_by(stock_id="5236").one().delisted_date is None
+
+    def test_keeps_true_delisting(self, db):
+        """真正下市者（下市日後無報價）不得被清除。"""
+        from src.data.pipeline import clear_false_delistings
+
+        db.add(StockInfo(stock_id="3454", stock_name="晶睿", delisted_date=date(2026, 3, 27)))
+        db.add(
+            DailyPrice(
+                stock_id="3454",
+                date=date(2026, 3, 18),  # 下市前最後交易日
+                open=10.0,
+                high=11.0,
+                low=9.0,
+                close=10.0,
+                volume=1000,
+                turnover=10000,
+            )
+        )
+        db.flush()
+        assert clear_false_delistings() == 0
+        assert db.query(StockInfo).filter_by(stock_id="3454").one().delisted_date == date(2026, 3, 27)
+
+    def test_single_dirty_row_does_not_flip(self, db):
+        """單筆髒資料不足以翻案——需達 min_trading_days_after 才判定誤記。"""
+        from src.data.pipeline import clear_false_delistings
+
+        self._seed(db, "9998", date(2026, 3, 27), trading_days_after=1)
+        assert clear_false_delistings(min_trading_days_after=3) == 0
+        assert db.query(StockInfo).filter_by(stock_id="9998").one().delisted_date is not None
+
+    def test_threshold_boundary(self, db):
+        from src.data.pipeline import clear_false_delistings
+
+        self._seed(db, "9997", date(2026, 3, 27), trading_days_after=3)
+        assert clear_false_delistings(min_trading_days_after=3) == 1
+
+    def test_no_delisted_stocks_is_noop(self, db):
+        from src.data.pipeline import clear_false_delistings
+
+        db.add(StockInfo(stock_id="2330", stock_name="台積電"))
+        db.flush()
+        assert clear_false_delistings() == 0
