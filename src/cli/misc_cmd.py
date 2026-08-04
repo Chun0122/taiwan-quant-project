@@ -399,7 +399,7 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
     """
     from datetime import date as _date
 
-    from src.data.pipeline import backfill_market_history, sync_delisting_info
+    from src.data.pipeline import backfill_daily_features, backfill_market_history, sync_delisting_info
 
     start = _date.fromisoformat(args.start)
     end = _date.fromisoformat(args.end) if getattr(args, "end", None) else None
@@ -410,6 +410,13 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
         print("同步下市清單（倖存者偏差修正）...")
         n = sync_delisting_info()
         print(f"  stock_info 更新 {n} 筆\n")
+
+    if args.features_only:
+        print(f"只回補 DailyFeature（B1②）：{start} ~ {end or '今日'}")
+        fr = backfill_daily_features(start, end, dry_run=args.dry_run)
+        if not args.dry_run:
+            print(f"\nDailyFeature 回補完成：{fr['dates']} 日 / {fr['rows']} 筆（已有 {fr['skipped_dates']} 日）")
+        return
 
     print(f"回補範圍：{start} ~ {end or '今日'}　dataset={','.join(datasets)}")
     print("  （已達全市場覆蓋的日期會自動跳過；中斷後重跑會從缺口續行）")
@@ -427,6 +434,11 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
     print(f"  三大法人   {result['institutional']:>6} 筆")
     print(f"  融資融券   {result['margin']:>6} 筆")
     print(f"  已跳過     {result['skipped']:>6} 日（DB 已有 / 週末）")
+
+    if args.with_features:
+        print("\n接著回補 DailyFeature（B1②）...")
+        fr = backfill_daily_features(start, end)
+        print(f"  DailyFeature {fr['dates']} 日 / {fr['rows']} 筆")
 
 
 def cmd_validate(args: argparse.Namespace) -> None:

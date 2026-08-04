@@ -429,3 +429,111 @@ class TestClearFalseDelistings:
         db.add(StockInfo(stock_id="2330", stock_name="台積電"))
         db.flush()
         assert clear_false_delistings() == 0
+
+
+# ====================================================================== #
+# F. B1② DailyFeature 歷史化
+# ====================================================================== #
+
+
+class TestBackfillDailyFeatures:
+    """PIT universe 過濾需要「當時那一天的特徵」，而每日路徑只寫最新一日。
+
+    最大風險是**分批計算的邊界**：MA60 需 60 個交易日暖身，若 chunk 起點沒有
+    足夠前置資料，邊界日的 ma60 會算錯。live 實測 6 個 chunk 邊界的 ma60 與
+    獨立重算差異皆為 0。
+    """
+
+    def _seed(self, session, n_days: int, n_stocks: int = 3, start=date(2024, 1, 1)):
+        from src.data.schema import DailyPrice
+
+        d = start
+        added = 0
+        while added < n_days:
+            if d.weekday() < 5:
+                for i in range(n_stocks):
+                    px = 100.0 + added + i
+                    session.add(
+                        DailyPrice(
+                            stock_id=f"{1000 + i}",
+                            date=d,
+                            open=px,
+                            high=px + 1,
+                            low=px - 1,
+                            close=px,
+                            volume=1000,
+                            turnover=10000,
+                        )
+                    )
+                added += 1
+            d += timedelta(days=1)
+        session.flush()
+
+    def test_writes_all_dates_not_only_latest(self, db, monkeypatch):
+        """與每日增量路徑的關鍵差異：整個區間都要寫，不是只寫最新一日。"""
+        from src.data.pipeline import backfill_daily_features
+        from src.data.schema import DailyFeature
+
+        self._seed(db, 30)
+        res = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        n_dates = db.query(DailyFeature.date).distinct().count()
+        assert res["dates"] == n_dates > 1, "應寫入多個日期"
+
+    def test_skips_already_computed_dates(self, db, monkeypatch):
+        from src.data.pipeline import backfill_daily_features
+
+        self._seed(db, 20)
+        first = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        second = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        assert first["dates"] > 0
+        assert second["dates"] == 0, "續跑應跳過已計算日期"
+        assert second["skipped_dates"] == first["dates"]
+
+    def test_features_are_backward_looking_only(self, db, monkeypatch):
+        """PIT：D 日的 ma20 只能用 <= D 的收盤價。"""
+        import pandas as pd
+
+        from src.data.pipeline import backfill_daily_features
+        from src.data.schema import DailyFeature, DailyPrice
+
+        self._seed(db, 40, n_stocks=1)
+        backfill_daily_features(date(2024, 1, 1), date(2024, 3, 31), min_stocks_per_day=1)
+
+        px = pd.DataFrame(
+            db.query(DailyPrice.date, DailyPrice.close).filter_by(stock_id="1000").order_by(DailyPrice.date).all(),
+            columns=["date", "close"],
+        )
+        feats = db.query(DailyFeature.date, DailyFeature.ma20).filter_by(stock_id="1000").all()
+        assert feats
+        for d, ma20 in feats:
+            if ma20 is None:
+                continue
+            expected = px[px["date"] <= d]["close"].tail(20).mean()
+            assert abs(ma20 - expected) < 1e-9, f"{d} 的 ma20 用到了未來資料"
+
+    def test_low_coverage_days_skipped(self, db, monkeypatch):
+        """DailyPrice 覆蓋不足的日期不計算特徵（避免用殘缺資料算 rolling）。"""
+        from src.data.pipeline import backfill_daily_features
+
+        self._seed(db, 20, n_stocks=3)
+        res = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1000)
+        assert res["dates"] == 0
+
+    def test_empty_range_is_noop(self, db, monkeypatch):
+        from src.data.pipeline import backfill_daily_features
+
+        res = backfill_daily_features(date(2024, 3, 1), date(2024, 1, 1))
+        assert res == {"dates": 0, "rows": 0, "skipped_dates": 0}
+
+    def test_shared_compute_function_is_used_by_both_paths(self):
+        """SSOT：每日路徑與回補路徑必須呼叫同一個計算函數。
+
+        兩邊算式若漂移，歷史特徵與今日特徵就不同質，PIT 重放得到的 universe
+        便不是當時真正會產生的那個。
+        """
+        import inspect
+
+        from src.data import pipeline as pl
+
+        for fn in (pl.compute_and_store_daily_features, pl.backfill_daily_features):
+            assert "compute_feature_columns" in inspect.getsource(fn), f"{fn.__name__} 未使用共用計算函數"

@@ -839,6 +839,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="要回補的資料集（逗號分隔：price/institutional/margin）",
     )
     sp_bf.add_argument("--skip-delisting", action="store_true", help="跳過下市清單同步")
+    sp_bf.add_argument(
+        "--features-only",
+        action="store_true",
+        help="只回補 DailyFeature（B1②，純 CPU 不打 API；需 DailyPrice 已就緒）",
+    )
+    sp_bf.add_argument("--with-features", action="store_true", help="價量回補完成後接著回補 DailyFeature")
     sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
 
     # rotation 子命令（輪動組合部位控制）

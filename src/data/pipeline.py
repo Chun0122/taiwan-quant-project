@@ -1836,6 +1836,68 @@ def save_rotation_backtest(result) -> int:
 # ────────────────────────────────────────────────────────────────
 
 
+DAILY_FEATURE_COLUMNS: list[str] = [
+    "stock_id",
+    "date",
+    "close",
+    "volume",
+    "turnover",
+    "ma20",
+    "ma60",
+    "volume_ma20",
+    "turnover_ma5",
+    "turnover_ma20",
+    "momentum_20d",
+    "volatility_20d",
+    "turnover_ratio_5d_20d",
+    "high_20d",
+    "computed_at",
+]
+
+
+def compute_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """在既有 DailyPrice 明細上向量化計算 DailyFeature 各欄（純函數）。
+
+    B1②（2026-08-04）抽出為共用實作：每日增量路徑
+    （`compute_and_store_daily_features`）與歷史回補路徑
+    （`backfill_daily_features`）必須用**完全相同**的算式，否則歷史特徵與
+    今日特徵不同質，PIT 重放出來的 universe 就不是當時真正會得到的那個。
+
+    輸入需已按 (stock_id, date) 排序且過濾掉 volume<=0 / close 無效者。
+    所有 rolling 皆為**後視窗**，天然不會用到未來資料。
+
+    Args:
+        df: 含 stock_id / date / high / close / volume / turnover 的明細。
+
+    Returns:
+        原 df 加上各特徵欄（原地修改後回傳同一物件）。
+    """
+    g_close = df.groupby("stock_id")["close"]
+    g_vol = df.groupby("stock_id")["volume"]
+    g_turnover = df.groupby("stock_id")["turnover"]
+
+    df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
+    df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
+    df["turnover_ma20"] = g_turnover.transform(lambda s: s.rolling(20, min_periods=10).mean())
+
+    # 20 日報酬率 (%)
+    df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
+
+    # 20 日年化波動率 (%)
+    df["volatility_20d"] = g_close.transform(
+        lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
+    )
+
+    # 5日/20日成交金額比（相對流動性：偵測「突然被市場關注」的股票）
+    df["turnover_ratio_5d_20d"] = df["turnover_ma5"] / df["turnover_ma20"].replace(0, float("nan"))
+
+    # 20 日最高價（突破型過濾：close / high_20d >= 0.9 確認真突破）
+    df["high_20d"] = df.groupby("stock_id")["high"].transform(lambda s: s.rolling(20, min_periods=10).max())
+    return df
+
+
 def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day: int = 1000) -> int:
     """計算並儲存全市場每日特徵到 DailyFeature 表（Feature Store）。
 
@@ -1890,32 +1952,7 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
         )
 
     logger.info("[DailyFeature] 共 %d 筆有效資料，開始向量化計算...", len(df))
-
-    # 向量化 rolling 計算（groupby + transform，無 Python for-loop）
-    g_close = df.groupby("stock_id")["close"]
-    g_vol = df.groupby("stock_id")["volume"]
-    g_turnover = df.groupby("stock_id")["turnover"]
-
-    df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=10).mean())
-    df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
-    df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
-    df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
-    df["turnover_ma20"] = g_turnover.transform(lambda s: s.rolling(20, min_periods=10).mean())
-
-    # 20 日報酬率 (%)
-    df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
-
-    # 20 日年化波動率 (%)
-    df["volatility_20d"] = g_close.transform(
-        lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
-    )
-
-    # 5日/20日成交金額比（相對流動性：偵測「突然被市場關注」的股票）
-    df["turnover_ratio_5d_20d"] = df["turnover_ma5"] / df["turnover_ma20"].replace(0, float("nan"))
-
-    # 20 日最高價（突破型過濾：close / high_20d >= 0.9 確認真突破）
-    g_high = df.groupby("stock_id")["high"]
-    df["high_20d"] = g_high.transform(lambda s: s.rolling(20, min_periods=10).max())
+    df = compute_feature_columns(df)
 
     # 只取最新一日（增量更新策略），並加最低覆蓋率守門
     # 防止「watchlist 子集先寫 DailyPrice → sync-features 抓到部分日期當 latest」的污染
@@ -1973,6 +2010,138 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
     )
     logger.info("[DailyFeature] 已寫入 %d 筆（日期 %s）", written, latest_date)
     return written
+
+
+def backfill_daily_features(
+    start: date,
+    end: date | None = None,
+    *,
+    chunk_days: int = 90,
+    lookback_buffer_days: int = 130,
+    min_stocks_per_day: int = 1000,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """回補歷史 `DailyFeature`（B1②）— PIT universe 過濾的資料前提。
+
+    `compute_and_store_daily_features()` 是**增量**設計：只寫最新一日，且錨在
+    `date.today()`。PIT 重放需要「當時那一天的特徵」，故需本函數逐日補齊歷史。
+
+    ## PIT 正確性
+
+    所有 rolling 皆為後視窗，計算 D 日特徵時只會用到 <= D 的資料，天然無
+    look-ahead。為使 chunk 邊界的 MA60 正確，每個 chunk 會**多讀
+    `lookback_buffer_days` 天**作為暖身，但只寫入 chunk 區間內的日期。
+
+    ## 續跑
+
+    以 DB 現況為準：`daily_feature` 已有的日期直接跳過，中斷後重跑自動續行。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        chunk_days: 每批處理的日曆天數（控制記憶體；90 天 ≈ 40 萬筆）。
+        lookback_buffer_days: 每批往前多讀的暖身天數（須 > MA60 所需交易日）。
+        min_stocks_per_day: 該日 DailyPrice 少於此數視為覆蓋不足，不計算特徵。
+        dry_run: 只估算待補日數，不計算也不寫入。
+
+    Returns:
+        {"dates": N, "rows": M, "skipped_dates": S}
+    """
+    init_db()
+    result = {"dates": 0, "rows": 0, "skipped_dates": 0}
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("[DailyFeature 回補] 範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    with get_session() as session:
+        # 有足夠 DailyPrice 覆蓋、值得算特徵的日期
+        price_dates = {
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                .group_by(DailyPrice.date)
+                .having(func.count(DailyPrice.id) >= min_stocks_per_day)
+            ).all()
+        }
+        done_dates = {
+            r[0]
+            for r in session.execute(
+                select(DailyFeature.date).where(DailyFeature.date >= start, DailyFeature.date <= end).distinct()
+            ).all()
+        }
+
+    pending = sorted(price_dates - done_dates)
+    result["skipped_dates"] = len(price_dates & done_dates)
+    logger.info(
+        "[DailyFeature 回補] %s ~ %s：待補 %d 日（已有 %d 日），chunk=%d 天",
+        start,
+        end,
+        len(pending),
+        result["skipped_dates"],
+        chunk_days,
+    )
+    if dry_run or not pending:
+        return result
+
+    pending_set = set(pending)
+    cursor = pending[0]
+    last = pending[-1]
+    while cursor <= last:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), last)
+        targets = sorted(d for d in pending_set if cursor <= d <= chunk_end)
+        if not targets:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        warm_start = cursor - timedelta(days=lookback_buffer_days)
+        with get_session() as session:
+            rows = session.execute(
+                select(
+                    DailyPrice.stock_id,
+                    DailyPrice.date,
+                    DailyPrice.high,
+                    DailyPrice.close,
+                    DailyPrice.volume,
+                    DailyPrice.turnover,
+                ).where(DailyPrice.date >= warm_start, DailyPrice.date <= chunk_end)
+            ).all()
+
+        if not rows:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        df = pd.DataFrame(rows, columns=["stock_id", "date", "high", "close", "volume", "turnover"])
+        df = df[(df["volume"] > 0) & df["close"].notna() & (df["close"] > 0)]
+        df = df.sort_values(["stock_id", "date"])
+        if df.empty:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        df = compute_feature_columns(df)
+        df_out = df[df["date"].isin(targets)].copy()
+        df_out["computed_at"] = pd.Timestamp.utcnow()
+        df_out = df_out[DAILY_FEATURE_COLUMNS].reset_index(drop=True)
+
+        update_cols = [c for c in DAILY_FEATURE_COLUMNS if c not in ("stock_id", "date")]
+        written = _upsert_batch(DailyFeature, df_out, ["stock_id", "date"], update_cols=update_cols)
+        result["dates"] += len(targets)
+        result["rows"] += written
+        logger.info(
+            "[DailyFeature 回補] %s ~ %s：%d 日 / %d 筆（累計 %d 日 / %d 筆）",
+            targets[0],
+            targets[-1],
+            len(targets),
+            written,
+            result["dates"],
+            result["rows"],
+        )
+        cursor = chunk_end + timedelta(days=1)
+
+    logger.info("[DailyFeature 回補] 完成 — %d 日 / %d 筆", result["dates"], result["rows"])
+    return result
 
 
 def sync_concepts_from_yaml(
