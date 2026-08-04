@@ -94,6 +94,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
+| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣 |
 | `discovery/ic_governance.py` | **IC 可執法性 SSOT**（P0 #16）：`select_enforceable_ic()` 三道閘門（窗口時效 `holding+14` 天／窗口數 ≥3／最小樣本 ≥100）+ `ICVerdict`；決策 IC = 最近 3 窗平均。M2 停用、scanner 門檻加成、rotation 阻擋買入三處共用 |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
@@ -145,7 +146,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Regime 冪等（P0 #15）** | `MarketRegimeDetector().detect()` 對**同一 TAIEX 資料日**恆等：呼叫端可自由 `MarketRegimeDetector()` 新建實例（現況 10+ 處），跨實例/跨行程都拿到同一 regime，hysteresis 每個資料日只推進一次。**勿**改回以 `date.today()` 為鍵——morning-routine Step 0 在同步前執行，會把 regime 凍結在前一交易日。回傳 `state_advanced` 標示本次是否推進 |
-| **PIT 時間注入（B1）** | `MarketScanner.run(as_of=...)` 是唯一注入點；引擎層一律用 `self._as_of()`，**禁止裸 `date.today()`**（`tests/test_pit.py` 靜態守門，純函數則須加 `as_of` 參數）。查詢一律加時間上界；基本面另套公布時滯（`data/pit.py`）——`MonthlyRevenue.date` 是營收月份不是公布日，直接用 `<= as_of` 會漏未來。`as_of` 為歷史日時自動 offline，禁止一切外部補抓。shared 與 DB 兩路徑須套**相同**上界 |
+| **PIT 時間注入（B1）** | `MarketScanner.run(as_of=...)` 與 `MarketRegimeDetector.detect(as_of=...)` 是兩個注入點（regime 驅動權重/門檻/模式封鎖，漏了它重放就不成立）；歷史 as_of 時 regime 走**唯讀**路徑不推進狀態機；引擎層一律用 `self._as_of()`，**禁止裸 `date.today()`**（`tests/test_pit.py` 靜態守門，純函數則須加 `as_of` 參數）。查詢一律加時間上界；基本面另套公布時滯（`data/pit.py`）——`MonthlyRevenue.date` 是營收月份不是公布日，直接用 `<= as_of` 會漏未來。`as_of` 為歷史日時自動 offline，禁止一切外部補抓。shared 與 DB 兩路徑須套**相同**上界 |
 | **IC 執法治理（P0 #16）** | 任何「因 IC 而自動行動」一律先過 `ic_governance.select_enforceable_ic()`：不可執法時只告警。**IC 反向不再跳過掃描**——五模式恆掃恆落庫（否則模式產不出 `discovery_record`，IC 無從重算而自鎖），停用只作用在 rotation 層（`resolve_rankings(exclude_modes=...)` 阻擋新買入，賣出/停損/到期不受影響）。backtest 路徑**刻意不套用**（今日裁定套到歷史日＝look-ahead）。新增 IC 驅動開關時務必沿用此模組，勿再自行 `iloc[-1]` |
 | **E2b/E2c 凍結中（P0 #17）** | IC 自動調權（E2b）與分數翻轉/中性化（E2c）**預設不生效**，開關在 `quant.ic_governance`（兩者 false）。凍結只在唯一套用點 `_score_candidates`——底層純函數與 `_apply_ic_weight_adjustment` 行為不變，**仍照常計算並記錄** would-be 動作（log 標【凍結中，未生效】）。`_ic_actions` 凍結時留空，避免 CLI 的 (N)/(F)/(D) 誤示為已套用。**解凍前提**：B2 落地 + `valuation`/`dividend` 維度納入落庫 + 改用標準誤顯著性判定，詳 `config.py:ICGovernanceConfig` |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
@@ -168,7 +169,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 ### CLI 設計原則
 
-- 入口：`python main.py <子命令>`（50 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
+- 入口：`python main.py <子命令>`（51 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
 - 每日例行：`morning-routine`（Step 0~18 + 子步驟 8b/8c/8d/8e/9b/11b，含全市場同步 + discover + 風控 + 通知）
   - Step 8e「同步後 regime 重解」：Step 0 宏觀預檢在同步**之前**執行，其 regime 只到前一交易日；Step 12 輪動須用同步後的判定（`resolve_regime_after_sync()`，dry_run/skip_sync 跳過）
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
@@ -180,7 +181,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2772 測試 / 106 檔）
+- **執行**：`pytest -v`（2787 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

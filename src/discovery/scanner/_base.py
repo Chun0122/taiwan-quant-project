@@ -236,7 +236,7 @@ class MarketScanner:
         try:
             from src.regime.detector import MarketRegimeDetector
 
-            regime_info = MarketRegimeDetector().detect()
+            regime_info = MarketRegimeDetector().detect(as_of=self.scan_date)
             self.regime = regime_info["regime"]
             logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
         except Exception:
@@ -633,6 +633,10 @@ class MarketScanner:
             universe_stats.get("final_candidates", 0),
         )
         # P1 任務 8：落庫 universe stats 供 dashboard 時序分析
+        # B1④：PIT 重放為唯讀——不得把歷史重放的統計寫進 live 表，否則
+        # dashboard 的時序分析會混入「事後重跑」的列，與當日真實掃描無法分辨。
+        if self._is_offline():
+            return universe_ids
         from src.discovery.universe import log_universe_stats
 
         log_universe_stats(

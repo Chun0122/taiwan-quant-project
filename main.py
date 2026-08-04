@@ -128,6 +128,7 @@ from src.cli.misc_cmd import (
     cmd_migrate,
     cmd_notify,
     cmd_optimize,
+    cmd_pit_replay,
     cmd_report,
     cmd_scan,
     cmd_schedule,
@@ -826,6 +827,24 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate 子命令
     subparsers.add_parser("migrate", help="執行資料庫 schema 遷移")
 
+    # pit-replay 子命令（B1④ PIT 歷史重放）
+    sp_pit = subparsers.add_parser("pit-replay", help="PIT 歷史重放：在歷史日重跑 scanner 並評估前瞻報酬")
+    sp_pit.add_argument(
+        "mode",
+        nargs="?",
+        default="momentum",
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="掃描模式（預設 momentum）",
+    )
+    sp_pit.add_argument("--date", default=None, help="單一基準日 YYYY-MM-DD")
+    sp_pit.add_argument("--start", default=None, help="範圍起始日（與 --date 二擇一）")
+    sp_pit.add_argument("--end", default=None, help="範圍結束日；省略＝今日")
+    sp_pit.add_argument("--every", type=int, default=20, help="每 N 個交易日取樣一次（預設 20≈每月）")
+    sp_pit.add_argument("--top", type=int, default=20, help="每次取前 N 名（預設 20）")
+    sp_pit.add_argument("--horizons", default="5,10,20", help="前瞻交易日數，逗號分隔（預設 5,10,20）")
+    sp_pit.add_argument("--export", default=None, help="明細匯出 CSV 路徑")
+    sp_pit.add_argument("--dry-run", action="store_true", help="只列出將重放的基準日與預估時間")
+
     # backfill-history 子命令（B1① PIT 歷史回補）
     sp_bf = subparsers.add_parser(
         "backfill-history",
@@ -1053,6 +1072,8 @@ def main() -> None:
         cmd_migrate(args)
     elif args.command == "backfill-history":
         cmd_backfill_history(args)
+    elif args.command == "pit-replay":
+        cmd_pit_replay(args)
     elif args.command == "export":
         cmd_export(args)
     elif args.command == "import-data":

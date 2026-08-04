@@ -288,8 +288,10 @@ class TestMarketScannerIntegration:
 
             _get_universe_ids = MarketScanner._get_universe_ids
             # B1：_get_universe_ids 改以 _as_of() 取基準日（PIT 單一時間來源），
-            # stub 需一併借用；此處 scan_date 已固定為 2026-05-17。
+            # 並在 offline（PIT 重放）時提前返回不寫 log；stub 需一併借用這兩個方法。
+            # 此處 scan_date 固定為 2026-05-17，_offline 未設 → 視為今日掃描會寫 log。
             _as_of = MarketScanner._as_of
+            _is_offline = MarketScanner._is_offline
 
         # 由於 log_universe_stats 是在 _get_universe_ids 內 `from ... import` 拉進來的，
         # 我們需要 patch source module 而非 _base 模組

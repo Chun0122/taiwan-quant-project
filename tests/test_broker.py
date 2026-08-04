@@ -869,7 +869,10 @@ class TestStage25AutoFetch:
         import src.regime.detector as regime_module
 
         monkeypatch.setattr(
-            regime_module.MarketRegimeDetector, "detect", lambda self: {"regime": "bull", "taiex_close": 20000.0}
+            regime_module.MarketRegimeDetector,
+            "detect",
+            # 需接受 as_of：Stage 0 自 B1 起以 detect(as_of=...) 呼叫
+            lambda self, as_of=None: {"regime": "bull", "taiex_close": 20000.0},
         )
 
         scanner.run()

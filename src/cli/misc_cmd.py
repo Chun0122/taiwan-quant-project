@@ -441,6 +441,86 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
         print(f"  DailyFeature {fr['dates']} 日 / {fr['rows']} 筆")
 
 
+def cmd_pit_replay(args: argparse.Namespace) -> None:
+    """PIT 歷史重放（B1④）——在歷史日重跑 scanner 並評估前瞻報酬。
+
+    唯讀：不寫入 DiscoveryRecord / CandidateFactorLog / universe_stat_log，
+    regime 亦不推進狀態機。
+    """
+    from datetime import date as _date
+
+    from src.discovery.pit_replay import (
+        compute_forward_returns,
+        replay_scan,
+        sample_replay_dates,
+        summarize_replays,
+    )
+
+    horizons = tuple(int(h) for h in args.horizons.split(",") if h.strip())
+
+    if args.date:
+        dates = [_date.fromisoformat(args.date)]
+    else:
+        start = _date.fromisoformat(args.start)
+        end = _date.fromisoformat(args.end) if args.end else _date.today()
+        dates = sample_replay_dates(start, end, args.every)
+        if not dates:
+            print("指定區間內無具備全市場資料的交易日——請先執行 backfill-history")
+            return
+
+    est_min = len(dates) * 90 / 60
+    print(f"PIT 重放：mode={args.mode}　{len(dates)} 個基準日　預估 {est_min:.0f} 分鐘")
+    print(f"  前瞻窗口：{', '.join(f'{h}d' for h in horizons)}　（唯讀，不寫入任何 live 資料表）\n")
+    if args.dry_run:
+        print("  " + ", ".join(str(d) for d in dates[:10]) + (" ..." if len(dates) > 10 else ""))
+        return
+
+    collected = []
+    print(f"{'基準日':<12}{'regime':<10}{'掃描':>6}{'粗篩':>6}{'產出':>6}   前瞻均報酬")
+    print("-" * 68)
+    for d in dates:
+        try:
+            res = replay_scan(args.mode, d, top_n=args.top)
+        except Exception as exc:  # noqa: BLE001 — 單日失敗不中斷整批
+            print(f"{str(d):<12}重放失敗：{exc}")
+            continue
+        if res.picks.empty:
+            print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{0:>6}   （無選股）")
+            continue
+        withfwd = compute_forward_returns(res.picks, d, horizons)
+        collected.append(withfwd)
+        summary = "  ".join(
+            f"{h}d={withfwd[f'fwd_{h}d'].mean():+.2f}%" if withfwd[f"fwd_{h}d"].notna().any() else f"{h}d=—"
+            for h in horizons
+        )
+        print(
+            f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}"
+            f"{res.n_picks:>6}   {summary}"
+        )
+
+    if not collected:
+        print("\n無任何選股結果可彙總")
+        return
+
+    print(f"\n{'=' * 68}")
+    print(f"彙總（{args.mode}，{len(collected)} 個有效基準日）")
+    print(f"{'=' * 68}")
+    summary_df = summarize_replays(collected, horizons)
+    print(f"{'窗口':<8}{'樣本':>7}{'平均':>9}{'中位':>9}{'勝率':>8}{'最佳':>9}{'最差':>9}")
+    print("-" * 60)
+    for _, r in summary_df.iterrows():
+        print(
+            f"{r['horizon']:<8}{int(r['n']):>7}{r['avg_return']:>8.2f}%{r['median']:>8.2f}%"
+            f"{r['win_rate']:>7.1%}{r['best']:>8.2f}%{r['worst']:>8.2f}%"
+        )
+
+    if args.export:
+        import pandas as _pd
+
+        _pd.concat(collected, ignore_index=True).to_csv(args.export, index=False)
+        print(f"\n明細已匯出：{args.export}")
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     """執行資料品質檢查。"""
     from src.data.validator import export_issues_csv, print_validation_report, run_validation

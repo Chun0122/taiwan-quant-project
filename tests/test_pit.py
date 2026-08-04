@@ -279,9 +279,24 @@ class TestNoBareTodayInEngine:
         #      呼叫端傳 as_of；這正是 §3 原則 4 要求的形態（fallback 才是今日）
         injectable = re.compile(r"^\s*[\w.]+\s*=\s*\w+\s+or\s+date\.today\(\)")
         as_of_fallback = re.compile(r"^\s*return getattr\(self, \"scan_date\", None\) or date\.today\(\)")
+        # regime 模組用 `datetime.date.today()`；同樣只允許「可注入」形態
+        injectable_dt = re.compile(r"^\s*[\w.]+\s*=\s*\w+\s+or\s+datetime\.date\.today\(\)")
+        inline_dt = re.compile(r"\(as_of or datetime\.date\.today\(\)\)")
+        # 逐條列舉的合法例外——**每新增一條都必須寫明為何不是 look-ahead**。
+        # 用精確字串而非放寬 regex，確保例外是刻意的、不會順手擴大。
+        explicit_allow = {
+            # 記錄「何時寫入」的掛鐘時間，非資料日；狀態機的冪等鍵是 data_date
+            "today_str = datetime.date.today().isoformat()",
+            # PIT 判定本身：必須跟真實今日比較才知道這是不是歷史重放
+            "if as_of is not None and as_of < datetime.date.today():",
+        }
 
         offenders: list[str] = []
-        for path in sorted(Path("src/discovery/scanner").glob("*.py")):
+        # 涵蓋 scanner **與 regime**：regime 驅動權重/門檻/模式封鎖，
+        # 2026-08-04 實測 detect() 原本完全沒有時間上界，PIT 重放會用到今天的
+        # TAIEX 與市場寬度——這個縫隙正是因為守門只掃 scanner 而漏掉的。
+        paths = sorted(Path("src/discovery/scanner").glob("*.py")) + sorted(Path("src/regime").glob("*.py"))
+        for path in paths:
             for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 stripped = line.strip()
                 if "date.today()" not in stripped:
@@ -289,6 +304,10 @@ class TestNoBareTodayInEngine:
                 if stripped.startswith("#") or "`date.today()`" in stripped:
                     continue  # 註解 / docstring 內提及
                 if injectable.match(line) or as_of_fallback.match(line):
+                    continue
+                if injectable_dt.match(line) or inline_dt.search(line):
+                    continue
+                if stripped in explicit_allow:
                     continue
                 offenders.append(f"{path.name}:{i}: {stripped}")
         assert offenders == [], (
@@ -342,7 +361,104 @@ def _stub_run_deps(scanner, monkeypatch):
     import src.regime.detector as det_mod
 
     class _FakeDetector:
-        def detect(self):
+        def detect(self, as_of=None):
+            # 需接受 as_of：Stage 0 自 B1 起以 detect(as_of=self.scan_date) 呼叫，
+            # 簽名不符會拋例外並被 Stage 0 吞掉 → regime 退回 sideways → 模式被封鎖
             return {"regime": "bull", "taiex_close": 20000.0}
 
     monkeypatch.setattr(det_mod, "MarketRegimeDetector", lambda *a, **kw: _FakeDetector())
+
+
+# ====================================================================== #
+# F. regime 的 PIT 化（2026-08-04 補）
+# ====================================================================== #
+
+
+class TestRegimePIT:
+    """regime 驅動評分權重、分數門檻、ATR 倍數、universe 乘數與 REGIME_MODE_BLOCK。
+
+    PIT 重放若沿用今日 regime，重放結果毫無意義。實測 `detect()` 原本三個查詢
+    （TAIEX / TW_VIX / US_VIX）**完全沒有時間上界**，且 `_compute_breadth()`
+    直接取 `MAX(DailyFeature.date)`＝今日。這個縫隙之所以漏掉，是因為靜態守門
+    當時只掃 `src/discovery/scanner`——現已擴及 `src/regime`。
+    """
+
+    def _seed_taiex(self, session, closes: list[float], end: date):
+        from src.data.schema import DailyPrice
+
+        for i, c in enumerate(reversed(closes)):
+            d = end - timedelta(days=i)
+            session.add(DailyPrice(stock_id="TAIEX", date=d, open=c, high=c, low=c, close=c, volume=0, turnover=0))
+        session.flush()
+
+    def test_detect_respects_as_of_upper_bound(self, db_session, monkeypatch):
+        """as_of 之後的 TAIEX 不得影響判定。"""
+        import src.data.database as db_mod
+        from src.regime.detector import MarketRegimeDetector
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        # 前 130 天穩定上升（bull），as_of 之後暴跌（若洩題會變 crisis）
+        rising = [15000 + i * 30 for i in range(130)]
+        self._seed_taiex(db_session, rising, date(2026, 3, 1))
+        crash = [18000, 16000, 14000, 12000]
+        self._seed_taiex(db_session, crash, date(2026, 3, 5))
+
+        r = MarketRegimeDetector().detect(as_of=date(2026, 3, 1))
+        assert r["regime"] != "crisis", "as_of 之後的崩盤不得洩入歷史判定"
+        assert r["taiex_close"] == pytest.approx(rising[-1])
+
+    def test_pit_replay_does_not_persist_state(self, db_session, monkeypatch):
+        """歷史重放為 read-only——不得推進 live 狀態機。"""
+        import src.data.database as db_mod
+        from src.data.schema import RegimeStateLog
+        from src.regime.detector import MarketRegimeDetector
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        self._seed_taiex(db_session, [15000 + i * 30 for i in range(130)], date(2026, 3, 1))
+
+        before = db_session.query(RegimeStateLog).count()
+        r = MarketRegimeDetector().detect(as_of=date(2026, 3, 1))
+        after = db_session.query(RegimeStateLog).count()
+
+        assert after == before, "PIT 重放不得寫入 RegimeStateLog"
+        assert r["state_advanced"] is False
+        assert r["transition_info"]["reason"] == "pit_replay_readonly"
+
+    def test_breadth_respects_as_of(self, db_session, monkeypatch):
+        """市場寬度取 <= as_of 的最新 DailyFeature，非今日。"""
+        import src.data.database as db_mod
+        from src.data.schema import DailyFeature
+        from src.regime.detector import MarketRegimeDetector
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        for d, below in ((date(2026, 3, 1), False), (date(2026, 6, 1), True)):
+            for i in range(10):
+                close, ma20 = (90.0, 100.0) if below else (110.0, 100.0)
+                db_session.add(
+                    DailyFeature(stock_id=f"{1000 + i}", date=d, close=close, volume=1, turnover=1, ma20=ma20)
+                )
+        db_session.flush()
+
+        assert MarketRegimeDetector._compute_breadth(date(2026, 3, 1)) == pytest.approx(0.0)
+        assert MarketRegimeDetector._compute_breadth(date(2026, 6, 1)) == pytest.approx(1.0)
