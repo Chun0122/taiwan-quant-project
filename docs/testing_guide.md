@@ -10,7 +10,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 
 ## 測試統計
 
-- **2808 個測試**，107 個測試檔
+- **2813 個測試**，107 個測試檔
 - Fixtures：`tests/conftest.py`（`in_memory_engine` / `db_session` / `sample_ohlcv`）
 - 共用建構函數：`tests/scanner_helpers.py`
 
@@ -31,7 +31,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_ml_strategy.py` | `strategy/ml_strategy.py` | 純函數 |
 | `test_backtest_engine.py` | `backtest/engine.py` + `metrics.py` | 純函數+mock |
 | `test_twse_helpers.py` | `data/twse_fetcher.py` | 純函數 |
-| `test_scanner.py` | `discovery/scanner/` 全模組 | 純函數 |
+| `test_scanner.py` | `discovery/scanner/` 全模組 + 粗篩 fail-closed 契約（§6.5 #19） | 純函數 |
 | `test_mops.py` | `mops_fetcher.py` + scanner 消息面 | 純函數+SQLite |
 | `test_regime.py` | `regime/detector.py` | 純函數 |
 | `test_regime_idempotence.py` | `regime/detector.py` 冪等閘門（P0 #15）+ morning `resolve_regime_after_sync` | 純函數+SQLite |

@@ -3462,6 +3462,42 @@ class MarketScanner:
 
         return result, sector_capped_ids, pool_ids
 
+    def _require_coarse_data(self, df: pd.DataFrame, *, table: str, gate: str) -> bool:
+        """定義性資料是否就緒——缺席時記 WARN 並回 False，呼叫端**必須** fail-closed。
+
+        ## 為什麼不能 fail-open
+
+        粗篩的定義性閘門（value 的 PE/殖利率、dividend 的殖利率、growth 的營收
+        YoY）是「這個模式之所以是這個模式」的條件。資料缺席時若跳過閘門而非
+        收斂，模式會**靜默變成另一個模式**——實測 2026-08-04 的 PIT 重放：
+        `stock_valuation` 在 2026-01-26 前無資料，ValueScanner 的估值閘門整段
+        被跳過，實際跑的是「基本過濾 + 成交量排名 + 法人淨買超 + 5 日動能」，
+        即流動性篩選。
+
+        危險之處在於**失效方向偏樂觀且無聲**：value 因此在 30 個基準日全數選出
+        18.7 檔（產能率 100%、五模式之冠），看起來是最強的模式，實際上只是閘門
+        沒有執行。若非實查資料表，該次審計會得出完全相反的結論。
+
+        Args:
+            df: 定義性資料表載入後的 DataFrame。
+            table: 資料表名稱，用於 log。
+            gate: 這份資料所支撐的閘門名稱，用於 log。
+
+        Returns:
+            True＝資料就緒可繼續；False＝呼叫端須回傳空 DataFrame。
+        """
+        if df is not None and not df.empty:
+            return True
+        logger.warning(
+            "[%s] Stage 2 粗篩中止：%s 於 %s 無資料，%s 閘門無法執行。"
+            "本模式改為不產出（fail-closed）——放行會使模式靜默退化為流動性篩選",
+            self.mode_name,
+            table,
+            self._as_of(),
+            gate,
+        )
+        return False
+
     def _reload_valuation(self, stock_ids: list[str]) -> None:
         """重新載入估值資料（補抓後 DB 已更新）。供 ValueScanner / DividendScanner 呼叫。"""
         cutoff = self._as_of() - timedelta(days=self.lookback_days + 10)

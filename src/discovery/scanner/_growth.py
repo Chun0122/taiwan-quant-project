@@ -185,18 +185,19 @@ class GrowthScanner(MarketScanner):
             df_revenue = self._load_revenue_data(months=1)
             self._coarse_revenue = df_revenue
 
-        if not df_revenue.empty:
-            filtered = filtered.merge(
-                df_revenue[["stock_id", "yoy_growth"]],
-                on="stock_id",
-                how="left",
-            )
-            # 必須有營收資料且 YoY > 10%
-            has_rev = filtered["yoy_growth"].notna()
-            yoy_ok = filtered["yoy_growth"] > 10.0
-            filtered = filtered[has_rev & yoy_ok].copy()
-        else:
+        # 營收缺席時 fail-closed（本模式原本即如此，改走共用守門以統一語意與 log）
+        if not self._require_coarse_data(df_revenue, table="monthly_revenue", gate="營收 YoY>10%"):
             return pd.DataFrame()
+
+        filtered = filtered.merge(
+            df_revenue[["stock_id", "yoy_growth"]],
+            on="stock_id",
+            how="left",
+        )
+        # 必須有營收資料且 YoY > 10%
+        has_rev = filtered["yoy_growth"].notna()
+        yoy_ok = filtered["yoy_growth"] > 10.0
+        filtered = filtered[has_rev & yoy_ok].copy()
 
         if filtered.empty:
             return pd.DataFrame()
