@@ -15,7 +15,12 @@ import pandas as pd
 from sqlalchemy import select
 
 from src.config import settings
-from src.constants import DISCOVERY_IC_HOLDING_DAYS_MAP, DISCOVERY_KEY_FACTOR_MAP
+from src.constants import (
+    DISCOVERY_IC_HOLDING_DAYS_MAP,
+    DISCOVERY_KEY_FACTOR_MAP,
+    VALUATION_FRESH_WINDOW_DAYS,
+    VALUATION_MIN_FRESH_STOCKS,
+)
 from src.data.database import get_session
 from src.data.pit import financial_visible_cutoff, is_pit_replay, revenue_visible_cutoff
 from src.data.schema import (
@@ -3483,18 +3488,33 @@ class MarketScanner:
 
         B1 offline：PIT 重放時直接返回（縱深防禦——`run()` 已擋一層，此處再擋，
         避免日後有人直接呼叫本方法而繞過 offline 保護）。
+
+        ⚠ **覆蓋率必須看「近期」而非「全表」**（2026-08-05 修）。原本數的是
+        `stock_valuation` **全表的相異 stock_id**，一旦歷史上曾累積 ≥500 檔就
+        永遠不再觸發——而 live 每日真正寫入的只有 `sync_valuation_for_stocks`
+        補的候選池（實測 43~150 檔）。實測 2026-07-31 全表 1,505 檔（閘門關閉）
+        但當日僅 43 檔有估值，value/dividend 因而在 `_coarse_filter` 的
+        `groupby.last()` 拿到**數月前的舊 PE** 評分。改看近 7 日窗口。
         """
         if self._is_offline():
             return
         try:
             from sqlalchemy import func as sa_func
 
+            recent_cutoff = self._as_of() - timedelta(days=VALUATION_FRESH_WINDOW_DAYS)
             with get_session() as session:
-                val_count = session.execute(select(sa_func.count(sa_func.distinct(StockValuation.stock_id)))).scalar()
-            if not val_count or val_count < 500:
+                val_count = session.execute(
+                    select(sa_func.count(sa_func.distinct(StockValuation.stock_id))).where(
+                        StockValuation.date >= recent_cutoff,
+                        StockValuation.date <= self._as_of(),
+                    )
+                ).scalar()
+            if not val_count or val_count < VALUATION_MIN_FRESH_STOCKS:
                 logger.info(
-                    "Stage 0.5: 估值資料僅 %d 支，自動從 TWSE/TPEX 同步全市場估值...",
+                    "Stage 0.5: 近 %d 日估值僅 %d 支（門檻 %d），自動從 TWSE/TPEX 同步全市場估值...",
+                    VALUATION_FRESH_WINDOW_DAYS,
                     val_count or 0,
+                    VALUATION_MIN_FRESH_STOCKS,
                 )
                 from src.data.pipeline import sync_valuation_all_market
 

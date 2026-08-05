@@ -282,6 +282,30 @@ BACKFILL_MIN_COMMON_STOCKS: int = 1500
 # 節流、且每個 dataset 都要跑一輪，再加解析與 upsert。
 SECONDS_PER_BACKFILL_DAY: float = 29.5
 
+# 估值回補（§6.5 #20）：某日 `stock_valuation` 檔數達此值即視為已補而跳過。
+# 門檻遠低於 BACKFILL_MIN_COMMON_STOCKS，因為估值的母體本來就小得多——
+# TWSE `BWIBBU_d` 只收錄有本益比可算的上市普通股（實測 2024-01-02 為 997 檔、
+# 2025-06-05 為 1,041 檔），ETF/權證/虧損股不在內。
+# 800 可乾淨分離「全市場已補（≈1,000）」與「僅候選股補抓（實測 43~150）」。
+BACKFILL_MIN_VALUATION_STOCKS: int = 800
+
+# 上櫃估值逐股回補的續跑門檻：某檔估值日數 ≥ 其價量日數 × 此比例即視為已補。
+# 不用固定日數——上櫃股上市時間不一，新股本來就只有少數交易日。
+# 0.8 而非 1.0：FinMind PER 對停牌/無 EPS 的日子會缺列，要求全等會永遠重抓。
+VALUATION_COVERAGE_RATIO: float = 0.8
+
+# API 節流間隔（秒）——與 CLAUDE.md §2 的速率規則一致，供 ETA 估算與回補迴圈共用
+TWSE_REQUEST_INTERVAL: float = 3.0
+FINMIND_REQUEST_INTERVAL: float = 0.5
+
+# Scanner Stage 0.5「估值覆蓋是否足夠」的判定窗口與門檻（2026-08-05）。
+# **必須看近期窗口而非全表**——原本數全表相異 stock_id，一旦歷史累積 ≥500 檔就
+# 永遠不再觸發全市場同步，而 live 每日只有候選池補抓（實測 43~150 檔）。
+# 後果：value/dividend 的 `_coarse_filter` 以 `groupby.last()` 取最新一筆估值，
+# 拿到的是數月前的舊 PE。窗口取 7 日以容忍假日與 TWSE 收盤後才發布的落差。
+VALUATION_FRESH_WINDOW_DAYS: int = 7
+VALUATION_MIN_FRESH_STOCKS: int = 500
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

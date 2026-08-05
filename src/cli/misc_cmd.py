@@ -399,11 +399,34 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
     """
     from datetime import date as _date
 
-    from src.data.pipeline import backfill_daily_features, backfill_market_history, sync_delisting_info
+    from src.data.pipeline import (
+        backfill_daily_features,
+        backfill_market_history,
+        backfill_valuation_history,
+        sync_delisting_info,
+    )
 
     start = _date.fromisoformat(args.start)
     end = _date.fromisoformat(args.end) if getattr(args, "end", None) else None
     datasets = tuple(s.strip() for s in (args.datasets or "price,institutional,margin").split(",") if s.strip())
+
+    if getattr(args, "valuation_only", False):
+        markets = tuple(
+            s.strip() for s in (getattr(args, "valuation_markets", None) or "twse,tpex").split(",") if s.strip()
+        )
+        print(f"只回補 stock_valuation（§6.5 #20）：{start} ~ {end or '今日'}　市場={','.join(markets)}")
+        print("  上市＝TWSE BWIBBU_d 每日全市場；上櫃＝FinMind 逐股（TPEX 估值端點已下架）")
+        if args.dry_run:
+            print("[dry-run] 僅估算，不實際抓取\n")
+        vr = backfill_valuation_history(start, end, markets=markets, dry_run=args.dry_run)
+        if args.dry_run:
+            print("dry-run 結束——上方 log 已列出待補量與預估時間")
+            return
+        print("\n估值回補完成：")
+        print(f"  上市 交易日 {vr['twse_days']:>6}　筆數 {vr['twse_rows']:>8}")
+        print(f"  上櫃 股票數 {vr['tpex_stocks']:>6}　筆數 {vr['tpex_rows']:>8}")
+        print(f"  已跳過      {vr['skipped_days']:>6} 日 / {vr['skipped_stocks']:>5} 檔（DB 已有）")
+        return
 
     # 先同步下市清單：倖存者偏差修正的前提（知道哪些股票何時下市）
     if not args.skip_delisting:

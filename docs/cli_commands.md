@@ -354,6 +354,55 @@ python main.py import-data daily_price data.csv --dry-run
 
 ---
 
+## PIT 研究環境（B1）
+
+### 歷史回補（`backfill-history`）
+
+長時間作業，**可隨時 Ctrl-C 中止，重跑自動從缺口續行**——進度以 DB 現況判定，不另存進度檔。
+
+```bash
+# 價量回補（TWSE/TPEX 每日全市場端點；含當時在市、如今已下市的標的）
+python main.py backfill-history --start 2024-01-01
+python main.py backfill-history --start 2024-01-01 --end 2024-12-31
+python main.py backfill-history --start 2024-01-01 --dry-run          # 只估算待補日數與時間
+python main.py backfill-history --start 2024-01-01 --datasets price   # 只補日K
+python main.py backfill-history --start 2024-01-01 --with-features    # 補完接著算 DailyFeature
+
+# DailyFeature 歷史化（B1②，純 CPU 不打 API；需 DailyPrice 已就緒）
+python main.py backfill-history --start 2024-01-01 --features-only
+
+# 估值回補（§6.5 #20；上市走 TWSE 每日端點、上櫃走 FinMind 逐股）
+python main.py backfill-history --valuation-only --start 2024-01-01
+python main.py backfill-history --valuation-only --start 2024-01-01 --valuation-markets twse
+python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
+```
+
+**估值為何要分兩條路**：TPEX 的估值端點（`peratio_book/pera_result.php`）**已下架**，所有日期含當日皆 302 導向 `/errors`；新版 openapi 只回當日、無日期參數。故上櫃歷史無官方來源，改走 FinMind `TaiwanStockPER` 逐股（支援日期區間，一檔一次呼叫涵蓋全期間）。上市則走 TWSE `BWIBBU_d`，健在且有完整歷史。
+
+**續跑判定**（不看「有無資料」——那會靜默跳過整段歷史）：
+
+| 資料 | 判定 |
+|------|------|
+| 價量 | 當日**普通股（4 碼）**檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`（1500） |
+| 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800） |
+| 估值/上櫃 | 該檔估值日數 ≥ 其價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
+
+### PIT 歷史重放（`pit-replay`）
+
+在歷史日重跑 scanner 並評估前瞻報酬。**唯讀**——不寫 `DiscoveryRecord` / `CandidateFactorLog` / `universe_stat_log`，regime 亦不推進狀態機。
+
+```bash
+python main.py pit-replay --as-of 2025-04-08 --mode momentum
+python main.py pit-replay --as-of 2025-04-08 --mode value --top-n 20
+python main.py pit-replay --start 2024-01-01 --end 2024-12-31 --mode momentum --every-n-days 20
+```
+
+單次重放約 90 秒，**範圍重放務必抽樣**（`--every-n-days`）。前瞻報酬是唯一允許看 `as_of` 之後資料之處（評分而非決策輸入）。
+
+⚠ 重放結果的有效性受資料覆蓋限制：估值/營收未回補的期間，value/dividend/growth 的粗篩會 **fail-open**（閘門消失而非收緊），模式靜默退化為流動性篩選。解讀前先確認對應期間的基本面資料存在。
+
+---
+
 ## 排程
 
 ```bash

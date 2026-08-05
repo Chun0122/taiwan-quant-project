@@ -68,6 +68,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/pipeline.py` 之 `compute_feature_columns` | **DailyFeature 算式 SSOT**（B1②）：每日增量與歷史回補共用同一實作，兩邊漂移會使歷史特徵與今日特徵不同質、PIT 重放的 universe 失真 |
 | `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead |
 | `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日普通股（4 碼）檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`」**——既不能看「有無資料」（2020~2024 每日皆有 6 檔 watchlist，會靜默跳過 5 年）也不能看總筆數（崩盤日權證無報價會偽陽性、權證多的半套日會偽陰性） |
+| `data/pipeline.py` 之 `backfill_valuation_history` | §6.5 #20 估值回補：**上市走 TWSE `BWIBBU_d` 每日端點、上櫃走 FinMind 逐股**——TPEX 估值端點（`peratio_book/pera_result.php`）已下架（所有日期含當日皆 302 導向 `/errors`），新版 openapi 只回當日無歷史，故上櫃無官方來源。續跑判定：上市看當日檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800，母體僅約 1,000 遠小於價量）、上櫃看該檔估值日數 ≥ 價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
@@ -143,6 +144,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **EAV 指標** | `TechnicalIndicator`（stock_id, date, name, value），`load_data()` pivot 為寬表 |
 | **除權息** | Layer 1 回溯調整 OHLC + 重算指標（保留 `raw_*`）；Layer 2 原始價格交易 + 股利入帳；預設關閉，`--adjust-dividend` 啟用 |
 | **Watchlist** | `get_effective_watchlist()`：DB 優先，`quant_params.yaml` fallback，全模組統一呼叫 |
+| **粗篩不得 fail-open** | 定義性資料（估值/營收）缺席時，`_coarse_filter` 必須**收斂**而非放行。歷史教訓（2026-08-04）：`_value.py` 的 `else` 分支在估值表為空時把 PE/殖利率閘門整段跳過，模式靜默退化成流動性篩選且無 log 警示——2024~2025 的 PIT 重放因此全部失效，且方向偏樂觀（value 看似「產能率 100%、五模式之冠」）。Stage 0.5 的覆蓋率閘門亦須看**近 `VALUATION_FRESH_WINDOW_DAYS` 日窗口**而非全表相異股票數（全表計數一旦累積夠就永不觸發，live 只剩候選池補抓的 43~150 檔） |
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Regime 冪等（P0 #15）** | `MarketRegimeDetector().detect()` 對**同一 TAIEX 資料日**恆等：呼叫端可自由 `MarketRegimeDetector()` 新建實例（現況 10+ 處），跨實例/跨行程都拿到同一 regime，hysteresis 每個資料日只推進一次。**勿**改回以 `date.today()` 為鍵——morning-routine Step 0 在同步前執行，會把 regime 凍結在前一交易日。回傳 `state_advanced` 標示本次是否推進 |
@@ -181,7 +183,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2787 測試 / 107 檔）
+- **執行**：`pytest -v`（2805 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

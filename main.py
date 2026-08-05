@@ -864,6 +864,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="只回補 DailyFeature（B1②，純 CPU 不打 API；需 DailyPrice 已就緒）",
     )
     sp_bf.add_argument("--with-features", action="store_true", help="價量回補完成後接著回補 DailyFeature")
+    sp_bf.add_argument(
+        "--valuation-only",
+        action="store_true",
+        help="只回補 stock_valuation（§6.5 #20：上市走 TWSE 每日端點、上櫃走 FinMind 逐股）",
+    )
+    sp_bf.add_argument(
+        "--valuation-markets",
+        default="twse,tpex",
+        help="估值回補的市場（逗號分隔：twse/tpex），搭配 --valuation-only",
+    )
     sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
 
     # rotation 子命令（輪動組合部位控制）

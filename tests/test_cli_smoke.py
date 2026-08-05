@@ -191,3 +191,61 @@ class TestCmdSyncConceptsSmoke:
         cmd_sync_concepts(argparse.Namespace(from_mops=True, days=90))
         out = capsys.readouterr().out
         assert "MOPS 關鍵字標記完成" in out
+
+
+# ====================================================================== #
+# §6.5 #20：backfill-history --valuation-only 的 parser 與 handler 接線
+# ====================================================================== #
+
+
+class TestValuationBackfillCli:
+    def test_valuation_flags_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["backfill-history", "--valuation-only", "--start", "2024-01-01", "--valuation-markets", "twse"]
+        )
+        assert args.valuation_only is True
+        assert args.valuation_markets == "twse"
+
+    def test_valuation_only_defaults(self):
+        args = build_parser().parse_args(["backfill-history", "--start", "2024-01-01"])
+        assert args.valuation_only is False
+        assert args.valuation_markets == "twse,tpex"
+
+    def test_handler_routes_to_valuation_backfill(self, monkeypatch, capsys):
+        """--valuation-only 必須走估值路徑，且**不得**觸發下市清單同步或價量回補。
+
+        （下市同步會打 FinMind，價量回補會打 TWSE 數小時——誤觸代價很高。）
+        """
+        import src.cli.misc_cmd as misc
+
+        captured = {}
+
+        def _fake_valuation(start, end, *, markets, dry_run=False, **kw):
+            captured["args"] = (start, end, markets, dry_run)
+            return {
+                "twse_days": 3,
+                "twse_rows": 300,
+                "tpex_stocks": 2,
+                "tpex_rows": 20,
+                "skipped_days": 1,
+                "skipped_stocks": 5,
+            }
+
+        def _boom(*a, **kw):
+            raise AssertionError("--valuation-only 不應觸發此路徑")
+
+        monkeypatch.setattr(pipeline_mod, "backfill_valuation_history", _fake_valuation)
+        monkeypatch.setattr(pipeline_mod, "backfill_market_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "sync_delisting_info", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_daily_features", _boom)
+
+        args = build_parser().parse_args(
+            ["backfill-history", "--valuation-only", "--start", "2024-01-01", "--end", "2024-01-31"]
+        )
+        misc.cmd_backfill_history(args)
+
+        assert captured["args"] == (date(2024, 1, 1), date(2024, 1, 31), ("twse", "tpex"), False)
+        out = capsys.readouterr().out
+        assert "估值回補完成" in out
+        assert "300" in out and "20" in out

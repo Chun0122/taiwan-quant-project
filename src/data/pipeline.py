@@ -13,9 +13,13 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from src.config import settings
 from src.constants import (
     BACKFILL_MIN_COMMON_STOCKS,
+    BACKFILL_MIN_VALUATION_STOCKS,
+    FINMIND_REQUEST_INTERVAL,
     PRICE_JUMP_WARN_THRESHOLD,
     SECONDS_PER_BACKFILL_DAY,
+    TWSE_REQUEST_INTERVAL,
     UPSERT_BATCH_SIZE,
+    VALUATION_COVERAGE_RATIO,
 )
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
@@ -1183,6 +1187,199 @@ def backfill_market_history(
         result["daily_price"],
         result["institutional"],
         result["margin"],
+    )
+    return result
+
+
+def backfill_valuation_history(
+    start: date,
+    end: date | None = None,
+    *,
+    markets: tuple[str, ...] = ("twse", "tpex"),
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """回補 `stock_valuation` 歷史（B1① 的基本面缺口，§6.5 #20）。
+
+    ## 為什麼要分兩條路走
+
+    B1① 只補了價量。估值缺口使 value/dividend/growth 的 PIT 重放全部失效
+    （粗篩在估值表為空時 fail-open，模式靜默退化成流動性篩選），
+    詳 `logs/pit_crossmode_20260804/REPORT.md` §3。
+
+    補法依市場分流，因為**兩邊的官方端點狀況不同**：
+
+    - **上市（twse）**：`BWIBBU_d` 每日全市場端點健在且**有完整歷史**
+      （實測 2024-01-02 回傳 997 檔）。一天一次呼叫拿全市場，走這條。
+    - **上櫃（tpex）**：`peratio_book/pera_result.php` **已下架**——所有日期
+      （含當日）皆 302 導向 `/errors`。TPEX 新版 openapi
+      （`tpex_mainboard_peratio_analysis`）只回**當日**、無日期參數。
+      故上櫃歷史**無官方來源**，改走 FinMind `TaiwanStockPER` 逐股。
+
+    逐股看似違反「官方優先」的資料源順序，但這裡沒有官方選項；且
+    FinMind PER 支援日期區間，一檔股票一次呼叫即涵蓋全期間
+    （1,100 檔 × 0.5s ≈ 10 分鐘），比每日端點更省。
+
+    ## 續跑
+
+    與 `backfill_market_history` 同樣**不維護進度檔**，直接以 DB 現況為準：
+
+    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過。
+    - tpex：某檔在區間內的估值日數達該檔**價量日數的 8 成**即視為已補。
+      不用固定門檻——上櫃股上市時間不一，新股本來就只有少數日子有資料。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        markets: 要回補的市場子集（"twse" / "tpex"）。
+        dry_run: 只估算不抓取。
+        progress_every: 每 N 個單位輸出一次進度。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"twse_days": N, "twse_rows": M, "tpex_stocks": K, "tpex_rows": J, "skipped_days": S, "skipped_stocks": T}
+    """
+    from src.data.twse_fetcher import fetch_twse_valuation_all
+
+    init_db()
+    result = {
+        "twse_days": 0,
+        "twse_rows": 0,
+        "tpex_stocks": 0,
+        "tpex_rows": 0,
+        "skipped_days": 0,
+        "skipped_stocks": 0,
+    }
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("估值回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # ---------- 上市：TWSE 每日全市場 ---------- #
+    if "twse" in markets:
+        with get_session() as session:
+            covered = {
+                r[0]
+                for r in session.execute(
+                    select(StockValuation.date)
+                    .where(StockValuation.date >= start, StockValuation.date <= end)
+                    .group_by(StockValuation.date)
+                    .having(func.count(StockValuation.id) >= BACKFILL_MIN_VALUATION_STOCKS)
+                ).all()
+            }
+        pending_days = [
+            d
+            for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
+            if d.weekday() < 5 and d not in covered
+        ]
+        result["skipped_days"] = (end - start).days + 1 - len(pending_days)
+        logger.info(
+            "[估值回補/上市] %s ~ %s：待補 %d 個平日（已跳過 %d 日），預估 %.1f 分鐘",
+            start,
+            end,
+            len(pending_days),
+            result["skipped_days"],
+            len(pending_days) * TWSE_REQUEST_INTERVAL / 60,
+        )
+
+        if not dry_run:
+            for i, d in enumerate(pending_days, 1):
+                if stop_flag is not None and stop_flag():
+                    logger.warning("[估值回補/上市] 收到中止訊號，已完成 %d/%d 日", i - 1, len(pending_days))
+                    break
+                df = fetch_twse_valuation_all(d)
+                if df.empty:
+                    continue  # 假日或該日無資料——不是錯誤
+                result["twse_days"] += 1
+                result["twse_rows"] += _upsert_valuation(df)
+                if result["twse_days"] % progress_every == 0:
+                    logger.info(
+                        "[估值回補/上市] 進度 %d/%d 平日（%s）— 交易日 %d, 累計 %d 筆",
+                        i,
+                        len(pending_days),
+                        d.isoformat(),
+                        result["twse_days"],
+                        result["twse_rows"],
+                    )
+
+    # ---------- 上櫃：FinMind 逐股全區間 ---------- #
+    if "tpex" in markets:
+        with get_session() as session:
+            otc_ids = [
+                r[0]
+                for r in session.execute(
+                    select(StockInfo.stock_id)
+                    .where(StockInfo.listing_type == "tpex")
+                    # 只補普通股：ETF/權證/特別股無 PE 語意
+                    .where(StockInfo.security_type == "stock")
+                    .order_by(StockInfo.stock_id)
+                ).all()
+            ]
+            # 各檔在區間內「已有的估值日數」與「應有的價量日數」
+            val_days = dict(
+                session.execute(
+                    select(StockValuation.stock_id, func.count(func.distinct(StockValuation.date)))
+                    .where(StockValuation.date >= start, StockValuation.date <= end)
+                    .group_by(StockValuation.stock_id)
+                ).all()
+            )
+            price_days = dict(
+                session.execute(
+                    select(DailyPrice.stock_id, func.count(func.distinct(DailyPrice.date)))
+                    .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                    .where(DailyPrice.stock_id.in_(otc_ids))
+                    .group_by(DailyPrice.stock_id)
+                ).all()
+            )
+
+        pending_ids = [
+            sid
+            for sid in otc_ids
+            # 沒有價量的（未上市/已下市於區間外）不必補；有價量者要求估值覆蓋 8 成
+            if price_days.get(sid, 0) > 0 and val_days.get(sid, 0) < price_days[sid] * VALUATION_COVERAGE_RATIO
+        ]
+        result["skipped_stocks"] = len(otc_ids) - len(pending_ids)
+        logger.info(
+            "[估值回補/上櫃] 待補 %d 檔（已跳過 %d 檔），FinMind 逐股，預估 %.1f 分鐘",
+            len(pending_ids),
+            result["skipped_stocks"],
+            len(pending_ids) * FINMIND_REQUEST_INTERVAL / 60,
+        )
+
+        if not dry_run and pending_ids:
+            fetcher = FinMindFetcher()
+            for i, sid in enumerate(pending_ids, 1):
+                if stop_flag is not None and stop_flag():
+                    logger.warning("[估值回補/上櫃] 收到中止訊號，已完成 %d/%d 檔", i - 1, len(pending_ids))
+                    break
+                try:
+                    df = fetcher.fetch_per_pbr(sid, start, end)
+                except Exception:
+                    logger.warning("[估值回補/上櫃] %s 抓取失敗，跳過", sid)
+                    continue
+                if df.empty:
+                    continue
+                result["tpex_stocks"] += 1
+                result["tpex_rows"] += _upsert_valuation(df)
+                if i % progress_every == 0:
+                    logger.info(
+                        "[估值回補/上櫃] 進度 %d/%d 檔（%s）— 有資料 %d 檔, 累計 %d 筆",
+                        i,
+                        len(pending_ids),
+                        sid,
+                        result["tpex_stocks"],
+                        result["tpex_rows"],
+                    )
+
+    logger.info(
+        "[估值回補] 完成 — 上市 %d 日/%d 筆, 上櫃 %d 檔/%d 筆",
+        result["twse_days"],
+        result["twse_rows"],
+        result["tpex_stocks"],
+        result["tpex_rows"],
     )
     return result
 

@@ -537,3 +537,329 @@ class TestBackfillDailyFeatures:
 
         for fn in (pl.compute_and_store_daily_features, pl.backfill_daily_features):
             assert "compute_feature_columns" in inspect.getsource(fn), f"{fn.__name__} 未使用共用計算函數"
+
+
+# ====================================================================== #
+# §6.5 #20：估值歷史回補（backfill_valuation_history）
+# ====================================================================== #
+
+
+def _seed_valuation(session, d: date, n_stocks: int, prefix: int = 1000):
+    from src.data.schema import StockValuation
+
+    for i in range(n_stocks):
+        session.add(StockValuation(stock_id=f"{prefix + i}", date=d, pe_ratio=10.0, pb_ratio=1.0, dividend_yield=3.0))
+    session.flush()
+
+
+class TestValuationBackfillTwse:
+    """上市路徑：TWSE 每日全市場端點 + 以「當日估值檔數」判定續跑。"""
+
+    def test_skips_days_already_covered(self, db, monkeypatch):
+        """已達 BACKFILL_MIN_VALUATION_STOCKS 的日期不得重抓。"""
+        import src.data.twse_fetcher as tw
+        from src.constants import BACKFILL_MIN_VALUATION_STOCKS
+        from src.data.pipeline import backfill_valuation_history
+
+        covered = date(2024, 1, 2)
+        _seed_valuation(db, covered, BACKFILL_MIN_VALUATION_STOCKS)
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+
+        backfill_valuation_history(covered, date(2024, 1, 3), markets=("twse",))
+        assert covered not in called, "已覆蓋日期不應重抓"
+        assert date(2024, 1, 3) in called
+
+    def test_thin_day_is_refetched(self, db, monkeypatch):
+        """只有候選股估值（實測 43~150 檔）的日期必須重抓。
+
+        這正是本次要修的缺口——live 的 `sync_valuation_for_stocks` 每天只補
+        候選池，若門檻設成「有無資料」，整段歷史都會被靜默跳過。
+        """
+        import src.data.twse_fetcher as tw
+        from src.data.pipeline import backfill_valuation_history
+
+        thin = date(2024, 1, 2)
+        _seed_valuation(db, thin, 150)  # live 候選股補抓的典型量
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+
+        backfill_valuation_history(thin, thin, markets=("twse",))
+        assert called == [thin], "僅有候選股估值的日期必須視為未補"
+
+    def test_writes_fetched_rows(self, db, monkeypatch):
+        import src.data.twse_fetcher as tw
+        from src.data.pipeline import backfill_valuation_history
+        from src.data.schema import StockValuation
+
+        d = date(2024, 1, 2)
+        monkeypatch.setattr(
+            tw,
+            "fetch_twse_valuation_all",
+            lambda td: (
+                pd.DataFrame(
+                    [
+                        {
+                            "stock_id": f"{2000 + i}",
+                            "date": td,
+                            "pe_ratio": 12.0,
+                            "pb_ratio": 1.5,
+                            "dividend_yield": 4.0,
+                        }
+                        for i in range(5)
+                    ]
+                )
+                if td == d
+                else pd.DataFrame()
+            ),
+        )
+
+        res = backfill_valuation_history(d, d, markets=("twse",))
+        assert res["twse_days"] == 1
+        rows = db.query(StockValuation).filter(StockValuation.date == d).all()
+        assert len(rows) == 5
+        assert rows[0].pe_ratio == 12.0
+
+    def test_weekend_excluded(self, db, monkeypatch):
+        import src.data.twse_fetcher as tw
+        from src.data.pipeline import backfill_valuation_history
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+        # 2024-01-06/07 為週六日
+        backfill_valuation_history(date(2024, 1, 5), date(2024, 1, 8), markets=("twse",))
+        assert called == [date(2024, 1, 5), date(2024, 1, 8)]
+
+    def test_dry_run_fetches_nothing(self, db, monkeypatch):
+        import src.data.twse_fetcher as tw
+        from src.data.pipeline import backfill_valuation_history
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+        backfill_valuation_history(date(2024, 1, 2), date(2024, 1, 5), markets=("twse",), dry_run=True)
+        assert called == []
+
+
+class TestValuationBackfillTpex:
+    """上櫃路徑：FinMind 逐股 + 以「估值日數 / 價量日數」比例判定續跑。
+
+    TPEX 官方估值端點（`peratio_book/pera_result.php`）已下架——所有日期含當日
+    皆 302 導向 `/errors`，新版 openapi 只回當日無歷史。故上櫃只能走 FinMind。
+    """
+
+    def _seed_otc(self, session, sid: str, price_days: int, val_days: int, start: date):
+        from src.data.schema import StockValuation
+
+        session.add(StockInfo(stock_id=sid, stock_name=f"櫃{sid}", listing_type="tpex", security_type="stock"))
+        for i in range(price_days):
+            session.add(
+                DailyPrice(
+                    stock_id=sid,
+                    date=start + timedelta(days=i),
+                    open=10.0,
+                    high=11.0,
+                    low=9.0,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                )
+            )
+        for i in range(val_days):
+            session.add(
+                StockValuation(
+                    stock_id=sid, date=start + timedelta(days=i), pe_ratio=10.0, pb_ratio=1.0, dividend_yield=3.0
+                )
+            )
+        session.flush()
+
+    def _stub_finmind(self, monkeypatch, requested: list[str]):
+        import src.data.pipeline as pl
+
+        class _F:
+            def fetch_per_pbr(self, sid, s, e):
+                requested.append(sid)
+                return pd.DataFrame(
+                    [{"stock_id": sid, "date": s, "pe_ratio": 9.0, "pb_ratio": 1.1, "dividend_yield": 5.0}]
+                )
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+
+    def test_skips_well_covered_stock(self, db, monkeypatch):
+        """估值覆蓋率達 VALUATION_COVERAGE_RATIO 的個股不得重抓。"""
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        self._seed_otc(db, "6488", price_days=10, val_days=9, start=start)  # 90% ≥ 80%
+        requested: list[str] = []
+        self._stub_finmind(monkeypatch, requested)
+
+        backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+        assert requested == []
+
+    def test_refetches_thin_stock(self, db, monkeypatch):
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        self._seed_otc(db, "6488", price_days=10, val_days=2, start=start)  # 20% < 80%
+        requested: list[str] = []
+        self._stub_finmind(monkeypatch, requested)
+
+        backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+        assert requested == ["6488"]
+
+    def test_stock_without_prices_is_skipped(self, db, monkeypatch):
+        """區間內無價量的個股（尚未上市/早已下市）不必補，避免浪費 API 額度。"""
+        from src.data.pipeline import backfill_valuation_history
+
+        db.add(StockInfo(stock_id="9999", stock_name="無量", listing_type="tpex", security_type="stock"))
+        db.flush()
+        requested: list[str] = []
+        self._stub_finmind(monkeypatch, requested)
+
+        backfill_valuation_history(date(2024, 1, 1), date(2024, 1, 31), markets=("tpex",))
+        assert requested == []
+
+    def test_only_common_stock_backfilled(self, db, monkeypatch):
+        """ETF/權證無本益比語意，不應消耗 FinMind 額度。"""
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        self._seed_otc(db, "6488", price_days=10, val_days=0, start=start)
+        # 同樣有價量、但 security_type 非 stock
+        db.add(StockInfo(stock_id="0056", stock_name="高股息", listing_type="tpex", security_type="etf"))
+        for i in range(10):
+            db.add(
+                DailyPrice(
+                    stock_id="0056",
+                    date=start + timedelta(days=i),
+                    open=10.0,
+                    high=11.0,
+                    low=9.0,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                )
+            )
+        db.flush()
+        requested: list[str] = []
+        self._stub_finmind(monkeypatch, requested)
+
+        backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+        assert requested == ["6488"], "ETF 不應被回補"
+
+    def test_fetch_failure_does_not_abort_run(self, db, monkeypatch):
+        """單一檔失敗不得中斷整輪——回補是長時作業，一檔壞掉全跑白費不可接受。"""
+        import src.data.pipeline as pl
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        for sid in ("6488", "5483"):
+            self._seed_otc(db, sid, price_days=10, val_days=0, start=start)
+
+        class _F:
+            def fetch_per_pbr(self, sid, s, e):
+                if sid == "6488":
+                    raise RuntimeError("API 掛了")
+                return pd.DataFrame(
+                    [{"stock_id": sid, "date": s, "pe_ratio": 9.0, "pb_ratio": 1.1, "dividend_yield": 5.0}]
+                )
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+        res = backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+        assert res["tpex_stocks"] == 1, "5483 仍應被補進來"
+
+
+class TestValuationBackfillCommon:
+    def test_market_subset_respected(self, db, monkeypatch):
+        import src.data.twse_fetcher as tw
+        from src.data.pipeline import backfill_valuation_history
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+        res = backfill_valuation_history(date(2024, 1, 2), date(2024, 1, 3), markets=("tpex",))
+        assert called == [], "markets 未含 twse 時不應打 TWSE 端點"
+        assert res["twse_days"] == 0
+
+    def test_empty_range_is_noop(self, db):
+        from src.data.pipeline import backfill_valuation_history
+
+        res = backfill_valuation_history(date(2024, 3, 1), date(2024, 1, 1))
+        assert res["twse_days"] == 0 and res["tpex_stocks"] == 0
+
+
+# ====================================================================== #
+# §6.5 #20b：Stage 0.5 估值覆蓋閘門必須看「近期窗口」而非全表
+# ====================================================================== #
+
+
+class TestValuationFreshnessGate:
+    """回歸測試：閘門看全表相異股票數 → 一旦歷史累積夠就永遠不再同步。
+
+    實測 2026-07-31：全表 1,505 檔（閘門關閉）但當日僅 43 檔有估值，
+    value/dividend 的 `_coarse_filter` 因而以數月前的舊 PE 評分。
+    """
+
+    def _scanner(self, monkeypatch, db_session, as_of: date):
+        import src.discovery.scanner._base as base_mod
+        from src.discovery.scanner import ValueScanner
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(base_mod, "get_session", lambda: _Ctx())
+        s = ValueScanner.__new__(ValueScanner)
+        s.scan_date = as_of
+        s._offline = False
+        return s
+
+    def _seed(self, session, d: date, n: int):
+        from src.data.schema import StockValuation
+
+        for i in range(n):
+            session.add(StockValuation(stock_id=f"{1000 + i}", date=d, pe_ratio=10.0, pb_ratio=1.0, dividend_yield=3.0))
+        session.flush()
+
+    def test_stale_bulk_does_not_satisfy_gate(self, db_session, monkeypatch):
+        """全表有 1,500 檔但都是半年前的 → 仍須觸發全市場同步。"""
+        import src.data.pipeline as pl
+
+        as_of = date(2026, 8, 3)
+        self._seed(db_session, as_of - timedelta(days=180), 1500)  # 陳舊
+        self._seed(db_session, as_of, 43)  # 當日只有候選池
+
+        synced: list[int] = []
+        monkeypatch.setattr(pl, "sync_valuation_all_market", lambda: synced.append(1) or 0)
+
+        self._scanner(monkeypatch, db_session, as_of)._maybe_sync_valuation()
+        assert synced, "近 7 日僅 43 檔，必須觸發同步"
+
+    def test_fresh_coverage_skips_sync(self, db_session, monkeypatch):
+        import src.data.pipeline as pl
+
+        as_of = date(2026, 8, 3)
+        self._seed(db_session, as_of - timedelta(days=1), 1000)
+
+        synced: list[int] = []
+        monkeypatch.setattr(pl, "sync_valuation_all_market", lambda: synced.append(1) or 0)
+
+        self._scanner(monkeypatch, db_session, as_of)._maybe_sync_valuation()
+        assert not synced, "近 7 日已有 1,000 檔，不應重複同步"
+
+    def test_future_rows_do_not_count(self, db_session, monkeypatch):
+        """PIT：`as_of` 之後的估值不得用來滿足覆蓋率（否則重放會洩題）。"""
+        import src.data.pipeline as pl
+
+        as_of = date(2026, 8, 3)
+        self._seed(db_session, as_of + timedelta(days=1), 1000)  # 未來資料
+
+        synced: list[int] = []
+        monkeypatch.setattr(pl, "sync_valuation_all_market", lambda: synced.append(1) or 0)
+
+        self._scanner(monkeypatch, db_session, as_of)._maybe_sync_valuation()
+        assert synced, "未來資料不得計入覆蓋率"
