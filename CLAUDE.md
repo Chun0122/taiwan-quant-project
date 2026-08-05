@@ -183,7 +183,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2805 測試 / 107 檔）
+- **執行**：`pytest -v`（2808 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

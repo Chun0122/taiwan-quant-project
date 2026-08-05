@@ -1191,6 +1191,21 @@ def backfill_market_history(
     return result
 
 
+def _is_quota_exhausted(exc: Exception) -> bool:
+    """判斷例外是否為 FinMind 配額/流量限制（而非個股層級的錯誤）。
+
+    FinMind 配額用盡回 **402 Payment Required**、超速回 **429**。兩者都代表
+    「再打下去也沒用」，與「這支股票沒資料」性質完全不同——後者該跳過續跑，
+    前者該立刻停手並告訴使用者稍後重跑。
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (402, 429):
+        return True
+    # 部分路徑只剩字串（例如被包過一層），退而求其次比對訊息
+    text = str(exc)
+    return "402" in text or "Payment Required" in text or "429" in text
+
+
 def backfill_valuation_history(
     start: date,
     end: date | None = None,
@@ -1250,6 +1265,7 @@ def backfill_valuation_history(
         "tpex_rows": 0,
         "skipped_days": 0,
         "skipped_stocks": 0,
+        "quota_exhausted": 0,
     }
 
     if end is None:
@@ -1357,8 +1373,22 @@ def backfill_valuation_history(
                     break
                 try:
                     df = fetcher.fetch_per_pbr(sid, start, end)
-                except Exception:
-                    logger.warning("[估值回補/上櫃] %s 抓取失敗，跳過", sid)
+                except Exception as exc:
+                    # 配額用盡與個股錯誤要分開處理：前者續跑只會空轉。
+                    # 實測 2026-08-05 首跑——580 檔後 FinMind 回 402，其後 299 次
+                    # 呼叫全部瞬間失敗（間隔 0 秒），純粹浪費且把真正的原因淹沒在
+                    # 299 行相同的 WARNING 裡。
+                    if _is_quota_exhausted(exc):
+                        logger.error(
+                            "[估值回補/上櫃] FinMind 配額用盡（%s），已完成 %d/%d 檔——"
+                            "配額恢復後重跑本指令即可從缺口續行",
+                            type(exc).__name__,
+                            i - 1,
+                            len(pending_ids),
+                        )
+                        result["quota_exhausted"] = 1
+                        break
+                    logger.warning("[估值回補/上櫃] %s 抓取失敗，跳過：%s", sid, exc)
                     continue
                 if df.empty:
                     continue

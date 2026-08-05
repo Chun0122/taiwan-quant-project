@@ -863,3 +863,101 @@ class TestValuationFreshnessGate:
 
         self._scanner(monkeypatch, db_session, as_of)._maybe_sync_valuation()
         assert synced, "未來資料不得計入覆蓋率"
+
+
+class TestValuationQuotaHandling:
+    """配額用盡必須立刻停手，不得像個股錯誤那樣續跑空轉。
+
+    實測 2026-08-05 首跑：580 檔後 FinMind 回 402，其後 299 次呼叫全部瞬間失敗
+    （間隔 0 秒）——純粹浪費，且真正的原因被淹沒在 299 行相同 WARNING 裡。
+    """
+
+    def _seed_otc(self, session, sid: str, start: date):
+        session.add(StockInfo(stock_id=sid, stock_name=f"櫃{sid}", listing_type="tpex", security_type="stock"))
+        for i in range(5):
+            session.add(
+                DailyPrice(
+                    stock_id=sid,
+                    date=start + timedelta(days=i),
+                    open=10.0,
+                    high=11.0,
+                    low=9.0,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                )
+            )
+        session.flush()
+
+    def test_quota_error_aborts_loop(self, db, monkeypatch):
+        import src.data.pipeline as pl
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        for sid in ("6001", "6002", "6003", "6004"):
+            self._seed_otc(db, sid, start)
+
+        attempted: list[str] = []
+
+        class _Resp:
+            status_code = 402
+
+        class _F:
+            def fetch_per_pbr(self, sid, s, e):
+                attempted.append(sid)
+                if sid == "6002":
+                    exc = RuntimeError("402 Client Error: Payment Required")
+                    exc.response = _Resp()
+                    raise exc
+                return pd.DataFrame(
+                    [{"stock_id": sid, "date": s, "pe_ratio": 9.0, "pb_ratio": 1.1, "dividend_yield": 5.0}]
+                )
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+        res = backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+
+        assert attempted == ["6001", "6002"], "配額用盡後不應繼續呼叫"
+        assert res["quota_exhausted"] == 1
+        assert res["tpex_stocks"] == 1, "配額用盡前已成功的仍須計入"
+
+    def test_ordinary_error_continues(self, db, monkeypatch):
+        """對照組：非配額錯誤仍應跳過續跑（一檔壞掉不該讓整輪白費）。"""
+        import src.data.pipeline as pl
+        from src.data.pipeline import backfill_valuation_history
+
+        start = date(2024, 1, 1)
+        for sid in ("6001", "6002", "6003"):
+            self._seed_otc(db, sid, start)
+
+        attempted: list[str] = []
+
+        class _F:
+            def fetch_per_pbr(self, sid, s, e):
+                attempted.append(sid)
+                if sid == "6002":
+                    raise ValueError("該股無資料")
+                return pd.DataFrame(
+                    [{"stock_id": sid, "date": s, "pe_ratio": 9.0, "pb_ratio": 1.1, "dividend_yield": 5.0}]
+                )
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+        res = backfill_valuation_history(start, start + timedelta(days=20), markets=("tpex",))
+
+        assert attempted == ["6001", "6002", "6003"], "個股錯誤不應中斷整輪"
+        assert res["quota_exhausted"] == 0
+        assert res["tpex_stocks"] == 2
+
+    def test_detector_recognises_status_codes(self):
+        from src.data.pipeline import _is_quota_exhausted
+
+        class _R:
+            def __init__(self, c):
+                self.status_code = c
+
+        for code, expected in ((402, True), (429, True), (500, False), (404, False)):
+            exc = RuntimeError("x")
+            exc.response = _R(code)
+            assert _is_quota_exhausted(exc) is expected, f"status {code}"
+        # 只剩字串的情形
+        assert _is_quota_exhausted(RuntimeError("402 Client Error: Payment Required")) is True
+        assert _is_quota_exhausted(RuntimeError("connection reset")) is False

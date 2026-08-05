@@ -426,6 +426,8 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
         print(f"  上市 交易日 {vr['twse_days']:>6}　筆數 {vr['twse_rows']:>8}")
         print(f"  上櫃 股票數 {vr['tpex_stocks']:>6}　筆數 {vr['tpex_rows']:>8}")
         print(f"  已跳過      {vr['skipped_days']:>6} 日 / {vr['skipped_stocks']:>5} 檔（DB 已有）")
+        if vr.get("quota_exhausted"):
+            print("\n⚠ FinMind 配額用盡，上櫃部分未跑完——配額恢復後重跑本指令即可從缺口續行")
         return
 
     # 先同步下市清單：倖存者偏差修正的前提（知道哪些股票何時下市）
