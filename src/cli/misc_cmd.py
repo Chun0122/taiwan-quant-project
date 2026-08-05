@@ -493,10 +493,7 @@ def cmd_pit_replay(args: argparse.Namespace) -> None:
             f"{h}d={withfwd[f'fwd_{h}d'].mean():+.2f}%" if withfwd[f"fwd_{h}d"].notna().any() else f"{h}d=—"
             for h in horizons
         )
-        print(
-            f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}"
-            f"{res.n_picks:>6}   {summary}"
-        )
+        print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{res.n_picks:>6}   {summary}")
 
     if not collected:
         print("\n無任何選股結果可彙總")
