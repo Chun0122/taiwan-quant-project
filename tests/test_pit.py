@@ -462,3 +462,207 @@ class TestRegimePIT:
 
         assert MarketRegimeDetector._compute_breadth(date(2026, 3, 1)) == pytest.approx(0.0)
         assert MarketRegimeDetector._compute_breadth(date(2026, 6, 1)) == pytest.approx(1.0)
+
+
+# ====================================================================== #
+# F. 資料覆蓋度（§6.5 #21b）——區分「模式不進場」與「輸入資料缺席」
+# ====================================================================== #
+
+
+class TestDataCoverage:
+    """`n_picks == 0` 有兩種意義，混為一談會讓無效結果被當成結論。
+
+    2026-08-04 的跨模式重放就是實例：dividend「30 天只選得出 4 天」被記錄為
+    模式產能，真因是 `stock_valuation` 在 2026-01-26 前完全沒有資料。
+    """
+
+    def _patch_session(self, db_session, monkeypatch):
+        """pit_replay 以 `from ... import get_session` 綁定，須 patch 該模組自身的名稱。"""
+        import src.discovery.pit_replay as pr_mod
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(pr_mod, "get_session", lambda: _Ctx())
+
+    def _seed_market(self, session, as_of, *, n_stocks=1600, with_feature=True):
+        from src.data.schema import DailyFeature, DailyPrice
+
+        for i in range(n_stocks):
+            sid = f"{1000 + i}"
+            session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            if with_feature:
+                session.add(DailyFeature(stock_id=sid, date=as_of, close=10.0, volume=1000, turnover=10000))
+        session.flush()
+
+    def test_value_without_valuation_is_no_data(self, db_session, monkeypatch):
+        """價量齊備但估值表為空 → value 的結果不可採信，而非「模式不進場」。"""
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of)
+
+        cov = assess_data_coverage("value", as_of)
+        assert cov.missing == ("stock_valuation",)
+        assert cov.sufficient is False
+        assert "stock_valuation" in cov.describe()
+
+    def test_momentum_unaffected_by_valuation_gap(self, db_session, monkeypatch):
+        """同一天、同一份資料，momentum 不依賴估值 → 必須判為就緒。
+
+        這是本機制的關鍵性質：可採信與否是**per-mode** 的，一律看全部表會把
+        純價量模式的有效結果誤殺。
+        """
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of)
+
+        assert assess_data_coverage("momentum", as_of).sufficient is True
+        assert assess_data_coverage("swing", as_of).sufficient is True
+
+    def test_future_valuation_rows_do_not_count(self, db_session, monkeypatch):
+        """as_of 之後的估值列不得計入覆蓋率——否則「當時還沒補」的日子會被誤判為就緒。"""
+        from src.data.schema import StockValuation
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of)
+        for i in range(800):  # 全部落在 as_of 之後
+            db_session.add(StockValuation(stock_id=f"{1000 + i}", date=as_of + timedelta(days=1), pe_ratio=10.0))
+        db_session.flush()
+
+        cov = assess_data_coverage("value", as_of)
+        assert cov.valuation_stocks == 0
+        assert cov.missing == ("stock_valuation",)
+
+    def test_stale_valuation_does_not_count(self, db_session, monkeypatch):
+        """窗口外的舊估值不算數——與 Stage 0.5 閘門同一判準（§6.5 #22）。"""
+        from src.data.schema import StockValuation
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of)
+        for i in range(800):
+            db_session.add(StockValuation(stock_id=f"{1000 + i}", date=as_of - timedelta(days=60), pe_ratio=10.0))
+        db_session.flush()
+
+        assert assess_data_coverage("value", as_of).sufficient is False
+
+    def test_fresh_valuation_is_sufficient(self, db_session, monkeypatch):
+        """對照組：窗口內足量估值 → value 判為就緒（證明上面兩題不是恆 False）。"""
+        from src.data.schema import StockValuation
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of)
+        for i in range(800):
+            db_session.add(StockValuation(stock_id=f"{1000 + i}", date=as_of - timedelta(days=1), pe_ratio=10.0))
+        db_session.flush()
+
+        cov = assess_data_coverage("value", as_of)
+        assert cov.valuation_stocks == 800
+        assert cov.sufficient is True
+
+    def test_revenue_coverage_respects_publication_lag(self, db_session, monkeypatch):
+        """覆蓋率本身也要套公布時滯——否則會把「當時看不到的營收」算成已就緒。"""
+        from src.data.schema import MonthlyRevenue
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)  # 未到 3/10，2 月營收依法尚未公布
+        after = date(2026, 3, 10)
+        self._seed_market(db_session, as_of)
+        self._seed_market(db_session, after)  # 兩天價量都齊備，使差異只來自營收可見性
+        for i in range(500):  # 全部是 2 月營收
+            db_session.add(
+                MonthlyRevenue(
+                    stock_id=f"{1000 + i}",
+                    date=date(2026, 2, 28),
+                    revenue=1000.0,
+                    revenue_year=2026,
+                    revenue_month=2,
+                    yoy_growth=20.0,
+                    mom_growth=1.0,
+                )
+            )
+        db_session.flush()
+
+        assert assess_data_coverage("growth", as_of).missing == ("monthly_revenue",)
+        # 3/10 起同一份資料變為可見
+        assert assess_data_coverage("growth", after).sufficient is True
+
+    def test_thin_market_day_flags_price_gap(self, db_session, monkeypatch):
+        """半套日（普通股遠少於全市場）→ 連 momentum 都不可採信。"""
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of, n_stocks=800)
+
+        assert assess_data_coverage("momentum", as_of).missing == ("daily_price",)
+
+    def test_missing_features_flags_gap(self, db_session, monkeypatch):
+        """DailyFeature 未回補 → universe Stage 2 已 fallback，結果不同質。"""
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2026, 3, 5)
+        self._seed_market(db_session, as_of, with_feature=False)
+
+        assert assess_data_coverage("momentum", as_of).missing == ("daily_feature",)
+
+    @pytest.mark.parametrize(
+        "sufficient,n_picks,expected",
+        [
+            (True, 3, "ok"),
+            (True, 0, "no_picks"),
+            (False, 0, "no_data"),
+            (False, 3, "no_data"),  # 資料缺席時即使有選股也不可採信（退化漏斗的產物）
+        ],
+    )
+    def test_verdict_matrix(self, sufficient, n_picks, expected):
+        from src.discovery.pit_replay import DataCoverage, ReplayResult
+
+        cov = DataCoverage(
+            as_of=date(2026, 3, 5),
+            mode="value",
+            price_stocks=1600,
+            feature_stocks=1600,
+            valuation_stocks=0 if not sufficient else 800,
+            revenue_stocks=0,
+            required=("stock_valuation",),
+            missing=() if sufficient else ("stock_valuation",),
+        )
+        res = ReplayResult(
+            as_of=date(2026, 3, 5),
+            mode="value",
+            regime="bull",
+            total_stocks=1600,
+            after_coarse=150,
+            picks=pd.DataFrame({"stock_id": [f"{i}" for i in range(n_picks)]}),
+            coverage=cov,
+        )
+        assert res.verdict == expected
+
+    def test_every_scanner_mode_declares_requirements(self):
+        """契約測試：新增模式若忘了登記依賴，會預設「恆就緒」而靜默產出無效結果。"""
+        from src.discovery.pit_replay import MODE_REQUIRED_TABLES
+
+        source = Path("src/discovery/pit_replay.py").read_text(encoding="utf-8")
+        modes = set(re.findall(r'"(\w+)": \w+Scanner,', source))
+        assert modes, "未能從 scanner_map 解析出模式清單——此測試需同步更新"
+        assert modes <= set(MODE_REQUIRED_TABLES), f"下列模式未登記資料依賴：{modes - set(MODE_REQUIRED_TABLES)}"

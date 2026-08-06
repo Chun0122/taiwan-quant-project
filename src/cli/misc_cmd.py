@@ -501,6 +501,8 @@ def cmd_pit_replay(args: argparse.Namespace) -> None:
         return
 
     collected = []
+    n_no_data = 0
+    n_no_picks = 0
     print(f"{'基準日':<12}{'regime':<10}{'掃描':>6}{'粗篩':>6}{'產出':>6}   前瞻均報酬")
     print("-" * 68)
     for d in dates:
@@ -509,7 +511,18 @@ def cmd_pit_replay(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001 — 單日失敗不中斷整批
             print(f"{str(d):<12}重放失敗：{exc}")
             continue
+        # §6.5 #21b：資料缺席的日子**不計入彙總**——此時的選股（若有）來自退化後的
+        # 漏斗，把它平均進去等於用別的東西的報酬去描述這個模式
+        if res.verdict == "no_data":
+            n_no_data += 1
+            note = res.coverage.describe() if res.coverage else "資料缺席"
+            print(
+                f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}"
+                f"{res.n_picks:>6}   ⚠ {note}（不計入）"
+            )
+            continue
         if res.picks.empty:
+            n_no_picks += 1
             print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{0:>6}   （無選股）")
             continue
         withfwd = compute_forward_returns(res.picks, d, horizons)
@@ -520,12 +533,17 @@ def cmd_pit_replay(args: argparse.Namespace) -> None:
         )
         print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{res.n_picks:>6}   {summary}")
 
+    n_valid = len(collected) + n_no_picks
+    print(f"\n基準日分類：可採信 {n_valid}（有選股 {len(collected)}／無選股 {n_no_picks}）　資料缺席 {n_no_data}")
+    if n_no_data:
+        print(f"  ⚠ {n_no_data} 個基準日的輸入資料不足，已排除——產能率與報酬皆以可採信的 {n_valid} 日為母體")
+
     if not collected:
         print("\n無任何選股結果可彙總")
         return
 
     print(f"\n{'=' * 68}")
-    print(f"彙總（{args.mode}，{len(collected)} 個有效基準日）")
+    print(f"彙總（{args.mode}，{len(collected)} 個有效基準日；產能率 {len(collected) / max(n_valid, 1):.0%}）")
     print(f"{'=' * 68}")
     summary_df = summarize_replays(collected, horizons)
     print(f"{'窗口':<8}{'樣本':>7}{'平均':>9}{'中位':>9}{'勝率':>8}{'最佳':>9}{'最差':>9}")

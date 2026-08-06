@@ -392,14 +392,28 @@ python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
 在歷史日重跑 scanner 並評估前瞻報酬。**唯讀**——不寫 `DiscoveryRecord` / `CandidateFactorLog` / `universe_stat_log`，regime 亦不推進狀態機。
 
 ```bash
-python main.py pit-replay --as-of 2025-04-08 --mode momentum
-python main.py pit-replay --as-of 2025-04-08 --mode value --top-n 20
-python main.py pit-replay --start 2024-01-01 --end 2024-12-31 --mode momentum --every-n-days 20
+python main.py pit-replay momentum --date 2025-04-08
+python main.py pit-replay value --date 2025-04-08 --top 20
+python main.py pit-replay momentum --start 2024-01-01 --end 2024-12-31 --every 20
 ```
 
-單次重放約 90 秒，**範圍重放務必抽樣**（`--every-n-days`）。前瞻報酬是唯一允許看 `as_of` 之後資料之處（評分而非決策輸入）。
+模式為**位置參數**（預設 momentum）。單次重放約 90 秒，**範圍重放務必抽樣**（`--every`）。前瞻報酬是唯一允許看 `as_of` 之後資料之處（評分而非決策輸入）。
 
-⚠ 重放結果的有效性受資料覆蓋限制：估值/營收未回補的期間，value/dividend/growth 的粗篩會 **fail-open**（閘門消失而非收緊），模式靜默退化為流動性篩選。解讀前先確認對應期間的基本面資料存在。
+#### 資料覆蓋度標記（§6.5 #21b）
+
+每個基準日會先量測該模式**定義性依賴**的資料表覆蓋度，輸出分三類：
+
+| verdict | 意義 | 是否計入彙總 |
+|---------|------|:---:|
+| `ok` | 資料就緒且有選股 | ✅ |
+| `no_picks` | 資料就緒、模式判斷不進場 | ✅（計入產能率分母） |
+| `no_data` | 定義性輸入缺席，結果不可採信 | ❌ 排除 |
+
+依賴表：momentum/swing＝`daily_price`+`daily_feature`；value/dividend 另加 `stock_valuation`；growth 另加 `monthly_revenue`。門檻沿用既有 SSOT（`BACKFILL_MIN_COMMON_STOCKS` / `VALUATION_MIN_FRESH_STOCKS` / `REPLAY_MIN_FEATURE_RATIO` / `REPLAY_MIN_REVENUE_STOCKS`），且**全部帶 PIT 上界**——否則「當時還沒回補」的日子會被未來資料誤判為就緒。
+
+⚠ 為何必要：`n_picks=0`（甚至 `n_picks=2`）無法分辨「模式看過全市場後不進場」與「輸入根本不存在」。2026-08-04 的跨模式重放正是栽在這裡——dividend「30 天只選得出 4 天」被記為模式產能，真因是 `stock_valuation` 在 2026-01-26 前無資料。實測 growth 2024-06-03 從 15,237 檔中「產出 2 檔」，那 2 檔只來自當時僅有的 5 支有營收股票。
+
+⚠ 現況缺口：`monthly_revenue`（2020~2024 每年僅 5 支）與 `financial_statement`（全表 15 支）尚未回補 → **growth 的歷史重放仍不可用**，會全數標記 `no_data`。
 
 ---
 

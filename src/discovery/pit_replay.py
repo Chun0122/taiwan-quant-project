@@ -29,14 +29,165 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from src.constants import (
+    BACKFILL_MIN_COMMON_STOCKS,
+    REPLAY_MIN_FEATURE_RATIO,
+    REPLAY_MIN_REVENUE_STOCKS,
+    VALUATION_FRESH_WINDOW_DAYS,
+    VALUATION_MIN_FRESH_STOCKS,
+)
 from src.data.database import get_session
-from src.data.schema import DailyPrice
+from src.data.pit import revenue_visible_cutoff
+from src.data.schema import DailyFeature, DailyPrice, MonthlyRevenue, StockValuation
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HORIZONS: tuple[int, ...] = (5, 10, 20)
+
+# 各模式**定義性**（粗篩閘門）依賴的資料表——缺席時該模式必然產出 0 筆，
+# 且那個 0 是「量不到」而非「模式判斷不進場」。
+#
+# 只列粗篩閘門的依賴，不列評分用的表：`financial_statement` 雖然參與品質評分
+# （`_base.py` 載入 EPS/ROE），但它缺席只會使該維度分數退化，**不會**把選股歸零，
+# 因此不屬於「結果是否可採信」的判定條件。列進來會把可評價的重放誤判為無效。
+MODE_REQUIRED_TABLES: dict[str, tuple[str, ...]] = {
+    "momentum": ("daily_price", "daily_feature"),
+    "swing": ("daily_price", "daily_feature"),
+    "value": ("daily_price", "daily_feature", "stock_valuation"),
+    "dividend": ("daily_price", "daily_feature", "stock_valuation"),
+    "growth": ("daily_price", "daily_feature", "monthly_revenue"),
+}
+
+
+@dataclass(frozen=True)
+class DataCoverage:
+    """`as_of` 當日各輸入資料表的覆蓋度（§6.5 #21b）。
+
+    ## 為什麼需要這個
+
+    `n_picks == 0` 有兩種**完全不同**的意義：模式看過全市場後判斷不進場（是結論），
+    或模式的定義性輸入根本不存在（結果無效、不可採信）。2026-08-04 的跨模式重放
+    無法區分兩者，導致 dividend「30 天只選得出 4 天」被當成模式特性記錄下來，
+    實際上那是 `stock_valuation` 在 2026-01-26 前完全沒有資料。
+
+    本結構在重放當下就把判準記錄下來，使結果自帶可採信與否的標記。
+    """
+
+    as_of: date
+    mode: str
+    price_stocks: int
+    feature_stocks: int
+    valuation_stocks: int
+    revenue_stocks: int
+    required: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+
+    @property
+    def sufficient(self) -> bool:
+        """本模式的定義性資料是否全部就緒——False 時該日重放結果不可採信。"""
+        return not self.missing
+
+    def describe(self) -> str:
+        """一行摘要，供 CLI 與報告輸出。"""
+        if self.sufficient:
+            return "資料就緒"
+        return "資料缺席：" + ", ".join(self.missing)
+
+
+def assess_data_coverage(mode: str, as_of: date) -> DataCoverage:
+    """量測 `as_of` 當日各資料表的覆蓋度，判定本模式的重放是否可採信。
+
+    **全部查詢都帶 PIT 上界**——覆蓋率本身若看到未來資料，就會把「當時資料還沒補」
+    的日子誤判為就緒。估值另取近 `VALUATION_FRESH_WINDOW_DAYS` 日窗口、月營收另套
+    法定公布時滯，與 scanner 實際取數的條件一致（否則量到的不是 scanner 看到的）。
+
+    門檻沿用既有 SSOT（見 `src/constants.py` 的 §6.5 #21b 段落），不另立數字。
+
+    Args:
+        mode: momentum / swing / value / dividend / growth。
+        as_of: 重放基準日。
+
+    Returns:
+        DataCoverage；未知模式的 `required` 為空（即恆視為就緒）。
+    """
+    val_cutoff = as_of - timedelta(days=VALUATION_FRESH_WINDOW_DAYS)
+    # 與 `_load_revenue_data` 完全相同的窗口：近 180 日內、且已依法公布者
+    rev_lower = as_of - timedelta(days=180)
+    rev_upper = revenue_visible_cutoff(as_of)
+
+    with get_session() as session:
+        price_stocks = (
+            session.execute(
+                select(func.count(func.distinct(DailyPrice.stock_id))).where(
+                    DailyPrice.date == as_of,
+                    func.length(DailyPrice.stock_id) == 4,
+                )
+            ).scalar()
+            or 0
+        )
+        feature_stocks = (
+            session.execute(
+                select(func.count(func.distinct(DailyFeature.stock_id))).where(
+                    DailyFeature.date == as_of,
+                    func.length(DailyFeature.stock_id) == 4,
+                )
+            ).scalar()
+            or 0
+        )
+        valuation_stocks = (
+            session.execute(
+                select(func.count(func.distinct(StockValuation.stock_id))).where(
+                    StockValuation.date >= val_cutoff,
+                    StockValuation.date <= as_of,
+                )
+            ).scalar()
+            or 0
+        )
+        revenue_stocks = (
+            session.execute(
+                select(func.count(func.distinct(MonthlyRevenue.stock_id))).where(
+                    MonthlyRevenue.date >= rev_lower,
+                    MonthlyRevenue.date <= rev_upper,
+                )
+            ).scalar()
+            or 0
+        )
+
+    required = MODE_REQUIRED_TABLES.get(mode, ())
+    # 特徵覆蓋率以當日價量檔數為分母——絕對值門檻會在早期市場（上市檔數本來就少）誤判
+    feature_ok = price_stocks > 0 and feature_stocks >= price_stocks * REPLAY_MIN_FEATURE_RATIO
+    ok_by_table = {
+        "daily_price": price_stocks >= BACKFILL_MIN_COMMON_STOCKS,
+        "daily_feature": feature_ok,
+        "stock_valuation": valuation_stocks >= VALUATION_MIN_FRESH_STOCKS,
+        "monthly_revenue": revenue_stocks >= REPLAY_MIN_REVENUE_STOCKS,
+    }
+    missing = tuple(t for t in required if not ok_by_table.get(t, True))
+
+    if missing:
+        logger.warning(
+            "[%s] %s 資料覆蓋不足：%s — 本日重放結果不可採信（價量 %d／特徵 %d／估值 %d／營收 %d）",
+            mode,
+            as_of,
+            ", ".join(missing),
+            price_stocks,
+            feature_stocks,
+            valuation_stocks,
+            revenue_stocks,
+        )
+
+    return DataCoverage(
+        as_of=as_of,
+        mode=mode,
+        price_stocks=price_stocks,
+        feature_stocks=feature_stocks,
+        valuation_stocks=valuation_stocks,
+        revenue_stocks=revenue_stocks,
+        required=required,
+        missing=missing,
+    )
 
 
 @dataclass
@@ -49,10 +200,23 @@ class ReplayResult:
     total_stocks: int
     after_coarse: int
     picks: pd.DataFrame = field(default_factory=pd.DataFrame)
+    coverage: DataCoverage | None = None
 
     @property
     def n_picks(self) -> int:
         return len(self.picks)
+
+    @property
+    def verdict(self) -> str:
+        """本日重放的可採信狀態——彙總時**必須**先看這個再看報酬。
+
+        - `no_data`：定義性輸入缺席，`n_picks` 無論是幾都不可採信
+        - `no_picks`：資料就緒，模式判斷不進場（這是結論，可計入產能率）
+        - `ok`：資料就緒且有選股
+        """
+        if self.coverage is not None and not self.coverage.sufficient:
+            return "no_data"
+        return "ok" if self.n_picks else "no_picks"
 
 
 def replay_scan(mode: str, as_of: date, top_n: int = 20) -> ReplayResult:
@@ -67,7 +231,8 @@ def replay_scan(mode: str, as_of: date, top_n: int = 20) -> ReplayResult:
         top_n: 取前 N 名。
 
     Returns:
-        ReplayResult；模式被 regime 封鎖或無候選時 `picks` 為空。
+        ReplayResult；模式被 regime 封鎖或無候選時 `picks` 為空——此時務必看
+        `verdict` 區分「模式不進場」與「輸入資料缺席」。
     """
     from src.discovery.scanner import (
         DividendScanner,
@@ -87,6 +252,10 @@ def replay_scan(mode: str, as_of: date, top_n: int = 20) -> ReplayResult:
     if mode not in scanner_map:
         raise ValueError(f"未知模式 {mode}；可用：{', '.join(scanner_map)}")
 
+    # 覆蓋度在**跑之前**量測：跑完才量的話，scanner 的 Stage 0.5 補抓可能已改變資料表，
+    # 量到的就不是它當時看到的東西（歷史 as_of 雖為 offline，但 today 重放不是）
+    coverage = assess_data_coverage(mode, as_of)
+
     scanner = scanner_map[mode](top_n_results=top_n, use_ic_adjustment=False)
     result = scanner.run(as_of=as_of)
 
@@ -102,6 +271,7 @@ def replay_scan(mode: str, as_of: date, top_n: int = 20) -> ReplayResult:
         total_stocks=result.total_stocks,
         after_coarse=result.after_coarse,
         picks=picks,
+        coverage=coverage,
     )
 
 

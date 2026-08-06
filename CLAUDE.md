@@ -95,7 +95,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
-| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣 |
+| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣。**`assess_data_coverage` + `ReplayResult.verdict`（§6.5 #21b）**：量測該模式定義性依賴表的覆蓋度（帶 PIT 上界），把 `no_data`（輸入缺席、結果無效）與 `no_picks`（模式判斷不進場）分開——前者排除於彙總。依賴宣告在 `MODE_REQUIRED_TABLES`，新增模式須登記（契約測試守門） |
 | `discovery/ic_governance.py` | **IC 可執法性 SSOT**（P0 #16）：`select_enforceable_ic()` 三道閘門（窗口時效 `holding+14` 天／窗口數 ≥3／最小樣本 ≥100）+ `ICVerdict`；決策 IC = 最近 3 窗平均。M2 停用、scanner 門檻加成、rotation 阻擋買入三處共用 |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |

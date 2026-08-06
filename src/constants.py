@@ -306,6 +306,21 @@ FINMIND_REQUEST_INTERVAL: float = 0.5
 VALUATION_FRESH_WINDOW_DAYS: int = 7
 VALUATION_MIN_FRESH_STOCKS: int = 500
 
+# PIT 重放的資料覆蓋門檻（§6.5 #21b，2026-08-06）。
+# 用途：區分「模式判斷不進場」與「輸入資料根本缺席」——兩者的 n_picks 都是 0，
+# 但前者是結論、後者是**結果無效**。2026-08-04 的跨模式重放正是栽在這裡：
+# value 因 fail-open 而 30 天全數產出、dividend 因 fail-closed 而 30 天只產出 4 天，
+# 兩者的 `n_picks` 都無法揭露真因，必須實查資料表才發現三個模式的結果不可採信。
+#
+# 門檻刻意沿用各自的 SSOT，不另立一套數字：
+#   • 價量＝BACKFILL_MIN_COMMON_STOCKS（全市場覆蓋的既有判定）
+#   • 估值＝VALUATION_MIN_FRESH_STOCKS（Scanner Stage 0.5 的同一門檻）
+#   • 特徵＝UniverseFilter._FEATURE_COVERAGE_MIN（低於此值 Stage 2 已 fallback）
+REPLAY_MIN_FEATURE_RATIO: float = 0.3
+# 月營收母體：live 實測 1,896 檔。300（≈16%）以下時 growth 的 universe 已非全市場，
+# 重放結果代表的是那個子集而非模式本身——實測 2020~2024 每年僅 **5 支**。
+REPLAY_MIN_REVENUE_STOCKS: int = 300
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"
