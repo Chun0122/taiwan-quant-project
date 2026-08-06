@@ -17,6 +17,9 @@ env/
 
 # Database
 data/stock.db
+# SQLite WAL 模式的暫存檔——內容隨交易變動，不得進版控
+data/stock.db-wal
+data/stock.db-shm
 data/regime_state.json
 data/quant.db
 

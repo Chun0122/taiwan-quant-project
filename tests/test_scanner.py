@@ -1,5 +1,6 @@
 """測試 src/discovery/scanner.py — MarketScanner / MomentumScanner / SwingScanner / ValueScanner / DividendScanner / GrowthScanner 純計算方法。"""
 
+import logging
 from datetime import date, timedelta
 
 import numpy as np
@@ -9012,3 +9013,80 @@ class TestIcHoldingMapMethods:
         monkeypatch.setattr(momentum_scanner, "mode_name", "nonexistent")
         assert momentum_scanner._get_ic_holding_days() == 5
         assert momentum_scanner._get_ic_cutoff_days() == 40
+
+
+# ====================================================================== #
+# §6.5 #19：粗篩對缺失資料必須 fail-closed
+# ====================================================================== #
+
+
+class TestCoarseFilterFailClosed:
+    """定義性資料缺席時，粗篩必須**收斂**而非放行。
+
+    2026-08-04 的 PIT 重放踩到這個洞：`stock_valuation` 在 2026-01-26 前無資料，
+    ValueScanner 的估值閘門整段被跳過（舊版把 pe/pb/dy 設 None 後續跑），實際
+    執行的是「基本過濾 + 成交量排名 + 法人淨買超 + 5 日動能」＝流動性篩選。
+
+    失效方向**偏樂觀且無聲**：value 因此在 30 個基準日全數選出 18.7 檔
+    （產能率 100%、五模式之冠），看起來是最強的模式。若非實查資料表，
+    該次審計會得出完全相反的結論。
+    """
+
+    def _price(self):
+        return make_price_df(20)
+
+    def test_value_returns_empty_without_valuation(self, caplog):
+        """回歸測試：這正是舊版會放行 20 檔的情境。"""
+        s = ValueScanner(min_volume=1, min_price=1, use_ic_adjustment=False)
+        s.scan_date = date(2025, 1, 3)
+        s._df_valuation = pd.DataFrame()
+        with caplog.at_level(logging.WARNING):
+            result = s._coarse_filter(self._price(), pd.DataFrame())
+        assert result.empty, "估值缺席時不得放行"
+        assert any("stock_valuation" in r.getMessage() for r in caplog.records), "必須留下可稽核的 WARN"
+
+    def test_dividend_returns_empty_without_valuation(self):
+        s = DividendScanner(min_volume=1, min_price=1, use_ic_adjustment=False)
+        s.scan_date = date(2025, 1, 3)
+        s._df_valuation = pd.DataFrame()
+        assert s._coarse_filter(self._price(), pd.DataFrame()).empty
+
+    def test_growth_returns_empty_without_revenue(self):
+        s = GrowthScanner(min_volume=1, min_price=1, use_ic_adjustment=False)
+        s.scan_date = date(2025, 1, 3)
+        s._coarse_revenue = pd.DataFrame()
+        # _load_revenue_data 亦回空（無 DB 資料）
+        s._load_revenue_data = lambda months=1: pd.DataFrame()
+        assert s._coarse_filter(self._price(), pd.DataFrame()).empty
+
+    def test_value_still_works_with_valuation(self):
+        """對照組：有估值資料時行為不變（證明 fail-closed 不是把功能關掉）。"""
+        df_price = self._price()
+        sids = df_price["stock_id"].unique().tolist()
+        s = ValueScanner(min_volume=1, min_price=1, use_ic_adjustment=False)
+        s.scan_date = date(2025, 1, 3)
+        s._df_valuation = pd.DataFrame(
+            [
+                {"stock_id": sid, "date": date(2025, 1, 3), "pe_ratio": 12.0, "pb_ratio": 1.2, "dividend_yield": 4.0}
+                for sid in sids
+            ]
+        )
+        result = s._coarse_filter(df_price, pd.DataFrame())
+        assert not result.empty, "有估值資料時應正常產出"
+        assert "pe_ratio" in result.columns
+
+    def test_no_coarse_filter_passes_through_on_empty(self):
+        """契約測試：三個資料依賴型模式的 `_coarse_filter` 都須走共用守門。
+
+        直接比對原始碼——避免日後有人新增模式時又寫出 fail-open 的 else 分支。
+        """
+        import inspect
+
+        for cls, table in (
+            (ValueScanner, "stock_valuation"),
+            (DividendScanner, "stock_valuation"),
+            (GrowthScanner, "monthly_revenue"),
+        ):
+            src = inspect.getsource(cls._coarse_filter)
+            assert "_require_coarse_data" in src, f"{cls.__name__} 未使用共用守門"
+            assert table in src, f"{cls.__name__} 守門未指明資料表 {table}"

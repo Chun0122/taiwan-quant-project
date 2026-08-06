@@ -391,6 +391,176 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         print("資料庫已是最新，無需遷移")
 
 
+def cmd_backfill_history(args: argparse.Namespace) -> None:
+    """回補歷史全市場資料（B1① PIT 研究環境的資料前提）。
+
+    長時間作業（2020 起約 1,200 個平日、數小時）。可隨時 Ctrl-C 中止，
+    重跑會自動從缺口續行——進度以 DB 現況判定，不另存進度檔。
+    """
+    from datetime import date as _date
+
+    from src.data.pipeline import (
+        backfill_daily_features,
+        backfill_market_history,
+        backfill_valuation_history,
+        sync_delisting_info,
+    )
+
+    start = _date.fromisoformat(args.start)
+    end = _date.fromisoformat(args.end) if getattr(args, "end", None) else None
+    datasets = tuple(s.strip() for s in (args.datasets or "price,institutional,margin").split(",") if s.strip())
+
+    if getattr(args, "valuation_only", False):
+        markets = tuple(
+            s.strip() for s in (getattr(args, "valuation_markets", None) or "twse,tpex").split(",") if s.strip()
+        )
+        print(f"只回補 stock_valuation（§6.5 #20）：{start} ~ {end or '今日'}　市場={','.join(markets)}")
+        print("  上市＝TWSE BWIBBU_d 每日全市場；上櫃＝FinMind 逐股（TPEX 估值端點已下架）")
+        if args.dry_run:
+            print("[dry-run] 僅估算，不實際抓取\n")
+        vr = backfill_valuation_history(start, end, markets=markets, dry_run=args.dry_run)
+        if args.dry_run:
+            print("dry-run 結束——上方 log 已列出待補量與預估時間")
+            return
+        print("\n估值回補完成：")
+        print(f"  上市 交易日 {vr['twse_days']:>6}　筆數 {vr['twse_rows']:>8}")
+        print(f"  上櫃 股票數 {vr['tpex_stocks']:>6}　筆數 {vr['tpex_rows']:>8}")
+        print(f"  已跳過      {vr['skipped_days']:>6} 日 / {vr['skipped_stocks']:>5} 檔（DB 已有）")
+        if vr.get("quota_exhausted"):
+            print("\n⚠ FinMind 配額用盡，上櫃部分未跑完——配額恢復後重跑本指令即可從缺口續行")
+        return
+
+    # 先同步下市清單：倖存者偏差修正的前提（知道哪些股票何時下市）
+    if not args.skip_delisting:
+        print("同步下市清單（倖存者偏差修正）...")
+        n = sync_delisting_info()
+        print(f"  stock_info 更新 {n} 筆\n")
+
+    if args.features_only:
+        print(f"只回補 DailyFeature（B1②）：{start} ~ {end or '今日'}")
+        fr = backfill_daily_features(start, end, dry_run=args.dry_run)
+        if not args.dry_run:
+            print(f"\nDailyFeature 回補完成：{fr['dates']} 日 / {fr['rows']} 筆（已有 {fr['skipped_dates']} 日）")
+        return
+
+    print(f"回補範圍：{start} ~ {end or '今日'}　dataset={','.join(datasets)}")
+    print("  （已達全市場覆蓋的日期會自動跳過；中斷後重跑會從缺口續行）")
+    if args.dry_run:
+        print("[dry-run] 僅估算，不實際抓取\n")
+
+    result = backfill_market_history(start, end, datasets=datasets, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("dry-run 結束——上方 log 已列出待補日數與預估時間")
+        return
+    print("\n回補完成：")
+    print(f"  交易日     {result['trading_days']:>6}")
+    print(f"  日K線     {result['daily_price']:>6} 筆")
+    print(f"  三大法人   {result['institutional']:>6} 筆")
+    print(f"  融資融券   {result['margin']:>6} 筆")
+    print(f"  已跳過     {result['skipped']:>6} 日（DB 已有 / 週末）")
+
+    if args.with_features:
+        print("\n接著回補 DailyFeature（B1②）...")
+        fr = backfill_daily_features(start, end)
+        print(f"  DailyFeature {fr['dates']} 日 / {fr['rows']} 筆")
+
+
+def cmd_pit_replay(args: argparse.Namespace) -> None:
+    """PIT 歷史重放（B1④）——在歷史日重跑 scanner 並評估前瞻報酬。
+
+    唯讀：不寫入 DiscoveryRecord / CandidateFactorLog / universe_stat_log，
+    regime 亦不推進狀態機。
+    """
+    from datetime import date as _date
+
+    from src.discovery.pit_replay import (
+        compute_forward_returns,
+        replay_scan,
+        sample_replay_dates,
+        summarize_replays,
+    )
+
+    horizons = tuple(int(h) for h in args.horizons.split(",") if h.strip())
+
+    if args.date:
+        dates = [_date.fromisoformat(args.date)]
+    else:
+        start = _date.fromisoformat(args.start)
+        end = _date.fromisoformat(args.end) if args.end else _date.today()
+        dates = sample_replay_dates(start, end, args.every)
+        if not dates:
+            print("指定區間內無具備全市場資料的交易日——請先執行 backfill-history")
+            return
+
+    est_min = len(dates) * 90 / 60
+    print(f"PIT 重放：mode={args.mode}　{len(dates)} 個基準日　預估 {est_min:.0f} 分鐘")
+    print(f"  前瞻窗口：{', '.join(f'{h}d' for h in horizons)}　（唯讀，不寫入任何 live 資料表）\n")
+    if args.dry_run:
+        print("  " + ", ".join(str(d) for d in dates[:10]) + (" ..." if len(dates) > 10 else ""))
+        return
+
+    collected = []
+    n_no_data = 0
+    n_no_picks = 0
+    print(f"{'基準日':<12}{'regime':<10}{'掃描':>6}{'粗篩':>6}{'產出':>6}   前瞻均報酬")
+    print("-" * 68)
+    for d in dates:
+        try:
+            res = replay_scan(args.mode, d, top_n=args.top)
+        except Exception as exc:  # noqa: BLE001 — 單日失敗不中斷整批
+            print(f"{str(d):<12}重放失敗：{exc}")
+            continue
+        # §6.5 #21b：資料缺席的日子**不計入彙總**——此時的選股（若有）來自退化後的
+        # 漏斗，把它平均進去等於用別的東西的報酬去描述這個模式
+        if res.verdict == "no_data":
+            n_no_data += 1
+            note = res.coverage.describe() if res.coverage else "資料缺席"
+            print(
+                f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}"
+                f"{res.n_picks:>6}   ⚠ {note}（不計入）"
+            )
+            continue
+        if res.picks.empty:
+            n_no_picks += 1
+            print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{0:>6}   （無選股）")
+            continue
+        withfwd = compute_forward_returns(res.picks, d, horizons)
+        collected.append(withfwd)
+        summary = "  ".join(
+            f"{h}d={withfwd[f'fwd_{h}d'].mean():+.2f}%" if withfwd[f"fwd_{h}d"].notna().any() else f"{h}d=—"
+            for h in horizons
+        )
+        print(f"{str(d):<12}{res.regime:<10}{res.total_stocks:>6}{res.after_coarse:>6}{res.n_picks:>6}   {summary}")
+
+    n_valid = len(collected) + n_no_picks
+    print(f"\n基準日分類：可採信 {n_valid}（有選股 {len(collected)}／無選股 {n_no_picks}）　資料缺席 {n_no_data}")
+    if n_no_data:
+        print(f"  ⚠ {n_no_data} 個基準日的輸入資料不足，已排除——產能率與報酬皆以可採信的 {n_valid} 日為母體")
+
+    if not collected:
+        print("\n無任何選股結果可彙總")
+        return
+
+    print(f"\n{'=' * 68}")
+    print(f"彙總（{args.mode}，{len(collected)} 個有效基準日；產能率 {len(collected) / max(n_valid, 1):.0%}）")
+    print(f"{'=' * 68}")
+    summary_df = summarize_replays(collected, horizons)
+    print(f"{'窗口':<8}{'樣本':>7}{'平均':>9}{'中位':>9}{'勝率':>8}{'最佳':>9}{'最差':>9}")
+    print("-" * 60)
+    for _, r in summary_df.iterrows():
+        print(
+            f"{r['horizon']:<8}{int(r['n']):>7}{r['avg_return']:>8.2f}%{r['median']:>8.2f}%"
+            f"{r['win_rate']:>7.1%}{r['best']:>8.2f}%{r['worst']:>8.2f}%"
+        )
+
+    if args.export:
+        import pandas as _pd
+
+        _pd.concat(collected, ignore_index=True).to_csv(args.export, index=False)
+        print(f"\n明細已匯出：{args.export}")
+
+
 def cmd_validate(args: argparse.Namespace) -> None:
     """執行資料品質檢查。"""
     from src.data.validator import export_issues_csv, print_validation_report, run_validation

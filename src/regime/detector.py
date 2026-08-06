@@ -1047,8 +1047,17 @@ class MarketRegimeDetector:
                 return_window=return_window,
             )
 
-    def detect(self) -> dict:
+    def detect(self, as_of: datetime.date | None = None) -> dict:
         """偵測市場狀態。
+
+        Args:
+            as_of: **B1 PIT 注入點**。指定歷史日期時，TAIEX/VIX 查詢一律加
+                `<= as_of` 上界，且**不寫入狀態機**（read-only）——歷史重放
+                若推進 live 的 hysteresis 狀態，等於用過去的資料污染今天的判定。
+                None（預設）＝今日偵測，行為與注入前完全相同。
+
+                regime 驅動評分權重、分數門檻、ATR 倍數、universe 乘數與
+                `REGIME_MODE_BLOCK`；PIT 重放若沿用今日 regime，重放結果便毫無意義。
 
         Returns:
             dict: {
@@ -1068,6 +1077,7 @@ class MarketRegimeDetector:
             rows = session.execute(
                 select(DailyPrice.date, DailyPrice.close, DailyPrice.volume)
                 .where(DailyPrice.stock_id == "TAIEX")
+                .where(DailyPrice.date <= (as_of or datetime.date.today()))
                 .order_by(DailyPrice.date)
             ).all()
 
@@ -1097,6 +1107,7 @@ class MarketRegimeDetector:
             vix_rows = session.execute(
                 select(DailyPrice.date, DailyPrice.close)
                 .where(DailyPrice.stock_id == "TW_VIX")
+                .where(DailyPrice.date <= (as_of or datetime.date.today()))
                 .order_by(DailyPrice.date)
             ).all()
         vix_series = pd.Series([r[1] for r in vix_rows], index=[r[0] for r in vix_rows]) if vix_rows else None
@@ -1106,6 +1117,7 @@ class MarketRegimeDetector:
             us_vix_rows = session.execute(
                 select(DailyPrice.date, DailyPrice.close)
                 .where(DailyPrice.stock_id == "US_VIX")
+                .where(DailyPrice.date <= (as_of or datetime.date.today()))
                 .order_by(DailyPrice.date)
             ).all()
         us_vix_series = (
@@ -1113,9 +1125,28 @@ class MarketRegimeDetector:
         )
 
         # 計算市場寬度：跌破 MA20 的股票比例
-        breadth_pct = self._compute_breadth()
+        breadth_pct = self._compute_breadth(as_of)
 
         if self.use_hysteresis:
+            # B1 PIT：歷史重放**不得**推進 live 狀態機——用過去的資料去推進今天的
+            # hysteresis，等於把重放的副作用寫回生產狀態。改走 read-only 路徑：
+            # 照常算 raw regime 與所有訊號，但不套遲滯、不寫 RegimeStateLog。
+            if as_of is not None and as_of < datetime.date.today():
+                result = detect_from_series(
+                    closes,
+                    volumes=volumes,
+                    vix_series=vix_series,
+                    us_vix_series=us_vix_series,
+                    sma_short=self.sma_short,
+                    sma_long=self.sma_long,
+                    return_window=self.return_window,
+                    breadth_below_ma20_pct=breadth_pct,
+                )
+                result["hysteresis_applied"] = False
+                result["raw_regime"] = result["regime"]
+                result["transition_info"] = {"reason": "pit_replay_readonly"}
+                result["state_advanced"] = False
+                return result
             result = self._state_machine.update(
                 closes,
                 volumes=volumes,
@@ -1184,8 +1215,14 @@ class MarketRegimeDetector:
         return result
 
     @staticmethod
-    def _compute_breadth() -> float | None:
+    def _compute_breadth(as_of: datetime.date | None = None) -> float | None:
         """從 DailyFeature 表計算跌破 MA20 的股票比例。
+
+        Args:
+            as_of: B1 PIT 上界；None ＝今日。**歷史重放必須傳入**，否則會取到
+                今天的 DailyFeature（市場寬度是 regime 降級的依據，用未來資料
+                等於直接洩題）。B1② 已把 DailyFeature 歷史化至 2024-01，
+                故歷史日有真實 breadth 可算。
 
         Returns:
             float | None: 跌破 MA20 比例（0.0~1.0），無資料時回傳 None
@@ -1194,8 +1231,11 @@ class MarketRegimeDetector:
             from src.data.schema import DailyFeature
 
             with get_session() as session:
-                # 取最新日期
-                latest_date = session.execute(select(func.max(DailyFeature.date))).scalar()
+                # 取 <= as_of 的最新日期（PIT：不得看未來）
+                q = select(func.max(DailyFeature.date))
+                if as_of is not None:
+                    q = q.where(DailyFeature.date <= as_of)
+                latest_date = session.execute(q).scalar()
                 if latest_date is None:
                     return None
 

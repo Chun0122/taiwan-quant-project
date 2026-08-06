@@ -219,20 +219,21 @@ class DividendScanner(MarketScanner):
             return pd.DataFrame()
 
         # 用估值資料過濾：必須有估值資料、殖利率 > 3%、PE > 0
+        # 估值缺席時 fail-closed（本模式原本即如此，改走共用守門以統一語意與 log）
         df_val = getattr(self, "_df_valuation", pd.DataFrame())
-        if not df_val.empty:
-            val_latest = df_val.sort_values("date").groupby("stock_id").last().reset_index()
-            filtered = filtered.merge(
-                val_latest[["stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]],
-                on="stock_id",
-                how="left",
-            )
-            has_val = filtered["dividend_yield"].notna()
-            dy_ok = filtered["dividend_yield"] > 3.0
-            pe_ok = filtered["pe_ratio"] > 0
-            filtered = filtered[has_val & dy_ok & pe_ok].copy()
-        else:
+        if not self._require_coarse_data(df_val, table="stock_valuation", gate="殖利率>3%/PE>0"):
             return pd.DataFrame()
+
+        val_latest = df_val.sort_values("date").groupby("stock_id").last().reset_index()
+        filtered = filtered.merge(
+            val_latest[["stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]],
+            on="stock_id",
+            how="left",
+        )
+        has_val = filtered["dividend_yield"].notna()
+        dy_ok = filtered["dividend_yield"] > 3.0
+        pe_ok = filtered["pe_ratio"] > 0
+        filtered = filtered[has_val & dy_ok & pe_ok].copy()
 
         if filtered.empty:
             return pd.DataFrame()

@@ -212,32 +212,32 @@ class ValueScanner(MarketScanner):
             return pd.DataFrame()
 
         # 用估值資料過濾：PE > 0 且 PE < 30，殖利率 > 2%
+        # ⚠ 估值缺席時 **fail-closed**（見 `_require_coarse_data` 的說明）——
+        # 舊版在此把三個欄位設 None 後整段放行，模式會靜默退化為流動性篩選。
         df_val = getattr(self, "_df_valuation", pd.DataFrame())
-        if not df_val.empty:
-            # 取最新一筆估值
-            val_latest = df_val.sort_values("date").groupby("stock_id").last().reset_index()
-            filtered = filtered.merge(
-                val_latest[["stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]],
-                on="stock_id",
-                how="left",
-            )
-            # 嚴格模式：必須有估值資料，且 PE 或殖利率至少一項合格
-            has_val = filtered["pe_ratio"].notna()
-            # 相對估值 PE：同產業中位數 × 1.5（樣本不足 3 支時 fallback PE < 50）
-            df_info = getattr(self, "_df_stock_info", pd.DataFrame())
-            if not df_info.empty:
-                info_map = df_info.set_index("stock_id")["industry_category"]
-                industry_cat = filtered["stock_id"].map(info_map).fillna("未分類")
-            else:
-                industry_cat = pd.Series("未分類", index=filtered.index)
-            pe_thresholds = compute_relative_pe_thresholds(industry_cat, filtered["pe_ratio"])
-            pe_ok = (filtered["pe_ratio"] > 0) & (filtered["pe_ratio"] < pe_thresholds.values)
-            dy_ok = filtered["dividend_yield"] > 2.0
-            filtered = filtered[has_val & (pe_ok | dy_ok)].copy()
+        if not self._require_coarse_data(df_val, table="stock_valuation", gate="PE/殖利率"):
+            return pd.DataFrame()
+
+        # 取最新一筆估值
+        val_latest = df_val.sort_values("date").groupby("stock_id").last().reset_index()
+        filtered = filtered.merge(
+            val_latest[["stock_id", "pe_ratio", "pb_ratio", "dividend_yield"]],
+            on="stock_id",
+            how="left",
+        )
+        # 嚴格模式：必須有估值資料，且 PE 或殖利率至少一項合格
+        has_val = filtered["pe_ratio"].notna()
+        # 相對估值 PE：同產業中位數 × 1.5（樣本不足 3 支時 fallback PE < 50）
+        df_info = getattr(self, "_df_stock_info", pd.DataFrame())
+        if not df_info.empty:
+            info_map = df_info.set_index("stock_id")["industry_category"]
+            industry_cat = filtered["stock_id"].map(info_map).fillna("未分類")
         else:
-            filtered["pe_ratio"] = None
-            filtered["pb_ratio"] = None
-            filtered["dividend_yield"] = None
+            industry_cat = pd.Series("未分類", index=filtered.index)
+        pe_thresholds = compute_relative_pe_thresholds(industry_cat, filtered["pe_ratio"])
+        pe_ok = (filtered["pe_ratio"] > 0) & (filtered["pe_ratio"] < pe_thresholds.values)
+        dy_ok = filtered["dividend_yield"] > 2.0
+        filtered = filtered[has_val & (pe_ok | dy_ok)].copy()
 
         if filtered.empty:
             return pd.DataFrame()

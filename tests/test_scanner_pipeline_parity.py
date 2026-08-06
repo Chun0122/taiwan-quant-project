@@ -124,7 +124,7 @@ def trace_stages(scanner_cls, monkeypatch, regime: str = "crisis") -> list[str]:
     import src.regime.detector as det_mod
 
     class _FakeDetector:
-        def detect(self):
+        def detect(self, as_of=None):
             return {"regime": regime, "taiex_close": 20000.0}
 
     monkeypatch.setattr(det_mod, "MarketRegimeDetector", lambda *a, **kw: _FakeDetector())

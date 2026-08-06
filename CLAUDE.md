@@ -65,6 +65,10 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/validator.py` | 7 個品質檢查純函數 |
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
+| `data/pipeline.py` 之 `compute_feature_columns` | **DailyFeature 算式 SSOT**（B1②）：每日增量與歷史回補共用同一實作，兩邊漂移會使歷史特徵與今日特徵不同質、PIT 重放的 universe 失真 |
+| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead |
+| `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日普通股（4 碼）檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`」**——既不能看「有無資料」（2020~2024 每日皆有 6 檔 watchlist，會靜默跳過 5 年）也不能看總筆數（崩盤日權證無報價會偽陽性、權證多的半套日會偽陰性） |
+| `data/pipeline.py` 之 `backfill_valuation_history` | §6.5 #20 估值回補：**上市走 TWSE `BWIBBU_d` 每日端點、上櫃走 FinMind 逐股**——TPEX 估值端點（`peratio_book/pera_result.php`）已下架（所有日期含當日皆 302 導向 `/errors`），新版 openapi 只回當日無歷史，故上櫃無官方來源。續跑判定：上市看當日檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800，母體僅約 1,000 遠小於價量）、上櫃看該檔估值日數 ≥ 價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
@@ -91,6 +95,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
+| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣。**`assess_data_coverage` + `ReplayResult.verdict`（§6.5 #21b）**：量測該模式定義性依賴表的覆蓋度（帶 PIT 上界），把 `no_data`（輸入缺席、結果無效）與 `no_picks`（模式判斷不進場）分開——前者排除於彙總。依賴宣告在 `MODE_REQUIRED_TABLES`，新增模式須登記（契約測試守門） |
 | `discovery/ic_governance.py` | **IC 可執法性 SSOT**（P0 #16）：`select_enforceable_ic()` 三道閘門（窗口時效 `holding+14` 天／窗口數 ≥3／最小樣本 ≥100）+ `ICVerdict`；決策 IC = 最近 3 窗平均。M2 停用、scanner 門檻加成、rotation 阻擋買入三處共用 |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |
@@ -139,10 +144,11 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **EAV 指標** | `TechnicalIndicator`（stock_id, date, name, value），`load_data()` pivot 為寬表 |
 | **除權息** | Layer 1 回溯調整 OHLC + 重算指標（保留 `raw_*`）；Layer 2 原始價格交易 + 股利入帳；預設關閉，`--adjust-dividend` 啟用 |
 | **Watchlist** | `get_effective_watchlist()`：DB 優先，`quant_params.yaml` fallback，全模組統一呼叫 |
+| **粗篩不得 fail-open** | 定義性資料（估值/營收）缺席時，`_coarse_filter` 必須**收斂**而非放行。歷史教訓（2026-08-04）：`_value.py` 的 `else` 分支在估值表為空時把 PE/殖利率閘門整段跳過，模式靜默退化成流動性篩選且無 log 警示——2024~2025 的 PIT 重放因此全部失效，且方向偏樂觀（value 看似「產能率 100%、五模式之冠」）。Stage 0.5 的覆蓋率閘門亦須看**近 `VALUATION_FRESH_WINDOW_DAYS` 日窗口**而非全表相異股票數（全表計數一旦累積夠就永不觸發，live 只剩候選池補抓的 43~150 檔） |
 | **Universe 漏斗** | Stage 1 SQL 硬過濾 → Stage 2 流動性（DailyFeature 優先/覆蓋率≥30% 時使用，否則 fallback DailyPrice + 相對流動性救援）→ Stage 3 趨勢（Value/Dividend 跳過）→ Candidate Memory（3 天漸進衰減）；Regime 自適應門檻（`REGIME_UNIVERSE_ADJUSTMENTS`） |
 | **Regime 四狀態** | bull/bear/sideways/crisis；三訊號多數決 + 市場寬度降級 + Crisis 快速覆蓋；影響：選股權重、評分閾值（bull=0.45/crisis=0.60）、ATR 倍數、Universe 門檻、部位大小 |
 | **Regime 冪等（P0 #15）** | `MarketRegimeDetector().detect()` 對**同一 TAIEX 資料日**恆等：呼叫端可自由 `MarketRegimeDetector()` 新建實例（現況 10+ 處），跨實例/跨行程都拿到同一 regime，hysteresis 每個資料日只推進一次。**勿**改回以 `date.today()` 為鍵——morning-routine Step 0 在同步前執行，會把 regime 凍結在前一交易日。回傳 `state_advanced` 標示本次是否推進 |
-| **PIT 時間注入（B1）** | `MarketScanner.run(as_of=...)` 是唯一注入點；引擎層一律用 `self._as_of()`，**禁止裸 `date.today()`**（`tests/test_pit.py` 靜態守門，純函數則須加 `as_of` 參數）。查詢一律加時間上界；基本面另套公布時滯（`data/pit.py`）——`MonthlyRevenue.date` 是營收月份不是公布日，直接用 `<= as_of` 會漏未來。`as_of` 為歷史日時自動 offline，禁止一切外部補抓。shared 與 DB 兩路徑須套**相同**上界 |
+| **PIT 時間注入（B1）** | `MarketScanner.run(as_of=...)` 與 `MarketRegimeDetector.detect(as_of=...)` 是兩個注入點（regime 驅動權重/門檻/模式封鎖，漏了它重放就不成立）；歷史 as_of 時 regime 走**唯讀**路徑不推進狀態機；引擎層一律用 `self._as_of()`，**禁止裸 `date.today()`**（`tests/test_pit.py` 靜態守門，純函數則須加 `as_of` 參數）。查詢一律加時間上界；基本面另套公布時滯（`data/pit.py`）——`MonthlyRevenue.date` 是營收月份不是公布日，直接用 `<= as_of` 會漏未來。`as_of` 為歷史日時自動 offline，禁止一切外部補抓。shared 與 DB 兩路徑須套**相同**上界 |
 | **IC 執法治理（P0 #16）** | 任何「因 IC 而自動行動」一律先過 `ic_governance.select_enforceable_ic()`：不可執法時只告警。**IC 反向不再跳過掃描**——五模式恆掃恆落庫（否則模式產不出 `discovery_record`，IC 無從重算而自鎖），停用只作用在 rotation 層（`resolve_rankings(exclude_modes=...)` 阻擋新買入，賣出/停損/到期不受影響）。backtest 路徑**刻意不套用**（今日裁定套到歷史日＝look-ahead）。新增 IC 驅動開關時務必沿用此模組，勿再自行 `iloc[-1]` |
 | **E2b/E2c 凍結中（P0 #17）** | IC 自動調權（E2b）與分數翻轉/中性化（E2c）**預設不生效**，開關在 `quant.ic_governance`（兩者 false）。凍結只在唯一套用點 `_score_candidates`——底層純函數與 `_apply_ic_weight_adjustment` 行為不變，**仍照常計算並記錄** would-be 動作（log 標【凍結中，未生效】）。`_ic_actions` 凍結時留空，避免 CLI 的 (N)/(F)/(D) 誤示為已套用。**解凍前提**：B2 落地 + `valuation`/`dividend` 維度納入落庫 + 改用標準誤顯著性判定，詳 `config.py:ICGovernanceConfig` |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
@@ -165,7 +171,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 ### CLI 設計原則
 
-- 入口：`python main.py <子命令>`（49 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
+- 入口：`python main.py <子命令>`（51 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
 - 每日例行：`morning-routine`（Step 0~18 + 子步驟 8b/8c/8d/8e/9b/11b，含全市場同步 + discover + 風控 + 通知）
   - Step 8e「同步後 regime 重解」：Step 0 宏觀預檢在同步**之前**執行，其 regime 只到前一交易日；Step 12 輪動須用同步後的判定（`resolve_regime_after_sync()`，dry_run/skip_sync 跳過）
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
@@ -177,7 +183,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2739 測試 / 105 檔）
+- **執行**：`pytest -v`（2813 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

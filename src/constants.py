@@ -261,6 +261,66 @@ RANKINGS_FALLBACK_MAX_TRADING_DAYS: int = 3
 # 正常交易日全市場 ~6,000+ 筆；2026-07-10 颱風假僅 1 筆（US_VIX）。
 PHANTOM_TRADING_DAY_MIN_ROWS: int = 100
 
+# ── 歷史回補的「全市場覆蓋」判定門檻（B1①，2026-08-01）────────────────────
+# backfill 以此判斷某日是否已回補過。**判定用「普通股（4 碼）檔數」而非總筆數**，
+# 這個選擇是被兩次實測逼出來的：
+#   1. 只看「該日有無資料」→ 2020~2024 每日皆有 6 檔（watchlist + TAIEX），
+#      整整 5 年會被靜默跳過、回補什麼都不做。
+#   2. 改看總筆數（門檻 3000）→ 仍有兩種誤判：
+#      • 偽陽性：2025-04-07 關稅崩盤日 TAIEX −9.7%、80% 普通股無量跌停，
+#        權證當日幾乎無報價 → 總筆數僅 2,922，但普通股 1,894 檔其實完整。
+#        以總筆數判定會讓崩盤日被永遠重抓。
+#      • 偽陰性：2026-03-03 總筆數 5,795（權證多）但普通股僅 879 檔＝半套，
+#        總筆數門檻放它過關。
+# 普通股檔數不受權證有無影響：實測完整日恆為 1,799~1,971 檔、假日 0 檔、
+# 半套日 879 檔——1500 可乾淨分離。
+BACKFILL_MIN_COMMON_STOCKS: int = 1500
+
+# 回補單一交易日（三個 dataset 全開）的實測耗時，用於 ETA 估算。
+# 實測 2026-08-03：458 個交易日耗時 3h45m ≈ 29.5 秒/日。
+# 原本以「3 秒 × dataset 數」估算低估近 3 倍——TWSE/TPEX 雖並行，但各自 3 秒
+# 節流、且每個 dataset 都要跑一輪，再加解析與 upsert。
+SECONDS_PER_BACKFILL_DAY: float = 29.5
+
+# 估值回補（§6.5 #20）：某日 `stock_valuation` 檔數達此值即視為已補而跳過。
+# 門檻遠低於 BACKFILL_MIN_COMMON_STOCKS，因為估值的母體本來就小得多——
+# TWSE `BWIBBU_d` 只收錄有本益比可算的上市普通股（實測 2024-01-02 為 997 檔、
+# 2025-06-05 為 1,041 檔），ETF/權證/虧損股不在內。
+# 800 可乾淨分離「全市場已補（≈1,000）」與「僅候選股補抓（實測 43~150）」。
+BACKFILL_MIN_VALUATION_STOCKS: int = 800
+
+# 上櫃估值逐股回補的續跑門檻：某檔估值日數 ≥ 其價量日數 × 此比例即視為已補。
+# 不用固定日數——上櫃股上市時間不一，新股本來就只有少數交易日。
+# 0.8 而非 1.0：FinMind PER 對停牌/無 EPS 的日子會缺列，要求全等會永遠重抓。
+VALUATION_COVERAGE_RATIO: float = 0.8
+
+# API 節流間隔（秒）——與 CLAUDE.md §2 的速率規則一致，供 ETA 估算與回補迴圈共用
+TWSE_REQUEST_INTERVAL: float = 3.0
+FINMIND_REQUEST_INTERVAL: float = 0.5
+
+# Scanner Stage 0.5「估值覆蓋是否足夠」的判定窗口與門檻（2026-08-05）。
+# **必須看近期窗口而非全表**——原本數全表相異 stock_id，一旦歷史累積 ≥500 檔就
+# 永遠不再觸發全市場同步，而 live 每日只有候選池補抓（實測 43~150 檔）。
+# 後果：value/dividend 的 `_coarse_filter` 以 `groupby.last()` 取最新一筆估值，
+# 拿到的是數月前的舊 PE。窗口取 7 日以容忍假日與 TWSE 收盤後才發布的落差。
+VALUATION_FRESH_WINDOW_DAYS: int = 7
+VALUATION_MIN_FRESH_STOCKS: int = 500
+
+# PIT 重放的資料覆蓋門檻（§6.5 #21b，2026-08-06）。
+# 用途：區分「模式判斷不進場」與「輸入資料根本缺席」——兩者的 n_picks 都是 0，
+# 但前者是結論、後者是**結果無效**。2026-08-04 的跨模式重放正是栽在這裡：
+# value 因 fail-open 而 30 天全數產出、dividend 因 fail-closed 而 30 天只產出 4 天，
+# 兩者的 `n_picks` 都無法揭露真因，必須實查資料表才發現三個模式的結果不可採信。
+#
+# 門檻刻意沿用各自的 SSOT，不另立一套數字：
+#   • 價量＝BACKFILL_MIN_COMMON_STOCKS（全市場覆蓋的既有判定）
+#   • 估值＝VALUATION_MIN_FRESH_STOCKS（Scanner Stage 0.5 的同一門檻）
+#   • 特徵＝UniverseFilter._FEATURE_COVERAGE_MIN（低於此值 Stage 2 已 fallback）
+REPLAY_MIN_FEATURE_RATIO: float = 0.3
+# 月營收母體：live 實測 1,896 檔。300（≈16%）以下時 growth 的 universe 已非全市場，
+# 重放結果代表的是那個子集而非模式本身——實測 2020~2024 每年僅 **5 支**。
+REPLAY_MIN_REVENUE_STOCKS: int = 300
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

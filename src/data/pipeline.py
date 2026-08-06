@@ -11,7 +11,16 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
-from src.constants import PRICE_JUMP_WARN_THRESHOLD, UPSERT_BATCH_SIZE
+from src.constants import (
+    BACKFILL_MIN_COMMON_STOCKS,
+    BACKFILL_MIN_VALUATION_STOCKS,
+    FINMIND_REQUEST_INTERVAL,
+    PRICE_JUMP_WARN_THRESHOLD,
+    SECONDS_PER_BACKFILL_DAY,
+    TWSE_REQUEST_INTERVAL,
+    UPSERT_BATCH_SIZE,
+    VALUATION_COVERAGE_RATIO,
+)
 from src.data.database import get_effective_watchlist, get_session, init_db
 from src.data.fetcher import FinMindFetcher
 from src.data.schema import (
@@ -1044,6 +1053,477 @@ def _classify_security_type(stock_id: str, stock_name: str = "") -> str:
     return "stock"
 
 
+def backfill_market_history(
+    start: date,
+    end: date | None = None,
+    *,
+    datasets: tuple[str, ...] = ("price", "institutional", "margin"),
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """以 TWSE/TPEX 每日全市場端點回補歷史資料（B1①）。
+
+    ## 為什麼走 TWSE/TPEX 而非 FinMind 逐股
+
+    每日全市場端點回傳的是**當日實際掛牌交易的所有股票**，因此 2020 年的檔案
+    自然含有當時在市、如今已下市的標的——倖存者偏差在資料源頭就被解掉，
+    不需要另外逐股補抓下市股（下市清單仍需同步，見 `sync_delisting_info`，
+    那是為了知道「何時下市」以供 PIT 判定可交易性）。
+
+    另一個理由是量：逐股回補 3,000+ 檔 × 5 年 × 3 個 dataset 在 FinMind
+    0.5s/次 下不可行；每日端點是 1,225 個交易日 × 3s。
+
+    ## 續跑
+
+    **不另外維護進度檔**——直接以 DB 現況為準：某日**普通股（4 碼）檔數**達
+    `BACKFILL_MIN_COMMON_STOCKS` 即視為已回補而跳過。中斷後重跑會自動從缺口
+    續行，且重跑安全（upsert）。
+
+    ⚠ 判定既不能用「該日是否有資料」也不能用「總筆數」——兩者都被實測打臉，
+    理由詳見 `constants.BACKFILL_MIN_COMMON_STOCKS` 的註解。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。範圍內已達全市場覆蓋的日期會自動跳過，
+            因此預設值可安全地涵蓋全部歷史（同時補中間的任何缺口）。
+        datasets: 要回補的資料集子集。
+        dry_run: 只列出將回補的日期與預估時間，不實際抓取。
+        progress_every: 每 N 個交易日輸出一次進度。
+        stop_flag: 可選的中止判定函數；回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"trading_days": N, "daily_price": M, "institutional": K, "margin": J, "skipped": S}
+    """
+    from src.data.twse_fetcher import (
+        fetch_market_daily_prices,
+        fetch_market_institutional,
+        fetch_market_margin,
+    )
+
+    init_db()
+    result = {"trading_days": 0, "daily_price": 0, "institutional": 0, "margin": 0, "skipped": 0}
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # 已達「全市場覆蓋」的日期（見 docstring：不能只看該日是否有資料）
+    with get_session() as session:
+        covered = {
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                # 只數 4 碼普通股：權證/ETF 在崩盤日會整批無報價，用總筆數會誤判
+                .where(func.length(DailyPrice.stock_id) == 4)
+                .group_by(DailyPrice.date)
+                .having(func.count(DailyPrice.id) >= BACKFILL_MIN_COMMON_STOCKS)
+            ).all()
+        }
+
+    # 待補的候選日（排除週末與已覆蓋者）；實際是否為交易日由 API 回空判定
+    pending = [
+        d
+        for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
+        if d.weekday() < 5 and d not in covered
+    ]
+    result["skipped"] = (end - start).days + 1 - len(pending)
+
+    # 每個交易日的實際耗時：每個 dataset 都要 TWSE + TPEX（雖並行但各自 3 秒節流）
+    # 再加解析/寫入。實測 2026-08-03 全程 458 個交易日 / 3h45m ≈ 29 秒/日；
+    # 原估算用 3 秒/dataset 低估近 3 倍，改用實測值。
+    n_ds = len([d for d in datasets if d in ("price", "institutional", "margin")])
+    est_sec = len(pending) * SECONDS_PER_BACKFILL_DAY * max(1, n_ds) / 3
+    logger.info(
+        "[回補] %s ~ %s：待補 %d 個平日（已跳過 %d 日），dataset=%s，預估 %.1f 小時",
+        start,
+        end,
+        len(pending),
+        result["skipped"],
+        ",".join(datasets),
+        est_sec / 3600,
+    )
+    if dry_run:
+        return result
+
+    for i, d in enumerate(pending, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[回補] 收到中止訊號，已完成 %d/%d 日", i - 1, len(pending))
+            break
+
+        df_price = fetch_market_daily_prices(d) if "price" in datasets else pd.DataFrame()
+        if df_price.empty:
+            # 假日或該日無資料——不是錯誤
+            continue
+
+        result["trading_days"] += 1
+        result["daily_price"] += _upsert_daily_price(df_price)
+
+        if "institutional" in datasets:
+            df_inst = fetch_market_institutional(d)
+            if not df_inst.empty:
+                result["institutional"] += _upsert_institutional(df_inst)
+        if "margin" in datasets:
+            df_margin = fetch_market_margin(d)
+            if not df_margin.empty:
+                result["margin"] += _upsert_margin(df_margin)
+
+        if result["trading_days"] % progress_every == 0:
+            logger.info(
+                "[回補] 進度 %d/%d 平日（%s）— 交易日 %d, 日K %d 筆",
+                i,
+                len(pending),
+                d.isoformat(),
+                result["trading_days"],
+                result["daily_price"],
+            )
+
+    logger.info(
+        "[回補] 完成 — 交易日 %d, 日K %d 筆, 法人 %d 筆, 融資融券 %d 筆",
+        result["trading_days"],
+        result["daily_price"],
+        result["institutional"],
+        result["margin"],
+    )
+    return result
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    """判斷例外是否為 FinMind 配額/流量限制（而非個股層級的錯誤）。
+
+    FinMind 配額用盡回 **402 Payment Required**、超速回 **429**。兩者都代表
+    「再打下去也沒用」，與「這支股票沒資料」性質完全不同——後者該跳過續跑，
+    前者該立刻停手並告訴使用者稍後重跑。
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (402, 429):
+        return True
+    # 部分路徑只剩字串（例如被包過一層），退而求其次比對訊息
+    text = str(exc)
+    return "402" in text or "Payment Required" in text or "429" in text
+
+
+def backfill_valuation_history(
+    start: date,
+    end: date | None = None,
+    *,
+    markets: tuple[str, ...] = ("twse", "tpex"),
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """回補 `stock_valuation` 歷史（B1① 的基本面缺口，§6.5 #20）。
+
+    ## 為什麼要分兩條路走
+
+    B1① 只補了價量。估值缺口使 value/dividend/growth 的 PIT 重放全部失效
+    （粗篩在估值表為空時 fail-open，模式靜默退化成流動性篩選），
+    詳 `logs/pit_crossmode_20260804/REPORT.md` §3。
+
+    補法依市場分流，因為**兩邊的官方端點狀況不同**：
+
+    - **上市（twse）**：`BWIBBU_d` 每日全市場端點健在且**有完整歷史**
+      （實測 2024-01-02 回傳 997 檔）。一天一次呼叫拿全市場，走這條。
+    - **上櫃（tpex）**：`peratio_book/pera_result.php` **已下架**——所有日期
+      （含當日）皆 302 導向 `/errors`。TPEX 新版 openapi
+      （`tpex_mainboard_peratio_analysis`）只回**當日**、無日期參數。
+      故上櫃歷史**無官方來源**，改走 FinMind `TaiwanStockPER` 逐股。
+
+    逐股看似違反「官方優先」的資料源順序，但這裡沒有官方選項；且
+    FinMind PER 支援日期區間，一檔股票一次呼叫即涵蓋全期間
+    （1,100 檔 × 0.5s ≈ 10 分鐘），比每日端點更省。
+
+    ## 續跑
+
+    與 `backfill_market_history` 同樣**不維護進度檔**，直接以 DB 現況為準：
+
+    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過。
+    - tpex：某檔在區間內的估值日數達該檔**價量日數的 8 成**即視為已補。
+      不用固定門檻——上櫃股上市時間不一，新股本來就只有少數日子有資料。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        markets: 要回補的市場子集（"twse" / "tpex"）。
+        dry_run: 只估算不抓取。
+        progress_every: 每 N 個單位輸出一次進度。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"twse_days": N, "twse_rows": M, "tpex_stocks": K, "tpex_rows": J, "skipped_days": S, "skipped_stocks": T}
+    """
+    from src.data.twse_fetcher import fetch_twse_valuation_all
+
+    init_db()
+    result = {
+        "twse_days": 0,
+        "twse_rows": 0,
+        "tpex_stocks": 0,
+        "tpex_rows": 0,
+        "skipped_days": 0,
+        "skipped_stocks": 0,
+        "quota_exhausted": 0,
+    }
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("估值回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # ---------- 上市：TWSE 每日全市場 ---------- #
+    if "twse" in markets:
+        with get_session() as session:
+            covered = {
+                r[0]
+                for r in session.execute(
+                    select(StockValuation.date)
+                    .where(StockValuation.date >= start, StockValuation.date <= end)
+                    .group_by(StockValuation.date)
+                    .having(func.count(StockValuation.id) >= BACKFILL_MIN_VALUATION_STOCKS)
+                ).all()
+            }
+        pending_days = [
+            d
+            for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
+            if d.weekday() < 5 and d not in covered
+        ]
+        result["skipped_days"] = (end - start).days + 1 - len(pending_days)
+        logger.info(
+            "[估值回補/上市] %s ~ %s：待補 %d 個平日（已跳過 %d 日），預估 %.1f 分鐘",
+            start,
+            end,
+            len(pending_days),
+            result["skipped_days"],
+            len(pending_days) * TWSE_REQUEST_INTERVAL / 60,
+        )
+
+        if not dry_run:
+            for i, d in enumerate(pending_days, 1):
+                if stop_flag is not None and stop_flag():
+                    logger.warning("[估值回補/上市] 收到中止訊號，已完成 %d/%d 日", i - 1, len(pending_days))
+                    break
+                df = fetch_twse_valuation_all(d)
+                if df.empty:
+                    continue  # 假日或該日無資料——不是錯誤
+                result["twse_days"] += 1
+                result["twse_rows"] += _upsert_valuation(df)
+                if result["twse_days"] % progress_every == 0:
+                    logger.info(
+                        "[估值回補/上市] 進度 %d/%d 平日（%s）— 交易日 %d, 累計 %d 筆",
+                        i,
+                        len(pending_days),
+                        d.isoformat(),
+                        result["twse_days"],
+                        result["twse_rows"],
+                    )
+
+    # ---------- 上櫃：FinMind 逐股全區間 ---------- #
+    if "tpex" in markets:
+        with get_session() as session:
+            otc_ids = [
+                r[0]
+                for r in session.execute(
+                    select(StockInfo.stock_id)
+                    .where(StockInfo.listing_type == "tpex")
+                    # 只補普通股：ETF/權證/特別股無 PE 語意
+                    .where(StockInfo.security_type == "stock")
+                    .order_by(StockInfo.stock_id)
+                ).all()
+            ]
+            # 各檔在區間內「已有的估值日數」與「應有的價量日數」
+            val_days = dict(
+                session.execute(
+                    select(StockValuation.stock_id, func.count(func.distinct(StockValuation.date)))
+                    .where(StockValuation.date >= start, StockValuation.date <= end)
+                    .group_by(StockValuation.stock_id)
+                ).all()
+            )
+            price_days = dict(
+                session.execute(
+                    select(DailyPrice.stock_id, func.count(func.distinct(DailyPrice.date)))
+                    .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                    .where(DailyPrice.stock_id.in_(otc_ids))
+                    .group_by(DailyPrice.stock_id)
+                ).all()
+            )
+
+        pending_ids = [
+            sid
+            for sid in otc_ids
+            # 沒有價量的（未上市/已下市於區間外）不必補；有價量者要求估值覆蓋 8 成
+            if price_days.get(sid, 0) > 0 and val_days.get(sid, 0) < price_days[sid] * VALUATION_COVERAGE_RATIO
+        ]
+        result["skipped_stocks"] = len(otc_ids) - len(pending_ids)
+        logger.info(
+            "[估值回補/上櫃] 待補 %d 檔（已跳過 %d 檔），FinMind 逐股，預估 %.1f 分鐘",
+            len(pending_ids),
+            result["skipped_stocks"],
+            len(pending_ids) * FINMIND_REQUEST_INTERVAL / 60,
+        )
+
+        if not dry_run and pending_ids:
+            fetcher = FinMindFetcher()
+            for i, sid in enumerate(pending_ids, 1):
+                if stop_flag is not None and stop_flag():
+                    logger.warning("[估值回補/上櫃] 收到中止訊號，已完成 %d/%d 檔", i - 1, len(pending_ids))
+                    break
+                try:
+                    df = fetcher.fetch_per_pbr(sid, start, end)
+                except Exception as exc:
+                    # 配額用盡與個股錯誤要分開處理：前者續跑只會空轉。
+                    # 實測 2026-08-05 首跑——580 檔後 FinMind 回 402，其後 299 次
+                    # 呼叫全部瞬間失敗（間隔 0 秒），純粹浪費且把真正的原因淹沒在
+                    # 299 行相同的 WARNING 裡。
+                    if _is_quota_exhausted(exc):
+                        logger.error(
+                            "[估值回補/上櫃] FinMind 配額用盡（%s），已完成 %d/%d 檔——"
+                            "配額恢復後重跑本指令即可從缺口續行",
+                            type(exc).__name__,
+                            i - 1,
+                            len(pending_ids),
+                        )
+                        result["quota_exhausted"] = 1
+                        break
+                    logger.warning("[估值回補/上櫃] %s 抓取失敗，跳過：%s", sid, exc)
+                    continue
+                if df.empty:
+                    continue
+                result["tpex_stocks"] += 1
+                result["tpex_rows"] += _upsert_valuation(df)
+                if i % progress_every == 0:
+                    logger.info(
+                        "[估值回補/上櫃] 進度 %d/%d 檔（%s）— 有資料 %d 檔, 累計 %d 筆",
+                        i,
+                        len(pending_ids),
+                        sid,
+                        result["tpex_stocks"],
+                        result["tpex_rows"],
+                    )
+
+    logger.info(
+        "[估值回補] 完成 — 上市 %d 日/%d 筆, 上櫃 %d 檔/%d 筆",
+        result["twse_days"],
+        result["twse_rows"],
+        result["tpex_stocks"],
+        result["tpex_rows"],
+    )
+    return result
+
+
+def clear_false_delistings(min_trading_days_after: int = 3) -> int:
+    """清除「下市後仍在交易」的 `delisted_date`（B1① 資料語意防線）。
+
+    FinMind `TaiwanStockDelisting` 收錄的是「**從該板終止**」，其中包含**轉板**
+    （如上櫃轉上市＝終止上櫃），並非全部都是真正停止交易。實測 2026-08-03：
+    30 檔有價量的下市股中，5236 凌陽創新於「下市日」2026-07-16 之後仍持續正常
+    交易（2026-08-03 成交 138,695 股）——它是轉板，不是下市。
+
+    誤判方向是**過度保守**（把還在交易的股票當成不可交易），比倖存者偏差安全，
+    但仍會讓 PIT universe 少掉真實可交易標的。
+
+    判定採「下市日之後仍有 >= N 個交易日的報價」，而非單日——避免單筆髒資料
+    就把真正的下市翻案。
+
+    Args:
+        min_trading_days_after: 下市日後需觀察到幾個交易日才判定為誤記。
+
+    Returns:
+        被清除 `delisted_date` 的股票數。
+    """
+    cleared = 0
+    with get_session() as session:
+        rows = session.execute(select(StockInfo).where(StockInfo.delisted_date.isnot(None))).scalars().all()
+        for info in rows:
+            n_after = session.execute(
+                select(func.count(func.distinct(DailyPrice.date))).where(
+                    DailyPrice.stock_id == info.stock_id,
+                    DailyPrice.date > info.delisted_date,
+                )
+            ).scalar()
+            if (n_after or 0) >= min_trading_days_after:
+                logger.warning(
+                    "疑似轉板而非下市：%s %s 於 %s 後仍有 %d 個交易日報價 — 清除 delisted_date",
+                    info.stock_id,
+                    info.stock_name or "",
+                    info.delisted_date,
+                    n_after,
+                )
+                info.delisted_date = None
+                cleared += 1
+        if cleared:
+            session.commit()
+    return cleared
+
+
+def sync_delisting_info(fetcher: FinMindFetcher | None = None) -> int:
+    """同步下市清單至 `stock_info.delisted_date`（B1① 倖存者偏差修正）。
+
+    為什麼需要：`stock_info` 原本只描述「今天還在市」的股票，歷史重放會自動
+    排除當時在市、後來下市的標的——而下市股往往正是表現最差的那批，排除它們
+    會讓歷史績效系統性偏高。有了 `delisted_date`，PIT 才能判定
+    「該股於 as_of 當時是否可交易」。
+
+    行為：
+      - 下市股若不在 `stock_info` 中（已從現行清單消失）→ **新增**一列，
+        `security_type='stock'` 讓它能通過 universe SQL 過濾
+      - 已存在者 → 僅補 `delisted_date`，不動既有產業分類
+      - 取得失敗（空 DataFrame）→ 回傳 0 且**不修改任何資料**，避免把全部
+        股票誤標為未下市
+
+    Returns:
+        寫入/更新的筆數。
+    """
+    init_db()
+    f = fetcher or FinMindFetcher()
+    df = f.fetch_delisting_list()
+    if df.empty or "stock_id" not in df.columns:
+        logger.warning("下市清單為空，跳過（維持 stock_info 現狀）")
+        return 0
+
+    updated = 0
+    with get_session() as session:
+        for _, row in df.iterrows():
+            sid = str(row["stock_id"]).strip()
+            if not sid:
+                continue
+            try:
+                dl_date = pd.to_datetime(row["date"]).date()
+            except Exception:
+                continue
+
+            existing = session.execute(select(StockInfo).where(StockInfo.stock_id == sid)).scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    StockInfo(
+                        stock_id=sid,
+                        stock_name=str(row.get("stock_name") or "") or None,
+                        industry_category=None,
+                        # 讓 UniverseFilter 的 SQL 過濾不會直接排除它；
+                        # 實際可交易性由 delisted_date + 當日有無報價決定
+                        security_type="stock",
+                        delisted_date=dl_date,
+                    )
+                )
+                updated += 1
+            elif existing.delisted_date != dl_date:
+                existing.delisted_date = dl_date
+                updated += 1
+        session.commit()
+
+    cleared = clear_false_delistings()
+    logger.info(
+        "下市清單同步完成：%d 筆 stock_info 更新（清單共 %d 筆，另清除 %d 筆疑似轉板）",
+        updated,
+        len(df),
+        cleared,
+    )
+    return updated
+
+
 def sync_stock_info(force_refresh: bool = False) -> int:
     """同步全市場股票基本資料（產業分類 + security_type）到 stock_info 表。
 
@@ -1583,6 +2063,68 @@ def save_rotation_backtest(result) -> int:
 # ────────────────────────────────────────────────────────────────
 
 
+DAILY_FEATURE_COLUMNS: list[str] = [
+    "stock_id",
+    "date",
+    "close",
+    "volume",
+    "turnover",
+    "ma20",
+    "ma60",
+    "volume_ma20",
+    "turnover_ma5",
+    "turnover_ma20",
+    "momentum_20d",
+    "volatility_20d",
+    "turnover_ratio_5d_20d",
+    "high_20d",
+    "computed_at",
+]
+
+
+def compute_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """在既有 DailyPrice 明細上向量化計算 DailyFeature 各欄（純函數）。
+
+    B1②（2026-08-04）抽出為共用實作：每日增量路徑
+    （`compute_and_store_daily_features`）與歷史回補路徑
+    （`backfill_daily_features`）必須用**完全相同**的算式，否則歷史特徵與
+    今日特徵不同質，PIT 重放出來的 universe 就不是當時真正會得到的那個。
+
+    輸入需已按 (stock_id, date) 排序且過濾掉 volume<=0 / close 無效者。
+    所有 rolling 皆為**後視窗**，天然不會用到未來資料。
+
+    Args:
+        df: 含 stock_id / date / high / close / volume / turnover 的明細。
+
+    Returns:
+        原 df 加上各特徵欄（原地修改後回傳同一物件）。
+    """
+    g_close = df.groupby("stock_id")["close"]
+    g_vol = df.groupby("stock_id")["volume"]
+    g_turnover = df.groupby("stock_id")["turnover"]
+
+    df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
+    df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
+    df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
+    df["turnover_ma20"] = g_turnover.transform(lambda s: s.rolling(20, min_periods=10).mean())
+
+    # 20 日報酬率 (%)
+    df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
+
+    # 20 日年化波動率 (%)
+    df["volatility_20d"] = g_close.transform(
+        lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
+    )
+
+    # 5日/20日成交金額比（相對流動性：偵測「突然被市場關注」的股票）
+    df["turnover_ratio_5d_20d"] = df["turnover_ma5"] / df["turnover_ma20"].replace(0, float("nan"))
+
+    # 20 日最高價（突破型過濾：close / high_20d >= 0.9 確認真突破）
+    df["high_20d"] = df.groupby("stock_id")["high"].transform(lambda s: s.rolling(20, min_periods=10).max())
+    return df
+
+
 def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day: int = 1000) -> int:
     """計算並儲存全市場每日特徵到 DailyFeature 表（Feature Store）。
 
@@ -1637,32 +2179,7 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
         )
 
     logger.info("[DailyFeature] 共 %d 筆有效資料，開始向量化計算...", len(df))
-
-    # 向量化 rolling 計算（groupby + transform，無 Python for-loop）
-    g_close = df.groupby("stock_id")["close"]
-    g_vol = df.groupby("stock_id")["volume"]
-    g_turnover = df.groupby("stock_id")["turnover"]
-
-    df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=10).mean())
-    df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=30).mean())
-    df["volume_ma20"] = g_vol.transform(lambda s: s.rolling(20, min_periods=10).mean())
-    df["turnover_ma5"] = g_turnover.transform(lambda s: s.rolling(5, min_periods=3).mean())
-    df["turnover_ma20"] = g_turnover.transform(lambda s: s.rolling(20, min_periods=10).mean())
-
-    # 20 日報酬率 (%)
-    df["momentum_20d"] = g_close.transform(lambda s: s.pct_change(20) * 100)
-
-    # 20 日年化波動率 (%)
-    df["volatility_20d"] = g_close.transform(
-        lambda s: s.pct_change().rolling(20, min_periods=10).std() * (252**0.5) * 100
-    )
-
-    # 5日/20日成交金額比（相對流動性：偵測「突然被市場關注」的股票）
-    df["turnover_ratio_5d_20d"] = df["turnover_ma5"] / df["turnover_ma20"].replace(0, float("nan"))
-
-    # 20 日最高價（突破型過濾：close / high_20d >= 0.9 確認真突破）
-    g_high = df.groupby("stock_id")["high"]
-    df["high_20d"] = g_high.transform(lambda s: s.rolling(20, min_periods=10).max())
+    df = compute_feature_columns(df)
 
     # 只取最新一日（增量更新策略），並加最低覆蓋率守門
     # 防止「watchlist 子集先寫 DailyPrice → sync-features 抓到部分日期當 latest」的污染
@@ -1720,6 +2237,138 @@ def compute_and_store_daily_features(lookback_days: int = 90, min_stocks_per_day
     )
     logger.info("[DailyFeature] 已寫入 %d 筆（日期 %s）", written, latest_date)
     return written
+
+
+def backfill_daily_features(
+    start: date,
+    end: date | None = None,
+    *,
+    chunk_days: int = 90,
+    lookback_buffer_days: int = 130,
+    min_stocks_per_day: int = 1000,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """回補歷史 `DailyFeature`（B1②）— PIT universe 過濾的資料前提。
+
+    `compute_and_store_daily_features()` 是**增量**設計：只寫最新一日，且錨在
+    `date.today()`。PIT 重放需要「當時那一天的特徵」，故需本函數逐日補齊歷史。
+
+    ## PIT 正確性
+
+    所有 rolling 皆為後視窗，計算 D 日特徵時只會用到 <= D 的資料，天然無
+    look-ahead。為使 chunk 邊界的 MA60 正確，每個 chunk 會**多讀
+    `lookback_buffer_days` 天**作為暖身，但只寫入 chunk 區間內的日期。
+
+    ## 續跑
+
+    以 DB 現況為準：`daily_feature` 已有的日期直接跳過，中斷後重跑自動續行。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        chunk_days: 每批處理的日曆天數（控制記憶體；90 天 ≈ 40 萬筆）。
+        lookback_buffer_days: 每批往前多讀的暖身天數（須 > MA60 所需交易日）。
+        min_stocks_per_day: 該日 DailyPrice 少於此數視為覆蓋不足，不計算特徵。
+        dry_run: 只估算待補日數，不計算也不寫入。
+
+    Returns:
+        {"dates": N, "rows": M, "skipped_dates": S}
+    """
+    init_db()
+    result = {"dates": 0, "rows": 0, "skipped_dates": 0}
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("[DailyFeature 回補] 範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    with get_session() as session:
+        # 有足夠 DailyPrice 覆蓋、值得算特徵的日期
+        price_dates = {
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(DailyPrice.date >= start, DailyPrice.date <= end)
+                .group_by(DailyPrice.date)
+                .having(func.count(DailyPrice.id) >= min_stocks_per_day)
+            ).all()
+        }
+        done_dates = {
+            r[0]
+            for r in session.execute(
+                select(DailyFeature.date).where(DailyFeature.date >= start, DailyFeature.date <= end).distinct()
+            ).all()
+        }
+
+    pending = sorted(price_dates - done_dates)
+    result["skipped_dates"] = len(price_dates & done_dates)
+    logger.info(
+        "[DailyFeature 回補] %s ~ %s：待補 %d 日（已有 %d 日），chunk=%d 天",
+        start,
+        end,
+        len(pending),
+        result["skipped_dates"],
+        chunk_days,
+    )
+    if dry_run or not pending:
+        return result
+
+    pending_set = set(pending)
+    cursor = pending[0]
+    last = pending[-1]
+    while cursor <= last:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), last)
+        targets = sorted(d for d in pending_set if cursor <= d <= chunk_end)
+        if not targets:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        warm_start = cursor - timedelta(days=lookback_buffer_days)
+        with get_session() as session:
+            rows = session.execute(
+                select(
+                    DailyPrice.stock_id,
+                    DailyPrice.date,
+                    DailyPrice.high,
+                    DailyPrice.close,
+                    DailyPrice.volume,
+                    DailyPrice.turnover,
+                ).where(DailyPrice.date >= warm_start, DailyPrice.date <= chunk_end)
+            ).all()
+
+        if not rows:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        df = pd.DataFrame(rows, columns=["stock_id", "date", "high", "close", "volume", "turnover"])
+        df = df[(df["volume"] > 0) & df["close"].notna() & (df["close"] > 0)]
+        df = df.sort_values(["stock_id", "date"])
+        if df.empty:
+            cursor = chunk_end + timedelta(days=1)
+            continue
+
+        df = compute_feature_columns(df)
+        df_out = df[df["date"].isin(targets)].copy()
+        df_out["computed_at"] = pd.Timestamp.utcnow()
+        df_out = df_out[DAILY_FEATURE_COLUMNS].reset_index(drop=True)
+
+        update_cols = [c for c in DAILY_FEATURE_COLUMNS if c not in ("stock_id", "date")]
+        written = _upsert_batch(DailyFeature, df_out, ["stock_id", "date"], update_cols=update_cols)
+        result["dates"] += len(targets)
+        result["rows"] += written
+        logger.info(
+            "[DailyFeature 回補] %s ~ %s：%d 日 / %d 筆（累計 %d 日 / %d 筆）",
+            targets[0],
+            targets[-1],
+            len(targets),
+            written,
+            result["dates"],
+            result["rows"],
+        )
+        cursor = chunk_end + timedelta(days=1)
+
+    logger.info("[DailyFeature 回補] 完成 — %d 日 / %d 筆", result["dates"], result["rows"])
+    return result
 
 
 def sync_concepts_from_yaml(

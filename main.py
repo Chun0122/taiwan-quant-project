@@ -120,6 +120,7 @@ from src.cli.discover_cmd import (
 from src.cli.export_dashboard_cmd import cmd_export_dashboard
 from src.cli.helpers import setup_logging
 from src.cli.misc_cmd import (
+    cmd_backfill_history,
     cmd_dashboard,
     cmd_export,
     cmd_import_data,
@@ -127,6 +128,7 @@ from src.cli.misc_cmd import (
     cmd_migrate,
     cmd_notify,
     cmd_optimize,
+    cmd_pit_replay,
     cmd_report,
     cmd_scan,
     cmd_schedule,
@@ -825,6 +827,55 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate 子命令
     subparsers.add_parser("migrate", help="執行資料庫 schema 遷移")
 
+    # pit-replay 子命令（B1④ PIT 歷史重放）
+    sp_pit = subparsers.add_parser("pit-replay", help="PIT 歷史重放：在歷史日重跑 scanner 並評估前瞻報酬")
+    sp_pit.add_argument(
+        "mode",
+        nargs="?",
+        default="momentum",
+        choices=["momentum", "swing", "value", "dividend", "growth"],
+        help="掃描模式（預設 momentum）",
+    )
+    sp_pit.add_argument("--date", default=None, help="單一基準日 YYYY-MM-DD")
+    sp_pit.add_argument("--start", default=None, help="範圍起始日（與 --date 二擇一）")
+    sp_pit.add_argument("--end", default=None, help="範圍結束日；省略＝今日")
+    sp_pit.add_argument("--every", type=int, default=20, help="每 N 個交易日取樣一次（預設 20≈每月）")
+    sp_pit.add_argument("--top", type=int, default=20, help="每次取前 N 名（預設 20）")
+    sp_pit.add_argument("--horizons", default="5,10,20", help="前瞻交易日數，逗號分隔（預設 5,10,20）")
+    sp_pit.add_argument("--export", default=None, help="明細匯出 CSV 路徑")
+    sp_pit.add_argument("--dry-run", action="store_true", help="只列出將重放的基準日與預估時間")
+
+    # backfill-history 子命令（B1① PIT 歷史回補）
+    sp_bf = subparsers.add_parser(
+        "backfill-history",
+        help="回補歷史全市場資料（TWSE/TPEX 每日端點；可中斷續跑）",
+    )
+    sp_bf.add_argument("--start", default="2020-01-01", help="起始日 YYYY-MM-DD（預設 2020-01-01）")
+    sp_bf.add_argument("--end", default=None, help="結束日 YYYY-MM-DD；省略＝補到接上現有資料")
+    sp_bf.add_argument(
+        "--datasets",
+        default="price,institutional,margin",
+        help="要回補的資料集（逗號分隔：price/institutional/margin）",
+    )
+    sp_bf.add_argument("--skip-delisting", action="store_true", help="跳過下市清單同步")
+    sp_bf.add_argument(
+        "--features-only",
+        action="store_true",
+        help="只回補 DailyFeature（B1②，純 CPU 不打 API；需 DailyPrice 已就緒）",
+    )
+    sp_bf.add_argument("--with-features", action="store_true", help="價量回補完成後接著回補 DailyFeature")
+    sp_bf.add_argument(
+        "--valuation-only",
+        action="store_true",
+        help="只回補 stock_valuation（§6.5 #20：上市走 TWSE 每日端點、上櫃走 FinMind 逐股）",
+    )
+    sp_bf.add_argument(
+        "--valuation-markets",
+        default="twse,tpex",
+        help="估值回補的市場（逗號分隔：twse/tpex），搭配 --valuation-only",
+    )
+    sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
+
     # rotation 子命令（輪動組合部位控制）
     sp_rot = subparsers.add_parser("rotation", help="輪動組合部位控制（建立/更新/狀態/回測/管理）")
     sp_rot.set_defaults(_subparser=sp_rot)
@@ -1029,6 +1080,10 @@ def main() -> None:
         cmd_revenue_scan(args)
     elif args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "backfill-history":
+        cmd_backfill_history(args)
+    elif args.command == "pit-replay":
+        cmd_pit_replay(args)
     elif args.command == "export":
         cmd_export(args)
     elif args.command == "import-data":
