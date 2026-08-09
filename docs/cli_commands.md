@@ -411,6 +411,8 @@ python main.py pit-replay momentum --start 2024-01-01 --end 2024-12-31 --every 2
 
 依賴表：momentum/swing＝`daily_price`+`daily_feature`；value/dividend 另加 `stock_valuation`；growth 另加 `monthly_revenue`。門檻沿用既有 SSOT（`BACKFILL_MIN_COMMON_STOCKS` / `VALUATION_MIN_FRESH_STOCKS` / `REPLAY_MIN_FEATURE_RATIO` / `REPLAY_MIN_REVENUE_STOCKS`），且**全部帶 PIT 上界**——否則「當時還沒回補」的日子會被未來資料誤判為就緒。
 
+`daily_feature` **同時檢查列數與欄位暖身**（§6.5 #21d）：列數足夠不代表欄位可用——MA60 需 60 個交易日才填滿，回補範圍頭幾十天 `ma60`/`turnover_ma20` 全是 NaN。實測 2020-01-02 有 1,706 列特徵但兩欄非空率皆 **0.0%**。門檻 `REPLAY_MIN_FEATURE_WARM_RATIO`（0.5），母體限 4 碼普通股（實測穩態 0.988~0.998；不限 4 碼會因權證上市時間短掉到 0.65~0.79）。這不只影響評分——`universe.py` 對 `turnover_ma20` 為 NaN 的個股**跳過 Stage 2 流動性門檻**，暖身期等於流動性過濾整段消失。
+
 ⚠ 為何必要：`n_picks=0`（甚至 `n_picks=2`）無法分辨「模式看過全市場後不進場」與「輸入根本不存在」。2026-08-04 的跨模式重放正是栽在這裡——dividend「30 天只選得出 4 天」被記為模式產能，真因是 `stock_valuation` 在 2026-01-26 前無資料。實測 growth 2024-06-03 從 15,237 檔中「產出 2 檔」，那 2 檔只來自當時僅有的 5 支有營收股票。
 
 ⚠ 現況缺口：`monthly_revenue`（2020~2024 每年僅 5 支）與 `financial_statement`（全表 15 支）尚未回補 → **growth 的歷史重放仍不可用**，會全數標記 `no_data`。

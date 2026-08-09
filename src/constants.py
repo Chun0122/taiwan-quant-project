@@ -336,6 +336,22 @@ REPLAY_MIN_FEATURE_RATIO: float = 0.3
 # 重放結果代表的是那個子集而非模式本身——實測 2020~2024 每年僅 **5 支**。
 REPLAY_MIN_REVENUE_STOCKS: int = 300
 
+# 特徵「暖身」門檻（§6.5 #21d，2026-08-09）：`daily_feature` 的列數足夠**不代表**
+# 欄位可用。MA60 需 60 個交易日才填滿，回補範圍的頭幾十天欄位全是 NaN，而列數檢查
+# 完全看不出來——與 fail-open 同一類的靜默失效。
+#
+# 具體後果不只是「分數不準」：`universe.py:125` 對 `turnover_ma20` 為 NaN 的個股
+# **跳過 Stage 2 流動性門檻**，暖身期等於流動性過濾整段消失。
+#
+# 門檻取 0.5——實測分布是乾淨的雙峰，不需判斷。**母體限 4 碼普通股**：
+#   • 暖身失效：非空率 **0.000**（2020-01-02、01-20、02-10）
+#   • 穩態：**0.988 ~ 0.998**（2020-03-10 至 2026-06-01 抽樣）
+# ⚠ 若不限 4 碼，穩態會掉到 0.646~0.786——權證/ETN 上市時間短、MA 天生填不滿，
+#   把它們算進母體會讓門檻無從設定。這也是本檢查與 `feature_stocks` 一致採
+#   `length(stock_id) == 4` 的原因。
+# 取 ma60 與 turnover_ma20 的**較小值**（ma60 窗口長，是 binding constraint）。
+REPLAY_MIN_FEATURE_WARM_RATIO: float = 0.5
+
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"
 PENDING_STATUS_FILLED: str = "filled"

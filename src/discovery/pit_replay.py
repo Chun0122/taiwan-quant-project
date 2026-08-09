@@ -34,6 +34,7 @@ from sqlalchemy import func, select
 from src.constants import (
     BACKFILL_MIN_COMMON_STOCKS,
     REPLAY_MIN_FEATURE_RATIO,
+    REPLAY_MIN_FEATURE_WARM_RATIO,
     REPLAY_MIN_REVENUE_STOCKS,
     VALUATION_FRESH_WINDOW_DAYS,
     VALUATION_MIN_FRESH_STOCKS,
@@ -81,6 +82,10 @@ class DataCoverage:
     feature_stocks: int
     valuation_stocks: int
     revenue_stocks: int
+    # §6.5 #21d：列數足夠**不代表**欄位可用。MA60 需 60 個交易日才填滿，回補範圍
+    # 頭幾十天欄位全是 NaN 而列數檢查完全看不出來。取 ma60 與 turnover_ma20 非空率
+    # 的較小值（ma60 天生較低，是 binding constraint）。
+    feature_warm_ratio: float = 1.0
     required: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
 
@@ -90,9 +95,15 @@ class DataCoverage:
         return not self.missing
 
     def describe(self) -> str:
-        """一行摘要，供 CLI 與報告輸出。"""
+        """一行摘要，供 CLI 與報告輸出。
+
+        暖身失效與整表缺席分開講——兩者都讓結果不可採信，但補救方式完全不同：
+        前者要往前多回補幾十個交易日，後者要補整張表。
+        """
         if self.sufficient:
             return "資料就緒"
+        if "daily_feature" in self.missing and self.feature_warm_ratio < REPLAY_MIN_FEATURE_WARM_RATIO:
+            return f"特徵未暖身（ma60/turnover_ma20 非空率 {self.feature_warm_ratio:.1%}）"
         return "資料缺席：" + ", ".join(self.missing)
 
 
@@ -154,24 +165,46 @@ def assess_data_coverage(mode: str, as_of: date) -> DataCoverage:
             ).scalar()
             or 0
         )
+        # §6.5 #21d 暖身檢查：量測**欄位**而非列數。這兩欄各自把守一道閘門——
+        # `ma60` 是 universe Stage 3 的趨勢過濾，`turnover_ma20` 是 Stage 2 的流動性
+        # 門檻，且後者為 NaN 時 `universe.py:125` 會**跳過該股的門檻**（per-stock
+        # fail-open），暖身期等於流動性過濾整段消失。
+        warm = session.execute(
+            select(
+                func.count(),
+                func.count(DailyFeature.ma60),
+                func.count(DailyFeature.turnover_ma20),
+            ).where(
+                DailyFeature.date == as_of,
+                func.length(DailyFeature.stock_id) == 4,
+            )
+        ).one()
+        total_rows = warm[0] or 0
+        feature_warm_ratio = min(warm[1] or 0, warm[2] or 0) / total_rows if total_rows else 0.0
 
     required = MODE_REQUIRED_TABLES.get(mode, ())
     # 特徵覆蓋率以當日價量檔數為分母——絕對值門檻會在早期市場（上市檔數本來就少）誤判
-    feature_ok = price_stocks > 0 and feature_stocks >= price_stocks * REPLAY_MIN_FEATURE_RATIO
+    feature_rows_ok = price_stocks > 0 and feature_stocks >= price_stocks * REPLAY_MIN_FEATURE_RATIO
+    feature_warm_ok = feature_warm_ratio >= REPLAY_MIN_FEATURE_WARM_RATIO
     ok_by_table = {
         "daily_price": price_stocks >= BACKFILL_MIN_COMMON_STOCKS,
-        "daily_feature": feature_ok,
+        # 列數與欄位**都要**過關：列數足夠但欄位全 NaN 是回補範圍起點的常態
+        "daily_feature": feature_rows_ok and feature_warm_ok,
         "stock_valuation": valuation_stocks >= VALUATION_MIN_FRESH_STOCKS,
         "monthly_revenue": revenue_stocks >= REPLAY_MIN_REVENUE_STOCKS,
     }
     missing = tuple(t for t in required if not ok_by_table.get(t, True))
 
     if missing:
+        reason = ""
+        if "daily_feature" in missing and feature_rows_ok and not feature_warm_ok:
+            reason = f"（特徵列數足夠但欄位未暖身：ma60/turnover_ma20 非空率 {feature_warm_ratio:.1%}）"
         logger.warning(
-            "[%s] %s 資料覆蓋不足：%s — 本日重放結果不可採信（價量 %d／特徵 %d／估值 %d／營收 %d）",
+            "[%s] %s 資料覆蓋不足：%s%s — 本日重放結果不可採信（價量 %d／特徵 %d／估值 %d／營收 %d）",
             mode,
             as_of,
             ", ".join(missing),
+            reason,
             price_stocks,
             feature_stocks,
             valuation_stocks,
@@ -185,6 +218,7 @@ def assess_data_coverage(mode: str, as_of: date) -> DataCoverage:
         feature_stocks=feature_stocks,
         valuation_stocks=valuation_stocks,
         revenue_stocks=revenue_stocks,
+        feature_warm_ratio=feature_warm_ratio,
         required=required,
         missing=missing,
     )
