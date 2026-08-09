@@ -85,6 +85,8 @@ class DataCoverage:
     # §6.5 #21d：列數足夠**不代表**欄位可用。MA60 需 60 個交易日才填滿，回補範圍
     # 頭幾十天欄位全是 NaN 而列數檢查完全看不出來。取 ma60 與 turnover_ma20 非空率
     # 的較小值（ma60 天生較低，是 binding constraint）。
+    # 分母是 `price_stocks`（當日應有的普通股數）而非既有特徵列數——後者會讓
+    # 「整批股票沒有特徵列」的日子算出 100% 暖身率（2026-08-09 實測 11 天如此）。
     feature_warm_ratio: float = 1.0
     required: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
@@ -97,13 +99,22 @@ class DataCoverage:
     def describe(self) -> str:
         """一行摘要，供 CLI 與報告輸出。
 
-        暖身失效與整表缺席分開講——兩者都讓結果不可採信，但補救方式完全不同：
-        前者要往前多回補幾十個交易日，後者要補整張表。
+        特徵的三種失效分開講——都讓結果不可採信，但補救方式完全不同：
+          • 暖身失效 → 往前多回補幾十個交易日（MA60 需 60 個交易日才填滿）
+          • 列缺口   → 重算該日特徵（價量事後補齊但特徵沒跟上，見 §6.5 #21d 更正）
+          • 整表缺席 → 補整張表
         """
         if self.sufficient:
             return "資料就緒"
-        if "daily_feature" in self.missing and self.feature_warm_ratio < REPLAY_MIN_FEATURE_WARM_RATIO:
-            return f"特徵未暖身（ma60/turnover_ma20 非空率 {self.feature_warm_ratio:.1%}）"
+        if "daily_feature" in self.missing:
+            if self.feature_stocks == 0:
+                return "資料缺席：daily_feature（整日無特徵）"
+            if self.feature_stocks < self.price_stocks * REPLAY_MIN_FEATURE_RATIO:
+                return (
+                    f"特徵列缺口（{self.feature_stocks}/{self.price_stocks} = "
+                    f"{self.feature_stocks / self.price_stocks:.1%}，缺列者直接排除於 universe）"
+                )
+            return f"特徵未暖身（ma60/turnover_ma20 可用率 {self.feature_warm_ratio:.1%}）"
         return "資料缺席：" + ", ".join(self.missing)
 
 
@@ -167,11 +178,17 @@ def assess_data_coverage(mode: str, as_of: date) -> DataCoverage:
         )
         # §6.5 #21d 暖身檢查：量測**欄位**而非列數。這兩欄各自把守一道閘門——
         # `ma60` 是 universe Stage 3 的趨勢過濾，`turnover_ma20` 是 Stage 2 的流動性
-        # 門檻，且後者為 NaN 時 `universe.py:125` 會**跳過該股的門檻**（per-stock
-        # fail-open），暖身期等於流動性過濾整段消失。
+        # 門檻，且後者為 NaN 時 `_stage2_liquidity_filter` 會**跳過該股的 ma20 門檻**
+        # （per-stock fail-open），暖身期等於流動性過濾整段消失。
+        #
+        # ⚠ 分母必須是**當日應有的普通股數（price_stocks）**，不是「已存在的特徵列數」。
+        # 2026-08-09 實測：TPEX 同步逾時使 11 天只有上市股算到特徵，那些日子存在的
+        # 973 檔 ma60 全是滿的 → 以列數為分母算出暖身率 ≈ 100%，整段檢查形同虛設。
+        # 而缺列的後果比 NaN 更重：`_stage2_liquidity_filter` 的 `avg5_map` 只由
+        # `df_feature` 既有列建立、回傳的 universe 又只取自 `avg5_map.index`，
+        # **完全沒有特徵列的股票直接進不了 universe**（不是門檻放寬，是候選池少四成）。
         warm = session.execute(
             select(
-                func.count(),
                 func.count(DailyFeature.ma60),
                 func.count(DailyFeature.turnover_ma20),
             ).where(
@@ -179,8 +196,7 @@ def assess_data_coverage(mode: str, as_of: date) -> DataCoverage:
                 func.length(DailyFeature.stock_id) == 4,
             )
         ).one()
-        total_rows = warm[0] or 0
-        feature_warm_ratio = min(warm[1] or 0, warm[2] or 0) / total_rows if total_rows else 0.0
+        feature_warm_ratio = min(warm[0] or 0, warm[1] or 0) / price_stocks if price_stocks else 0.0
 
     required = MODE_REQUIRED_TABLES.get(mode, ())
     # 特徵覆蓋率以當日價量檔數為分母——絕對值門檻會在早期市場（上市檔數本來就少）誤判

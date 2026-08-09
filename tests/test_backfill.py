@@ -495,8 +495,8 @@ class TestBackfillDailyFeatures:
         2026-08-09 實測踩到——TPEX 同步逾時使該日只有上市價量，特徵算完寫入後
         日期被永久標記為已補，事後補齊上櫃價量也不再重算。11 天中招（含 3 個
         live 交易日），`daily_price` 4,400~7,300 列但 `daily_feature` 僅 1,147~1,362 列。
-        後果不只重放失真：`UniverseFilter` Stage 2 的覆蓋率門檻(0.3)被踩破，
-        流動性過濾靜默退回 DailyPrice fallback。
+        後果不只重放失真：缺特徵列的股票被 `_stage2_liquidity_filter` **整批排除於
+        universe 之外**（`avg5_map` 只由既有列建立），那 11 天的候選池少約四成。
         """
         from src.data.pipeline import backfill_daily_features
         from src.data.schema import DailyFeature, DailyPrice

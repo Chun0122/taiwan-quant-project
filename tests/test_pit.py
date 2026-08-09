@@ -687,8 +687,13 @@ class TestFeatureWarmup:
     而列數檢查完全看不出來——與 fail-open 同一類的靜默失效。實測 2020-01-02 的
     ma60/turnover_ma20 非空率皆為 **0.000**，卻有 5,086 列特徵。
 
-    後果不只是分數不準：`universe.py:125` 對 `turnover_ma20` 為 NaN 的個股**跳過
-    Stage 2 流動性門檻**，暖身期等於流動性過濾整段消失。
+    後果不只是分數不準：`_stage2_liquidity_filter` 對 `turnover_ma20` 為 NaN 的個股
+    **跳過 Stage 2 流動性門檻**，暖身期等於流動性過濾整段消失。
+
+    另有一種更重的失效是**整批股票沒有特徵列**（2026-08-09 實測 11 天，TPEX 同步
+    逾時所致）：`avg5_map` 只由既有列建立、回傳的 universe 又只取自 `avg5_map.index`，
+    故缺列的股票**直接進不了 universe**——不是門檻放寬，是候選池少四成。
+    暖身率的分母因此必須是「當日應有的普通股數」而非既有特徵列數。
     """
 
     def _patch_session(self, db_session, monkeypatch):
@@ -739,6 +744,47 @@ class TestFeatureWarmup:
         assert cov.feature_warm_ratio == 0.0
         assert cov.missing == ("daily_feature",)
         assert "未暖身" in cov.describe()
+
+    def test_missing_feature_rows_are_not_warm(self, db_session, monkeypatch):
+        """整批股票沒有特徵列 → 不得因「既有列都暖身」而算出 100%。
+
+        2026-08-09 實測的第二現場：TPEX 同步逾時使 11 天只有上市股算到特徵，
+        既有的 973 檔 ma60 全滿。以「既有列數」為分母會得到暖身率 100%、整段
+        檢查形同虛設；以「當日應有普通股數」為分母才會揭露 44% 的缺口。
+        """
+        from src.data.schema import DailyFeature, DailyPrice
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2022, 2, 17)
+        # 價量 1,750 檔（上市+上櫃），但只有前 973 檔（上市）有特徵列且欄位全滿
+        for i in range(1750):
+            sid = f"{1000 + i}"
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            if i < 973:
+                db_session.add(
+                    DailyFeature(
+                        stock_id=sid,
+                        date=as_of,
+                        close=10.0,
+                        volume=1000,
+                        turnover=10000,
+                        ma60=10.0,
+                        turnover_ma20=10000.0,
+                    )
+                )
+        db_session.flush()
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_warm_ratio == pytest.approx(973 / 1750, abs=1e-6), (
+            "分母須為當日應有普通股數；用既有特徵列數會得到 1.0"
+        )
+        assert cov.missing == ("daily_feature",)
+        assert "列缺口" in cov.describe(), f"應與『未暖身』『整表缺席』分開講，實得：{cov.describe()}"
 
     def test_warm_columns_are_sufficient(self, db_session, monkeypatch):
         """對照組：欄位填滿時判為就緒，證明上一題不是恆 False。"""
