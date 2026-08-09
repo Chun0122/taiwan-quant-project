@@ -66,7 +66,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
 | `data/pipeline.py` 之 `compute_feature_columns` | **DailyFeature 算式 SSOT**（B1②）：每日增量與歷史回補共用同一實作，兩邊漂移會使歷史特徵與今日特徵不同質、PIT 重放的 universe 失真 |
-| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead |
+| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead。**續跑判定看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」**——不可改回「該日有無特徵列」：TPEX 逾時使該日只有上市價量時算過特徵，日期會被永久標記已補，事後補齊上櫃也不重算（2026-08-09 實測 11 天中招，含 3 個 live 日；後果是 UniverseFilter Stage 2 覆蓋率門檻被踩破而退回 fallback） |
 | `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日普通股（4 碼）檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`」**——既不能看「有無資料」（2020~2024 每日皆有 6 檔 watchlist，會靜默跳過 5 年）也不能看總筆數（崩盤日權證無報價會偽陽性、權證多的半套日會偽陰性） |
 | `data/pipeline.py` 之 `backfill_valuation_history` | §6.5 #20 估值回補：**上市走 TWSE `BWIBBU_d` 每日端點、上櫃走 FinMind 逐股**——TPEX 估值端點（`peratio_book/pera_result.php`）已下架（所有日期含當日皆 302 導向 `/errors`），新版 openapi 只回當日無歷史，故上櫃無官方來源。續跑判定：上市看當日檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800，母體僅約 1,000 遠小於價量）、上櫃看該檔估值日數 ≥ 價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |

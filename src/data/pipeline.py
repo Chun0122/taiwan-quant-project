@@ -14,6 +14,7 @@ from src.config import settings
 from src.constants import (
     BACKFILL_MIN_COMMON_STOCKS,
     BACKFILL_MIN_VALUATION_STOCKS,
+    FEATURE_BACKFILL_MIN_COVERAGE_RATIO,
     FINMIND_REQUEST_INTERVAL,
     PRICE_JUMP_WARN_THRESHOLD,
     SECONDS_PER_BACKFILL_DAY,
@@ -2261,7 +2262,10 @@ def backfill_daily_features(
 
     ## 續跑
 
-    以 DB 現況為準：`daily_feature` 已有的日期直接跳過，中斷後重跑自動續行。
+    以 DB 現況為準，中斷後重跑自動續行。判定看**該日特徵列數 ≥ 價量列數 ×
+    `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`**，而非「該日有無特徵列」——後者會讓
+    「價量只補了一半時算過特徵」的日期被永久標記為已補，事後補齊價量也不再重算
+    （2026-08-09 實測 11 天中招，含 3 個 live 交易日）。
 
     Args:
         start: 起始日（含）。
@@ -2284,24 +2288,41 @@ def backfill_daily_features(
 
     with get_session() as session:
         # 有足夠 DailyPrice 覆蓋、值得算特徵的日期
-        price_dates = {
-            r[0]
+        price_counts = {
+            r[0]: r[1]
             for r in session.execute(
-                select(DailyPrice.date)
+                select(DailyPrice.date, func.count(DailyPrice.id))
                 .where(DailyPrice.date >= start, DailyPrice.date <= end)
                 .group_by(DailyPrice.date)
                 .having(func.count(DailyPrice.id) >= min_stocks_per_day)
             ).all()
         }
-        done_dates = {
-            r[0]
+        feature_counts = {
+            r[0]: r[1]
             for r in session.execute(
-                select(DailyFeature.date).where(DailyFeature.date >= start, DailyFeature.date <= end).distinct()
+                select(DailyFeature.date, func.count(DailyFeature.id))
+                .where(DailyFeature.date >= start, DailyFeature.date <= end)
+                .group_by(DailyFeature.date)
             ).all()
         }
 
-    pending = sorted(price_dates - done_dates)
-    result["skipped_dates"] = len(price_dates & done_dates)
+    # 續跑判定看**檔數比例**而非「該日有無特徵列」。後者會讓「價量只補了一半時
+    # 算過特徵」的日期被永久標記為已補——事後補齊價量也不再重算（詳
+    # `FEATURE_BACKFILL_MIN_COVERAGE_RATIO` 的註解，實測 11 天中招）。
+    done_dates = {
+        d for d, pc in price_counts.items() if feature_counts.get(d, 0) >= pc * FEATURE_BACKFILL_MIN_COVERAGE_RATIO
+    }
+    stale_dates = sorted(d for d in price_counts if d not in done_dates and feature_counts.get(d, 0) > 0)
+    if stale_dates:
+        logger.warning(
+            "[DailyFeature 回補] %d 日的特徵覆蓋不足將重算（價量補齊後未重算的舊缺口）：%s%s",
+            len(stale_dates),
+            ", ".join(str(d) for d in stale_dates[:5]),
+            " ..." if len(stale_dates) > 5 else "",
+        )
+
+    pending = sorted(set(price_counts) - done_dates)
+    result["skipped_dates"] = len(done_dates)
     logger.info(
         "[DailyFeature 回補] %s ~ %s：待補 %d 日（已有 %d 日），chunk=%d 天",
         start,

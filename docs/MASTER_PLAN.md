@@ -252,6 +252,8 @@ R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPOR
 | `level="insufficient"` 混用四種語意，log 印「樣本不足（n=260，需 ≥20）」 | `morning_cmd.py:669/693/714/720` | 2026-07-31 發現 → §6.4 #18 |
 | ★ **粗篩對缺失資料 fail-open**：估值表為空時**跳過定義性閘門而非收斂**，模式靜默退化成流動性篩選且無 log 警示 | `_value.py:_coarse_filter` 的 `else` 分支（**僅此一處**——`_dividend.py`／`_growth.py` 原本即 fail-closed，初判「同構」有誤） | ✅ 2026-08-05 已修（§6.5 #19，改走共用守門 `_require_coarse_data`）。歷史教訓：若非實查資料表，2026-08-04 的審計會得出「value 是最強模式」的錯誤結論——**漏斗統計察覺不到**，兩次重放的 `769→150→20` 完全相同，但選股 9/20 換人 |
 
+| ★ **DailyFeature 回補的續跑判定看「該日有無特徵列」** — 與 B1① 價量回補當初的缺陷同型（`ee128d0` 已把價量改為看普通股檔數，特徵沒跟著改） | `pipeline.py:backfill_daily_features` 的 `done_dates` | ✅ 2026-08-09 已修（改為看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」）。**病灶**：TPEX 同步逾時 → 該日只有上市價量 → 特徵以半套資料算完寫入 → 日期被永久標記已補 → 事後補齊上櫃價量後**永不重算**。實測 **11 天中招**（2022~2023 歷史回補 8 天 + **live 3 天**：2026-05-27／06-22／06-24），`daily_price` 4,400~7,300 列但 `daily_feature` 僅 1,147~1,362 列。**後果不限於重放**：`UniverseFilter` Stage 2 的 `_FEATURE_COVERAGE_MIN`(0.3) 被踩破 → 流動性過濾靜默退回 DailyPrice fallback。門檻取 0.95 因實測分布完全雙峰（正常日 1,591 天全在 0.9989~1.0、中招日 11 天全在 0.18~0.26，中間無任何一天），且誤判方向安全（判成未補只多花 CPU，upsert 冪等） |
+
 ### 結構債
 - **四套交易模擬器**（BacktestEngine / PortfolioBacktestEngine / walk_forward fold / rotation backtest），成本行為已漂移（walk_forward 無停損無動態滑價）→ B8。
 - **live/backtest overlay 組裝兩份**（manager.update vs backtest 各 400 行）→ B7。

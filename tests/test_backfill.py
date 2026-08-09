@@ -489,6 +489,58 @@ class TestBackfillDailyFeatures:
         assert second["dates"] == 0, "續跑應跳過已計算日期"
         assert second["skipped_dates"] == first["dates"]
 
+    def test_recomputes_when_price_arrives_later(self, db, monkeypatch):
+        """核心回歸：價量只補一半時算過特徵的日期，補齊後**必須**重算。
+
+        2026-08-09 實測踩到——TPEX 同步逾時使該日只有上市價量，特徵算完寫入後
+        日期被永久標記為已補，事後補齊上櫃價量也不再重算。11 天中招（含 3 個
+        live 交易日），`daily_price` 4,400~7,300 列但 `daily_feature` 僅 1,147~1,362 列。
+        後果不只重放失真：`UniverseFilter` Stage 2 的覆蓋率門檻(0.3)被踩破，
+        流動性過濾靜默退回 DailyPrice fallback。
+        """
+        from src.data.pipeline import backfill_daily_features
+        from src.data.schema import DailyFeature, DailyPrice
+
+        # 第一輪：只有 3 檔「上市」股
+        self._seed(db, 20, n_stocks=3)
+        first = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        assert first["dates"] > 0
+
+        # 事後補進 12 檔「上櫃」股（同一批日期），使特徵覆蓋率掉到 3/15 = 0.2
+        dates = sorted({r[0] for r in db.query(DailyPrice.date).distinct().all()})
+        for d in dates:
+            for i in range(12):
+                px = 50.0 + i
+                db.add(
+                    DailyPrice(
+                        stock_id=f"{6000 + i}",
+                        date=d,
+                        open=px,
+                        high=px + 1,
+                        low=px - 1,
+                        close=px,
+                        volume=1000,
+                        turnover=10000,
+                    )
+                )
+        db.flush()
+
+        second = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        assert second["dates"] == first["dates"], "價量補齊後應重算全部日期，而非跳過"
+
+        # 補齊後每日特徵檔數應與價量一致
+        feat_per_day = {d: db.query(DailyFeature).filter(DailyFeature.date == d).count() for d in dates[-3:]}
+        assert all(n == 15 for n in feat_per_day.values()), f"補齊後應每日 15 檔，實得 {feat_per_day}"
+
+    def test_full_coverage_still_skips(self, db, monkeypatch):
+        """對照組：覆蓋率已足時仍要跳過，證明上一題不是「永遠重算」。"""
+        from src.data.pipeline import backfill_daily_features
+
+        self._seed(db, 20, n_stocks=3)
+        backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        again = backfill_daily_features(date(2024, 1, 1), date(2024, 2, 29), min_stocks_per_day=1)
+        assert again["dates"] == 0
+
     def test_features_are_backward_looking_only(self, db, monkeypatch):
         """PIT：D 日的 ma20 只能用 <= D 的收盤價。"""
         import pandas as pd

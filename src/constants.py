@@ -276,6 +276,21 @@ PHANTOM_TRADING_DAY_MIN_ROWS: int = 100
 # 半套日 879 檔——1500 可乾淨分離。
 BACKFILL_MIN_COMMON_STOCKS: int = 1500
 
+# DailyFeature 回補的續跑判定：某日特徵列數 ≥ 當日 DailyPrice 列數 × 此比例才算已補。
+# **不可改回「該日有無 DailyFeature 列」**——那是上面 BACKFILL_MIN_COMMON_STOCKS
+# 註解所述同一個坑的第二現場，2026-08-09 實測踩到：
+#   TPEX 當日同步逾時 → 該日只有上市價量 → 特徵以上市資料算完並寫入 →
+#   日期被永久標記為已補 → 事後補齊上櫃價量後，特徵**永遠不會重算**。
+# 實測 11 天中招（2022-02-17 起 8 天為歷史回補、2026-05-27/06-22/06-24 為 live），
+# 這些日子 daily_price 有 4,400~7,300 列但 daily_feature 只有 1,147~1,362 列。
+# 後果不只是重放：`UniverseFilter` Stage 2 的 `_FEATURE_COVERAGE_MIN`(0.3) 會被踩破，
+# 整個流動性過濾靜默退回 DailyPrice fallback。
+#
+# 門檻取 0.95：實測比例分布完全雙峰——正常日 1,591 天全在 0.9989~1.0（僅 volume=0
+# 的列不算特徵），中招日 11 天全在 0.18~0.26，中間**沒有任何一天**。
+# 誤判方向也是安全的：判成未補只是多花 CPU 重算（upsert 冪等），判成已補才會留下靜默缺口。
+FEATURE_BACKFILL_MIN_COVERAGE_RATIO: float = 0.95
+
 # 回補單一交易日（三個 dataset 全開）的實測耗時，用於 ETA 估算。
 # 實測 2026-08-03：458 個交易日耗時 3h45m ≈ 29.5 秒/日。
 # 原本以「3 秒 × dataset 數」估算低估近 3 倍——TWSE/TPEX 雖並行，但各自 3 秒
