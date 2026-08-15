@@ -128,6 +128,10 @@ class MonthlyRevenue(Base):
     revenue_year: Mapped[int] = mapped_column(Integer, nullable=False)  # 年度
     mom_growth: Mapped[float | None] = mapped_column(Float, nullable=True)  # 月增率 (%)
     yoy_growth: Mapped[float | None] = mapped_column(Float, nullable=True)  # 年增率 (%)
+    # 資料來源（§6.6 #23）："mops"＝全市場 HTML（權威、含官方 YoY）／"finmind"＝逐股補抓。
+    # 續跑判定必須只數 mops 列——否則候選池逐股補抓的列會把閘門灌滿，
+    # 使該月的全市場同步永不執行（詳 constants.BACKFILL_MIN_REVENUE_STOCKS）。
+    source: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     def __repr__(self) -> str:
         return f"<MonthlyRevenue {self.stock_id} {self.date} revenue={self.revenue:,}>"

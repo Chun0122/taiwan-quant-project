@@ -991,7 +991,7 @@ python main.py discover swing --top 20 --ai-summary --notify
 | 階段 | 動作 | 說明 |
 |------|------|------|
 | Stage 0 | 市場狀態偵測 | 根據 TAIEX 判斷 bull/bear/sideways，動態調整權重 |
-| Stage 0.5 | 資料冷啟動補抓 | **growth**：月營收覆蓋 < 500 支時自動從 MOPS 同步；**value/dividend**：估值資料（PE/PB/殖利率）覆蓋 < 500 支時自動從 TWSE/TPEX 同步 |
+| Stage 0.5 | 資料冷啟動補抓 | **growth**：**當下依法已公布的那個月份**由 MOPS 抓回的股票數 < 1,400 時自動同步該月（看逐月覆蓋而非全表累計，§6.6 #23）；**value/dividend**：估值資料（PE/PB/殖利率）覆蓋 < 500 支時自動從 TWSE/TPEX 同步 |
 | Stage 1 | 資料載入 | 從 DB 讀取全市場日K + 三大法人 + 融資融券 |
 | Stage 2 | 粗篩 | 模式專屬條件篩選，取前 ~150 名 |
 | Stage 2.5 | 補抓候選股資料 | **MomentumScanner**：自動從 FinMind 補抓月營收 + 最近 5 天分點交易資料（`sync_broker_for_stocks`）。其他模式僅補抓月營收/估值 |
@@ -1098,7 +1098,12 @@ python main.py sync-revenue
 
 # 同步最近 3 個月
 python main.py sync-revenue --months 3
+
+# 回補歷史月營收（2020 起全部月份，約 8 分鐘）
+python main.py backfill-history --revenue-only --start 2020-01-01
 ```
+
+**已補齊的月份會自動跳過**：判定為「該月由 MOPS 抓回的相異股票數 ≥ 1,400」。**只數 MOPS 來源**——候選池逐股補抓（Stage 2.5）每月會累積上千列，若把它們算進覆蓋率，該月的全市場同步會被誤判為完成而永不執行（2026-02 曾因此只寫進 1 筆，§6.6 #23）。
 
 **參數說明：**
 

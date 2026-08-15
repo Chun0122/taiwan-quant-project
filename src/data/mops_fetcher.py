@@ -20,6 +20,9 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 
+from src.constants import MOPS_REQUEST_INTERVAL
+from src.data.pit import month_end
+
 # MOPS 的 SSL 憑證在部分系統會驗證失敗，停用警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -29,8 +32,8 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
-# 請求間隔（秒），避免被封鎖
-_REQUEST_DELAY = 3
+# 請求間隔（秒），避免被封鎖（常數 SSOT 在 src/constants.py）
+_REQUEST_DELAY = MOPS_REQUEST_INTERVAL
 
 # --- 上下文情緒 Regex Patterns（優先於單詞比對，捕捉特定上下文誤判）--- #
 
@@ -626,14 +629,8 @@ def _parse_revenue_html(html_content: bytes, year: int, month: int) -> pd.DataFr
                 errors="coerce",
             )
 
-    # 建立日期欄位：以該月最後一天為日期
-    if month == 12:
-        next_month_first = date(year + 1, 1, 1)
-    else:
-        next_month_first = date(year, month + 1, 1)
-    month_end = next_month_first - timedelta(days=1)
-
-    df["date"] = month_end
+    # 建立日期欄位：以該月最後一天為日期（canonical 語意 SSOT 在 pit.month_end）
+    df["date"] = month_end(year, month)
     df["revenue_month"] = month
     df["revenue_year"] = year
 

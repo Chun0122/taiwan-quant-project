@@ -316,6 +316,29 @@ VALUATION_COVERAGE_RATIO: float = 0.8
 # API 節流間隔（秒）——與 CLAUDE.md §2 的速率規則一致，供 ETA 估算與回補迴圈共用
 TWSE_REQUEST_INTERVAL: float = 3.0
 FINMIND_REQUEST_INTERVAL: float = 0.5
+MOPS_REQUEST_INTERVAL: float = 3.0  # MOPS 靜態頁（mopsov）比照官方端點節流
+
+# 月營收回補/同步的續跑門檻（§6.6 #23/#24，2026-08-15）：某營收月份**由 MOPS 全市場
+# 抓回**的相異股票數達此值，即視為該月已補齊。
+#
+# ⚠ 三個細節都是踩過坑才定的，改動前先讀：
+#   1. **必須只數 `source='mops'` 的列**。舊版數的是該月全部列數 ≥500，而候選池逐股
+#      補抓（`sync_revenue_for_stocks`）每天寫入約 150 檔、一個月累積上千列——門檻
+#      被那些列灌滿後，全市場 MOPS 同步**此後永不執行**。實測 2026-02 的 MOPS 列
+#      只有 1 筆（候選池 1,284 筆）、2026-06 為 498 筆，整個月永久凍結在半套。
+#      這與 §6.5 #22 的估值閘門是同一種病（計數看錯軸）。
+#   2. **1,400 而非 500**：MOPS 成熟月份實測 1,658（2020-01）~1,731（2022-07）檔，
+#      而月初剛開始公布時只有數百檔。門檻若低於實際母體，第一次半套抓取就會把該月
+#      標記為完成——這正是舊版的失效方式。
+#   3. 全市場母體只會成長（上市櫃家數逐年增加），故此值對 2020 年也安全。
+BACKFILL_MIN_REVENUE_STOCKS: int = 1400
+
+# FinMind 逐股月營收的回溯天數（§6.6 #23）：**必須 ≥ 13 個月**。
+# `fetch_monthly_revenue` 的 YoY 是 `revenue / revenue.shift(12) - 1`，需要 13 筆
+# 才算得出最新一筆的年增率。舊值 180 天只取回 6 筆 → `yoy_growth` 恆為 NULL
+# （實測 8,663 筆 FinMind 列中 8,353 筆 NULL），而 growth 粗篩是
+# `yoy_growth.notna() & > 10`，那些列在粗篩階段就全數蒸發。
+REVENUE_FINMIND_LOOKBACK_DAYS: int = 430
 
 # Scanner Stage 0.5「估值覆蓋是否足夠」的判定窗口與門檻（2026-08-05）。
 # **必須看近期窗口而非全表**——原本數全表相異 stock_id，一旦歷史累積 ≥500 檔就

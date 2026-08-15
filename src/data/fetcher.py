@@ -24,6 +24,7 @@ import pandas as pd
 import requests
 
 from src.config import settings
+from src.data.pit import month_end
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,16 @@ class FinMindFetcher(DataFetcher):
 
         回傳欄位: date, stock_id, revenue, revenue_month, revenue_year,
                   mom_growth, yoy_growth
+
+        ## 兩個與 §6.6 #23 有關的語意約定
+
+        1. **`date` 一律正規化為營收月份的月底**（`pit.month_end`）。FinMind 原始
+           回傳的是「次月 1 日」（1 月營收 → `2024-02-01`），而 MOPS 寫的是當月月底，
+           兩者都落在 `(stock_id, date)` 這個 unique key 上卻互不衝突——實測產生
+           2,488 組同月雙列，使 `pivot_revenue_rows` 的 4 個月窗口實際只拿到 2 個月。
+        2. **MoM/YoY 以年月對齊計算，不用位置 `shift`**。FinMind 對停業/未公布的
+           月份會缺列，位置位移會把「13 列之前」當成「去年同月」而算出錯誤的 YoY；
+           缺列時應為 NaN 而非錯值。
         """
         if end is None:
             end = date.today().isoformat()
@@ -284,15 +295,36 @@ class FinMindFetcher(DataFetcher):
         df = df[[c for c in keep if c in df.columns]]
         _standardize_date_column(df)
 
-        # 計算月增率 (MoM) 和年增率 (YoY)
-        df = df.sort_values("date").reset_index(drop=True)
-        df["mom_growth"] = df["revenue"].pct_change() * 100
+        if "revenue_year" not in df.columns or "revenue_month" not in df.columns:
+            # 無年月欄位時由原始 date 反推（FinMind 慣例＝次月 1 日）
+            prev = pd.to_datetime(df["date"]) - pd.Timedelta(days=1)
+            df["revenue_year"] = prev.dt.year
+            df["revenue_month"] = prev.dt.month
 
-        # 年增率：與 12 個月前比較
-        if len(df) > 12:
-            df["yoy_growth"] = (df["revenue"] / df["revenue"].shift(12) - 1) * 100
-        else:
-            df["yoy_growth"] = None
+        df["revenue_year"] = pd.to_numeric(df["revenue_year"], errors="coerce").astype("Int64")
+        df["revenue_month"] = pd.to_numeric(df["revenue_month"], errors="coerce").astype("Int64")
+        df = df[df["revenue_year"].notna() & df["revenue_month"].notna()].copy()
+        if df.empty:
+            return df
+
+        df["date"] = [month_end(int(y), int(m)) for y, m in zip(df["revenue_year"], df["revenue_month"], strict=True)]
+        df["revenue_year"] = df["revenue_year"].astype(int)
+        df["revenue_month"] = df["revenue_month"].astype(int)
+
+        # 以「年 × 12 + 月」為序位，MoM/YoY 皆按序位對齊查表（缺月即 NaN，不位移）
+        df = df.sort_values(["revenue_year", "revenue_month"]).reset_index(drop=True)
+        period = df["revenue_year"] * 12 + df["revenue_month"]
+        revenue_by_period = dict(zip(period, pd.to_numeric(df["revenue"], errors="coerce"), strict=True))
+
+        def _growth(offset: int) -> list[float | None]:
+            out: list[float | None] = []
+            for p, cur in zip(period, pd.to_numeric(df["revenue"], errors="coerce"), strict=True):
+                base = revenue_by_period.get(p - offset)
+                out.append((cur / base - 1) * 100 if base and pd.notna(cur) and base > 0 else None)
+            return out
+
+        df["mom_growth"] = _growth(1)
+        df["yoy_growth"] = _growth(12)
 
         return df
 

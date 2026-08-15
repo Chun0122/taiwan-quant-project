@@ -375,7 +375,16 @@ python main.py backfill-history --start 2024-01-01 --features-only
 python main.py backfill-history --valuation-only --start 2024-01-01
 python main.py backfill-history --valuation-only --start 2024-01-01 --valuation-markets twse
 python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
+
+# 月營收回補（§6.6 #24；MOPS 全市場靜態頁，免費且自帶官方 YoY）
+python main.py backfill-history --revenue-only --start 2020-01-01
+python main.py backfill-history --revenue-only --start 2020-01-01 --end 2024-12-31
+python main.py backfill-history --revenue-only --start 2020-01-01 --dry-run
 ```
+
+**月營收為何走 MOPS 而非 FinMind**：MOPS 的 `t21sc03_{民國年}_{月}_0.html` 歷史頁面回溯到 2020-01 仍健在，一個月兩個請求（上市 sii + 上櫃 otc）即拿到全市場約 1,700 檔，且**自帶官方 YoY**——79 個月僅 158 個免費請求。FinMind 逐股則要 ~2,000 次呼叫並吃 600/hr 配額，且自算的 YoY 在缺月時會失準。`--start` 只取年月，日忽略；`--end` 省略時補到上個月（當月營收尚未公布）。
+
+回補**開頭會自動執行 `normalize_revenue_date_semantics()`**（冪等）：舊資料中 FinMind 寫的「次月 1 日」會改寫為營收月份月底並與 MOPS 列合併，否則同月雙列會讓 scanner 的 N 個月營收窗口實際只拿到一半（§6.6 #23）。
 
 **估值為何要分兩條路**：TPEX 的估值端點（`peratio_book/pera_result.php`）**已下架**，所有日期含當日皆 302 導向 `/errors`；新版 openapi 只回當日、無日期參數。故上櫃歷史無官方來源，改走 FinMind `TaiwanStockPER` 逐股（支援日期區間，一檔一次呼叫涵蓋全期間）。上市則走 TWSE `BWIBBU_d`，健在且有完整歷史。
 
@@ -386,6 +395,7 @@ python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
 | 價量 | 當日**普通股（4 碼）**檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`（1500） |
 | 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800） |
 | 估值/上櫃 | 該檔估值日數 ≥ 其價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
+| 月營收 | 該月**由 MOPS 抓回**（`source='mops'`）的相異股票數 ≥ `BACKFILL_MIN_REVENUE_STOCKS`（1400）。**只數 mops 列**——候選池逐股補抓每月累積上千列，算進來會把閘門灌滿使該月永不重抓（§6.6 #23） |
 
 ### PIT 歷史重放（`pit-replay`）
 

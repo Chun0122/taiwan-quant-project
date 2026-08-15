@@ -1013,3 +1013,287 @@ class TestValuationQuotaHandling:
         # 只剩字串的情形
         assert _is_quota_exhausted(RuntimeError("402 Client Error: Payment Required")) is True
         assert _is_quota_exhausted(RuntimeError("connection reset")) is False
+
+
+# ====================================================================== #
+# G. §6.6 #23/#24 — 月營收日期語意、MOPS 續跑閘門、歷史回補
+# ====================================================================== #
+
+
+def _seed_revenue(session, stock_id: str, year: int, month: int, *, day: int | None = None, **kw):
+    """種一筆月營收；`day=None` 走 canonical 月底，指定 day 則模擬舊 FinMind 慣例。"""
+    from src.data.pit import month_end
+    from src.data.schema import MonthlyRevenue
+
+    d = month_end(year, month) if day is None else date(year, month, 1) + timedelta(days=day - 1)
+    row = MonthlyRevenue(
+        stock_id=stock_id,
+        date=d,
+        revenue=kw.pop("revenue", 1_000_000),
+        revenue_year=year,
+        revenue_month=month,
+        mom_growth=kw.pop("mom_growth", None),
+        yoy_growth=kw.pop("yoy_growth", None),
+        source=kw.pop("source", None),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+class TestRevenueDateNormalization:
+    """§6.6 #23：`monthly_revenue` 的日期語意統一。"""
+
+    def test_finmind_row_moves_to_month_end(self, db):
+        from src.data.pipeline import normalize_revenue_date_semantics
+        from src.data.schema import MonthlyRevenue
+
+        # FinMind 慣例：1 月營收寫成 2/1
+        _seed_revenue(db, "2330", 2024, 1, day=32)  # 2024-01-01 + 31 天 = 2024-02-01
+        stats = normalize_revenue_date_semantics()
+
+        row = db.query(MonthlyRevenue).one()
+        assert row.date == date(2024, 1, 31), "次月 1 日必須改寫為營收月份的月底"
+        assert row.source == "finmind", "來源標記必須依**原本**的日期慣例回填"
+        assert stats["moved"] == 1
+
+    def test_month_end_row_tagged_as_mops(self, db):
+        from src.data.pipeline import normalize_revenue_date_semantics
+        from src.data.schema import MonthlyRevenue
+
+        _seed_revenue(db, "2330", 2024, 1)
+        normalize_revenue_date_semantics()
+        assert db.query(MonthlyRevenue).one().source == "mops"
+
+    def test_duplicate_month_merges_keeping_mops(self, db):
+        """**核心回歸**：同月雙列必須合併成一列，且保留 MOPS 的官方 YoY。
+
+        實測 live 有 2,488 組這種重複——unique key 是 `(stock_id, date)`，
+        兩套日期慣例並存時完全不衝突，`pivot_revenue_rows` 的 4 個月窗口
+        因此實際只拿到 2 個月。
+        """
+        from src.data.pipeline import normalize_revenue_date_semantics
+        from src.data.schema import MonthlyRevenue
+
+        _seed_revenue(db, "2330", 2024, 1, revenue=500, yoy_growth=12.5)  # MOPS（月底）
+        _seed_revenue(db, "2330", 2024, 1, day=32, revenue=500, mom_growth=3.0)  # FinMind（次月 1 日）
+
+        stats = normalize_revenue_date_semantics()
+
+        rows = db.query(MonthlyRevenue).all()
+        assert len(rows) == 1, "同月只能留一列"
+        assert rows[0].date == date(2024, 1, 31)
+        assert rows[0].source == "mops", "衝突時保留權威來源"
+        assert rows[0].yoy_growth == 12.5, "MOPS 的官方 YoY 不得被覆蓋"
+        assert rows[0].mom_growth == 3.0, "被合併那筆的非空欄位要補進來"
+        assert stats["merged"] == 1
+
+    def test_is_idempotent(self, db):
+        from src.data.pipeline import normalize_revenue_date_semantics
+        from src.data.schema import MonthlyRevenue
+
+        _seed_revenue(db, "2330", 2024, 1, day=32)
+        _seed_revenue(db, "2454", 2024, 1)
+        normalize_revenue_date_semantics()
+        second = normalize_revenue_date_semantics()
+
+        assert second == {"tagged": 0, "moved": 0, "merged": 0}, "第二次執行必須完全無動作"
+        assert db.query(MonthlyRevenue).count() == 2
+
+
+class TestMopsRevenueGate:
+    """§6.6 #23：續跑閘門必須只數 MOPS 來源的股票數。"""
+
+    def _stub_mops(self, monkeypatch, n_stocks: int):
+        import src.data.mops_fetcher as mf
+
+        called: list[tuple[int, int]] = []
+
+        def _fetch(year=None, month=None):
+            called.append((year, month))
+            from src.data.pit import month_end
+
+            return pd.DataFrame(
+                [
+                    {
+                        "stock_id": f"{1000 + i}",
+                        "date": month_end(year, month),
+                        "revenue": 1_000_000,
+                        "revenue_month": month,
+                        "revenue_year": year,
+                        "mom_growth": 1.0,
+                        "yoy_growth": 2.0,
+                    }
+                    for i in range(n_stocks)
+                ]
+            )
+
+        monkeypatch.setattr(mf, "fetch_mops_monthly_revenue", _fetch)
+        return called
+
+    def test_candidate_pool_rows_do_not_satisfy_gate(self, db, monkeypatch):
+        """**核心回歸**：候選池逐股補抓的列再多也不算數。
+
+        舊版數「該月全部列數 ≥500」，被 FinMind 列灌滿後全市場同步永不執行——
+        實測 2026-02 的 MOPS 列因此永久停在 1 筆（候選池 1,284 筆）。
+        """
+        from src.constants import BACKFILL_MIN_REVENUE_STOCKS
+        from src.data.pipeline import _sync_mops_revenue_month
+
+        for i in range(BACKFILL_MIN_REVENUE_STOCKS + 100):
+            _seed_revenue(db, f"9{i:03d}", 2026, 2, day=32, source="finmind")
+
+        called = self._stub_mops(monkeypatch, 1500)
+        _sync_mops_revenue_month(2026, 2)
+        assert called == [(2026, 2)], "全部是 finmind 列時必須照抓"
+
+    def test_partial_mops_month_is_retried(self, db, monkeypatch):
+        """半套 MOPS（月初剛開始公布）不得被視為已完成。"""
+        from src.data.pipeline import _sync_mops_revenue_month
+
+        for i in range(498):  # 實測 2026-06 的 MOPS 覆蓋
+            _seed_revenue(db, f"8{i:03d}", 2026, 6, source="mops")
+
+        called = self._stub_mops(monkeypatch, 1700)
+        _sync_mops_revenue_month(2026, 6)
+        assert called == [(2026, 6)]
+
+    def test_full_mops_month_is_skipped(self, db, monkeypatch):
+        from src.constants import BACKFILL_MIN_REVENUE_STOCKS
+        from src.data.pipeline import _sync_mops_revenue_month
+
+        for i in range(BACKFILL_MIN_REVENUE_STOCKS + 10):
+            _seed_revenue(db, f"7{i:04d}", 2026, 1, source="mops")
+
+        called = self._stub_mops(monkeypatch, 1700)
+        assert _sync_mops_revenue_month(2026, 1) == 0
+        assert called == [], "MOPS 覆蓋已達標的月份不得重抓"
+
+    def test_mops_upsert_overwrites_finmind_row(self, db, monkeypatch):
+        """MOPS 必須覆蓋候選池先寫進來的 NULL YoY，並把 source 翻成 mops。
+
+        否則該股永遠算不進閘門、`yoy_growth` 也永遠是 NULL（growth 粗篩要求非空）。
+        """
+        from src.data.pipeline import _sync_mops_revenue_month
+        from src.data.schema import MonthlyRevenue
+
+        _seed_revenue(db, "1000", 2026, 3, source="finmind", yoy_growth=None)
+        self._stub_mops(monkeypatch, 3)
+        _sync_mops_revenue_month(2026, 3)
+
+        row = db.query(MonthlyRevenue).filter_by(stock_id="1000", revenue_year=2026, revenue_month=3).one()
+        assert row.source == "mops"
+        assert row.yoy_growth == 2.0
+
+
+class TestRevenueBackfill:
+    """§6.6 #24：`backfill_revenue_history` 的月份序列與續跑。"""
+
+    def _stub(self, monkeypatch, n_stocks: int = 1700):
+        return TestMopsRevenueGate()._stub_mops(monkeypatch, n_stocks)
+
+    def test_iterates_months_across_year_boundary(self, db, monkeypatch):
+        from src.data.pipeline import backfill_revenue_history
+
+        called = self._stub(monkeypatch)
+        res = backfill_revenue_history(date(2023, 11, 1), date(2024, 2, 28))
+
+        assert called == [(2023, 11), (2023, 12), (2024, 1), (2024, 2)]
+        assert res["months"] == 4
+
+    def test_covered_months_are_skipped(self, db, monkeypatch):
+        from src.constants import BACKFILL_MIN_REVENUE_STOCKS
+        from src.data.pipeline import backfill_revenue_history
+
+        for i in range(BACKFILL_MIN_REVENUE_STOCKS + 5):
+            _seed_revenue(db, f"6{i:04d}", 2024, 1, source="mops")
+
+        called = self._stub(monkeypatch)
+        res = backfill_revenue_history(date(2024, 1, 1), date(2024, 2, 29))
+
+        assert called == [(2024, 2)]
+        assert res["skipped_months"] == 1
+
+    def test_dry_run_does_not_fetch(self, db, monkeypatch):
+        from src.data.pipeline import backfill_revenue_history
+
+        called = self._stub(monkeypatch)
+        res = backfill_revenue_history(date(2024, 1, 1), date(2024, 3, 31), dry_run=True)
+
+        assert called == []
+        assert res["months"] == 0
+
+    def test_normalizes_before_fetching(self, db, monkeypatch):
+        """回補前必須先正規化——否則寫進來的月底列會與舊的次月 1 日列並存。"""
+        from src.data.pipeline import backfill_revenue_history
+        from src.data.schema import MonthlyRevenue
+
+        _seed_revenue(db, "2330", 2024, 1, day=32)  # 舊 FinMind 列
+        self._stub(monkeypatch, n_stocks=2)  # 回補會寫 1000/1001，不含 2330
+        backfill_revenue_history(date(2024, 1, 1), date(2024, 1, 31))
+
+        rows = db.query(MonthlyRevenue).filter_by(stock_id="2330").all()
+        assert len(rows) == 1 and rows[0].date == date(2024, 1, 31)
+
+
+class TestGrowthStage05RevenueGate:
+    """§6.6 #23：growth 的 Stage 0.5 必須看「該月覆蓋」而非全表相異股票數。"""
+
+    def _scanner(self, as_of: date):
+        from src.discovery.scanner._growth import GrowthScanner
+
+        scanner = GrowthScanner.__new__(GrowthScanner)  # 跳過 __init__（不需要 universe/DB）
+        scanner.scan_date = as_of  # `_as_of()` 讀的是 scan_date
+        return scanner
+
+    def test_syncs_latest_visible_month_not_calendar_last_month(self, monkeypatch):
+        """月初尚未到 10 日時，該補的是**兩個月前**那個月（依法已公布者）。"""
+        import src.data.pipeline as pl
+
+        called: list[tuple[int, int]] = []
+        monkeypatch.setattr(pl, "_sync_mops_revenue_month", lambda y, m: called.append((y, m)) or 0)
+
+        self._scanner(date(2026, 3, 5))._prepare_before_load()
+        assert called == [(2026, 1)], "3/5 尚未到 3/10，最新可見的是 1 月營收"
+
+        called.clear()
+        self._scanner(date(2026, 3, 10))._prepare_before_load()
+        assert called == [(2026, 2)]
+
+    def test_full_table_does_not_suppress_sync(self, db, monkeypatch):
+        """**核心回歸**：全表已有上千檔，但當月缺席時仍必須補抓。
+
+        舊版數 `count(distinct stock_id)` 且無日期條件，累積 ≥500 後永不觸發——
+        live 因此在 2026-02 只寫進 1 筆的情況下完全沒有自癒。
+        """
+        import src.data.mops_fetcher as mf
+
+        for i in range(1900):  # 全表很滿，但都是別的月份
+            _seed_revenue(db, f"{1000 + i}", 2025, 12, source="mops")
+
+        fetched: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            mf,
+            "fetch_mops_monthly_revenue",
+            lambda year=None, month=None: fetched.append((year, month)) or pd.DataFrame(),
+        )
+
+        self._scanner(date(2026, 3, 10))._prepare_before_load()
+        assert fetched == [(2026, 2)], "當月無資料時必須實際打 MOPS"
+
+    def test_covered_month_is_not_refetched(self, db, monkeypatch):
+        import src.data.mops_fetcher as mf
+        from src.constants import BACKFILL_MIN_REVENUE_STOCKS
+
+        for i in range(BACKFILL_MIN_REVENUE_STOCKS + 5):
+            _seed_revenue(db, f"{2000 + i}", 2026, 2, source="mops")
+
+        fetched: list = []
+        monkeypatch.setattr(
+            mf,
+            "fetch_mops_monthly_revenue",
+            lambda year=None, month=None: fetched.append((year, month)) or pd.DataFrame(),
+        )
+
+        self._scanner(date(2026, 3, 10))._prepare_before_load()
+        assert fetched == []

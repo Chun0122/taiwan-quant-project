@@ -13,10 +13,13 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from src.config import settings
 from src.constants import (
     BACKFILL_MIN_COMMON_STOCKS,
+    BACKFILL_MIN_REVENUE_STOCKS,
     BACKFILL_MIN_VALUATION_STOCKS,
     FEATURE_BACKFILL_MIN_COVERAGE_RATIO,
     FINMIND_REQUEST_INTERVAL,
+    MOPS_REQUEST_INTERVAL,
     PRICE_JUMP_WARN_THRESHOLD,
+    REVENUE_FINMIND_LOOKBACK_DAYS,
     SECONDS_PER_BACKFILL_DAY,
     TWSE_REQUEST_INTERVAL,
     UPSERT_BATCH_SIZE,
@@ -265,9 +268,108 @@ def _upsert_margin(df: pd.DataFrame) -> int:
     return _upsert_batch(MarginTrading, df, ["stock_id", "date"])
 
 
-def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
-    """將月營收 DataFrame 寫入 monthly_revenue 表。"""
-    return _upsert_batch(MonthlyRevenue, df, ["stock_id", "date"])
+def _upsert_monthly_revenue(df: pd.DataFrame, *, source: str = "finmind") -> int:
+    """將月營收 DataFrame 寫入 monthly_revenue 表（§6.6 #23）。
+
+    衝突語意刻意**依來源而異**：
+
+    - `source="mops"`：`on_conflict_do_update`。MOPS 是全市場官方頁面且自帶
+      官方 YoY，是這張表的權威來源；覆寫才能把候選池先寫進來的 `yoy_growth=NULL`
+      的列補實，也才能把 `source` 翻成 `mops` 讓續跑判定數得到。
+    - `source="finmind"`：`on_conflict_do_nothing`。逐股補抓的 YoY 是自算的，
+      缺月時會與官方值不同，不該覆蓋已有的 MOPS 列。
+
+    Args:
+        df: 需含 stock_id/date/revenue/revenue_year/revenue_month。
+        source: "mops" 或 "finmind"。
+    """
+    if df.empty:
+        return 0
+    df = df.copy()
+    df["source"] = source
+    update_cols = ["revenue", "revenue_year", "revenue_month", "mom_growth", "yoy_growth", "source"]
+    return _upsert_batch(
+        MonthlyRevenue,
+        df,
+        ["stock_id", "date"],
+        update_cols=update_cols if source == "mops" else None,
+    )
+
+
+def normalize_revenue_date_semantics() -> dict[str, int]:
+    """把 `monthly_revenue` 的日期語意統一為「營收月份月底」（§6.6 #23，冪等）。
+
+    ## 為什麼要有這支一次性遷移
+
+    同一筆 1 月營收，FinMind 逐股寫成 `2024-02-01`（次月 1 日）、MOPS 全市場寫成
+    `2024-01-31`（當月月底），而 unique key 是 `(stock_id, date)`——**兩者不衝突，
+    於是同月並存兩列**（實測 2,488 組）。後果不是多幾列而已：
+    `pivot_revenue_rows` 取每股最近 `months` 列，growth 要的 4 個月窗口實際只拿到
+    2 個月，`prev_yoy_growth` 還可能是同一個月的另一份來源（且多半是 NULL）。
+
+    ## 順序很重要
+
+    先依**原本的日期慣例**回填 `source`（月底＝mops、其餘＝finmind），再改日期。
+    反過來做就再也分不出來源——這是本函數唯一不可交換的兩個步驟。
+
+    合併規則：同月雙列時保留**月底那筆**（MOPS 權威），並用 finmind 列補上它缺的
+    `mom_growth`/`yoy_growth`，然後刪除 finmind 列。
+
+    Returns:
+        {"tagged": N, "moved": M, "merged": K}
+    """
+    from src.data.pit import month_end
+
+    stats = {"tagged": 0, "moved": 0, "merged": 0}
+    with get_session() as session:
+        rows = session.execute(select(MonthlyRevenue)).scalars().all()
+        if not rows:
+            return stats
+
+        # ── 步驟 1：回填 source（必須在改日期之前）──
+        for row in rows:
+            if row.source:
+                continue
+            row.source = "mops" if row.date == month_end(row.revenue_year, row.revenue_month) else "finmind"
+            stats["tagged"] += 1
+
+        # ── 步驟 2：日期正規化 + 同月合併 ──
+        by_key: dict[tuple[str, date], MonthlyRevenue] = {}
+        for row in rows:
+            target = month_end(row.revenue_year, row.revenue_month)
+            key = (row.stock_id, target)
+            keeper = by_key.get(key)
+            if keeper is None:
+                by_key[key] = row
+                continue
+            # 已有同月列 → 保留 mops 那筆，另一筆的非空欄位補進來後刪除
+            winner, loser = (keeper, row) if keeper.source == "mops" else (row, keeper)
+            for field in ("mom_growth", "yoy_growth"):
+                if getattr(winner, field) is None and getattr(loser, field) is not None:
+                    setattr(winner, field, getattr(loser, field))
+            by_key[key] = winner
+            session.delete(loser)
+            stats["merged"] += 1
+
+        # 先讓刪除落地再改日期：unit of work 預設先 UPDATE 後 DELETE，
+        # 若同月的兩列一前一後，改期時目標日期還被舊列佔著會觸發 unique 衝突。
+        session.flush()
+
+        for (_, target), row in by_key.items():
+            if row.date != target:
+                row.date = target
+                stats["moved"] += 1
+
+        session.commit()
+
+    if stats["moved"] or stats["merged"]:
+        logger.info(
+            "[月營收語意正規化] 標記來源 %d 筆、改期 %d 筆、合併同月重複 %d 筆",
+            stats["tagged"],
+            stats["moved"],
+            stats["merged"],
+        )
+    return stats
 
 
 def _upsert_dividend(df: pd.DataFrame) -> int:
@@ -315,6 +417,7 @@ def _sync_per_stock(
     cache_days: int,
     lookback_days: int,
     label: str,
+    incremental: bool = True,
 ) -> int:
     """通用逐股同步：cache 檢查 → fetch → upsert。
 
@@ -326,6 +429,11 @@ def _sync_per_stock(
         cache_days:    DB 資料在此天數內視為新鮮，跳過
         lookback_days: 回溯查詢天數
         label:         日誌標籤（如 "估值補抓"）
+        incremental:   True＝以 DB 最後一筆為起點（省頻寬）；
+            False＝**恆取完整 `lookback_days` 窗口**。月營收必須用 False——
+            它的 YoY 是在 fetcher 內由整段序列算出來的，若以最後一筆為起點只會
+            拿回一兩個月，`yoy_growth` 永遠是 NULL（§6.6 #23）。逐股 API 一次
+            呼叫即涵蓋整個區間，故窗口放大不增加請求數。
 
     Returns:
         新增筆數
@@ -343,7 +451,7 @@ def _sync_per_stock(
             skipped += 1
             continue
         try:
-            df = fetch_fn(fetcher, sid, last or start, end)
+            df = fetch_fn(fetcher, sid, (last or start) if incremental else start, end)
             total += upsert_fn(df)
         except Exception:
             logger.warning("[%s] %s失敗，跳過", sid, label, exc_info=True)
@@ -367,15 +475,21 @@ def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
 
 
 def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
-    """為指定股票補抓最新月營收。"""
+    """為指定股票補抓最新月營收。
+
+    `lookback_days` 走 `REVENUE_FINMIND_LOOKBACK_DAYS`(430) 而非舊值 180：
+    YoY 需要 13 個月才算得出來，180 天只取回 6 筆 → `yoy_growth` 恆為 NULL，
+    而 growth 粗篩要求 `yoy_growth.notna()`，那些列等於白抓（§6.6 #23）。
+    """
     return _sync_per_stock(
         model=MonthlyRevenue,
         stock_ids=stock_ids,
         fetch_fn=lambda f, sid, s, e: f.fetch_monthly_revenue(sid, s, e),
-        upsert_fn=_upsert_monthly_revenue,
+        upsert_fn=lambda df: _upsert_monthly_revenue(df, source="finmind"),
         cache_days=30,
-        lookback_days=180,
+        lookback_days=REVENUE_FINMIND_LOOKBACK_DAYS,
         label="營收補抓",
+        incremental=False,
     )
 
 
@@ -512,11 +626,54 @@ def sync_mops_announcements(days: int = 7) -> int:
     return total
 
 
+def _mops_covered_stocks(year: int, month: int) -> int:
+    """回傳某營收月份**由 MOPS 全市場抓回**的相異股票數（§6.6 #23 續跑判定）。
+
+    只數 `source='mops'`——候選池逐股補抓每天寫入約 150 檔，一個月累積上千列，
+    若把它們算進來，門檻會被灌滿而使全市場同步此後永不執行（實測 2026-02 的
+    MOPS 列因此永久停在 1 筆）。與 §6.5 #22 的估值閘門是同一種病。
+    """
+    with get_session() as session:
+        return (
+            session.execute(
+                select(func.count(func.distinct(MonthlyRevenue.stock_id))).where(
+                    MonthlyRevenue.revenue_year == year,
+                    MonthlyRevenue.revenue_month == month,
+                    MonthlyRevenue.source == "mops",
+                )
+            ).scalar()
+            or 0
+        )
+
+
+def _sync_mops_revenue_month(year: int, month: int) -> int:
+    """同步單一營收月份的 MOPS 全市場資料；已補齊則跳過。回傳寫入筆數。"""
+    from src.data.mops_fetcher import fetch_mops_monthly_revenue
+
+    covered = _mops_covered_stocks(year, month)
+    if covered >= BACKFILL_MIN_REVENUE_STOCKS:
+        logger.info("[MOPS 月營收] %d/%d 已有 %d 檔（跳過）", year, month, covered)
+        return 0
+
+    df = fetch_mops_monthly_revenue(year=year, month=month)
+    if df.empty:
+        logger.warning("[MOPS 月營收] %d/%d 無資料（該月頁面可能尚未產生）", year, month)
+        return 0
+
+    n = _upsert_monthly_revenue(df, source="mops")
+    logger.info("[MOPS 月營收] %d/%d 寫入 %d 筆（原有 %d 檔）", year, month, n, covered)
+    return n
+
+
 def sync_mops_revenue(months: int = 1) -> int:
     """從 MOPS 同步全市場月營收（上市+上櫃）。
 
     使用 MOPS 公開資訊觀測站的靜態 HTML 頁面，
     兩次 HTTP 請求即可取得全市場 ~2000+ 支股票的月營收。
+
+    續跑判定見 `_mops_covered_stocks`——**只數 MOPS 來源的相異股票數**，
+    門檻 `BACKFILL_MIN_REVENUE_STOCKS`。舊版數「該月全部列數 ≥500」，
+    被候選池逐股補抓的列灌滿後該月永不重抓，實測多個月份長期凍結在半套。
 
     Args:
         months: 同步最近幾個月的營收（預設 1 = 上月）
@@ -524,56 +681,100 @@ def sync_mops_revenue(months: int = 1) -> int:
     Returns:
         新增的月營收筆數
     """
-    from src.data.mops_fetcher import fetch_mops_monthly_revenue
-
     init_db()
 
     total = 0
-    today = date.today()
-
-    for i in range(months):
-        # 計算目標月份（從上月往回推）
-        target = today.replace(day=1) - timedelta(days=1)  # 上月底
-        for _ in range(i):
-            target = target.replace(day=1) - timedelta(days=1)  # 再往前推
-        target_year = target.year
-        target_month = target.month
-
-        # 檢查 DB 是否已有該月份全市場資料
-        with get_session() as session:
-            count = session.execute(
-                select(func.count())
-                .select_from(MonthlyRevenue)
-                .where(
-                    MonthlyRevenue.revenue_year == target_year,
-                    MonthlyRevenue.revenue_month == target_month,
-                )
-            ).scalar()
-
-        if count and count >= 500:
-            logger.info(
-                "[MOPS 月營收] %d/%d 已有 %d 筆（跳過）",
-                target_year,
-                target_month,
-                count,
-            )
-            continue
-
-        df = fetch_mops_monthly_revenue(year=target_year, month=target_month)
-        if df.empty:
-            continue
-
-        n = _upsert_monthly_revenue(df)
-        total += n
-        logger.info(
-            "[MOPS 月營收] %d/%d 寫入 %d 筆",
-            target_year,
-            target_month,
-            n,
-        )
+    target = date.today().replace(day=1) - timedelta(days=1)  # 上月底
+    for _ in range(months):
+        total += _sync_mops_revenue_month(target.year, target.month)
+        target = target.replace(day=1) - timedelta(days=1)  # 再往前推一個月
 
     logger.info("[MOPS 月營收] 同步完成，共寫入 %d 筆", total)
     return total
+
+
+def backfill_revenue_history(
+    start: date,
+    end: date | None = None,
+    *,
+    dry_run: bool = False,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """回補 `monthly_revenue` 歷史（§6.6 #24，B1① 最後一塊基本面缺口）。
+
+    ## 為什麼走 MOPS 而不是 FinMind 逐股
+
+    §2 的資料來源優先序①：MOPS 是官方、免費、全市場。實測其歷史頁面
+    （`t21sc03_{民國年}_{月}_0.html`）回溯到 2020-01 仍健在，一個月兩個請求
+    （上市 sii + 上櫃 otc）即拿到全市場，且**自帶官方 YoY**。
+    79 個月 ≈ 158 個免費請求、約 8 分鐘；FinMind 逐股則是 ~2,000 檔 × 0.5s
+    並且要吃 600/hr 的配額，兩邊差三個數量級。
+
+    ## 續跑
+
+    與其他回補一致，**不維護進度檔**：某月由 MOPS 抓回的相異股票數達
+    `BACKFILL_MIN_REVENUE_STOCKS` 即視為已補（`_mops_covered_stocks`）。
+
+    開跑前一律先跑 `normalize_revenue_date_semantics()`——舊資料若還帶著
+    「次月 1 日」的 FinMind 日期，回補寫進來的月底列會與之並存成同月雙列。
+
+    Args:
+        start: 起始月份（取其年月，日忽略）。
+        end: 結束月份（含）；None ＝今日所屬月份的**上個月**（當月營收尚未公布）。
+        dry_run: 只列出待補月份，不實際抓取。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"months": N, "rows": M, "skipped_months": S, "normalized": K}
+    """
+    init_db()
+    result = {"months": 0, "rows": 0, "skipped_months": 0, "normalized": 0}
+
+    if end is None:
+        end = date.today().replace(day=1) - timedelta(days=1)
+
+    # (year, month) 序列
+    months: list[tuple[int, int]] = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        months.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+    if not months:
+        logger.info("月營收回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    if not dry_run:
+        stats = normalize_revenue_date_semantics()
+        result["normalized"] = stats["moved"] + stats["merged"]
+
+    pending = [(y, m) for y, m in months if _mops_covered_stocks(y, m) < BACKFILL_MIN_REVENUE_STOCKS]
+    result["skipped_months"] = len(months) - len(pending)
+    logger.info(
+        "[月營收回補] %d/%02d ~ %d/%02d：待補 %d 個月（已跳過 %d 個），預估 %.1f 分鐘",
+        start.year,
+        start.month,
+        end.year,
+        end.month,
+        len(pending),
+        result["skipped_months"],
+        len(pending) * 2 * MOPS_REQUEST_INTERVAL / 60,
+    )
+
+    if dry_run:
+        return result
+
+    for i, (year, month) in enumerate(pending, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[月營收回補] 收到中止訊號，已完成 %d/%d 個月", i - 1, len(pending))
+            break
+        n = _sync_mops_revenue_month(year, month)
+        if n:
+            result["months"] += 1
+            result["rows"] += n
+
+    logger.info("[月營收回補] 完成 — %d 個月 / %d 筆", result["months"], result["rows"])
+    return result
 
 
 def sync_valuation_all_market() -> int:
@@ -952,9 +1153,13 @@ def sync_stock(
     # --- 月營收 ---
     last = _resolve_last("revenue", MonthlyRevenue)
     s = last if last and last > default_start else default_start
-    logger.info("[%s] 同步月營收: %s ~ %s", stock_id, s, end_date)
-    df_rev = fetcher.fetch_monthly_revenue(stock_id, s, end_date)
-    result["revenue"] = _upsert_monthly_revenue(df_rev)
+    # YoY 由整段序列在 fetcher 內算出，起點太近會讓 `yoy_growth` 恆為 NULL（§6.6 #23），
+    # 故不論增量起點為何都至少回溯 13 個月；逐股 API 一次呼叫涵蓋全區間，不增加請求數。
+    rev_floor = (date.fromisoformat(end_date) - timedelta(days=REVENUE_FINMIND_LOOKBACK_DAYS)).isoformat()
+    rev_start = min(s, rev_floor)
+    logger.info("[%s] 同步月營收: %s ~ %s", stock_id, rev_start, end_date)
+    df_rev = fetcher.fetch_monthly_revenue(stock_id, rev_start, end_date)
+    result["revenue"] = _upsert_monthly_revenue(df_rev, source="finmind")
 
     # --- 股利 ---
     last = _resolve_last("dividend", Dividend)

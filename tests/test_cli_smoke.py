@@ -249,3 +249,47 @@ class TestValuationBackfillCli:
         out = capsys.readouterr().out
         assert "估值回補完成" in out
         assert "300" in out and "20" in out
+
+
+# ====================================================================== #
+# §6.6 #24：backfill-history --revenue-only 的 parser 與 handler 接線
+# ====================================================================== #
+
+
+class TestRevenueBackfillCli:
+    def test_revenue_flag_parses(self):
+        args = build_parser().parse_args(["backfill-history", "--revenue-only", "--start", "2020-01-01"])
+        assert args.revenue_only is True
+
+    def test_revenue_only_defaults_false(self):
+        assert build_parser().parse_args(["backfill-history", "--start", "2020-01-01"]).revenue_only is False
+
+    def test_handler_routes_to_revenue_backfill(self, monkeypatch, capsys):
+        """--revenue-only 必須走營收路徑，且不得觸發下市同步／價量／估值回補。"""
+        import src.cli.misc_cmd as misc
+
+        captured = {}
+
+        def _fake_revenue(start, end, *, dry_run=False, **kw):
+            captured["args"] = (start, end, dry_run)
+            return {"months": 4, "rows": 6800, "skipped_months": 2, "normalized": 12}
+
+        def _boom(*a, **kw):
+            raise AssertionError("--revenue-only 不應觸發此路徑")
+
+        monkeypatch.setattr(pipeline_mod, "backfill_revenue_history", _fake_revenue)
+        monkeypatch.setattr(pipeline_mod, "backfill_market_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_valuation_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "sync_delisting_info", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_daily_features", _boom)
+
+        args = build_parser().parse_args(
+            ["backfill-history", "--revenue-only", "--start", "2020-01-01", "--end", "2020-04-30"]
+        )
+        misc.cmd_backfill_history(args)
+
+        assert captured["args"] == (date(2020, 1, 1), date(2020, 4, 30), False)
+        out = capsys.readouterr().out
+        assert "月營收回補完成" in out
+        assert "6800" in out
+        assert "12" in out  # 正規化筆數有回報

@@ -402,6 +402,7 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
     from src.data.pipeline import (
         backfill_daily_features,
         backfill_market_history,
+        backfill_revenue_history,
         backfill_valuation_history,
         sync_delisting_info,
     )
@@ -409,6 +410,22 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
     start = _date.fromisoformat(args.start)
     end = _date.fromisoformat(args.end) if getattr(args, "end", None) else None
     datasets = tuple(s.strip() for s in (args.datasets or "price,institutional,margin").split(",") if s.strip())
+
+    if getattr(args, "revenue_only", False):
+        print(f"只回補 monthly_revenue（§6.6 #24）：{start:%Y/%m} ~ {end.strftime('%Y/%m') if end else '上月'}")
+        print("  來源＝MOPS 全市場靜態頁（免費、官方、自帶 YoY），一個月兩個請求")
+        if args.dry_run:
+            print("[dry-run] 僅列出待補月份，不實際抓取\n")
+        rr = backfill_revenue_history(start, end, dry_run=args.dry_run)
+        if args.dry_run:
+            print("dry-run 結束——上方 log 已列出待補月數與預估時間")
+            return
+        print("\n月營收回補完成：")
+        print(f"  月份數 {rr['months']:>4}　筆數 {rr['rows']:>8}")
+        print(f"  已跳過 {rr['skipped_months']:>4} 個月（MOPS 覆蓋已達標）")
+        if rr["normalized"]:
+            print(f"  日期語意正規化：{rr['normalized']} 筆（次月 1 日 → 月底、同月重複已合併）")
+        return
 
     if getattr(args, "valuation_only", False):
         markets = tuple(

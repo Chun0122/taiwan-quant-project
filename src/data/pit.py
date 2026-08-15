@@ -40,6 +40,18 @@ QUARTERLY_PUBLISH_LAG_DAYS: int = 45  # Q1/Q2/Q3 財報：季終了後 45 日內
 ANNUAL_PUBLISH_LAG_DAYS: int = 90  # 年報（Q4）：會計年度終了後 3 個月
 
 
+def month_end(year: int, month: int) -> date:
+    """回傳某年某月的最後一天。
+
+    **`MonthlyRevenue.date` 的 canonical 語意**（§6.6 #23）：一筆月營收的 `date`
+    恆為其 `revenue_year`/`revenue_month` 的月底。此函數是該語意的 SSOT——
+    MOPS 解析、FinMind 正規化、續跑判定與 `revenue_visible_cutoff` 全部走它，
+    避免再出現「FinMind 寫次月 1 日、MOPS 寫當月月底」那種同月雙列的分裂。
+    """
+    ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+    return date(ny, nm, 1) - timedelta(days=1)
+
+
 def latest_visible_revenue_month(as_of: date) -> tuple[int, int]:
     """回傳 `as_of` 當下**已公布**的最新營收月份 `(year, month)`。
 
@@ -70,9 +82,7 @@ def revenue_visible_cutoff(as_of: date) -> date:
     `MonthlyRevenue.date` 為營收月份的代表日，故取「最新可見月份」的月底。
     """
     y, m = latest_visible_revenue_month(as_of)
-    # 該月最後一天 = 次月 1 日往前一天
-    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
-    return date(ny, nm, 1) - timedelta(days=1)
+    return month_end(y, m)
 
 
 def quarter_publish_deadline(year: int, quarter: int) -> date:

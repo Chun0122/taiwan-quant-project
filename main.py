@@ -874,6 +874,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="twse,tpex",
         help="估值回補的市場（逗號分隔：twse/tpex），搭配 --valuation-only",
     )
+    sp_bf.add_argument(
+        "--revenue-only",
+        action="store_true",
+        help="只回補 monthly_revenue（§6.6 #24：MOPS 全市場靜態頁，免費且自帶官方 YoY）",
+    )
     sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
 
     # rotation 子命令（輪動組合部位控制）
