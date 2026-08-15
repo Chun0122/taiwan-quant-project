@@ -333,6 +333,33 @@ MOPS_REQUEST_INTERVAL: float = 3.0  # MOPS 靜態頁（mopsov）比照官方端�
 #   3. 全市場母體只會成長（上市櫃家數逐年增加），故此值對 2020 年也安全。
 BACKFILL_MIN_REVENUE_STOCKS: int = 1400
 
+# 財報回補（§6.6 #25）——FinMind 逐股三表（損益/資產負債/現金流），每檔 3 個請求。
+#
+# 母體門檻：區間內有 ≥60 個交易日的 4 碼普通股（實測 2020-2026 為 1,994 檔）。
+# 不補「幾乎沒交易過」的股票——它們永遠不會進 universe，卻要吃掉 3 個請求。
+FINANCIAL_BACKFILL_MIN_TRADING_DAYS: int = 60
+FINMIND_REQUESTS_PER_FINANCIAL_STOCK: int = 3
+
+# 續跑判定：某檔在區間內「**欄位非空**的季數 ≥ 應有季數 × 此比例」即視為已補。
+#
+# ⚠ 判定看的是**欄位**不是列數（§6.5 #21d 的教訓）：三表任一在抓取當下逾時，
+# `fetch_financial_summary` 仍會回傳只有損益表的 DataFrame，寫進去就是
+# `roe`/`debt_ratio`/`free_cf` 全 NULL 的列——列數檢查完全看不出來，而
+# `compute_peer_fundamental_ranking` 會照樣拿這些 NULL 去做同業排名。
+# 故 eps（損益）、equity（資產負債）、operating_cf（現金流）三者分別計數，
+# 任一未達標就重抓；`_upsert_financial` 同步改為 on_conflict_do_update，
+# 否則重抓回來的完整值會被舊的半套列擋在門外（C2 教訓）。
+#
+# 0.8 而非 1.0：FinMind 對部分公司的早期季度本來就缺（興櫃轉上市前無合併報表），
+# 要求全等會讓那些股票每次執行都重抓。
+FINANCIAL_COVERAGE_RATIO: float = 0.8
+
+# FinMind 免費版每小時請求上限。**只作為配額查詢失敗時的 fallback**——
+# 正常路徑是開跑前打 `fetch_quota_status()` 拿帳號真實上限，據以推導節流間隔
+# （3600/limit ＝ 600 時每請求 6 秒）。刻意選「連續慢跑」而非「爆衝後撞 402」：
+# 兩者的每小時吞吐相同，但前者不會把錯誤日誌塞滿 402、也不需要等整點。
+FINMIND_FREE_HOURLY_LIMIT: int = 600
+
 # FinMind 逐股月營收的回溯天數（§6.6 #23）：**必須 ≥ 13 個月**。
 # `fetch_monthly_revenue` 的 YoY 是 `revenue / revenue.shift(12) - 1`，需要 13 筆
 # 才算得出最新一筆的年增率。舊值 180 天只取回 6 筆 → `yoy_growth` 恆為 NULL

@@ -1297,3 +1297,316 @@ class TestGrowthStage05RevenueGate:
 
         self._scanner(date(2026, 3, 10))._prepare_before_load()
         assert fetched == []
+
+
+# ====================================================================== #
+# H. §6.6 #25 — 財報回補（欄位級續跑判定 / 配額治理 / 母體）
+# ====================================================================== #
+
+
+def _seed_financial_stock(
+    session,
+    sid: str,
+    *,
+    n_days: int = 70,
+    listing_type: str = "twse",
+    security_type: str = "stock",
+    turnover: float = 1_000_000.0,
+    first_day: date = date(2024, 1, 2),
+    step_days: int = 5,
+):
+    """種一檔可進財報回補母體的股票（StockInfo + 跨全年的價量）。"""
+    from src.data.schema import StockInfo
+
+    session.add(StockInfo(stock_id=sid, stock_name=sid, listing_type=listing_type, security_type=security_type))
+    for i in range(n_days):
+        session.add(
+            DailyPrice(
+                stock_id=sid,
+                date=first_day + timedelta(days=i * step_days),
+                open=10.0,
+                high=11.0,
+                low=9.0,
+                close=10.0,
+                volume=1000,
+                turnover=turnover,
+            )
+        )
+    session.flush()
+
+
+def _seed_financial_rows(session, sid: str, quarters: list[date], *, eps=1.0, equity=100, operating_cf=50):
+    """種財報列；把 equity / operating_cf 設 None 即模擬「三表只抓到損益表」的半套列。"""
+    from src.data.schema import FinancialStatement
+
+    for d in quarters:
+        session.add(
+            FinancialStatement(
+                stock_id=sid,
+                date=d,
+                year=d.year,
+                quarter=(d.month - 1) // 3 + 1,
+                eps=eps,
+                equity=equity,
+                operating_cf=operating_cf,
+            )
+        )
+    session.flush()
+
+
+_Q2024 = [date(2024, 3, 31), date(2024, 6, 30), date(2024, 9, 30)]  # 2024 年底前已屆申報期限的三季
+
+
+def _stub_financial_fetcher(monkeypatch, *, rows_per_stock: int = 3, fail: dict | None = None):
+    """打樁 FinMindFetcher：回傳被請求的股票清單，`fail[sid]` 指定要拋的例外。"""
+    import src.data.pipeline as pl
+
+    called: list[str] = []
+    fail = fail or {}
+
+    class _F:
+        def fetch_quota_status(self):
+            return {"level": 1, "level_title": "Free", "limit": 600, "used": 0, "remaining": 600}
+
+        def fetch_financial_summary(self, sid, s, e):
+            called.append(sid)
+            if sid in fail:
+                exc = fail[sid]
+                raise exc() if isinstance(exc, type) else exc
+            return pd.DataFrame(
+                [
+                    {
+                        "stock_id": sid,
+                        "date": _Q2024[i],
+                        "year": 2024,
+                        "quarter": i + 1,
+                        "eps": 1.5,
+                        "equity": 1000,
+                        "operating_cf": 500,
+                    }
+                    for i in range(rows_per_stock)
+                ]
+            )
+
+    monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+    return called
+
+
+def _quota_error(status: int = 402):
+    class _R:
+        status_code = status
+
+    exc = RuntimeError("quota")
+    exc.response = _R()
+    return exc
+
+
+class TestFinancialExpectedQuarters:
+    """§6.6 #25：應有季數必須同時受「該股價量區間」與「法定申報期限」約束。"""
+
+    def test_counts_only_published_quarters(self):
+        from src.data.pipeline import _financial_expected_quarters
+
+        # 2024 全年有價量，end=2024-12-31：Q4 年報要到 2025-03-31 才須申報 → 不算
+        n = _financial_expected_quarters(date(2024, 1, 2), date(2024, 12, 30), date(2024, 1, 1), date(2024, 12, 31))
+        assert n == 3
+
+    def test_unpublished_quarter_not_required(self):
+        """**核心回歸**：最近一季未到申報期限就不能算缺漏，否則該股每次都重抓。"""
+        from src.data.pipeline import _financial_expected_quarters
+
+        # end=2024-11-01：Q3（期限 11/14）尚未到 → 只剩 Q1/Q2
+        n = _financial_expected_quarters(date(2024, 1, 2), date(2024, 11, 1), date(2024, 1, 1), date(2024, 11, 1))
+        assert n == 2
+
+    def test_late_listed_stock_not_required_to_cover_full_range(self):
+        from src.data.pipeline import _financial_expected_quarters
+
+        # 2024-08 才上市 → 只有 Q3 落在價量區間內
+        n = _financial_expected_quarters(date(2024, 8, 1), date(2024, 12, 30), date(2024, 1, 1), date(2024, 12, 31))
+        assert n == 1
+
+
+class TestFinancialBackfillResume:
+    """§6.6 #25：續跑判定看**欄位**不看列數。"""
+
+    def test_half_filled_rows_are_retried(self, db, monkeypatch):
+        """**核心回歸**：列數滿額但 equity/operating_cf 全 NULL 必須重抓。
+
+        三表任一逾時時 `fetch_financial_summary` 仍會回傳只有損益表的 DataFrame，
+        寫進去就是半套列——列數檢查完全看不出來，而 peer ranking 會照樣拿它排名。
+        """
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+        _seed_financial_rows(db, "2330", _Q2024, equity=None, operating_cf=None)
+
+        called = _stub_financial_fetcher(monkeypatch)
+        backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+        assert called == ["2330"]
+
+    def test_complete_stock_is_skipped(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+        _seed_financial_rows(db, "2330", _Q2024)
+
+        called = _stub_financial_fetcher(monkeypatch)
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+        assert called == []
+        assert res["skipped_stocks"] == 1
+
+    def test_missing_stock_is_fetched(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+        called = _stub_financial_fetcher(monkeypatch)
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+
+        assert called == ["2330"]
+        assert res["stocks"] == 1 and res["rows"] == 3
+
+    def test_upsert_overwrites_half_filled_row(self, db, monkeypatch):
+        """重抓回來的完整值必須覆蓋半套列——do_nothing 會讓續跑判定永遠自癒不了。"""
+        from src.data.pipeline import backfill_financial_history
+        from src.data.schema import FinancialStatement
+
+        _seed_financial_stock(db, "2330")
+        _seed_financial_rows(db, "2330", _Q2024, equity=None, operating_cf=None)
+
+        _stub_financial_fetcher(monkeypatch)
+        backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+
+        rows = db.query(FinancialStatement).filter_by(stock_id="2330").all()
+        assert len(rows) == 3, "不得新增重複列"
+        assert all(r.equity == 1000 and r.operating_cf == 500 for r in rows)
+
+
+class TestFinancialBackfillUniverse:
+    def test_illiquid_and_nonstock_excluded(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")  # 70 個交易日 → 入選
+        _seed_financial_stock(db, "0050", security_type="etf")  # ETF 無財報語意
+        _seed_financial_stock(db, "9999", n_days=5)  # 交易日太少
+        _seed_financial_stock(db, "5678", listing_type="emerging")  # 興櫃不補
+
+        called = _stub_financial_fetcher(monkeypatch)
+        backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+        assert called == ["2330"]
+
+    def test_ordered_by_liquidity(self, db, monkeypatch):
+        """中斷時要先補到最可能進 universe 的標的。"""
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "1111", turnover=1_000.0)
+        _seed_financial_stock(db, "2222", turnover=9_000_000.0)
+        _seed_financial_stock(db, "3333", turnover=500_000.0)
+
+        called = _stub_financial_fetcher(monkeypatch)
+        backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+        assert called == ["2222", "3333", "1111"]
+
+    def test_dry_run_does_not_fetch(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+        called = _stub_financial_fetcher(monkeypatch)
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), dry_run=True, request_interval=0)
+        assert called == []
+        assert res["stocks"] == 0
+
+
+class TestFinancialBackfillQuota:
+    def test_stops_on_quota_exhaustion(self, db, monkeypatch):
+        """配額用盡要立刻停手——續跑只會空轉，還會把真因淹沒在重複警告裡。"""
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "1111", turnover=900.0)
+        _seed_financial_stock(db, "2222", turnover=9_000_000.0)
+
+        called = _stub_financial_fetcher(monkeypatch, fail={"2222": _quota_error()})
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+
+        assert called == ["2222"], "撞到配額後不得繼續打第二檔"
+        assert res["quota_exhausted"] == 1
+
+    def test_wait_on_quota_sleeps_and_resumes(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+
+        attempts = {"n": 0}
+        slept: list[float] = []
+
+        import src.data.pipeline as pl
+
+        class _F:
+            def fetch_quota_status(self):
+                return {}
+
+            def fetch_financial_summary(self, sid, s, e):
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise _quota_error()
+                return pd.DataFrame(
+                    [{"stock_id": sid, "date": _Q2024[0], "year": 2024, "quarter": 1, "eps": 1.0, "equity": 5}]
+                )
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+        monkeypatch.setattr(pl.time, "sleep", lambda s: slept.append(s))
+
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0, wait_on_quota=True)
+
+        assert attempts["n"] == 2, "等待後必須重試同一檔"
+        assert res["quota_waits"] == 1
+        assert res["quota_exhausted"] == 0
+        assert slept and slept[0] > 0
+
+    def test_per_stock_error_does_not_abort(self, db, monkeypatch):
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "1111", turnover=900.0)
+        _seed_financial_stock(db, "2222", turnover=9_000_000.0)
+
+        called = _stub_financial_fetcher(monkeypatch, fail={"2222": ValueError("該股無資料")})
+        res = backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31), request_interval=0)
+
+        assert called == ["2222", "1111"], "個股錯誤不應中斷整輪"
+        assert res["failed_stocks"] == 1
+        assert res["stocks"] == 1
+
+    def test_interval_derived_from_quota(self, db, monkeypatch):
+        """未指定 request_interval 時，節流間隔由帳號真實上限推導（3600/limit）。"""
+        from src.data.pipeline import backfill_financial_history
+
+        _seed_financial_stock(db, "2330")
+        _seed_financial_rows(db, "2330", _Q2024)  # 已完整 → 不會真的 sleep
+
+        import src.data.pipeline as pl
+
+        captured = {}
+
+        class _F:
+            def fetch_quota_status(self):
+                captured["asked"] = True
+                return {"level": 1, "level_title": "Free", "limit": 600, "used": 0, "remaining": 600}
+
+            def fetch_financial_summary(self, sid, s, e):  # pragma: no cover — 本測試不應走到
+                raise AssertionError("已完整的股票不該被抓取")
+
+        monkeypatch.setattr(pl, "FinMindFetcher", lambda *a, **kw: _F())
+        backfill_financial_history(date(2024, 1, 1), date(2024, 12, 31))
+        assert captured.get("asked"), "開跑前必須查配額"
+
+
+class TestSecondsUntilNextHour:
+    def test_returns_positive_with_buffer(self):
+        from datetime import datetime
+
+        from src.data.pipeline import _seconds_until_next_hour
+
+        # 10:30:00 → 距 11:00 為 1800 秒，加 60 秒緩衝
+        assert _seconds_until_next_hour(datetime(2026, 8, 15, 10, 30, 0)) == pytest.approx(1860.0)
+        # 整點前一秒也必須是正值（不能算成 0 而連續重試）
+        assert _seconds_until_next_hour(datetime(2026, 8, 15, 10, 59, 59)) == pytest.approx(61.0)

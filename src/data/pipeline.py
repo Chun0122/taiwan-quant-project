@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
@@ -16,7 +17,11 @@ from src.constants import (
     BACKFILL_MIN_REVENUE_STOCKS,
     BACKFILL_MIN_VALUATION_STOCKS,
     FEATURE_BACKFILL_MIN_COVERAGE_RATIO,
+    FINANCIAL_BACKFILL_MIN_TRADING_DAYS,
+    FINANCIAL_COVERAGE_RATIO,
+    FINMIND_FREE_HOURLY_LIMIT,
     FINMIND_REQUEST_INTERVAL,
+    FINMIND_REQUESTS_PER_FINANCIAL_STOCK,
     MOPS_REQUEST_INTERVAL,
     PRICE_JUMP_WARN_THRESHOLD,
     REVENUE_FINMIND_LOOKBACK_DAYS,
@@ -512,9 +517,39 @@ def sync_dividends_for_stocks(stock_ids: list[str]) -> int:
     )
 
 
+_FINANCIAL_UPDATE_COLS = [
+    "year",
+    "quarter",
+    "revenue",
+    "gross_profit",
+    "operating_income",
+    "net_income",
+    "eps",
+    "total_assets",
+    "total_liabilities",
+    "equity",
+    "operating_cf",
+    "investing_cf",
+    "financing_cf",
+    "free_cf",
+    "gross_margin",
+    "operating_margin",
+    "net_margin",
+    "roe",
+    "roa",
+    "debt_ratio",
+]
+
+
 def _upsert_financial(df: pd.DataFrame) -> int:
-    """將財報 DataFrame 寫入 financial_statement 表。"""
-    return _upsert_batch(FinancialStatement, df, ["stock_id", "date"])
+    """將財報 DataFrame 寫入 financial_statement 表。
+
+    衝突時**覆寫**而非 do_nothing（§6.6 #25）：三表中任一在抓取當下逾時，
+    寫進去的就是 `equity`/`operating_cf` 全 NULL 的半套列。若沿用 do_nothing，
+    重抓回來的完整值會被那筆半套列永遠擋在門外，續跑判定也就永遠自癒不了
+    （與 C2 修復同一個教訓）。
+    """
+    return _upsert_batch(FinancialStatement, df, ["stock_id", "date"], update_cols=_FINANCIAL_UPDATE_COLS)
 
 
 def sync_financial_statements(
@@ -1616,6 +1651,264 @@ def backfill_valuation_history(
         result["twse_rows"],
         result["tpex_stocks"],
         result["tpex_rows"],
+    )
+    return result
+
+
+def _seconds_until_next_hour(now: datetime | None = None) -> float:
+    """距離下一個整點的秒數（+60 秒緩衝）——FinMind 配額以整點為窗口重置。"""
+    now = now or datetime.now()
+    nxt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return (nxt - now).total_seconds() + 60
+
+
+def _financial_expected_quarters(first_day: date, last_day: date, start: date, end: date) -> int:
+    """某檔在 [start, end] 內「**應該**要有幾季財報」。
+
+    兩個條件同時成立才算數：
+      1. 季末日落在該股實際有價量的區間內（新上市/已下市股不該被要求補滿全期）；
+      2. 該季的**法定申報期限**已在 `end` 之前（Q1~Q3 季後 45 日、年報次年 3/31）
+         ——否則會把「還沒到公布期限」當成缺漏，讓最近一季永遠重抓。
+    """
+    from src.data.pit import quarter_publish_deadline
+
+    count = 0
+    for year in range(start.year, end.year + 1):
+        for q, quarter_end in enumerate(
+            (date(year, 3, 31), date(year, 6, 30), date(year, 9, 30), date(year, 12, 31)), start=1
+        ):
+            if not (start <= quarter_end <= end):
+                continue
+            if not (first_day <= quarter_end <= last_day):
+                continue
+            if quarter_publish_deadline(year, q) > end:
+                continue
+            count += 1
+    return count
+
+
+def backfill_financial_history(
+    start: date,
+    end: date | None = None,
+    *,
+    min_trading_days: int = FINANCIAL_BACKFILL_MIN_TRADING_DAYS,
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+    wait_on_quota: bool = False,
+    request_interval: float | None = None,
+    max_quota_waits: int = 24,
+) -> dict[str, int]:
+    """回補 `financial_statement` 歷史（§6.6 #25，B1① 最後一塊基本面缺口）。
+
+    ## 為什麼只能走 FinMind 逐股
+
+    月營收有 MOPS 全市場靜態頁可用（§6.6 #24），財報沒有對應的免費全市場歷史
+    端點：TWSE openapi 的財報只回**當季**。故走 FinMind `TaiwanStockFinancialStatements`
+    ／`BalanceSheet`／`CashFlowsStatement` 三個 dataset 逐股抓，一檔 3 個請求
+    （日期區間一次涵蓋全期間，實測 2330 單次呼叫回 26 季）。
+
+    ## 配額與節流
+
+    免費版 600 請求/小時、母體 1,994 檔 × 3 ＝ **約 10 小時**。開跑前先打
+    `fetch_quota_status()` 取帳號真實上限，據以推導間隔（3600/limit ＝ 6 秒/請求）
+    並**連續慢跑**，而非 0.5 秒爆衝後撞 402——兩者每小時吞吐相同，但後者會把
+    日誌塞滿 402 並得等整點。`wait_on_quota=True` 時遇 402 會睡到下個整點續跑，
+    否則立即停止（重跑本函數會從缺口續行）。
+
+    ⚠ **請在自己的 Terminal 配 `caffeinate -i` 執行**——長跑作業綁在互動 session
+    上會被中斷（2020–2023 價量回補跑三趟的教訓）。續跑冪等，進度不會損失。
+
+    ## 續跑判定看欄位不看列數
+
+    三表任一逾時，`fetch_financial_summary` 仍會回傳只有損益表的 DataFrame，
+    寫進去就是 `equity`／`operating_cf` 全 NULL 的半套列——**列數檢查看不出來**
+    （§6.5 #21d 同型）。故 `eps`／`equity`／`operating_cf` 三個欄位分別計數，
+    任一低於「應有季數 × `FINANCIAL_COVERAGE_RATIO`」就重抓。
+
+    母體依區間內平均成交金額**由大到小**排序：中斷時先補到的是最可能進 universe
+    的標的，尾端小型股晚一點補齊不影響研究可用性。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        min_trading_days: 區間內交易日數低於此值的股票不補（預設 60）。
+        dry_run: 只估算待補檔數與時間，不實際抓取。
+        progress_every: 每 N 檔輸出一次進度。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+        wait_on_quota: 配額用盡時睡到下個整點續跑（預設 False ＝ 立即停止）。
+        request_interval: 每個請求的間隔秒數；None ＝由配額推導。0 ＝不節流（測試用）。
+        max_quota_waits: `wait_on_quota` 時最多等待幾次整點，防止無限迴圈。
+
+    Returns:
+        {"stocks": N, "rows": M, "skipped_stocks": S, "failed_stocks": F,
+         "quota_exhausted": 0/1, "quota_waits": W}
+    """
+    init_db()
+    result = {
+        "stocks": 0,
+        "rows": 0,
+        "skipped_stocks": 0,
+        "failed_stocks": 0,
+        "quota_exhausted": 0,
+        "quota_waits": 0,
+    }
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("財報回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # ---------- 母體與續跑判定 ---------- #
+    with get_session() as session:
+        price_rows = session.execute(
+            select(
+                DailyPrice.stock_id,
+                func.count(func.distinct(DailyPrice.date)),
+                func.min(DailyPrice.date),
+                func.max(DailyPrice.date),
+                func.avg(DailyPrice.turnover),
+            )
+            .join(StockInfo, StockInfo.stock_id == DailyPrice.stock_id)
+            .where(
+                DailyPrice.date >= start,
+                DailyPrice.date <= end,
+                func.length(DailyPrice.stock_id) == 4,
+                StockInfo.security_type == "stock",
+                StockInfo.listing_type.in_(("twse", "tpex")),
+            )
+            .group_by(DailyPrice.stock_id)
+            .having(func.count(func.distinct(DailyPrice.date)) >= min_trading_days)
+            # 流動性由大到小：中斷時先補到最可能進 universe 的標的
+            .order_by(func.avg(DailyPrice.turnover).desc())
+        ).all()
+
+        # 欄位級覆蓋度：列數足夠不代表三表都抓到了
+        have = {
+            r[0]: (r[1] or 0, r[2] or 0, r[3] or 0)
+            for r in session.execute(
+                select(
+                    FinancialStatement.stock_id,
+                    func.sum(case((FinancialStatement.eps.isnot(None), 1), else_=0)),
+                    func.sum(case((FinancialStatement.equity.isnot(None), 1), else_=0)),
+                    func.sum(case((FinancialStatement.operating_cf.isnot(None), 1), else_=0)),
+                )
+                .where(FinancialStatement.date >= start, FinancialStatement.date <= end)
+                .group_by(FinancialStatement.stock_id)
+            ).all()
+        }
+
+    pending_ids: list[str] = []
+    for sid, _days, first_day, last_day, _turnover in price_rows:
+        expected = _financial_expected_quarters(first_day, last_day, start, end)
+        if expected <= 0:
+            continue  # 區間內沒有任何一季到達申報期限——無從判定，不補
+        need = expected * FINANCIAL_COVERAGE_RATIO
+        if min(have.get(sid, (0, 0, 0))) < need:
+            pending_ids.append(sid)
+
+    result["skipped_stocks"] = len(price_rows) - len(pending_ids)
+
+    # ---------- 配額與節流 ---------- #
+    fetcher = FinMindFetcher()
+    if request_interval is None:
+        quota = fetcher.fetch_quota_status()
+        limit = quota.get("limit") or FINMIND_FREE_HOURLY_LIMIT
+        request_interval = 3600.0 / limit
+        if quota:
+            logger.info(
+                "[財報回補] FinMind 配額：%s（level=%s）上限 %d/小時、本小時已用 %d、剩餘 %d",
+                quota.get("level_title") or "?",
+                quota.get("level"),
+                quota["limit"],
+                quota["used"],
+                quota["remaining"],
+            )
+        else:
+            logger.warning("[財報回補] 配額查詢失敗，退回預設上限 %d/小時", FINMIND_FREE_HOURLY_LIMIT)
+
+    per_stock_budget = request_interval * FINMIND_REQUESTS_PER_FINANCIAL_STOCK
+    logger.info(
+        "[財報回補] %s ~ %s：待補 %d 檔（已跳過 %d 檔），每檔 %d 請求 × %.1f 秒，預估 %.1f 小時",
+        start,
+        end,
+        len(pending_ids),
+        result["skipped_stocks"],
+        FINMIND_REQUESTS_PER_FINANCIAL_STOCK,
+        request_interval,
+        len(pending_ids) * per_stock_budget / 3600,
+    )
+
+    if dry_run or not pending_ids:
+        return result
+
+    start_iso, end_iso = start.isoformat(), end.isoformat()
+    for i, sid in enumerate(pending_ids, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[財報回補] 收到中止訊號，已完成 %d/%d 檔", i - 1, len(pending_ids))
+            break
+
+        t0 = time.monotonic()
+        df = None
+        while True:
+            try:
+                df = fetcher.fetch_financial_summary(sid, start_iso, end_iso)
+                break
+            except Exception as exc:
+                if not _is_quota_exhausted(exc):
+                    logger.warning("[財報回補] %s 抓取失敗，跳過：%s", sid, exc)
+                    result["failed_stocks"] += 1
+                    break
+                if not wait_on_quota or result["quota_waits"] >= max_quota_waits:
+                    logger.error(
+                        "[財報回補] FinMind 配額用盡（%s），已完成 %d/%d 檔——"
+                        "配額恢復後重跑本指令即可從缺口續行（或加 --wait-on-quota 自動等待）",
+                        type(exc).__name__,
+                        i - 1,
+                        len(pending_ids),
+                    )
+                    result["quota_exhausted"] = 1
+                    break
+                wait_s = _seconds_until_next_hour()
+                result["quota_waits"] += 1
+                logger.warning(
+                    "[財報回補] 配額用盡，睡 %.1f 分鐘至下個整點後續跑（第 %d 次，已完成 %d/%d 檔）",
+                    wait_s / 60,
+                    result["quota_waits"],
+                    i - 1,
+                    len(pending_ids),
+                )
+                time.sleep(wait_s)
+
+        if result["quota_exhausted"]:
+            break
+        if df is not None and not df.empty:
+            result["stocks"] += 1
+            result["rows"] += _upsert_financial(df)
+
+        if i % progress_every == 0:
+            logger.info(
+                "[財報回補] 進度 %d/%d 檔（%s）— 有資料 %d 檔, 累計 %d 筆, 失敗 %d 檔",
+                i,
+                len(pending_ids),
+                sid,
+                result["stocks"],
+                result["rows"],
+                result["failed_stocks"],
+            )
+
+        remaining = per_stock_budget - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    logger.info(
+        "[財報回補] 完成 — %d 檔 / %d 筆（跳過 %d 檔、失敗 %d 檔、等待配額 %d 次）",
+        result["stocks"],
+        result["rows"],
+        result["skipped_stocks"],
+        result["failed_stocks"],
+        result["quota_waits"],
     )
     return result
 

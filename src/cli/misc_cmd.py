@@ -378,6 +378,24 @@ def cmd_industry(args: argparse.Namespace) -> None:
         print("\nDiscord 通知已發送")
 
 
+def cmd_finmind_quota(args: argparse.Namespace) -> None:  # noqa: ARG001 — 無參數，保持 dispatch 簽名一致
+    """查詢 FinMind 配額（§6.6 #25：逐股長跑回補前先確認額度）。"""
+    from src.data.fetcher import FinMindFetcher
+
+    quota = FinMindFetcher().fetch_quota_status()
+    if not quota:
+        print("配額查詢失敗——請確認 config/secrets.yaml 的 finmind.api_token")
+        return
+
+    print(f"帳號等級   {quota['level_title'] or '?'}（level={quota['level']}）")
+    print(f"每小時上限 {quota['limit']:>6}")
+    print(f"本小時已用 {quota['used']:>6}")
+    print(f"剩餘       {quota['remaining']:>6}")
+    if quota["limit"]:
+        print(f"\n連續慢跑節流間隔＝3600/{quota['limit']} ＝ {3600 / quota['limit']:.1f} 秒/請求")
+        print(f"財報回補每檔 3 請求 → 每小時約 {quota['limit'] // 3} 檔")
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     """執行 DB schema 遷移。"""
     from src.data.migrate import run_migrations
@@ -401,6 +419,7 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
 
     from src.data.pipeline import (
         backfill_daily_features,
+        backfill_financial_history,
         backfill_market_history,
         backfill_revenue_history,
         backfill_valuation_history,
@@ -425,6 +444,31 @@ def cmd_backfill_history(args: argparse.Namespace) -> None:
         print(f"  已跳過 {rr['skipped_months']:>4} 個月（MOPS 覆蓋已達標）")
         if rr["normalized"]:
             print(f"  日期語意正規化：{rr['normalized']} 筆（次月 1 日 → 月底、同月重複已合併）")
+        return
+
+    if getattr(args, "financial_only", False):
+        print(f"只回補 financial_statement（§6.6 #25）：{start} ~ {end or '今日'}")
+        print("  來源＝FinMind 逐股三表（損益/資產負債/現金流），每檔 3 個請求、吃配額")
+        print("  ⚠ 約 10 小時——請在自己的 Terminal 配 `caffeinate -i` 執行，中斷可續跑")
+        if args.dry_run:
+            print("[dry-run] 僅估算待補檔數與時間，不實際抓取\n")
+        fr = backfill_financial_history(
+            start,
+            end,
+            dry_run=args.dry_run,
+            wait_on_quota=getattr(args, "wait_on_quota", False),
+        )
+        if args.dry_run:
+            print("dry-run 結束——上方 log 已列出待補檔數與預估時間")
+            return
+        print("\n財報回補完成：")
+        print(f"  股票數 {fr['stocks']:>5}　筆數 {fr['rows']:>8}")
+        print(f"  已跳過 {fr['skipped_stocks']:>5} 檔（欄位覆蓋已達標）　失敗 {fr['failed_stocks']:>4} 檔")
+        if fr["quota_waits"]:
+            print(f"  等待配額 {fr['quota_waits']} 次（每次到下個整點）")
+        if fr["quota_exhausted"]:
+            print("\n⚠ FinMind 配額用盡，未跑完——配額恢復後重跑本指令即可從缺口續行")
+            print("   或加 --wait-on-quota 讓它自動睡到下個整點續跑")
         return
 
     if getattr(args, "valuation_only", False):

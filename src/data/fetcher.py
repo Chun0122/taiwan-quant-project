@@ -28,6 +28,9 @@ from src.data.pit import month_end
 
 logger = logging.getLogger(__name__)
 
+# 配額查詢端點（與資料 API 不同網域，且不計入配額）
+_USER_INFO_URL = "https://api.web.finmindtrade.com/v2/user_info"
+
 
 def _standardize_date_column(df: pd.DataFrame, col: str = "date") -> None:
     """將 DataFrame 的日期欄位從字串/Timestamp 統一轉為 datetime.date（in-place）。"""
@@ -146,6 +149,44 @@ class FinMindFetcher(DataFetcher):
     # ------------------------------------------------------------------ #
     #  公開介面
     # ------------------------------------------------------------------ #
+
+    def fetch_quota_status(self) -> dict:
+        """查詢 FinMind 帳號的每小時配額與已用量（§6.6 #25 的開跑前檢查）。
+
+        走 `user_info` 端點（與資料 API 不同網域），**本身不計入配額**。
+        長跑回補開跑前先看清楚額度，比跑到一半撞 402 再回頭猜好得多；
+        回傳的 `limit` 也是節流間隔（3600/limit）的推導依據。
+
+        失敗時回空 dict 而非拋例外——配額查詢掛掉不該讓回補作業中止，
+        呼叫端退回 `FINMIND_FREE_HOURLY_LIMIT` 即可。
+
+        Returns:
+            {"level", "level_title", "limit", "used", "remaining"}；失敗時 {}。
+        """
+        if not self.api_token:
+            logger.warning("未設定 FinMind token，無法查詢配額")
+            return {}
+        try:
+            resp = self._session.get(_USER_INFO_URL, params={"token": self.api_token}, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning("FinMind 配額查詢失敗（不影響作業，退回預設上限）：%s", exc)
+            return {}
+
+        limit = payload.get("api_request_limit_hour") or payload.get("api_request_limit")
+        used = payload.get("user_count")
+        if not isinstance(limit, int) or not isinstance(used, int):
+            logger.warning("FinMind 配額回應格式非預期：%s", payload.get("msg"))
+            return {}
+
+        return {
+            "level": payload.get("level"),
+            "level_title": payload.get("level_title", ""),
+            "limit": limit,
+            "used": used,
+            "remaining": max(0, limit - used),
+        }
 
     def fetch_delisting_list(self) -> pd.DataFrame:
         """抓取台股下市清單（`TaiwanStockDelisting`，B1① 倖存者偏差修正）。

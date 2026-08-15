@@ -123,6 +123,7 @@ from src.cli.misc_cmd import (
     cmd_backfill_history,
     cmd_dashboard,
     cmd_export,
+    cmd_finmind_quota,
     cmd_import_data,
     cmd_industry,
     cmd_migrate,
@@ -827,6 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
     # migrate 子命令
     subparsers.add_parser("migrate", help="執行資料庫 schema 遷移")
 
+    # finmind-quota 子命令（§6.6 #25：長跑逐股回補前的配額檢查）
+    subparsers.add_parser("finmind-quota", help="查詢 FinMind 帳號每小時配額與已用量")
+
     # pit-replay 子命令（B1④ PIT 歷史重放）
     sp_pit = subparsers.add_parser("pit-replay", help="PIT 歷史重放：在歷史日重跑 scanner 並評估前瞻報酬")
     sp_pit.add_argument(
@@ -878,6 +882,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--revenue-only",
         action="store_true",
         help="只回補 monthly_revenue（§6.6 #24：MOPS 全市場靜態頁，免費且自帶官方 YoY）",
+    )
+    sp_bf.add_argument(
+        "--financial-only",
+        action="store_true",
+        help="只回補 financial_statement（§6.6 #25：FinMind 逐股三表，每檔 3 請求、約 10 小時）",
+    )
+    sp_bf.add_argument(
+        "--wait-on-quota",
+        action="store_true",
+        help="FinMind 配額用盡時睡到下個整點續跑（搭配 --financial-only；預設立即停止）",
     )
     sp_bf.add_argument("--dry-run", action="store_true", help="只估算待補日數與時間，不實際抓取")
 
@@ -1085,6 +1099,8 @@ def main() -> None:
         cmd_revenue_scan(args)
     elif args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "finmind-quota":
+        cmd_finmind_quota(args)
     elif args.command == "backfill-history":
         cmd_backfill_history(args)
     elif args.command == "pit-replay":

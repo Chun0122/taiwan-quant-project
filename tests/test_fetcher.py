@@ -254,3 +254,67 @@ class TestMonthlyRevenueDateSemantics:
         rows = [self._row(2023, m, 100) for m in range(1, 13)] + [self._row(2024, 1, 120)]
         df = self._fetch(monkeypatch, rows)
         assert df.iloc[-1]["yoy_growth"] == pytest.approx(20.0)
+
+
+class TestQuotaStatus:
+    """§6.6 #25：長跑逐股回補前的配額查詢。"""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self, monkeypatch):
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = "test_token"
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+
+    def _fetcher(self, monkeypatch, payload, *, status=200, boom=False):
+        from src.data.fetcher import FinMindFetcher
+
+        f = FinMindFetcher(api_token="test_token")
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = payload
+        resp.raise_for_status = MagicMock()
+
+        def _get(*a, **kw):
+            if boom:
+                raise ConnectionError("network down")
+            return resp
+
+        monkeypatch.setattr(f._session, "get", _get)
+        return f
+
+    def test_parses_limit_and_usage(self, monkeypatch):
+        f = self._fetcher(
+            monkeypatch,
+            {
+                "msg": "success",
+                "level": 1,
+                "level_title": "Free",
+                "api_request_limit": 600,
+                "api_request_limit_hour": 600,
+                "user_count": 232,
+            },
+        )
+        q = f.fetch_quota_status()
+        assert q["limit"] == 600
+        assert q["used"] == 232
+        assert q["remaining"] == 368
+        assert q["level_title"] == "Free"
+
+    def test_network_failure_returns_empty_not_raise(self, monkeypatch):
+        """配額查詢掛掉不該讓 10 小時的回補作業中止——呼叫端會退回預設上限。"""
+        f = self._fetcher(monkeypatch, {}, boom=True)
+        assert f.fetch_quota_status() == {}
+
+    def test_unexpected_payload_returns_empty(self, monkeypatch):
+        f = self._fetcher(monkeypatch, {"msg": "token not valid"})
+        assert f.fetch_quota_status() == {}
+
+    def test_no_token_returns_empty(self, monkeypatch):
+        from src.data.fetcher import FinMindFetcher
+
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = ""
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+        assert FinMindFetcher(api_token="").fetch_quota_status() == {}
