@@ -66,7 +66,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
 | `data/pipeline.py` 之 `compute_feature_columns` | **DailyFeature 算式 SSOT**（B1②）：每日增量與歷史回補共用同一實作，兩邊漂移會使歷史特徵與今日特徵不同質、PIT 重放的 universe 失真 |
-| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead。**續跑判定看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」**——不可改回「該日有無特徵列」：TPEX 逾時使該日只有上市價量時算過特徵，日期會被永久標記已補，事後補齊上櫃也不重算（2026-08-09 實測 11 天中招，含 3 個 live 日；後果是 UniverseFilter Stage 2 覆蓋率門檻被踩破而退回 fallback） |
+| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead。**續跑判定看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」**——不可改回「該日有無特徵列」：TPEX 逾時使該日只有上市價量時算過特徵，日期會被永久標記已補，事後補齊上櫃也不重算（2026-08-09 實測 11 天中招，含 3 個 live 日；後果是缺特徵列的股票被 `_stage2_liquidity_filter` **整批排除於 universe 之外**——`avg5_map` 只由既有列建立，非「門檻放寬」亦非 fallback） |
 | `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日普通股（4 碼）檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`」**——既不能看「有無資料」（2020~2024 每日皆有 6 檔 watchlist，會靜默跳過 5 年）也不能看總筆數（崩盤日權證無報價會偽陽性、權證多的半套日會偽陰性） |
 | `data/pipeline.py` 之 `backfill_valuation_history` | §6.5 #20 估值回補：**上市走 TWSE `BWIBBU_d` 每日端點、上櫃走 FinMind 逐股**——TPEX 估值端點（`peratio_book/pera_result.php`）已下架（所有日期含當日皆 302 導向 `/errors`），新版 openapi 只回當日無歷史，故上櫃無官方來源。續跑判定：上市看當日檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800，母體僅約 1,000 遠小於價量）、上櫃看該檔估值日數 ≥ 價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`） |
@@ -95,7 +95,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `discovery/performance.py` | 推薦績效回測、策略衰減警告、訊號穩定性監控（`compute_signal_stability`：top-N 相鄰掃描日 Jaccard，落 `StrategyDecayLog.signal_jaccard_mean/pairs`） |
 | `discovery/ablation.py` | 因子消融測試（維度級 + 子因子級 + 績效消融） |
 | `discovery/cross_mode_corr.py` | 跨模式 score 相關性研究（per-date Spearman + 重疊統計，`cross-mode-corr` CLI） |
-| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣。**`assess_data_coverage` + `ReplayResult.verdict`（§6.5 #21b）**：量測該模式定義性依賴表的覆蓋度（帶 PIT 上界），把 `no_data`（輸入缺席、結果無效）與 `no_picks`（模式判斷不進場）分開——前者排除於彙總。依賴宣告在 `MODE_REQUIRED_TABLES`，新增模式須登記（契約測試守門） |
+| `discovery/pit_replay.py` | **B1④ PIT 歷史重放**：`replay_scan(as_of)` / `compute_forward_returns` / `sample_replay_dates`；`pit-replay` CLI。**唯讀**——不寫任何 live 表。單次重放約 90 秒，範圍重放須抽樣。**`assess_data_coverage` + `ReplayResult.verdict`（§6.5 #21b）**：量測該模式定義性依賴表的覆蓋度（帶 PIT 上界），把 `no_data`（輸入缺席、結果無效）與 `no_picks`（模式判斷不進場）分開——前者排除於彙總。依賴宣告在 `MODE_REQUIRED_TABLES`，新增模式須登記（契約測試守門）。**特徵同時看列數與欄位暖身（#21d）**：`daily_feature` 列數足夠不代表欄位可用（MA60 需 60 交易日填滿），故另查 `ma60`/`turnover_ma20` 非空率（限 4 碼普通股，門檻 `REPLAY_MIN_FEATURE_WARM_RATIO`）——`universe.py` 對 `turnover_ma20` 為 NaN 者**跳過 Stage 2 流動性門檻**，暖身期等於該過濾消失 |
 | `discovery/ic_governance.py` | **IC 可執法性 SSOT**（P0 #16）：`select_enforceable_ic()` 三道閘門（窗口時效 `holding+14` 天／窗口數 ≥3／最小樣本 ≥100）+ `ICVerdict`；決策 IC = 最近 3 窗平均。M2 停用、scanner 門檻加成、rotation 阻擋買入三處共用 |
 | `discovery/strategy_events.py` | 策略調整事件抽取（git log + quant_params.yaml diff，供 dashboard 事件流） |
 | `discovery/universe.py:log_universe_stats` | UniverseFilter 每次 scan 後落庫 `UniverseStatLog`（P1 任務 8，audit 時序對比用） |

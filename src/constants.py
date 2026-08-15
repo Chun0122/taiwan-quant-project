@@ -283,8 +283,12 @@ BACKFILL_MIN_COMMON_STOCKS: int = 1500
 #   日期被永久標記為已補 → 事後補齊上櫃價量後，特徵**永遠不會重算**。
 # 實測 11 天中招（2022-02-17 起 8 天為歷史回補、2026-05-27/06-22/06-24 為 live），
 # 這些日子 daily_price 有 4,400~7,300 列但 daily_feature 只有 1,147~1,362 列。
-# 後果不只是重放：`UniverseFilter` Stage 2 的 `_FEATURE_COVERAGE_MIN`(0.3) 會被踩破，
-# 整個流動性過濾靜默退回 DailyPrice fallback。
+# 後果不只是重放：缺特徵列的股票會被 `_stage2_liquidity_filter` **整批排除於 universe
+# 之外**（`avg5_map` 只由既有列建立，回傳的 universe 又只取自 `avg5_map.index`）。
+# ⚠ 初判寫的是「踩破 `_FEATURE_COVERAGE_MIN`(0.3) → 退回 DailyPrice fallback」，**有誤**：
+# 那 0.185 是含權證的全表比例，而該門檻的分母是 `stage1_ids`（普通股），實際為
+# 973/1750 ≈ 0.556 **高於** 0.3 → 不會 fallback，而是走 DailyFeature 路徑並把
+# 沒有特徵列的四成股票靜默丟掉。方向比誤判時所想的更嚴重。
 #
 # 門檻取 0.95：實測比例分布完全雙峰——正常日 1,591 天全在 0.9989~1.0（僅 volume=0
 # 的列不算特徵），中招日 11 天全在 0.18~0.26，中間**沒有任何一天**。
@@ -330,11 +334,38 @@ VALUATION_MIN_FRESH_STOCKS: int = 500
 # 門檻刻意沿用各自的 SSOT，不另立一套數字：
 #   • 價量＝BACKFILL_MIN_COMMON_STOCKS（全市場覆蓋的既有判定）
 #   • 估值＝VALUATION_MIN_FRESH_STOCKS（Scanner Stage 0.5 的同一門檻）
-#   • 特徵＝UniverseFilter._FEATURE_COVERAGE_MIN（低於此值 Stage 2 已 fallback）
-REPLAY_MIN_FEATURE_RATIO: float = 0.3
+#   • 特徵＝FEATURE_BACKFILL_MIN_COVERAGE_RATIO（與回補續跑判定同一個 0.95）
+#
+# ⚠ 2026-08-09 更正：原值 0.3，理由寫的是「＝UniverseFilter._FEATURE_COVERAGE_MIN，
+# 低於此值 Stage 2 已 fallback」——**那個理由是錯的**，兩件事都錯：
+#   1. 缺特徵列的股票不是「門檻放寬」而是**整批被排除**。`_stage2_liquidity_filter`
+#      的 `avg5_map` 只由 `df_feature` 既有列建立，`passed_absolute` 又只取自
+#      `avg5_map.index` → 沒有特徵列的股票根本進不了 universe。
+#   2. 因此 0.3 這個「fallback 邊界」根本不是可採信與否的邊界。實測 11 個缺口日
+#      的比例是 0.556（973/1750），遠在 0.3 之上卻少了四成候選池，靜默通過。
+# 改用 0.95：價量/特徵列比的實測分布與回補判定是**同一個雙峰**（正常日 0.9989~1.0、
+# 缺口日 0.18~0.26），故沿用同一個數字，不再自立一套。
+REPLAY_MIN_FEATURE_RATIO: float = 0.95
 # 月營收母體：live 實測 1,896 檔。300（≈16%）以下時 growth 的 universe 已非全市場，
 # 重放結果代表的是那個子集而非模式本身——實測 2020~2024 每年僅 **5 支**。
 REPLAY_MIN_REVENUE_STOCKS: int = 300
+
+# 特徵「暖身」門檻（§6.5 #21d，2026-08-09）：`daily_feature` 的列數足夠**不代表**
+# 欄位可用。MA60 需 60 個交易日才填滿，回補範圍的頭幾十天欄位全是 NaN，而列數檢查
+# 完全看不出來——與 fail-open 同一類的靜默失效。
+#
+# 具體後果不只是「分數不準」：`_stage2_liquidity_filter` 對 `turnover_ma20` 為 NaN
+# 的個股**跳過該股的 ma20 門檻**，暖身期等於那道過濾整段消失。
+# （NaN 與「整批缺列」是兩種不同失效——後者是直接排除，由 REPLAY_MIN_FEATURE_RATIO 把守。）
+#
+# 門檻取 0.5——實測分布是乾淨的雙峰，不需判斷。**母體限 4 碼普通股**：
+#   • 暖身失效：非空率 **0.000**（2020-01-02、01-20、02-10）
+#   • 穩態：**0.988 ~ 0.998**（2020-03-10 至 2026-06-01 抽樣）
+# ⚠ 若不限 4 碼，穩態會掉到 0.646~0.786——權證/ETN 上市時間短、MA 天生填不滿，
+#   把它們算進母體會讓門檻無從設定。這也是本檢查與 `feature_stocks` 一致採
+#   `length(stock_id) == 4` 的原因。
+# 取 ma60 與 turnover_ma20 的**較小值**（ma60 窗口長，是 binding constraint）。
+REPLAY_MIN_FEATURE_WARM_RATIO: float = 0.5
 
 # RotationPendingOrder.status 狀態機：pending → filled | cancelled（無其他轉移）
 PENDING_STATUS_PENDING: str = "pending"

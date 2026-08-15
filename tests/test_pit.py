@@ -500,7 +500,19 @@ class TestDataCoverage:
                 )
             )
             if with_feature:
-                session.add(DailyFeature(stock_id=sid, date=as_of, close=10.0, volume=1000, turnover=10000))
+                # ma60/turnover_ma20 必填——§6.5 #21d 起特徵的判定同時看列數與欄位暖身，
+                # 留空會讓本類每個測試都因暖身失效而 missing，測不到各自要驗的那一軸
+                session.add(
+                    DailyFeature(
+                        stock_id=sid,
+                        date=as_of,
+                        close=10.0,
+                        volume=1000,
+                        turnover=10000,
+                        ma60=10.0,
+                        turnover_ma20=10000.0,
+                    )
+                )
         session.flush()
 
     def test_value_without_valuation_is_no_data(self, db_session, monkeypatch):
@@ -666,3 +678,190 @@ class TestDataCoverage:
         modes = set(re.findall(r'"(\w+)": \w+Scanner,', source))
         assert modes, "未能從 scanner_map 解析出模式清單——此測試需同步更新"
         assert modes <= set(MODE_REQUIRED_TABLES), f"下列模式未登記資料依賴：{modes - set(MODE_REQUIRED_TABLES)}"
+
+
+class TestFeatureWarmup:
+    """§6.5 #21d：列數足夠**不代表**欄位可用。
+
+    `daily_feature` 的 MA60 需 60 個交易日才填滿，回補範圍頭幾十天欄位全是 NaN，
+    而列數檢查完全看不出來——與 fail-open 同一類的靜默失效。實測 2020-01-02 的
+    ma60/turnover_ma20 非空率皆為 **0.000**，卻有 5,086 列特徵。
+
+    後果不只是分數不準：`_stage2_liquidity_filter` 對 `turnover_ma20` 為 NaN 的個股
+    **跳過 Stage 2 流動性門檻**，暖身期等於流動性過濾整段消失。
+
+    另有一種更重的失效是**整批股票沒有特徵列**（2026-08-09 實測 11 天，TPEX 同步
+    逾時所致）：`avg5_map` 只由既有列建立、回傳的 universe 又只取自 `avg5_map.index`，
+    故缺列的股票**直接進不了 universe**——不是門檻放寬，是候選池少四成。
+    暖身率的分母因此必須是「當日應有的普通股數」而非既有特徵列數。
+    """
+
+    def _patch_session(self, db_session, monkeypatch):
+        import src.discovery.pit_replay as pr_mod
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(pr_mod, "get_session", lambda: _Ctx())
+
+    def _seed(self, session, as_of, *, n=1600, warm=True):
+        from src.data.schema import DailyFeature, DailyPrice
+
+        for i in range(n):
+            sid = f"{1000 + i}"
+            session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            session.add(
+                DailyFeature(
+                    stock_id=sid,
+                    date=as_of,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                    ma60=10.0 if warm else None,
+                    turnover_ma20=10000.0 if warm else None,
+                )
+            )
+        session.flush()
+
+    def test_rows_present_but_columns_null_is_no_data(self, db_session, monkeypatch):
+        """列數滿額但 MA 欄位全 NaN → 必須判為不可採信。這是本項的核心回歸。"""
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2020, 1, 2)
+        self._seed(db_session, as_of, warm=False)
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_stocks == 1600, "列數本身是足夠的——正是舊版看不出問題的原因"
+        assert cov.feature_warm_ratio == 0.0
+        assert cov.missing == ("daily_feature",)
+        assert "未暖身" in cov.describe()
+
+    def test_missing_feature_rows_are_not_warm(self, db_session, monkeypatch):
+        """整批股票沒有特徵列 → 不得因「既有列都暖身」而算出 100%。
+
+        2026-08-09 實測的第二現場：TPEX 同步逾時使 11 天只有上市股算到特徵，
+        既有的 973 檔 ma60 全滿。以「既有列數」為分母會得到暖身率 100%、整段
+        檢查形同虛設；以「當日應有普通股數」為分母才會揭露 44% 的缺口。
+        """
+        from src.data.schema import DailyFeature, DailyPrice
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2022, 2, 17)
+        # 價量 1,750 檔（上市+上櫃），但只有前 973 檔（上市）有特徵列且欄位全滿
+        for i in range(1750):
+            sid = f"{1000 + i}"
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            if i < 973:
+                db_session.add(
+                    DailyFeature(
+                        stock_id=sid,
+                        date=as_of,
+                        close=10.0,
+                        volume=1000,
+                        turnover=10000,
+                        ma60=10.0,
+                        turnover_ma20=10000.0,
+                    )
+                )
+        db_session.flush()
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_warm_ratio == pytest.approx(973 / 1750, abs=1e-6), (
+            "分母須為當日應有普通股數；用既有特徵列數會得到 1.0"
+        )
+        assert cov.missing == ("daily_feature",)
+        assert "列缺口" in cov.describe(), f"應與『未暖身』『整表缺席』分開講，實得：{cov.describe()}"
+
+    def test_warm_columns_are_sufficient(self, db_session, monkeypatch):
+        """對照組：欄位填滿時判為就緒，證明上一題不是恆 False。"""
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2020, 7, 7)
+        self._seed(db_session, as_of, warm=True)
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_warm_ratio == 1.0
+        assert cov.sufficient is True
+
+    def test_steady_state_null_rate_passes(self, db_session, monkeypatch):
+        """遠低於實測穩態、但仍在門檻之上的覆蓋率不得被誤殺。
+
+        4 碼普通股的實測穩態為 **0.988~0.998**（不限 4 碼才會掉到 0.646~0.786，
+        因權證上市時間短）。本測試刻意取 0.675 這個遠低於穩態的值，確認門檻 0.5
+        的判定邊界是「暖身失效（0.0）vs 其他」而非貼著穩態——否則穩態稍有波動
+        就會整批誤殺。
+        """
+        from src.data.schema import DailyFeature, DailyPrice
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2023, 6, 1)
+        for i in range(1600):
+            sid = f"{1000 + i}"
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            db_session.add(
+                DailyFeature(
+                    stock_id=sid,
+                    date=as_of,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                    ma60=10.0 if i < 1080 else None,  # 67.5% 非空，落在實測穩態帶
+                    turnover_ma20=10000.0 if i < 1450 else None,  # 90.6%
+                )
+            )
+        db_session.flush()
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_warm_ratio == pytest.approx(0.675)
+        assert cov.sufficient is True, "穩態的 NaN 率不得被當成暖身失效"
+
+    def test_binding_constraint_is_the_lower_column(self, db_session, monkeypatch):
+        """取兩欄的**較小值**——只要有一道閘門的輸入不可用，結果就不可採信。"""
+        from src.data.schema import DailyFeature, DailyPrice
+        from src.discovery.pit_replay import assess_data_coverage
+
+        self._patch_session(db_session, monkeypatch)
+        as_of = date(2020, 1, 20)
+        for i in range(1600):
+            sid = f"{1000 + i}"
+            db_session.add(
+                DailyPrice(
+                    stock_id=sid, date=as_of, open=10.0, high=10.0, low=10.0, close=10.0, volume=1000, turnover=10000
+                )
+            )
+            db_session.add(
+                DailyFeature(
+                    stock_id=sid,
+                    date=as_of,
+                    close=10.0,
+                    volume=1000,
+                    turnover=10000,
+                    ma60=None,  # 20 個交易日時 MA60 尚未填滿
+                    turnover_ma20=10000.0,  # 但 20 日窗口的欄位已可用（實測 0.82）
+                )
+            )
+        db_session.flush()
+
+        cov = assess_data_coverage("momentum", as_of)
+        assert cov.feature_warm_ratio == 0.0, "ma60 為 0 即整體為 0，不得被 turnover_ma20 稀釋"
+        assert cov.sufficient is False
