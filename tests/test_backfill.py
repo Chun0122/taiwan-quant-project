@@ -605,7 +605,11 @@ def _seed_valuation(session, d: date, n_stocks: int, prefix: int = 1000):
 
 
 class TestValuationBackfillTwse:
-    """上市路徑：TWSE 每日全市場端點 + 以「當日估值檔數」判定續跑。"""
+    """上市路徑：TWSE 每日全市場端點 + 以「當日估值檔數」判定續跑。
+
+    §6.6 #27 起**只走 DB 認定的交易日**（該日 4 碼普通股價量檔數 ≥
+    `BACKFILL_MIN_COMMON_STOCKS`），故各測試須先種當日價量才會被納入。
+    """
 
     def test_skips_days_already_covered(self, db, monkeypatch):
         """已達 BACKFILL_MIN_VALUATION_STOCKS 的日期不得重抓。"""
@@ -614,6 +618,8 @@ class TestValuationBackfillTwse:
         from src.data.pipeline import backfill_valuation_history
 
         covered = date(2024, 1, 2)
+        _seed_prices(db, covered, BACKFILL_MIN_COMMON_STOCKS)
+        _seed_prices(db, date(2024, 1, 3), BACKFILL_MIN_COMMON_STOCKS)
         _seed_valuation(db, covered, BACKFILL_MIN_VALUATION_STOCKS)
 
         called: list[date] = []
@@ -626,14 +632,15 @@ class TestValuationBackfillTwse:
     def test_thin_day_is_refetched(self, db, monkeypatch):
         """只有候選股估值（實測 43~150 檔）的日期必須重抓。
 
-        這正是本次要修的缺口——live 的 `sync_valuation_for_stocks` 每天只補
+        這正是 §6.5 #20 要修的缺口——live 的 `sync_valuation_for_stocks` 每天只補
         候選池，若門檻設成「有無資料」，整段歷史都會被靜默跳過。
         """
         import src.data.twse_fetcher as tw
         from src.data.pipeline import backfill_valuation_history
 
         thin = date(2024, 1, 2)
-        _seed_valuation(db, thin, 150)  # live 候選股補抓的典型量
+        _seed_prices(db, thin, BACKFILL_MIN_COMMON_STOCKS)
+        _seed_valuation(db, thin, 150, prefix=5000)  # live 候選股補抓的典型量
 
         called: list[date] = []
         monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
@@ -647,6 +654,7 @@ class TestValuationBackfillTwse:
         from src.data.schema import StockValuation
 
         d = date(2024, 1, 2)
+        _seed_prices(db, d, BACKFILL_MIN_COMMON_STOCKS)
         monkeypatch.setattr(
             tw,
             "fetch_twse_valuation_all",
@@ -654,7 +662,7 @@ class TestValuationBackfillTwse:
                 pd.DataFrame(
                     [
                         {
-                            "stock_id": f"{2000 + i}",
+                            "stock_id": f"{6000 + i}",
                             "date": td,
                             "pe_ratio": 12.0,
                             "pb_ratio": 1.5,
@@ -674,24 +682,84 @@ class TestValuationBackfillTwse:
         assert len(rows) == 5
         assert rows[0].pe_ratio == 12.0
 
-    def test_weekend_excluded(self, db, monkeypatch):
-        import src.data.twse_fetcher as tw
-        from src.data.pipeline import backfill_valuation_history
-
-        called: list[date] = []
-        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
-        # 2024-01-06/07 為週六日
-        backfill_valuation_history(date(2024, 1, 5), date(2024, 1, 8), markets=("twse",))
-        assert called == [date(2024, 1, 5), date(2024, 1, 8)]
-
     def test_dry_run_fetches_nothing(self, db, monkeypatch):
         import src.data.twse_fetcher as tw
         from src.data.pipeline import backfill_valuation_history
 
+        _seed_prices(db, date(2024, 1, 2), BACKFILL_MIN_COMMON_STOCKS)
         called: list[date] = []
         monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
         backfill_valuation_history(date(2024, 1, 2), date(2024, 1, 5), markets=("twse",), dry_run=True)
         assert called == []
+
+
+class TestValuationHolidaySkip:
+    """§6.6 #27：非交易日不得進入待補清單。"""
+
+    def _stub(self, monkeypatch):
+        import src.data.twse_fetcher as tw
+
+        called: list[date] = []
+        monkeypatch.setattr(tw, "fetch_twse_valuation_all", lambda d: (called.append(d), pd.DataFrame())[1])
+        return called
+
+    def test_weekend_and_holiday_not_requested(self, db, monkeypatch):
+        """**核心回歸**：假日永遠達不到估值門檻，不濾掉就每次執行都重打。
+
+        實測 2020–2023 有 69 天這樣的日子，資料其實零缺口，卻永遠列為待補
+        （ETA 因此失真 5 倍）。
+        """
+        from src.data.pipeline import backfill_valuation_history
+
+        # 2024-01-01 元旦（週一，休市）、01-06/07 週末；只有 02~05 有價量
+        for d in (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)):
+            _seed_prices(db, d, BACKFILL_MIN_COMMON_STOCKS)
+
+        called = self._stub(monkeypatch)
+        res = backfill_valuation_history(date(2024, 1, 1), date(2024, 1, 8), markets=("twse",))
+
+        assert called == [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
+        assert date(2024, 1, 1) not in called, "元旦休市日不得請求"
+        assert res["skipped_days"] == 0, "skipped_days 語意＝已在 DB 中的交易日"
+
+    def test_calendar_gap_years_still_filtered(self, db, monkeypatch):
+        """**不可改用 `calendar.is_trading_day`**：假日表只有 2025~2027。
+
+        2021-02-11 是農曆除夕（休市）但不在 `_TWSE_HOLIDAYS`，行事曆會判為交易日。
+        DB 判定不受此限——這正是本修法走 DB 而非行事曆的理由。
+        """
+        from src.data.calendar import is_trading_day
+        from src.data.pipeline import backfill_valuation_history
+
+        lunar_new_year_eve = date(2021, 2, 11)
+        assert is_trading_day(lunar_new_year_eve), "前提：行事曆對 2021 年會誤判（假日表未涵蓋）"
+
+        _seed_prices(db, date(2021, 2, 10), BACKFILL_MIN_COMMON_STOCKS)  # 除夕前最後交易日
+
+        called = self._stub(monkeypatch)
+        backfill_valuation_history(date(2021, 2, 10), date(2021, 2, 12), markets=("twse",))
+        assert called == [date(2021, 2, 10)], "無價量的休市日不得請求"
+
+    def test_thin_price_day_not_treated_as_trading_day(self, db, monkeypatch):
+        """只有 watchlist 等級價量的日子不算交易日（與價量回補判定同源）。"""
+        from src.data.pipeline import backfill_valuation_history
+
+        _seed_prices(db, date(2024, 1, 2), 6)  # 2020~2024 的 watchlist 稀疏資料
+        called = self._stub(monkeypatch)
+        backfill_valuation_history(date(2024, 1, 2), date(2024, 1, 2), markets=("twse",))
+        assert called == []
+
+    def test_warns_when_no_trading_days(self, db, monkeypatch, caplog):
+        """價量未回補時要明講前提不成立，而不是靜默回報「零待補」。"""
+        import logging
+
+        from src.data.pipeline import backfill_valuation_history
+
+        called = self._stub(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            backfill_valuation_history(date(2024, 1, 2), date(2024, 1, 5), markets=("twse",))
+        assert called == []
+        assert any("查無交易日" in r.message for r in caplog.records)
 
 
 class TestValuationBackfillTpex:

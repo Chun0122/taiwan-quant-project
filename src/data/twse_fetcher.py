@@ -776,8 +776,22 @@ def fetch_twse_valuation_all(target_date: date | None = None) -> pd.DataFrame:
     單次 HTTP 請求即可取得全市場（上市）所有股票的估值資料。
     免費、無需 Token。
 
+    ⚠ **節流必須涵蓋提前返回路徑**（§6.6 #27）：原本 `time.sleep` 只寫在成功
+    路徑的 `return df` 之前，但本函數有 4 條提前返回（請求失敗／`stat != OK`／
+    無資料列／欄位不足），走那些路徑等於完全不節流。實測估值回補打 69 個假日時
+    以約 1.7 req/s 連發，違反 CLAUDE.md §2 的 TWSE 3 秒/次。現改為 `finally`
+    統一收口——不論成功與否都付出間隔。
+
     回傳欄位: date, stock_id, pe_ratio, pb_ratio, dividend_yield
     """
+    try:
+        return _fetch_twse_valuation_all_inner(target_date)
+    finally:
+        time.sleep(_REQUEST_DELAY)
+
+
+def _fetch_twse_valuation_all_inner(target_date: date | None = None) -> pd.DataFrame:
+    """`fetch_twse_valuation_all` 的本體（節流由外層 `finally` 統一負責）。"""
     if target_date is None:
         target_date = _find_last_trading_day(date.today())
 
@@ -857,7 +871,6 @@ def fetch_twse_valuation_all(target_date: date | None = None) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     logger.info("TWSE 估值: %d 支股票", len(df))
-    time.sleep(_REQUEST_DELAY)
     return df
 
 

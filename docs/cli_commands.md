@@ -1,6 +1,6 @@
 # CLI 指令完整參考
 
-入口：`python main.py <子命令>`（38 子命令，dispatch table 在 `main.py`）
+入口：`python main.py <子命令>`（52 子命令，dispatch table 在 `main.py`）
 
 ---
 
@@ -409,7 +409,7 @@ caffeinate -i python main.py backfill-history --financial-only --start 2020-01-0
 | 資料 | 判定 |
 |------|------|
 | 價量 | 當日**普通股（4 碼）**檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`（1500） |
-| 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800） |
+| 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800）。**只走 DB 認定的交易日**（§6.6 #27）——假日永遠達不到門檻，不濾掉就每次執行都重打（實測 69 天）；不可改用 `calendar.is_trading_day`，假日表只有 2025~2027 |
 | 估值/上櫃 | 該檔估值日數 ≥ 其價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
 | 月營收 | 該月**由 MOPS 抓回**（`source='mops'`）的相異股票數 ≥ `BACKFILL_MIN_REVENUE_STOCKS`（1400）。**只數 mops 列**——候選池逐股補抓每月累積上千列，算進來會把閘門灌滿使該月永不重抓（§6.6 #23） |
 | 財報 | 該檔 `eps`／`equity`／`operating_cf` **各自非空的季數** ≥ 應有季數 × `FINANCIAL_COVERAGE_RATIO`（0.8）。**看欄位不看列數**——三表任一逾時會寫進只有損益表的半套列，列數檢查看不出來（§6.5 #21d 同型）。應有季數＝該股價量區間內、且**法定申報期限已過**的季數（否則最近一季永遠重抓） |

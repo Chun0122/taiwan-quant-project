@@ -1481,9 +1481,23 @@ def backfill_valuation_history(
 
     與 `backfill_market_history` 同樣**不維護進度檔**，直接以 DB 現況為準：
 
-    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過。
+    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過，
+      且**只走真正的交易日**（見下）。
     - tpex：某檔在區間內的估值日數達該檔**價量日數的 8 成**即視為已補。
       不用固定門檻——上櫃股上市時間不一，新股本來就只有少數日子有資料。
+
+    ## 為什麼交易日要查 DB 而不是行事曆（§6.6 #27）
+
+    上市段原本只濾 `weekday() < 5`，而續跑判定是「當日估值檔數 ≥ 800」——
+    假日永遠達不到，於是**每次執行都重新請求同一批假日**且永遠列為待補
+    （實測 2020–2023 有 69 天，資料其實零缺口；ETA 因此失真 5 倍）。
+
+    直覺修法是改用 `calendar.is_trading_day`，但**那對歷史區間無效**：
+    `_TWSE_HOLIDAYS` 只有 2025/2026/2027，其他年份 `is_twse_holiday` 回 False，
+    `is_trading_day` 退化成「只判週末」，2020–2024 照打不誤。故改以 DB 判定
+    （該日 4 碼普通股價量檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`），與
+    `backfill_market_history` 的續跑判定同源——價量已回補是估值回補的前提，
+    這個依賴本來就成立。
 
     Args:
         start: 起始日（含）。
@@ -1527,20 +1541,40 @@ def backfill_valuation_history(
                     .having(func.count(StockValuation.id) >= BACKFILL_MIN_VALUATION_STOCKS)
                 ).all()
             }
-        pending_days = [
-            d
-            for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
-            if d.weekday() < 5 and d not in covered
-        ]
-        result["skipped_days"] = (end - start).days + 1 - len(pending_days)
+            # 交易日以 DB 價量為準——行事曆只有 2025~2027，歷史區間會退化成只判週末
+            trading_days = {
+                r[0]
+                for r in session.execute(
+                    select(DailyPrice.date)
+                    .where(
+                        DailyPrice.date >= start,
+                        DailyPrice.date <= end,
+                        func.length(DailyPrice.stock_id) == 4,
+                    )
+                    .group_by(DailyPrice.date)
+                    .having(func.count(func.distinct(DailyPrice.stock_id)) >= BACKFILL_MIN_COMMON_STOCKS)
+                ).all()
+            }
+
+        pending_days = sorted(d for d in trading_days if d not in covered)
+        # 語意＝「已在 DB 中的交易日」（CLI 顯示為「已跳過 N 日（DB 已有）」）。
+        # 舊版是「日曆天 − 待補平日」，把週末假日也算成跳過，數字與標籤對不上。
+        result["skipped_days"] = len(trading_days) - len(pending_days)
         logger.info(
-            "[估值回補/上市] %s ~ %s：待補 %d 個平日（已跳過 %d 日），預估 %.1f 分鐘",
+            "[估值回補/上市] %s ~ %s：待補 %d 個交易日（區間內交易日 %d、已跳過 %d 日），預估 %.1f 分鐘",
             start,
             end,
             len(pending_days),
+            len(trading_days),
             result["skipped_days"],
             len(pending_days) * TWSE_REQUEST_INTERVAL / 60,
         )
+        if not trading_days:
+            logger.warning(
+                "[估值回補/上市] 區間內查無交易日（daily_price 每日普通股 < %d）——"
+                "估值回補以價量已回補為前提，請先跑 backfill-history",
+                BACKFILL_MIN_COMMON_STOCKS,
+            )
 
         if not dry_run:
             for i, d in enumerate(pending_days, 1):
@@ -1549,12 +1583,14 @@ def backfill_valuation_history(
                     break
                 df = fetch_twse_valuation_all(d)
                 if df.empty:
-                    continue  # 假日或該日無資料——不是錯誤
+                    # 已濾過交易日，故這裡是端點暫時性失敗或該日確實無估值列——
+                    # 不寫入即代表該日仍未達覆蓋門檻，下次執行會自動重試
+                    continue
                 result["twse_days"] += 1
                 result["twse_rows"] += _upsert_valuation(df)
                 if result["twse_days"] % progress_every == 0:
                     logger.info(
-                        "[估值回補/上市] 進度 %d/%d 平日（%s）— 交易日 %d, 累計 %d 筆",
+                        "[估值回補/上市] 進度 %d/%d 交易日（%s）— 有資料 %d 日, 累計 %d 筆",
                         i,
                         len(pending_days),
                         d.isoformat(),

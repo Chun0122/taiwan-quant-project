@@ -180,3 +180,74 @@ class TestFetchTwseValuationAll:
         monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda x: None)
         df = fetch_twse_valuation_all(date(2026, 3, 5))
         assert df.empty
+
+
+class TestValuationThrottleCoverage:
+    """§6.6 #27：節流必須涵蓋**所有**返回路徑，不只成功路徑。
+
+    原本 `time.sleep(_REQUEST_DELAY)` 寫在 `return df` 之前，而本函數有 4 條
+    提前返回。實測估值回補打 69 個假日時以約 1.7 req/s 連發，違反 TWSE 3 秒/次。
+    """
+
+    def _run(self, monkeypatch, *, json_data=None, raise_exc=False):
+        from unittest.mock import MagicMock
+
+        from src.data.twse_fetcher import fetch_twse_valuation_all
+
+        slept: list[float] = []
+
+        if raise_exc:
+
+            def _get(*a, **kw):
+                raise ConnectionError("無法連線")
+        else:
+            mock = MagicMock()
+            mock.raise_for_status = MagicMock()
+            mock.json.return_value = json_data
+
+            def _get(*a, **kw):
+                return mock
+
+        monkeypatch.setattr("src.data.twse_fetcher.requests.get", _get)
+        monkeypatch.setattr("src.data.twse_fetcher.time.sleep", lambda s: slept.append(s))
+        df = fetch_twse_valuation_all(date(2026, 3, 5))
+        return df, slept
+
+    def test_throttles_on_success(self, monkeypatch):
+        from src.data.twse_fetcher import _REQUEST_DELAY
+
+        df, slept = self._run(
+            monkeypatch,
+            json_data={"stat": "OK", "data": [["2330", "台積電", "1.02", "113", "21.50", "6.20", "113/Q3"]]},
+        )
+        assert not df.empty
+        assert slept == [_REQUEST_DELAY]
+
+    def test_throttles_on_holiday_response(self, monkeypatch):
+        """**核心回歸**：`stat != OK` 是假日的常態路徑，最需要節流的正是它。"""
+        from src.data.twse_fetcher import _REQUEST_DELAY
+
+        df, slept = self._run(monkeypatch, json_data={"stat": "很抱歉，找不到符合條件的資料！"})
+        assert df.empty
+        assert slept == [_REQUEST_DELAY]
+
+    def test_throttles_on_empty_data_rows(self, monkeypatch):
+        from src.data.twse_fetcher import _REQUEST_DELAY
+
+        df, slept = self._run(monkeypatch, json_data={"stat": "OK", "data": []})
+        assert df.empty
+        assert slept == [_REQUEST_DELAY]
+
+    def test_throttles_on_request_failure(self, monkeypatch):
+        from src.data.twse_fetcher import _REQUEST_DELAY
+
+        df, slept = self._run(monkeypatch, raise_exc=True)
+        assert df.empty
+        assert slept == [_REQUEST_DELAY]
+
+    def test_delay_matches_documented_rate(self):
+        """節流間隔須與 CLAUDE.md §2 的 TWSE 3 秒/次一致。"""
+        from src.constants import TWSE_REQUEST_INTERVAL
+        from src.data.twse_fetcher import _REQUEST_DELAY
+
+        assert _REQUEST_DELAY >= TWSE_REQUEST_INTERVAL
