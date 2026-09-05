@@ -72,6 +72,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/pipeline.py` 之 `backfill_revenue_history` | §6.6 #24 月營收回補：**走 MOPS 全市場靜態頁不走 FinMind 逐股**（`t21sc03_{民國年}_{月}_0.html` 回溯到 2020-01 仍健在，一個月兩個請求拿全市場 ~1,700 檔且自帶官方 YoY；79 個月僅 158 個免費請求，FinMind 則要 ~2,000 次呼叫並吃配額）。續跑判定看「該月 `source='mops'` 的相異股票數 ≥ `BACKFILL_MIN_REVENUE_STOCKS`（1400）」——**只數 mops 列**，候選池逐股補抓每月累積上千列，算進來會把閘門灌滿使該月永不重抓（與 §6.5 #22 同型）。開頭自動跑 `normalize_revenue_date_semantics()` |
 | `data/pipeline.py` 之 `backfill_financial_history` | §6.6 #25 財報回補：**FinMind 逐股三表**（損益/資產負債/現金流，每檔 3 請求；財報無免費全市場歷史端點，TWSE openapi 只回當季）。**續跑判定看欄位不看列數**——三表任一逾時仍會寫進只有損益表的半套列，故 `eps`/`equity`/`operating_cf` 分別計數，任一 < 應有季數 × `FINANCIAL_COVERAGE_RATIO`(0.8) 就重抓；應有季數同時受該股價量區間與**法定申報期限**約束（否則最近一季永遠重抓）。`_upsert_financial` 因此必須 `on_conflict_do_update`，否則半套列擋住重抓的完整值。節流由 `fetch_quota_status()` 的真實上限推導（3600/limit＝6 秒/請求連續慢跑，不爆衝撞 402）；母體依成交金額排序使中斷時先補到最可能進 universe 的標的 |
 | `data/pipeline.py` 之 `normalize_revenue_date_semantics` | §6.6 #23 一次性遷移（冪等）：`monthly_revenue.date` 的 canonical 語意＝**營收月份月底**（SSOT `pit.month_end`）。FinMind 原寫「次月 1 日」、MOPS 寫「當月月底」，而 unique key 是 `(stock_id, date)` **擋不住**——實測 2,488 組同月雙列，使 `pivot_revenue_rows`（取每股最近 N 列）的 4 個月窗口實際只拿到 2 個月。**順序不可交換**：先依原本的日期慣例回填 `source`，再改日期——改完就再也分不出來源 |
+| `data/pipeline.py` 之 `_classify_security_type` | **有價證券類型分類 SSOT**（§6.6 #29）：`security_type` 是 UniverseFilter Stage 1 的硬過濾條件**且該處不限 4 碼**，每個誤判都直接反映成選股池污染或真股票被踢出。**依代號形態判定，勿改回看名稱**——舊規則「名稱含『特』→ preferred」實測誤殺 **30 檔真普通股**（宜特/惠特/台特化/雅特力-KY/熙特爾-創 等 5 檔流動性足以進 universe，**每天都被排除**），同時真特別股 `2833A 台壽甲` 因名稱無「特」而漏網。舊規則另要求 `len==6 and isdigit()` 才判權證，使 REIT／ETN／認售權證／類股指數／**`TAIEX` 加權指數**全數漏網成 `stock`（TAIEX 實測通過 Stage 1，只因 `turnover=0` 才被 Stage 2 擋下）。特別股規則**必須排在權證之前**（`2887Z1` 是 6 碼）。`sync_stock_info` 結尾自動跑 `reclassify_security_types()` 全表重算——`sync_delisting_info` 是第二個寫入來源且既有列不更新，光靠 upsert 修不掉 |
 | `data/pit.py` | **PIT 資料可見性 SSOT**（B1）：月營收/季報無公布日欄位，以證交法 §36 法定期限建模（`revenue_visible_cutoff` / `financial_visible_cutoff` / `is_pit_replay`）；`month_end()` 為月營收日期語意的 SSOT |
 | `data/retry.py` | `request_with_retry()` exponential backoff（429/5xx） |
 | `data/migrate.py` | DB schema 遷移工具 |
@@ -186,7 +187,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2892 測試 / 107 檔）
+- **執行**：`pytest -v`（2903 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

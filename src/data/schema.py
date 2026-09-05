@@ -449,7 +449,9 @@ class StockInfo(Base):
     listing_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     security_type: Mapped[str | None] = mapped_column(
         String(20), nullable=True, index=True
-    )  # stock / etf / etn / warrant / preferred / None（未填入時不過濾）
+    )  # stock / etf / etn / reit / dr / warrant / preferred / index / None（未填入時不過濾）
+    # ⚠ 分類 SSOT ＝ `pipeline._classify_security_type`（§6.6 #29）：UniverseFilter Stage 1
+    # 以 `== "stock"` 硬過濾**且不限 4 碼**，故每個誤判都直接反映成選股池污染或真股票被踢出
     # 下市日；None ＝仍在市。見 class docstring 的倖存者偏差說明。
     delisted_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
