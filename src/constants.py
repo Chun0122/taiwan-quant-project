@@ -295,6 +295,26 @@ BACKFILL_MIN_COMMON_STOCKS: int = 1500
 # 誤判方向也是安全的：判成未補只是多花 CPU 重算（upsert 冪等），判成已補才會留下靜默缺口。
 FEATURE_BACKFILL_MIN_COVERAGE_RATIO: float = 0.95
 
+# DailyFeature 回補的**欄位暖身**門檻（§6.6 #28，2026-09-05）。
+#
+# 上面那個比例只管「列數」，而列數滿額**不代表欄位可用**——這是 §6.5 #21d 的教訓
+# 在回補層的重演：#21d 只修了重放層的覆蓋度判定（新增 `feature_warm_ratio`），
+# 回補層的續跑判定沒跟著改，於是資料本身的洞一直在。
+#
+# 實測 2024-01-02 ~ 2024-02-20 共 **29 個交易日**的 `ma60` 非空率僅 **0.0022**，
+# 列數卻是滿的（1,799~1,822 列）：B1① 第一批回補範圍是 2024-01 起，`daily_feature`
+# 也從該日起算故頭幾十天暖身不足；2026-08-08 補完 2020–2023 價量後，續跑判定看
+# 列數就判為已補、**永不重算**。
+#
+# 取 0.5 與 `REPLAY_MIN_FEATURE_WARM_RATIO` 同值（同一個現象的兩層判定不該有兩套
+# 數字），實測分布完全雙峰：正常日 0.94~1.0、中招日 0.0022，中間無任何一天。
+FEATURE_BACKFILL_MIN_WARM_RATIO: float = 0.5
+
+# 全表最早的 60 個交易日 `ma60` 天生填不滿（沒有更早的資料可暖身），
+# 對這些日子套用上面的門檻會讓它們**每次執行都重算**——與本項要修的
+# 「永遠重抓」是同一種病，方向相反。故暖身判定只作用於此邊界之後。
+FEATURE_WARMUP_EXEMPT_TRADING_DAYS: int = 60
+
 # 回補單一交易日（三個 dataset 全開）的實測耗時，用於 ETA 估算。
 # 實測 2026-08-03：458 個交易日耗時 3h45m ≈ 29.5 秒/日。
 # 原本以「3 秒 × dataset 數」估算低估近 3 倍——TWSE/TPEX 雖並行，但各自 3 秒
@@ -316,6 +336,56 @@ VALUATION_COVERAGE_RATIO: float = 0.8
 # API 節流間隔（秒）——與 CLAUDE.md §2 的速率規則一致，供 ETA 估算與回補迴圈共用
 TWSE_REQUEST_INTERVAL: float = 3.0
 FINMIND_REQUEST_INTERVAL: float = 0.5
+MOPS_REQUEST_INTERVAL: float = 3.0  # MOPS 靜態頁（mopsov）比照官方端點節流
+
+# 月營收回補/同步的續跑門檻（§6.6 #23/#24，2026-08-15）：某營收月份**由 MOPS 全市場
+# 抓回**的相異股票數達此值，即視為該月已補齊。
+#
+# ⚠ 三個細節都是踩過坑才定的，改動前先讀：
+#   1. **必須只數 `source='mops'` 的列**。舊版數的是該月全部列數 ≥500，而候選池逐股
+#      補抓（`sync_revenue_for_stocks`）每天寫入約 150 檔、一個月累積上千列——門檻
+#      被那些列灌滿後，全市場 MOPS 同步**此後永不執行**。實測 2026-02 的 MOPS 列
+#      只有 1 筆（候選池 1,284 筆）、2026-06 為 498 筆，整個月永久凍結在半套。
+#      這與 §6.5 #22 的估值閘門是同一種病（計數看錯軸）。
+#   2. **1,400 而非 500**：MOPS 成熟月份實測 1,658（2020-01）~1,731（2022-07）檔，
+#      而月初剛開始公布時只有數百檔。門檻若低於實際母體，第一次半套抓取就會把該月
+#      標記為完成——這正是舊版的失效方式。
+#   3. 全市場母體只會成長（上市櫃家數逐年增加），故此值對 2020 年也安全。
+BACKFILL_MIN_REVENUE_STOCKS: int = 1400
+
+# 財報回補（§6.6 #25）——FinMind 逐股三表（損益/資產負債/現金流），每檔 3 個請求。
+#
+# 母體門檻：區間內有 ≥60 個交易日的 4 碼普通股（實測 2020-2026 為 1,994 檔）。
+# 不補「幾乎沒交易過」的股票——它們永遠不會進 universe，卻要吃掉 3 個請求。
+FINANCIAL_BACKFILL_MIN_TRADING_DAYS: int = 60
+FINMIND_REQUESTS_PER_FINANCIAL_STOCK: int = 3
+
+# 續跑判定：某檔在區間內「**欄位非空**的季數 ≥ 應有季數 × 此比例」即視為已補。
+#
+# ⚠ 判定看的是**欄位**不是列數（§6.5 #21d 的教訓）：三表任一在抓取當下逾時，
+# `fetch_financial_summary` 仍會回傳只有損益表的 DataFrame，寫進去就是
+# `roe`/`debt_ratio`/`free_cf` 全 NULL 的列——列數檢查完全看不出來，而
+# `compute_peer_fundamental_ranking` 會照樣拿這些 NULL 去做同業排名。
+# 故 eps（損益）、equity（資產負債）、operating_cf（現金流）三者分別計數，
+# 任一未達標就重抓；`_upsert_financial` 同步改為 on_conflict_do_update，
+# 否則重抓回來的完整值會被舊的半套列擋在門外（C2 教訓）。
+#
+# 0.8 而非 1.0：FinMind 對部分公司的早期季度本來就缺（興櫃轉上市前無合併報表），
+# 要求全等會讓那些股票每次執行都重抓。
+FINANCIAL_COVERAGE_RATIO: float = 0.8
+
+# FinMind 免費版每小時請求上限。**只作為配額查詢失敗時的 fallback**——
+# 正常路徑是開跑前打 `fetch_quota_status()` 拿帳號真實上限，據以推導節流間隔
+# （3600/limit ＝ 600 時每請求 6 秒）。刻意選「連續慢跑」而非「爆衝後撞 402」：
+# 兩者的每小時吞吐相同，但前者不會把錯誤日誌塞滿 402、也不需要等整點。
+FINMIND_FREE_HOURLY_LIMIT: int = 600
+
+# FinMind 逐股月營收的回溯天數（§6.6 #23）：**必須 ≥ 13 個月**。
+# `fetch_monthly_revenue` 的 YoY 是 `revenue / revenue.shift(12) - 1`，需要 13 筆
+# 才算得出最新一筆的年增率。舊值 180 天只取回 6 筆 → `yoy_growth` 恆為 NULL
+# （實測 8,663 筆 FinMind 列中 8,353 筆 NULL），而 growth 粗篩是
+# `yoy_growth.notna() & > 10`，那些列在粗篩階段就全數蒸發。
+REVENUE_FINMIND_LOOKBACK_DAYS: int = 430
 
 # Scanner Stage 0.5「估值覆蓋是否足夠」的判定窗口與門檻（2026-08-05）。
 # **必須看近期窗口而非全表**——原本數全表相異 stock_id，一旦歷史累積 ≥500 檔就

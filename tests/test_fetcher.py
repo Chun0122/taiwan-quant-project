@@ -189,3 +189,132 @@ class TestDividendNaTHandling:
         # 第二筆：有效日期應正確轉換
         assert df.iloc[1]["cash_payment_date"] == date(2024, 2, 15)
         assert df.iloc[1]["announcement_date"] == date(2023, 12, 1)
+
+
+class TestMonthlyRevenueDateSemantics:
+    """§6.6 #23：FinMind 月營收的 date 正規化與缺月安全的 MoM/YoY。"""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self, monkeypatch):
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = "test_token"
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+
+    def _fetch(self, monkeypatch, rows):
+        from src.data.fetcher import FinMindFetcher
+
+        fetcher = FinMindFetcher(api_token="test_token")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"msg": "success", "data": rows}
+        monkeypatch.setattr(fetcher._session, "get", lambda *a, **kw: mock_resp)
+        monkeypatch.setattr("src.data.fetcher.time.sleep", lambda x: None)
+        return fetcher.fetch_monthly_revenue("2330", "2020-01-01")
+
+    def _row(self, year, month, revenue):
+        # FinMind 原始慣例：date ＝ 次月 1 日
+        nxt = (year + 1, 1) if month == 12 else (year, month + 1)
+        return {
+            "date": f"{nxt[0]:04d}-{nxt[1]:02d}-01",
+            "stock_id": "2330",
+            "revenue": revenue,
+            "revenue_month": month,
+            "revenue_year": year,
+        }
+
+    def test_date_normalized_to_month_end(self, monkeypatch):
+        """次月 1 日必須改寫成營收月份的月底——否則與 MOPS 列同月並存。"""
+        from datetime import date as _date
+
+        df = self._fetch(monkeypatch, [self._row(2024, 1, 100), self._row(2024, 2, 110)])
+        assert list(df["date"]) == [_date(2024, 1, 31), _date(2024, 2, 29)]
+
+    def test_yoy_aligns_on_year_month_not_position(self, monkeypatch):
+        """**核心回歸**：缺月時不得用位置位移當「去年同月」。
+
+        FinMind 對未公布/停業月份會缺列，`shift(12)` 會把 12 列之前當成去年同月，
+        算出張冠李戴的 YoY（且無從察覺）。
+        """
+        rows = [self._row(2023, m, 100) for m in range(1, 13)]
+        rows.pop(5)  # 挖掉 2023-06，只剩 11 列
+        rows.append(self._row(2024, 1, 150))
+
+        df = self._fetch(monkeypatch, rows)
+        latest = df[(df["revenue_year"] == 2024) & (df["revenue_month"] == 1)].iloc[0]
+        assert latest["yoy_growth"] == pytest.approx(50.0), "應與 2023-01 相比 (150/100-1)"
+
+    def test_missing_previous_month_gives_none_not_wrong_value(self, monkeypatch):
+        df = self._fetch(monkeypatch, [self._row(2024, 1, 100), self._row(2024, 3, 130)])
+        march = df[df["revenue_month"] == 3].iloc[0]
+        assert march["mom_growth"] is None, "上月缺列時 MoM 必須是 None 而非跟 1 月比"
+
+    def test_yoy_available_with_thirteen_months(self, monkeypatch):
+        """13 個月即可算出最新一筆的 YoY（`REVENUE_FINMIND_LOOKBACK_DAYS`=430 的理由）。"""
+        rows = [self._row(2023, m, 100) for m in range(1, 13)] + [self._row(2024, 1, 120)]
+        df = self._fetch(monkeypatch, rows)
+        assert df.iloc[-1]["yoy_growth"] == pytest.approx(20.0)
+
+
+class TestQuotaStatus:
+    """§6.6 #25：長跑逐股回補前的配額查詢。"""
+
+    @pytest.fixture(autouse=True)
+    def _patch_settings(self, monkeypatch):
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = "test_token"
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+
+    def _fetcher(self, monkeypatch, payload, *, status=200, boom=False):
+        from src.data.fetcher import FinMindFetcher
+
+        f = FinMindFetcher(api_token="test_token")
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = payload
+        resp.raise_for_status = MagicMock()
+
+        def _get(*a, **kw):
+            if boom:
+                raise ConnectionError("network down")
+            return resp
+
+        monkeypatch.setattr(f._session, "get", _get)
+        return f
+
+    def test_parses_limit_and_usage(self, monkeypatch):
+        f = self._fetcher(
+            monkeypatch,
+            {
+                "msg": "success",
+                "level": 1,
+                "level_title": "Free",
+                "api_request_limit": 600,
+                "api_request_limit_hour": 600,
+                "user_count": 232,
+            },
+        )
+        q = f.fetch_quota_status()
+        assert q["limit"] == 600
+        assert q["used"] == 232
+        assert q["remaining"] == 368
+        assert q["level_title"] == "Free"
+
+    def test_network_failure_returns_empty_not_raise(self, monkeypatch):
+        """配額查詢掛掉不該讓 10 小時的回補作業中止——呼叫端會退回預設上限。"""
+        f = self._fetcher(monkeypatch, {}, boom=True)
+        assert f.fetch_quota_status() == {}
+
+    def test_unexpected_payload_returns_empty(self, monkeypatch):
+        f = self._fetcher(monkeypatch, {"msg": "token not valid"})
+        assert f.fetch_quota_status() == {}
+
+    def test_no_token_returns_empty(self, monkeypatch):
+        from src.data.fetcher import FinMindFetcher
+
+        mock_settings = MagicMock()
+        mock_settings.finmind.api_url = "https://api.finmindtrade.com/api/v4/data"
+        mock_settings.finmind.api_token = ""
+        monkeypatch.setattr("src.data.fetcher.settings", mock_settings)
+        assert FinMindFetcher(api_token="").fetch_quota_status() == {}

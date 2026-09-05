@@ -16,7 +16,6 @@ from src.data.schema import (
     DailyPrice,
     InstitutionalInvestor,
     MarginTrading,
-    MonthlyRevenue,
 )
 from src.discovery.scanner._base import MarketScanner, StageConfig
 from src.discovery.scanner._functions import (
@@ -79,22 +78,23 @@ class GrowthScanner(MarketScanner):
         """Stage 0.5：月營收覆蓋率不足時，自動從 MOPS 補抓全市場月營收。
 
         growth 的粗篩主因子是營收 YoY，覆蓋率不足會直接讓候選池失真。
+
+        ⚠ 判定看的是「**當下依法已公布的那個月份**由 MOPS 抓回幾檔」，而不是全表的
+        相異股票數。舊版數全表（無任何日期條件），一旦歷史累積 ≥500 檔就永遠不再觸發
+        ——與 §6.5 #22 的估值閘門是同一種病。實際覆蓋率是逐月的：live 曾出現
+        2026-02 全市場只寫進 1 筆的月份，而全表計數當時已有 1,900 檔。
+
+        判定與補抓都委派給 `_sync_mops_revenue_month`（門檻 SSOT 在該處），
+        避免兩邊各拿一套數字。
         """
         try:
-            from sqlalchemy import func as sa_func
+            from src.data.pipeline import _sync_mops_revenue_month
+            from src.data.pit import latest_visible_revenue_month
 
-            with get_session() as session:
-                rev_count = session.execute(select(sa_func.count(sa_func.distinct(MonthlyRevenue.stock_id)))).scalar()
-
-            if not rev_count or rev_count < 500:
-                logger.info(
-                    "Stage 0.5: 月營收僅 %d 支，自動從 MOPS 同步全市場月營收...",
-                    rev_count or 0,
-                )
-                from src.data.pipeline import sync_mops_revenue
-
-                mops_count = sync_mops_revenue(months=1)
-                logger.info("Stage 0.5: MOPS 月營收同步完成，新增 %d 筆", mops_count)
+            year, month = latest_visible_revenue_month(self._as_of())
+            n = _sync_mops_revenue_month(year, month)
+            if n:
+                logger.info("Stage 0.5: MOPS 月營收（%d/%d）同步完成，新增 %d 筆", year, month, n)
         except Exception:
             logger.warning("Stage 0.5: MOPS 月營收自動同步失敗，使用既有資料")
 

@@ -97,6 +97,11 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # B1①（2026-08-01）：下市日，倖存者偏差修正的關鍵欄位。
     # NULL ＝仍在市；PIT 判定可交易性＝ delisted_date is None or delisted_date > as_of。
     ("stock_info", "delisted_date", "DATE"),
+    # §6.6 #23（2026-08-15）：月營收來源標記（mops/finmind）。
+    # 舊列為 NULL，由 `pipeline.normalize_revenue_date_semantics()` 依原本的日期慣例回填
+    # （月底＝mops、次月 1 日＝finmind）——**必須在日期正規化之前跑**，
+    # 因為統一日期之後就再也分不出哪筆來自哪個來源。
+    ("monthly_revenue", "source", "VARCHAR(10)"),
 ]
 
 # Phase 2 效能優化：複合索引加速頻繁查詢

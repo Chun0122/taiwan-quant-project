@@ -249,3 +249,140 @@ class TestValuationBackfillCli:
         out = capsys.readouterr().out
         assert "估值回補完成" in out
         assert "300" in out and "20" in out
+
+
+# ====================================================================== #
+# §6.6 #24：backfill-history --revenue-only 的 parser 與 handler 接線
+# ====================================================================== #
+
+
+class TestRevenueBackfillCli:
+    def test_revenue_flag_parses(self):
+        args = build_parser().parse_args(["backfill-history", "--revenue-only", "--start", "2020-01-01"])
+        assert args.revenue_only is True
+
+    def test_revenue_only_defaults_false(self):
+        assert build_parser().parse_args(["backfill-history", "--start", "2020-01-01"]).revenue_only is False
+
+    def test_handler_routes_to_revenue_backfill(self, monkeypatch, capsys):
+        """--revenue-only 必須走營收路徑，且不得觸發下市同步／價量／估值回補。"""
+        import src.cli.misc_cmd as misc
+
+        captured = {}
+
+        def _fake_revenue(start, end, *, dry_run=False, **kw):
+            captured["args"] = (start, end, dry_run)
+            return {"months": 4, "rows": 6800, "skipped_months": 2, "normalized": 12}
+
+        def _boom(*a, **kw):
+            raise AssertionError("--revenue-only 不應觸發此路徑")
+
+        monkeypatch.setattr(pipeline_mod, "backfill_revenue_history", _fake_revenue)
+        monkeypatch.setattr(pipeline_mod, "backfill_market_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_valuation_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "sync_delisting_info", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_daily_features", _boom)
+
+        args = build_parser().parse_args(
+            ["backfill-history", "--revenue-only", "--start", "2020-01-01", "--end", "2020-04-30"]
+        )
+        misc.cmd_backfill_history(args)
+
+        assert captured["args"] == (date(2020, 1, 1), date(2020, 4, 30), False)
+        out = capsys.readouterr().out
+        assert "月營收回補完成" in out
+        assert "6800" in out
+        assert "12" in out  # 正規化筆數有回報
+
+
+# ====================================================================== #
+# §6.6 #25：backfill-history --financial-only + finmind-quota
+# ====================================================================== #
+
+
+class TestFinancialBackfillCli:
+    def test_financial_flags_parse(self):
+        args = build_parser().parse_args(
+            ["backfill-history", "--financial-only", "--start", "2020-01-01", "--wait-on-quota"]
+        )
+        assert args.financial_only is True
+        assert args.wait_on_quota is True
+
+    def test_financial_flags_default_false(self):
+        args = build_parser().parse_args(["backfill-history", "--start", "2020-01-01"])
+        assert args.financial_only is False
+        assert args.wait_on_quota is False
+
+    def test_handler_routes_to_financial_backfill(self, monkeypatch, capsys):
+        """--financial-only 必須走財報路徑，且不得觸發下市同步／價量／估值／營收回補。"""
+        import src.cli.misc_cmd as misc
+
+        captured = {}
+
+        def _fake_financial(start, end, *, dry_run=False, wait_on_quota=False, **kw):
+            captured["args"] = (start, end, dry_run, wait_on_quota)
+            return {
+                "stocks": 1979,
+                "rows": 48000,
+                "skipped_stocks": 15,
+                "failed_stocks": 3,
+                "quota_exhausted": 0,
+                "quota_waits": 2,
+            }
+
+        def _boom(*a, **kw):
+            raise AssertionError("--financial-only 不應觸發此路徑")
+
+        monkeypatch.setattr(pipeline_mod, "backfill_financial_history", _fake_financial)
+        monkeypatch.setattr(pipeline_mod, "backfill_market_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_valuation_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_revenue_history", _boom)
+        monkeypatch.setattr(pipeline_mod, "sync_delisting_info", _boom)
+        monkeypatch.setattr(pipeline_mod, "backfill_daily_features", _boom)
+
+        args = build_parser().parse_args(
+            ["backfill-history", "--financial-only", "--start", "2020-01-01", "--wait-on-quota"]
+        )
+        misc.cmd_backfill_history(args)
+
+        assert captured["args"] == (date(2020, 1, 1), None, False, True)
+        out = capsys.readouterr().out
+        assert "財報回補完成" in out
+        assert "48000" in out
+        assert "等待配額 2 次" in out
+
+
+class TestFinMindQuotaCli:
+    def test_parses(self):
+        assert build_parser().parse_args(["finmind-quota"]).command == "finmind-quota"
+
+    def test_handler_prints_quota(self, monkeypatch, capsys):
+        import argparse
+
+        import src.cli.misc_cmd as misc
+        import src.data.fetcher as fetcher_mod
+
+        class _F:
+            def fetch_quota_status(self):
+                return {"level": 1, "level_title": "Free", "limit": 600, "used": 232, "remaining": 368}
+
+        monkeypatch.setattr(fetcher_mod, "FinMindFetcher", lambda *a, **kw: _F())
+        misc.cmd_finmind_quota(argparse.Namespace())
+
+        out = capsys.readouterr().out
+        assert "600" in out and "232" in out and "368" in out
+        assert "6.0 秒/請求" in out
+
+    def test_handler_reports_failure(self, monkeypatch, capsys):
+        import argparse
+
+        import src.cli.misc_cmd as misc
+        import src.data.fetcher as fetcher_mod
+
+        class _F:
+            def fetch_quota_status(self):
+                return {}
+
+        monkeypatch.setattr(fetcher_mod, "FinMindFetcher", lambda *a, **kw: _F())
+        misc.cmd_finmind_quota(argparse.Namespace())
+        assert "配額查詢失敗" in capsys.readouterr().out

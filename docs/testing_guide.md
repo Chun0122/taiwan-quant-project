@@ -10,7 +10,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 
 ## 測試統計
 
-- **2813 個測試**，107 個測試檔
+- **2892 個測試**，107 個測試檔
 - Fixtures：`tests/conftest.py`（`in_memory_engine` / `db_session` / `sample_ohlcv`）
 - 共用建構函數：`tests/scanner_helpers.py`
 
@@ -30,7 +30,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_ml_features.py` | `features/ml_features.py` | 純函數 |
 | `test_ml_strategy.py` | `strategy/ml_strategy.py` | 純函數 |
 | `test_backtest_engine.py` | `backtest/engine.py` + `metrics.py` | 純函數+mock |
-| `test_twse_helpers.py` | `data/twse_fetcher.py` | 純函數 |
+| `test_twse_helpers.py` | `data/twse_fetcher.py` + §6.6 #27 估值端點節流涵蓋全部返回路徑 | 純函數 |
 | `test_scanner.py` | `discovery/scanner/` 全模組 + 粗篩 fail-closed 契約（§6.5 #19） | 純函數 |
 | `test_mops.py` | `mops_fetcher.py` + scanner 消息面 | 純函數+SQLite |
 | `test_regime.py` | `regime/detector.py` | 純函數 |
@@ -39,7 +39,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_ic_freeze.py` | E2b/E2c 凍結（P0 #17）：`_score_candidates` 套用點 + config 契約 + 開啟對照組 | monkeypatch |
 | `test_scanner_pipeline_parity.py` | N2 單一漏斗：五模式 × 三 regime 選股階段序列 parity + 無 `run()` 覆寫契約 | monkeypatch |
 | `test_candidate_pool.py` | B2 全候選池落庫：擷取時點 / selected 標記 / 維度真實語意 / IC 取數介面 | 純函數+SQLite |
-| `test_backfill.py` | B1① 歷史回補續跑判定 / 下市清單同步 / PIT 可交易性語意 / §6.5 #20 估值回補（上市日粒度 + 上櫃股粒度續跑）/ Stage 0.5 覆蓋率閘門看近期窗口 | 純函數+SQLite |
+| `test_backfill.py` | B1① 歷史回補續跑判定 / 下市清單同步 / PIT 可交易性語意 / §6.5 #20 估值回補（上市日粒度 + 上櫃股粒度續跑）/ Stage 0.5 覆蓋率閘門看近期窗口 / §6.6 #23~#25 月營收日期語意正規化 + MOPS 逐月閘門 + 歷史回補 + 財報欄位級續跑/配額治理 / §6.6 #27 估值回補只走 DB 交易日 / §6.6 #28 特徵回補欄位暖身判定 | 純函數+SQLite |
 | `test_pit_replay.py` | B1④ PIT 重放：前瞻報酬只看 as_of 之後 / 抽樣 / 彙總 / 唯讀契約 | 純函數+SQLite |
 | `test_pit.py` | B1 PIT：公布時滯規則 / as_of 注入 / 未來資料不外洩 / offline / 裸 `date.today()` 靜態守門 | 純函數+SQLite |
 | `test_fetcher.py` | `data/fetcher.py` | mock HTTP |

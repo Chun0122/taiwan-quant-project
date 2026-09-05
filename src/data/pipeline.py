@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 
 from src.config import settings
 from src.constants import (
     BACKFILL_MIN_COMMON_STOCKS,
+    BACKFILL_MIN_REVENUE_STOCKS,
     BACKFILL_MIN_VALUATION_STOCKS,
     FEATURE_BACKFILL_MIN_COVERAGE_RATIO,
+    FEATURE_BACKFILL_MIN_WARM_RATIO,
+    FEATURE_WARMUP_EXEMPT_TRADING_DAYS,
+    FINANCIAL_BACKFILL_MIN_TRADING_DAYS,
+    FINANCIAL_COVERAGE_RATIO,
+    FINMIND_FREE_HOURLY_LIMIT,
     FINMIND_REQUEST_INTERVAL,
+    FINMIND_REQUESTS_PER_FINANCIAL_STOCK,
+    MOPS_REQUEST_INTERVAL,
     PRICE_JUMP_WARN_THRESHOLD,
+    REVENUE_FINMIND_LOOKBACK_DAYS,
     SECONDS_PER_BACKFILL_DAY,
     TWSE_REQUEST_INTERVAL,
     UPSERT_BATCH_SIZE,
@@ -265,9 +275,108 @@ def _upsert_margin(df: pd.DataFrame) -> int:
     return _upsert_batch(MarginTrading, df, ["stock_id", "date"])
 
 
-def _upsert_monthly_revenue(df: pd.DataFrame) -> int:
-    """將月營收 DataFrame 寫入 monthly_revenue 表。"""
-    return _upsert_batch(MonthlyRevenue, df, ["stock_id", "date"])
+def _upsert_monthly_revenue(df: pd.DataFrame, *, source: str = "finmind") -> int:
+    """將月營收 DataFrame 寫入 monthly_revenue 表（§6.6 #23）。
+
+    衝突語意刻意**依來源而異**：
+
+    - `source="mops"`：`on_conflict_do_update`。MOPS 是全市場官方頁面且自帶
+      官方 YoY，是這張表的權威來源；覆寫才能把候選池先寫進來的 `yoy_growth=NULL`
+      的列補實，也才能把 `source` 翻成 `mops` 讓續跑判定數得到。
+    - `source="finmind"`：`on_conflict_do_nothing`。逐股補抓的 YoY 是自算的，
+      缺月時會與官方值不同，不該覆蓋已有的 MOPS 列。
+
+    Args:
+        df: 需含 stock_id/date/revenue/revenue_year/revenue_month。
+        source: "mops" 或 "finmind"。
+    """
+    if df.empty:
+        return 0
+    df = df.copy()
+    df["source"] = source
+    update_cols = ["revenue", "revenue_year", "revenue_month", "mom_growth", "yoy_growth", "source"]
+    return _upsert_batch(
+        MonthlyRevenue,
+        df,
+        ["stock_id", "date"],
+        update_cols=update_cols if source == "mops" else None,
+    )
+
+
+def normalize_revenue_date_semantics() -> dict[str, int]:
+    """把 `monthly_revenue` 的日期語意統一為「營收月份月底」（§6.6 #23，冪等）。
+
+    ## 為什麼要有這支一次性遷移
+
+    同一筆 1 月營收，FinMind 逐股寫成 `2024-02-01`（次月 1 日）、MOPS 全市場寫成
+    `2024-01-31`（當月月底），而 unique key 是 `(stock_id, date)`——**兩者不衝突，
+    於是同月並存兩列**（實測 2,488 組）。後果不是多幾列而已：
+    `pivot_revenue_rows` 取每股最近 `months` 列，growth 要的 4 個月窗口實際只拿到
+    2 個月，`prev_yoy_growth` 還可能是同一個月的另一份來源（且多半是 NULL）。
+
+    ## 順序很重要
+
+    先依**原本的日期慣例**回填 `source`（月底＝mops、其餘＝finmind），再改日期。
+    反過來做就再也分不出來源——這是本函數唯一不可交換的兩個步驟。
+
+    合併規則：同月雙列時保留**月底那筆**（MOPS 權威），並用 finmind 列補上它缺的
+    `mom_growth`/`yoy_growth`，然後刪除 finmind 列。
+
+    Returns:
+        {"tagged": N, "moved": M, "merged": K}
+    """
+    from src.data.pit import month_end
+
+    stats = {"tagged": 0, "moved": 0, "merged": 0}
+    with get_session() as session:
+        rows = session.execute(select(MonthlyRevenue)).scalars().all()
+        if not rows:
+            return stats
+
+        # ── 步驟 1：回填 source（必須在改日期之前）──
+        for row in rows:
+            if row.source:
+                continue
+            row.source = "mops" if row.date == month_end(row.revenue_year, row.revenue_month) else "finmind"
+            stats["tagged"] += 1
+
+        # ── 步驟 2：日期正規化 + 同月合併 ──
+        by_key: dict[tuple[str, date], MonthlyRevenue] = {}
+        for row in rows:
+            target = month_end(row.revenue_year, row.revenue_month)
+            key = (row.stock_id, target)
+            keeper = by_key.get(key)
+            if keeper is None:
+                by_key[key] = row
+                continue
+            # 已有同月列 → 保留 mops 那筆，另一筆的非空欄位補進來後刪除
+            winner, loser = (keeper, row) if keeper.source == "mops" else (row, keeper)
+            for field in ("mom_growth", "yoy_growth"):
+                if getattr(winner, field) is None and getattr(loser, field) is not None:
+                    setattr(winner, field, getattr(loser, field))
+            by_key[key] = winner
+            session.delete(loser)
+            stats["merged"] += 1
+
+        # 先讓刪除落地再改日期：unit of work 預設先 UPDATE 後 DELETE，
+        # 若同月的兩列一前一後，改期時目標日期還被舊列佔著會觸發 unique 衝突。
+        session.flush()
+
+        for (_, target), row in by_key.items():
+            if row.date != target:
+                row.date = target
+                stats["moved"] += 1
+
+        session.commit()
+
+    if stats["moved"] or stats["merged"]:
+        logger.info(
+            "[月營收語意正規化] 標記來源 %d 筆、改期 %d 筆、合併同月重複 %d 筆",
+            stats["tagged"],
+            stats["moved"],
+            stats["merged"],
+        )
+    return stats
 
 
 def _upsert_dividend(df: pd.DataFrame) -> int:
@@ -315,6 +424,7 @@ def _sync_per_stock(
     cache_days: int,
     lookback_days: int,
     label: str,
+    incremental: bool = True,
 ) -> int:
     """通用逐股同步：cache 檢查 → fetch → upsert。
 
@@ -326,6 +436,11 @@ def _sync_per_stock(
         cache_days:    DB 資料在此天數內視為新鮮，跳過
         lookback_days: 回溯查詢天數
         label:         日誌標籤（如 "估值補抓"）
+        incremental:   True＝以 DB 最後一筆為起點（省頻寬）；
+            False＝**恆取完整 `lookback_days` 窗口**。月營收必須用 False——
+            它的 YoY 是在 fetcher 內由整段序列算出來的，若以最後一筆為起點只會
+            拿回一兩個月，`yoy_growth` 永遠是 NULL（§6.6 #23）。逐股 API 一次
+            呼叫即涵蓋整個區間，故窗口放大不增加請求數。
 
     Returns:
         新增筆數
@@ -343,7 +458,7 @@ def _sync_per_stock(
             skipped += 1
             continue
         try:
-            df = fetch_fn(fetcher, sid, last or start, end)
+            df = fetch_fn(fetcher, sid, (last or start) if incremental else start, end)
             total += upsert_fn(df)
         except Exception:
             logger.warning("[%s] %s失敗，跳過", sid, label, exc_info=True)
@@ -367,15 +482,21 @@ def sync_valuation_for_stocks(stock_ids: list[str]) -> int:
 
 
 def sync_revenue_for_stocks(stock_ids: list[str]) -> int:
-    """為指定股票補抓最新月營收。"""
+    """為指定股票補抓最新月營收。
+
+    `lookback_days` 走 `REVENUE_FINMIND_LOOKBACK_DAYS`(430) 而非舊值 180：
+    YoY 需要 13 個月才算得出來，180 天只取回 6 筆 → `yoy_growth` 恆為 NULL，
+    而 growth 粗篩要求 `yoy_growth.notna()`，那些列等於白抓（§6.6 #23）。
+    """
     return _sync_per_stock(
         model=MonthlyRevenue,
         stock_ids=stock_ids,
         fetch_fn=lambda f, sid, s, e: f.fetch_monthly_revenue(sid, s, e),
-        upsert_fn=_upsert_monthly_revenue,
+        upsert_fn=lambda df: _upsert_monthly_revenue(df, source="finmind"),
         cache_days=30,
-        lookback_days=180,
+        lookback_days=REVENUE_FINMIND_LOOKBACK_DAYS,
         label="營收補抓",
+        incremental=False,
     )
 
 
@@ -398,9 +519,39 @@ def sync_dividends_for_stocks(stock_ids: list[str]) -> int:
     )
 
 
+_FINANCIAL_UPDATE_COLS = [
+    "year",
+    "quarter",
+    "revenue",
+    "gross_profit",
+    "operating_income",
+    "net_income",
+    "eps",
+    "total_assets",
+    "total_liabilities",
+    "equity",
+    "operating_cf",
+    "investing_cf",
+    "financing_cf",
+    "free_cf",
+    "gross_margin",
+    "operating_margin",
+    "net_margin",
+    "roe",
+    "roa",
+    "debt_ratio",
+]
+
+
 def _upsert_financial(df: pd.DataFrame) -> int:
-    """將財報 DataFrame 寫入 financial_statement 表。"""
-    return _upsert_batch(FinancialStatement, df, ["stock_id", "date"])
+    """將財報 DataFrame 寫入 financial_statement 表。
+
+    衝突時**覆寫**而非 do_nothing（§6.6 #25）：三表中任一在抓取當下逾時，
+    寫進去的就是 `equity`/`operating_cf` 全 NULL 的半套列。若沿用 do_nothing，
+    重抓回來的完整值會被那筆半套列永遠擋在門外，續跑判定也就永遠自癒不了
+    （與 C2 修復同一個教訓）。
+    """
+    return _upsert_batch(FinancialStatement, df, ["stock_id", "date"], update_cols=_FINANCIAL_UPDATE_COLS)
 
 
 def sync_financial_statements(
@@ -512,11 +663,54 @@ def sync_mops_announcements(days: int = 7) -> int:
     return total
 
 
+def _mops_covered_stocks(year: int, month: int) -> int:
+    """回傳某營收月份**由 MOPS 全市場抓回**的相異股票數（§6.6 #23 續跑判定）。
+
+    只數 `source='mops'`——候選池逐股補抓每天寫入約 150 檔，一個月累積上千列，
+    若把它們算進來，門檻會被灌滿而使全市場同步此後永不執行（實測 2026-02 的
+    MOPS 列因此永久停在 1 筆）。與 §6.5 #22 的估值閘門是同一種病。
+    """
+    with get_session() as session:
+        return (
+            session.execute(
+                select(func.count(func.distinct(MonthlyRevenue.stock_id))).where(
+                    MonthlyRevenue.revenue_year == year,
+                    MonthlyRevenue.revenue_month == month,
+                    MonthlyRevenue.source == "mops",
+                )
+            ).scalar()
+            or 0
+        )
+
+
+def _sync_mops_revenue_month(year: int, month: int) -> int:
+    """同步單一營收月份的 MOPS 全市場資料；已補齊則跳過。回傳寫入筆數。"""
+    from src.data.mops_fetcher import fetch_mops_monthly_revenue
+
+    covered = _mops_covered_stocks(year, month)
+    if covered >= BACKFILL_MIN_REVENUE_STOCKS:
+        logger.info("[MOPS 月營收] %d/%d 已有 %d 檔（跳過）", year, month, covered)
+        return 0
+
+    df = fetch_mops_monthly_revenue(year=year, month=month)
+    if df.empty:
+        logger.warning("[MOPS 月營收] %d/%d 無資料（該月頁面可能尚未產生）", year, month)
+        return 0
+
+    n = _upsert_monthly_revenue(df, source="mops")
+    logger.info("[MOPS 月營收] %d/%d 寫入 %d 筆（原有 %d 檔）", year, month, n, covered)
+    return n
+
+
 def sync_mops_revenue(months: int = 1) -> int:
     """從 MOPS 同步全市場月營收（上市+上櫃）。
 
     使用 MOPS 公開資訊觀測站的靜態 HTML 頁面，
     兩次 HTTP 請求即可取得全市場 ~2000+ 支股票的月營收。
+
+    續跑判定見 `_mops_covered_stocks`——**只數 MOPS 來源的相異股票數**，
+    門檻 `BACKFILL_MIN_REVENUE_STOCKS`。舊版數「該月全部列數 ≥500」，
+    被候選池逐股補抓的列灌滿後該月永不重抓，實測多個月份長期凍結在半套。
 
     Args:
         months: 同步最近幾個月的營收（預設 1 = 上月）
@@ -524,56 +718,100 @@ def sync_mops_revenue(months: int = 1) -> int:
     Returns:
         新增的月營收筆數
     """
-    from src.data.mops_fetcher import fetch_mops_monthly_revenue
-
     init_db()
 
     total = 0
-    today = date.today()
-
-    for i in range(months):
-        # 計算目標月份（從上月往回推）
-        target = today.replace(day=1) - timedelta(days=1)  # 上月底
-        for _ in range(i):
-            target = target.replace(day=1) - timedelta(days=1)  # 再往前推
-        target_year = target.year
-        target_month = target.month
-
-        # 檢查 DB 是否已有該月份全市場資料
-        with get_session() as session:
-            count = session.execute(
-                select(func.count())
-                .select_from(MonthlyRevenue)
-                .where(
-                    MonthlyRevenue.revenue_year == target_year,
-                    MonthlyRevenue.revenue_month == target_month,
-                )
-            ).scalar()
-
-        if count and count >= 500:
-            logger.info(
-                "[MOPS 月營收] %d/%d 已有 %d 筆（跳過）",
-                target_year,
-                target_month,
-                count,
-            )
-            continue
-
-        df = fetch_mops_monthly_revenue(year=target_year, month=target_month)
-        if df.empty:
-            continue
-
-        n = _upsert_monthly_revenue(df)
-        total += n
-        logger.info(
-            "[MOPS 月營收] %d/%d 寫入 %d 筆",
-            target_year,
-            target_month,
-            n,
-        )
+    target = date.today().replace(day=1) - timedelta(days=1)  # 上月底
+    for _ in range(months):
+        total += _sync_mops_revenue_month(target.year, target.month)
+        target = target.replace(day=1) - timedelta(days=1)  # 再往前推一個月
 
     logger.info("[MOPS 月營收] 同步完成，共寫入 %d 筆", total)
     return total
+
+
+def backfill_revenue_history(
+    start: date,
+    end: date | None = None,
+    *,
+    dry_run: bool = False,
+    stop_flag: "callable | None" = None,
+) -> dict[str, int]:
+    """回補 `monthly_revenue` 歷史（§6.6 #24，B1① 最後一塊基本面缺口）。
+
+    ## 為什麼走 MOPS 而不是 FinMind 逐股
+
+    §2 的資料來源優先序①：MOPS 是官方、免費、全市場。實測其歷史頁面
+    （`t21sc03_{民國年}_{月}_0.html`）回溯到 2020-01 仍健在，一個月兩個請求
+    （上市 sii + 上櫃 otc）即拿到全市場，且**自帶官方 YoY**。
+    79 個月 ≈ 158 個免費請求、約 8 分鐘；FinMind 逐股則是 ~2,000 檔 × 0.5s
+    並且要吃 600/hr 的配額，兩邊差三個數量級。
+
+    ## 續跑
+
+    與其他回補一致，**不維護進度檔**：某月由 MOPS 抓回的相異股票數達
+    `BACKFILL_MIN_REVENUE_STOCKS` 即視為已補（`_mops_covered_stocks`）。
+
+    開跑前一律先跑 `normalize_revenue_date_semantics()`——舊資料若還帶著
+    「次月 1 日」的 FinMind 日期，回補寫進來的月底列會與之並存成同月雙列。
+
+    Args:
+        start: 起始月份（取其年月，日忽略）。
+        end: 結束月份（含）；None ＝今日所屬月份的**上個月**（當月營收尚未公布）。
+        dry_run: 只列出待補月份，不實際抓取。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+
+    Returns:
+        {"months": N, "rows": M, "skipped_months": S, "normalized": K}
+    """
+    init_db()
+    result = {"months": 0, "rows": 0, "skipped_months": 0, "normalized": 0}
+
+    if end is None:
+        end = date.today().replace(day=1) - timedelta(days=1)
+
+    # (year, month) 序列
+    months: list[tuple[int, int]] = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        months.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+    if not months:
+        logger.info("月營收回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    if not dry_run:
+        stats = normalize_revenue_date_semantics()
+        result["normalized"] = stats["moved"] + stats["merged"]
+
+    pending = [(y, m) for y, m in months if _mops_covered_stocks(y, m) < BACKFILL_MIN_REVENUE_STOCKS]
+    result["skipped_months"] = len(months) - len(pending)
+    logger.info(
+        "[月營收回補] %d/%02d ~ %d/%02d：待補 %d 個月（已跳過 %d 個），預估 %.1f 分鐘",
+        start.year,
+        start.month,
+        end.year,
+        end.month,
+        len(pending),
+        result["skipped_months"],
+        len(pending) * 2 * MOPS_REQUEST_INTERVAL / 60,
+    )
+
+    if dry_run:
+        return result
+
+    for i, (year, month) in enumerate(pending, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[月營收回補] 收到中止訊號，已完成 %d/%d 個月", i - 1, len(pending))
+            break
+        n = _sync_mops_revenue_month(year, month)
+        if n:
+            result["months"] += 1
+            result["rows"] += n
+
+    logger.info("[月營收回補] 完成 — %d 個月 / %d 筆", result["months"], result["rows"])
+    return result
 
 
 def sync_valuation_all_market() -> int:
@@ -952,9 +1190,13 @@ def sync_stock(
     # --- 月營收 ---
     last = _resolve_last("revenue", MonthlyRevenue)
     s = last if last and last > default_start else default_start
-    logger.info("[%s] 同步月營收: %s ~ %s", stock_id, s, end_date)
-    df_rev = fetcher.fetch_monthly_revenue(stock_id, s, end_date)
-    result["revenue"] = _upsert_monthly_revenue(df_rev)
+    # YoY 由整段序列在 fetcher 內算出，起點太近會讓 `yoy_growth` 恆為 NULL（§6.6 #23），
+    # 故不論增量起點為何都至少回溯 13 個月；逐股 API 一次呼叫涵蓋全區間，不增加請求數。
+    rev_floor = (date.fromisoformat(end_date) - timedelta(days=REVENUE_FINMIND_LOOKBACK_DAYS)).isoformat()
+    rev_start = min(s, rev_floor)
+    logger.info("[%s] 同步月營收: %s ~ %s", stock_id, rev_start, end_date)
+    df_rev = fetcher.fetch_monthly_revenue(stock_id, rev_start, end_date)
+    result["revenue"] = _upsert_monthly_revenue(df_rev, source="finmind")
 
     # --- 股利 ---
     last = _resolve_last("dividend", Dividend)
@@ -1241,9 +1483,23 @@ def backfill_valuation_history(
 
     與 `backfill_market_history` 同樣**不維護進度檔**，直接以 DB 現況為準：
 
-    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過。
+    - twse：某日估值檔數達 `BACKFILL_MIN_VALUATION_STOCKS` 即視為已補而跳過，
+      且**只走真正的交易日**（見下）。
     - tpex：某檔在區間內的估值日數達該檔**價量日數的 8 成**即視為已補。
       不用固定門檻——上櫃股上市時間不一，新股本來就只有少數日子有資料。
+
+    ## 為什麼交易日要查 DB 而不是行事曆（§6.6 #27）
+
+    上市段原本只濾 `weekday() < 5`，而續跑判定是「當日估值檔數 ≥ 800」——
+    假日永遠達不到，於是**每次執行都重新請求同一批假日**且永遠列為待補
+    （實測 2020–2023 有 69 天，資料其實零缺口；ETA 因此失真 5 倍）。
+
+    直覺修法是改用 `calendar.is_trading_day`，但**那對歷史區間無效**：
+    `_TWSE_HOLIDAYS` 只有 2025/2026/2027，其他年份 `is_twse_holiday` 回 False，
+    `is_trading_day` 退化成「只判週末」，2020–2024 照打不誤。故改以 DB 判定
+    （該日 4 碼普通股價量檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`），與
+    `backfill_market_history` 的續跑判定同源——價量已回補是估值回補的前提，
+    這個依賴本來就成立。
 
     Args:
         start: 起始日（含）。
@@ -1287,20 +1543,40 @@ def backfill_valuation_history(
                     .having(func.count(StockValuation.id) >= BACKFILL_MIN_VALUATION_STOCKS)
                 ).all()
             }
-        pending_days = [
-            d
-            for d in (start + timedelta(days=i) for i in range((end - start).days + 1))
-            if d.weekday() < 5 and d not in covered
-        ]
-        result["skipped_days"] = (end - start).days + 1 - len(pending_days)
+            # 交易日以 DB 價量為準——行事曆只有 2025~2027，歷史區間會退化成只判週末
+            trading_days = {
+                r[0]
+                for r in session.execute(
+                    select(DailyPrice.date)
+                    .where(
+                        DailyPrice.date >= start,
+                        DailyPrice.date <= end,
+                        func.length(DailyPrice.stock_id) == 4,
+                    )
+                    .group_by(DailyPrice.date)
+                    .having(func.count(func.distinct(DailyPrice.stock_id)) >= BACKFILL_MIN_COMMON_STOCKS)
+                ).all()
+            }
+
+        pending_days = sorted(d for d in trading_days if d not in covered)
+        # 語意＝「已在 DB 中的交易日」（CLI 顯示為「已跳過 N 日（DB 已有）」）。
+        # 舊版是「日曆天 − 待補平日」，把週末假日也算成跳過，數字與標籤對不上。
+        result["skipped_days"] = len(trading_days) - len(pending_days)
         logger.info(
-            "[估值回補/上市] %s ~ %s：待補 %d 個平日（已跳過 %d 日），預估 %.1f 分鐘",
+            "[估值回補/上市] %s ~ %s：待補 %d 個交易日（區間內交易日 %d、已跳過 %d 日），預估 %.1f 分鐘",
             start,
             end,
             len(pending_days),
+            len(trading_days),
             result["skipped_days"],
             len(pending_days) * TWSE_REQUEST_INTERVAL / 60,
         )
+        if not trading_days:
+            logger.warning(
+                "[估值回補/上市] 區間內查無交易日（daily_price 每日普通股 < %d）——"
+                "估值回補以價量已回補為前提，請先跑 backfill-history",
+                BACKFILL_MIN_COMMON_STOCKS,
+            )
 
         if not dry_run:
             for i, d in enumerate(pending_days, 1):
@@ -1309,12 +1585,14 @@ def backfill_valuation_history(
                     break
                 df = fetch_twse_valuation_all(d)
                 if df.empty:
-                    continue  # 假日或該日無資料——不是錯誤
+                    # 已濾過交易日，故這裡是端點暫時性失敗或該日確實無估值列——
+                    # 不寫入即代表該日仍未達覆蓋門檻，下次執行會自動重試
+                    continue
                 result["twse_days"] += 1
                 result["twse_rows"] += _upsert_valuation(df)
                 if result["twse_days"] % progress_every == 0:
                     logger.info(
-                        "[估值回補/上市] 進度 %d/%d 平日（%s）— 交易日 %d, 累計 %d 筆",
+                        "[估值回補/上市] 進度 %d/%d 交易日（%s）— 有資料 %d 日, 累計 %d 筆",
                         i,
                         len(pending_days),
                         d.isoformat(),
@@ -1411,6 +1689,264 @@ def backfill_valuation_history(
         result["twse_rows"],
         result["tpex_stocks"],
         result["tpex_rows"],
+    )
+    return result
+
+
+def _seconds_until_next_hour(now: datetime | None = None) -> float:
+    """距離下一個整點的秒數（+60 秒緩衝）——FinMind 配額以整點為窗口重置。"""
+    now = now or datetime.now()
+    nxt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return (nxt - now).total_seconds() + 60
+
+
+def _financial_expected_quarters(first_day: date, last_day: date, start: date, end: date) -> int:
+    """某檔在 [start, end] 內「**應該**要有幾季財報」。
+
+    兩個條件同時成立才算數：
+      1. 季末日落在該股實際有價量的區間內（新上市/已下市股不該被要求補滿全期）；
+      2. 該季的**法定申報期限**已在 `end` 之前（Q1~Q3 季後 45 日、年報次年 3/31）
+         ——否則會把「還沒到公布期限」當成缺漏，讓最近一季永遠重抓。
+    """
+    from src.data.pit import quarter_publish_deadline
+
+    count = 0
+    for year in range(start.year, end.year + 1):
+        for q, quarter_end in enumerate(
+            (date(year, 3, 31), date(year, 6, 30), date(year, 9, 30), date(year, 12, 31)), start=1
+        ):
+            if not (start <= quarter_end <= end):
+                continue
+            if not (first_day <= quarter_end <= last_day):
+                continue
+            if quarter_publish_deadline(year, q) > end:
+                continue
+            count += 1
+    return count
+
+
+def backfill_financial_history(
+    start: date,
+    end: date | None = None,
+    *,
+    min_trading_days: int = FINANCIAL_BACKFILL_MIN_TRADING_DAYS,
+    dry_run: bool = False,
+    progress_every: int = 20,
+    stop_flag: "callable | None" = None,
+    wait_on_quota: bool = False,
+    request_interval: float | None = None,
+    max_quota_waits: int = 24,
+) -> dict[str, int]:
+    """回補 `financial_statement` 歷史（§6.6 #25，B1① 最後一塊基本面缺口）。
+
+    ## 為什麼只能走 FinMind 逐股
+
+    月營收有 MOPS 全市場靜態頁可用（§6.6 #24），財報沒有對應的免費全市場歷史
+    端點：TWSE openapi 的財報只回**當季**。故走 FinMind `TaiwanStockFinancialStatements`
+    ／`BalanceSheet`／`CashFlowsStatement` 三個 dataset 逐股抓，一檔 3 個請求
+    （日期區間一次涵蓋全期間，實測 2330 單次呼叫回 26 季）。
+
+    ## 配額與節流
+
+    免費版 600 請求/小時、母體 1,994 檔 × 3 ＝ **約 10 小時**。開跑前先打
+    `fetch_quota_status()` 取帳號真實上限，據以推導間隔（3600/limit ＝ 6 秒/請求）
+    並**連續慢跑**，而非 0.5 秒爆衝後撞 402——兩者每小時吞吐相同，但後者會把
+    日誌塞滿 402 並得等整點。`wait_on_quota=True` 時遇 402 會睡到下個整點續跑，
+    否則立即停止（重跑本函數會從缺口續行）。
+
+    ⚠ **請在自己的 Terminal 配 `caffeinate -i` 執行**——長跑作業綁在互動 session
+    上會被中斷（2020–2023 價量回補跑三趟的教訓）。續跑冪等，進度不會損失。
+
+    ## 續跑判定看欄位不看列數
+
+    三表任一逾時，`fetch_financial_summary` 仍會回傳只有損益表的 DataFrame，
+    寫進去就是 `equity`／`operating_cf` 全 NULL 的半套列——**列數檢查看不出來**
+    （§6.5 #21d 同型）。故 `eps`／`equity`／`operating_cf` 三個欄位分別計數，
+    任一低於「應有季數 × `FINANCIAL_COVERAGE_RATIO`」就重抓。
+
+    母體依區間內平均成交金額**由大到小**排序：中斷時先補到的是最可能進 universe
+    的標的，尾端小型股晚一點補齊不影響研究可用性。
+
+    Args:
+        start: 起始日（含）。
+        end: 結束日（含）；None ＝今日。
+        min_trading_days: 區間內交易日數低於此值的股票不補（預設 60）。
+        dry_run: 只估算待補檔數與時間，不實際抓取。
+        progress_every: 每 N 檔輸出一次進度。
+        stop_flag: 回傳 True 時提前結束（供 CLI 接 Ctrl-C）。
+        wait_on_quota: 配額用盡時睡到下個整點續跑（預設 False ＝ 立即停止）。
+        request_interval: 每個請求的間隔秒數；None ＝由配額推導。0 ＝不節流（測試用）。
+        max_quota_waits: `wait_on_quota` 時最多等待幾次整點，防止無限迴圈。
+
+    Returns:
+        {"stocks": N, "rows": M, "skipped_stocks": S, "failed_stocks": F,
+         "quota_exhausted": 0/1, "quota_waits": W}
+    """
+    init_db()
+    result = {
+        "stocks": 0,
+        "rows": 0,
+        "skipped_stocks": 0,
+        "failed_stocks": 0,
+        "quota_exhausted": 0,
+        "quota_waits": 0,
+    }
+
+    if end is None:
+        end = date.today()
+    if start > end:
+        logger.info("財報回補範圍為空（start=%s > end=%s）", start, end)
+        return result
+
+    # ---------- 母體與續跑判定 ---------- #
+    with get_session() as session:
+        price_rows = session.execute(
+            select(
+                DailyPrice.stock_id,
+                func.count(func.distinct(DailyPrice.date)),
+                func.min(DailyPrice.date),
+                func.max(DailyPrice.date),
+                func.avg(DailyPrice.turnover),
+            )
+            .join(StockInfo, StockInfo.stock_id == DailyPrice.stock_id)
+            .where(
+                DailyPrice.date >= start,
+                DailyPrice.date <= end,
+                func.length(DailyPrice.stock_id) == 4,
+                StockInfo.security_type == "stock",
+                StockInfo.listing_type.in_(("twse", "tpex")),
+            )
+            .group_by(DailyPrice.stock_id)
+            .having(func.count(func.distinct(DailyPrice.date)) >= min_trading_days)
+            # 流動性由大到小：中斷時先補到最可能進 universe 的標的
+            .order_by(func.avg(DailyPrice.turnover).desc())
+        ).all()
+
+        # 欄位級覆蓋度：列數足夠不代表三表都抓到了
+        have = {
+            r[0]: (r[1] or 0, r[2] or 0, r[3] or 0)
+            for r in session.execute(
+                select(
+                    FinancialStatement.stock_id,
+                    func.sum(case((FinancialStatement.eps.isnot(None), 1), else_=0)),
+                    func.sum(case((FinancialStatement.equity.isnot(None), 1), else_=0)),
+                    func.sum(case((FinancialStatement.operating_cf.isnot(None), 1), else_=0)),
+                )
+                .where(FinancialStatement.date >= start, FinancialStatement.date <= end)
+                .group_by(FinancialStatement.stock_id)
+            ).all()
+        }
+
+    pending_ids: list[str] = []
+    for sid, _days, first_day, last_day, _turnover in price_rows:
+        expected = _financial_expected_quarters(first_day, last_day, start, end)
+        if expected <= 0:
+            continue  # 區間內沒有任何一季到達申報期限——無從判定，不補
+        need = expected * FINANCIAL_COVERAGE_RATIO
+        if min(have.get(sid, (0, 0, 0))) < need:
+            pending_ids.append(sid)
+
+    result["skipped_stocks"] = len(price_rows) - len(pending_ids)
+
+    # ---------- 配額與節流 ---------- #
+    fetcher = FinMindFetcher()
+    if request_interval is None:
+        quota = fetcher.fetch_quota_status()
+        limit = quota.get("limit") or FINMIND_FREE_HOURLY_LIMIT
+        request_interval = 3600.0 / limit
+        if quota:
+            logger.info(
+                "[財報回補] FinMind 配額：%s（level=%s）上限 %d/小時、本小時已用 %d、剩餘 %d",
+                quota.get("level_title") or "?",
+                quota.get("level"),
+                quota["limit"],
+                quota["used"],
+                quota["remaining"],
+            )
+        else:
+            logger.warning("[財報回補] 配額查詢失敗，退回預設上限 %d/小時", FINMIND_FREE_HOURLY_LIMIT)
+
+    per_stock_budget = request_interval * FINMIND_REQUESTS_PER_FINANCIAL_STOCK
+    logger.info(
+        "[財報回補] %s ~ %s：待補 %d 檔（已跳過 %d 檔），每檔 %d 請求 × %.1f 秒，預估 %.1f 小時",
+        start,
+        end,
+        len(pending_ids),
+        result["skipped_stocks"],
+        FINMIND_REQUESTS_PER_FINANCIAL_STOCK,
+        request_interval,
+        len(pending_ids) * per_stock_budget / 3600,
+    )
+
+    if dry_run or not pending_ids:
+        return result
+
+    start_iso, end_iso = start.isoformat(), end.isoformat()
+    for i, sid in enumerate(pending_ids, 1):
+        if stop_flag is not None and stop_flag():
+            logger.warning("[財報回補] 收到中止訊號，已完成 %d/%d 檔", i - 1, len(pending_ids))
+            break
+
+        t0 = time.monotonic()
+        df = None
+        while True:
+            try:
+                df = fetcher.fetch_financial_summary(sid, start_iso, end_iso)
+                break
+            except Exception as exc:
+                if not _is_quota_exhausted(exc):
+                    logger.warning("[財報回補] %s 抓取失敗，跳過：%s", sid, exc)
+                    result["failed_stocks"] += 1
+                    break
+                if not wait_on_quota or result["quota_waits"] >= max_quota_waits:
+                    logger.error(
+                        "[財報回補] FinMind 配額用盡（%s），已完成 %d/%d 檔——"
+                        "配額恢復後重跑本指令即可從缺口續行（或加 --wait-on-quota 自動等待）",
+                        type(exc).__name__,
+                        i - 1,
+                        len(pending_ids),
+                    )
+                    result["quota_exhausted"] = 1
+                    break
+                wait_s = _seconds_until_next_hour()
+                result["quota_waits"] += 1
+                logger.warning(
+                    "[財報回補] 配額用盡，睡 %.1f 分鐘至下個整點後續跑（第 %d 次，已完成 %d/%d 檔）",
+                    wait_s / 60,
+                    result["quota_waits"],
+                    i - 1,
+                    len(pending_ids),
+                )
+                time.sleep(wait_s)
+
+        if result["quota_exhausted"]:
+            break
+        if df is not None and not df.empty:
+            result["stocks"] += 1
+            result["rows"] += _upsert_financial(df)
+
+        if i % progress_every == 0:
+            logger.info(
+                "[財報回補] 進度 %d/%d 檔（%s）— 有資料 %d 檔, 累計 %d 筆, 失敗 %d 檔",
+                i,
+                len(pending_ids),
+                sid,
+                result["stocks"],
+                result["rows"],
+                result["failed_stocks"],
+            )
+
+        remaining = per_stock_budget - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    logger.info(
+        "[財報回補] 完成 — %d 檔 / %d 筆（跳過 %d 檔、失敗 %d 檔、等待配額 %d 次）",
+        result["stocks"],
+        result["rows"],
+        result["skipped_stocks"],
+        result["failed_stocks"],
+        result["quota_waits"],
     )
     return result
 
@@ -2262,10 +2798,22 @@ def backfill_daily_features(
 
     ## 續跑
 
-    以 DB 現況為準，中斷後重跑自動續行。判定看**該日特徵列數 ≥ 價量列數 ×
-    `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`**，而非「該日有無特徵列」——後者會讓
-    「價量只補了一半時算過特徵」的日期被永久標記為已補，事後補齊價量也不再重算
-    （2026-08-09 實測 11 天中招，含 3 個 live 交易日）。
+    以 DB 現況為準，中斷後重跑自動續行。判定**列數與欄位都要過關**：
+
+    1. **列數**：該日特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`。
+       不能看「該日有無特徵列」——後者會讓「價量只補了一半時算過特徵」的日期被
+       永久標記為已補，事後補齊價量也不再重算（2026-08-09 實測 11 天中招，含 3
+       個 live 交易日）。
+    2. **欄位**（§6.6 #28）：`ma60`／`turnover_ma20` 非空率取較小值 ≥
+       `FEATURE_BACKFILL_MIN_WARM_RATIO`。**列數滿額不代表欄位可用**——實測
+       2024-01-02 ~ 2024-02-20 共 29 個交易日的 `ma60` 非空率僅 0.0022 而列數是
+       滿的（B1① 第一批回補範圍是 2024-01 起、特徵從該日起算故暖身不足；事後補了
+       2020–2023 價量，列數判定卻看不出來所以永不重算）。這是 §6.5 #21d 的教訓在
+       回補層的重演——當時只修了重放層的覆蓋度判定。
+
+    欄位判定**只作用於全表最早 `FEATURE_WARMUP_EXEMPT_TRADING_DAYS` 個交易日之後**：
+    最早那批沒有更早的資料可暖身，`ma60` 天生填不滿，套用門檻會讓它們每次執行都
+    重算（與本項要修的「永遠重抓」是同一種病，方向相反）。
 
     Args:
         start: 起始日（含）。
@@ -2305,20 +2853,76 @@ def backfill_daily_features(
                 .group_by(DailyFeature.date)
             ).all()
         }
+        # 欄位暖身率（§6.6 #28）——母體限 4 碼普通股：權證/ETN 上市時間短、MA 天生
+        # 填不滿，不限的話穩態會從 0.99 掉到 0.65~0.79，門檻將無從設定（§6.5 #21d）。
+        warm_ratios = {
+            r[0]: (min(r[1] or 0, r[2] or 0) / r[3]) if r[3] else 0.0
+            for r in session.execute(
+                select(
+                    DailyFeature.date,
+                    func.sum(case((DailyFeature.ma60.isnot(None), 1), else_=0)),
+                    func.sum(case((DailyFeature.turnover_ma20.isnot(None), 1), else_=0)),
+                    func.count(DailyFeature.id),
+                )
+                .where(
+                    DailyFeature.date >= start,
+                    DailyFeature.date <= end,
+                    func.length(DailyFeature.stock_id) == 4,
+                )
+                .group_by(DailyFeature.date)
+            ).all()
+        }
+        # 全表最早的 N 個交易日豁免欄位判定（沒有更早的資料可暖身）
+        earliest_days = [
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(func.length(DailyPrice.stock_id) == 4)
+                .group_by(DailyPrice.date)
+                .order_by(DailyPrice.date)
+                .limit(FEATURE_WARMUP_EXEMPT_TRADING_DAYS + 1)
+            ).all()
+        ]
+    # 第 N 個交易日（含）以前豁免：ma60 要 N 個先前觀測才填得滿，第 N+1 個才是
+    # 第一個「有能力」填滿的日子。全表短於 N 個交易日時**全部**豁免——若在此情況
+    # 回傳 None（不豁免），每個日期都會因欄位為 NULL 而永遠重算。
+    warmup_exempt_before = (
+        earliest_days[FEATURE_WARMUP_EXEMPT_TRADING_DAYS - 1]
+        if len(earliest_days) >= FEATURE_WARMUP_EXEMPT_TRADING_DAYS
+        else (earliest_days[-1] if earliest_days else None)
+    )
 
     # 續跑判定看**檔數比例**而非「該日有無特徵列」。後者會讓「價量只補了一半時
     # 算過特徵」的日期被永久標記為已補——事後補齊價量也不再重算（詳
     # `FEATURE_BACKFILL_MIN_COVERAGE_RATIO` 的註解，實測 11 天中招）。
-    done_dates = {
-        d for d, pc in price_counts.items() if feature_counts.get(d, 0) >= pc * FEATURE_BACKFILL_MIN_COVERAGE_RATIO
-    }
-    stale_dates = sorted(d for d in price_counts if d not in done_dates and feature_counts.get(d, 0) > 0)
-    if stale_dates:
+    def _rows_ok(d: date, pc: int) -> bool:
+        return feature_counts.get(d, 0) >= pc * FEATURE_BACKFILL_MIN_COVERAGE_RATIO
+
+    def _warm_ok(d: date) -> bool:
+        # 暖身豁免區間內不判欄位（否則最早那批每次都重算）
+        if warmup_exempt_before is not None and d <= warmup_exempt_before:
+            return True
+        return warm_ratios.get(d, 0.0) >= FEATURE_BACKFILL_MIN_WARM_RATIO
+
+    done_dates = {d for d, pc in price_counts.items() if _rows_ok(d, pc) and _warm_ok(d)}
+
+    stale_rows = sorted(d for d, pc in price_counts.items() if feature_counts.get(d, 0) > 0 and not _rows_ok(d, pc))
+    stale_warm = sorted(
+        d for d, pc in price_counts.items() if feature_counts.get(d, 0) > 0 and _rows_ok(d, pc) and not _warm_ok(d)
+    )
+    if stale_rows:
         logger.warning(
-            "[DailyFeature 回補] %d 日的特徵覆蓋不足將重算（價量補齊後未重算的舊缺口）：%s%s",
-            len(stale_dates),
-            ", ".join(str(d) for d in stale_dates[:5]),
-            " ..." if len(stale_dates) > 5 else "",
+            "[DailyFeature 回補] %d 日的特徵**列數**不足將重算（價量補齊後未重算的舊缺口）：%s%s",
+            len(stale_rows),
+            ", ".join(str(d) for d in stale_rows[:5]),
+            " ..." if len(stale_rows) > 5 else "",
+        )
+    if stale_warm:
+        logger.warning(
+            "[DailyFeature 回補] %d 日的特徵**欄位未暖身**將重算（列數滿額但 ma60/turnover_ma20 多為 NULL，§6.6 #28）：%s%s",
+            len(stale_warm),
+            ", ".join(f"{d}({warm_ratios.get(d, 0.0):.3f})" for d in stale_warm[:5]),
+            " ..." if len(stale_warm) > 5 else "",
         )
 
     pending = sorted(set(price_counts) - done_dates)

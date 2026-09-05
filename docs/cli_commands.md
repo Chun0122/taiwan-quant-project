@@ -1,6 +1,6 @@
 # CLI 指令完整參考
 
-入口：`python main.py <子命令>`（38 子命令，dispatch table 在 `main.py`）
+入口：`python main.py <子命令>`（52 子命令，dispatch table 在 `main.py`）
 
 ---
 
@@ -350,6 +350,11 @@ python main.py export daily_price --format parquet -o data/export/dp.parquet
 # 匯入
 python main.py import-data daily_price data/export/daily_price.csv
 python main.py import-data daily_price data.csv --dry-run
+
+# FinMind 配額（§6.6 #25：逐股長跑回補前先確認額度）
+python main.py finmind-quota
+# 印出帳號等級 / 每小時上限 / 本小時已用 / 剩餘，並換算連續慢跑的節流間隔
+# 實測 2026-08-15：Free level=1、600/hr、免費版不限歷史深度
 ```
 
 ---
@@ -375,7 +380,27 @@ python main.py backfill-history --start 2024-01-01 --features-only
 python main.py backfill-history --valuation-only --start 2024-01-01
 python main.py backfill-history --valuation-only --start 2024-01-01 --valuation-markets twse
 python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
+
+# 月營收回補（§6.6 #24；MOPS 全市場靜態頁，免費且自帶官方 YoY）
+python main.py backfill-history --revenue-only --start 2020-01-01
+python main.py backfill-history --revenue-only --start 2020-01-01 --end 2024-12-31
+python main.py backfill-history --revenue-only --start 2020-01-01 --dry-run
+
+# 財報回補（§6.6 #25；FinMind 逐股三表，每檔 3 請求、吃配額、約 10 小時）
+python main.py finmind-quota                                             # 開跑前先看額度
+python main.py backfill-history --financial-only --start 2020-01-01 --dry-run
+caffeinate -i python main.py backfill-history --financial-only --start 2020-01-01 --wait-on-quota
 ```
+
+**財報回補的三個注意事項**：
+
+1. **約 10 小時**（1,994 檔 × 3 請求 ÷ 600 請求/小時）。**請在自己的 Terminal 配 `caffeinate -i` 執行**——長跑作業綁在互動 session 上會被中斷。續跑冪等，中斷不損失進度。
+2. **節流是連續慢跑**（由 `fetch_quota_status()` 的真實上限推導，600/hr → 6 秒/請求），不是 0.5 秒爆衝後撞 402：每小時吞吐相同，但後者會把日誌塞滿 402 且得等整點。`--wait-on-quota` 讓它撞到配額時自動睡到下個整點續跑（預設立即停止）。
+3. **母體依成交金額由大到小排序**，中斷時先補到的是最可能進 universe 的標的。
+
+**月營收為何走 MOPS 而非 FinMind**：MOPS 的 `t21sc03_{民國年}_{月}_0.html` 歷史頁面回溯到 2020-01 仍健在，一個月兩個請求（上市 sii + 上櫃 otc）即拿到全市場約 1,700 檔，且**自帶官方 YoY**——79 個月僅 158 個免費請求。FinMind 逐股則要 ~2,000 次呼叫並吃 600/hr 配額，且自算的 YoY 在缺月時會失準。`--start` 只取年月，日忽略；`--end` 省略時補到上個月（當月營收尚未公布）。
+
+回補**開頭會自動執行 `normalize_revenue_date_semantics()`**（冪等）：舊資料中 FinMind 寫的「次月 1 日」會改寫為營收月份月底並與 MOPS 列合併，否則同月雙列會讓 scanner 的 N 個月營收窗口實際只拿到一半（§6.6 #23）。
 
 **估值為何要分兩條路**：TPEX 的估值端點（`peratio_book/pera_result.php`）**已下架**，所有日期含當日皆 302 導向 `/errors`；新版 openapi 只回當日、無日期參數。故上櫃歷史無官方來源，改走 FinMind `TaiwanStockPER` 逐股（支援日期區間，一檔一次呼叫涵蓋全期間）。上市則走 TWSE `BWIBBU_d`，健在且有完整歷史。
 
@@ -384,8 +409,10 @@ python main.py backfill-history --valuation-only --start 2024-01-01 --dry-run
 | 資料 | 判定 |
 |------|------|
 | 價量 | 當日**普通股（4 碼）**檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`（1500） |
-| 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800） |
+| 估值/上市 | 當日估值檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800）。**只走 DB 認定的交易日**（§6.6 #27）——假日永遠達不到門檻，不濾掉就每次執行都重打（實測 69 天）；不可改用 `calendar.is_trading_day`，假日表只有 2025~2027 |
 | 估值/上櫃 | 該檔估值日數 ≥ 其價量日數 × `VALUATION_COVERAGE_RATIO`（0.8） |
+| 月營收 | 該月**由 MOPS 抓回**（`source='mops'`）的相異股票數 ≥ `BACKFILL_MIN_REVENUE_STOCKS`（1400）。**只數 mops 列**——候選池逐股補抓每月累積上千列，算進來會把閘門灌滿使該月永不重抓（§6.6 #23） |
+| 財報 | 該檔 `eps`／`equity`／`operating_cf` **各自非空的季數** ≥ 應有季數 × `FINANCIAL_COVERAGE_RATIO`（0.8）。**看欄位不看列數**——三表任一逾時會寫進只有損益表的半套列，列數檢查看不出來（§6.5 #21d 同型）。應有季數＝該股價量區間內、且**法定申報期限已過**的季數（否則最近一季永遠重抓） |
 
 ### PIT 歷史重放（`pit-replay`）
 
