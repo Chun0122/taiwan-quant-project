@@ -17,6 +17,8 @@ from src.constants import (
     BACKFILL_MIN_REVENUE_STOCKS,
     BACKFILL_MIN_VALUATION_STOCKS,
     FEATURE_BACKFILL_MIN_COVERAGE_RATIO,
+    FEATURE_BACKFILL_MIN_WARM_RATIO,
+    FEATURE_WARMUP_EXEMPT_TRADING_DAYS,
     FINANCIAL_BACKFILL_MIN_TRADING_DAYS,
     FINANCIAL_COVERAGE_RATIO,
     FINMIND_FREE_HOURLY_LIMIT,
@@ -2796,10 +2798,22 @@ def backfill_daily_features(
 
     ## 續跑
 
-    以 DB 現況為準，中斷後重跑自動續行。判定看**該日特徵列數 ≥ 價量列數 ×
-    `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`**，而非「該日有無特徵列」——後者會讓
-    「價量只補了一半時算過特徵」的日期被永久標記為已補，事後補齊價量也不再重算
-    （2026-08-09 實測 11 天中招，含 3 個 live 交易日）。
+    以 DB 現況為準，中斷後重跑自動續行。判定**列數與欄位都要過關**：
+
+    1. **列數**：該日特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`。
+       不能看「該日有無特徵列」——後者會讓「價量只補了一半時算過特徵」的日期被
+       永久標記為已補，事後補齊價量也不再重算（2026-08-09 實測 11 天中招，含 3
+       個 live 交易日）。
+    2. **欄位**（§6.6 #28）：`ma60`／`turnover_ma20` 非空率取較小值 ≥
+       `FEATURE_BACKFILL_MIN_WARM_RATIO`。**列數滿額不代表欄位可用**——實測
+       2024-01-02 ~ 2024-02-20 共 29 個交易日的 `ma60` 非空率僅 0.0022 而列數是
+       滿的（B1① 第一批回補範圍是 2024-01 起、特徵從該日起算故暖身不足；事後補了
+       2020–2023 價量，列數判定卻看不出來所以永不重算）。這是 §6.5 #21d 的教訓在
+       回補層的重演——當時只修了重放層的覆蓋度判定。
+
+    欄位判定**只作用於全表最早 `FEATURE_WARMUP_EXEMPT_TRADING_DAYS` 個交易日之後**：
+    最早那批沒有更早的資料可暖身，`ma60` 天生填不滿，套用門檻會讓它們每次執行都
+    重算（與本項要修的「永遠重抓」是同一種病，方向相反）。
 
     Args:
         start: 起始日（含）。
@@ -2839,20 +2853,76 @@ def backfill_daily_features(
                 .group_by(DailyFeature.date)
             ).all()
         }
+        # 欄位暖身率（§6.6 #28）——母體限 4 碼普通股：權證/ETN 上市時間短、MA 天生
+        # 填不滿，不限的話穩態會從 0.99 掉到 0.65~0.79，門檻將無從設定（§6.5 #21d）。
+        warm_ratios = {
+            r[0]: (min(r[1] or 0, r[2] or 0) / r[3]) if r[3] else 0.0
+            for r in session.execute(
+                select(
+                    DailyFeature.date,
+                    func.sum(case((DailyFeature.ma60.isnot(None), 1), else_=0)),
+                    func.sum(case((DailyFeature.turnover_ma20.isnot(None), 1), else_=0)),
+                    func.count(DailyFeature.id),
+                )
+                .where(
+                    DailyFeature.date >= start,
+                    DailyFeature.date <= end,
+                    func.length(DailyFeature.stock_id) == 4,
+                )
+                .group_by(DailyFeature.date)
+            ).all()
+        }
+        # 全表最早的 N 個交易日豁免欄位判定（沒有更早的資料可暖身）
+        earliest_days = [
+            r[0]
+            for r in session.execute(
+                select(DailyPrice.date)
+                .where(func.length(DailyPrice.stock_id) == 4)
+                .group_by(DailyPrice.date)
+                .order_by(DailyPrice.date)
+                .limit(FEATURE_WARMUP_EXEMPT_TRADING_DAYS + 1)
+            ).all()
+        ]
+    # 第 N 個交易日（含）以前豁免：ma60 要 N 個先前觀測才填得滿，第 N+1 個才是
+    # 第一個「有能力」填滿的日子。全表短於 N 個交易日時**全部**豁免——若在此情況
+    # 回傳 None（不豁免），每個日期都會因欄位為 NULL 而永遠重算。
+    warmup_exempt_before = (
+        earliest_days[FEATURE_WARMUP_EXEMPT_TRADING_DAYS - 1]
+        if len(earliest_days) >= FEATURE_WARMUP_EXEMPT_TRADING_DAYS
+        else (earliest_days[-1] if earliest_days else None)
+    )
 
     # 續跑判定看**檔數比例**而非「該日有無特徵列」。後者會讓「價量只補了一半時
     # 算過特徵」的日期被永久標記為已補——事後補齊價量也不再重算（詳
     # `FEATURE_BACKFILL_MIN_COVERAGE_RATIO` 的註解，實測 11 天中招）。
-    done_dates = {
-        d for d, pc in price_counts.items() if feature_counts.get(d, 0) >= pc * FEATURE_BACKFILL_MIN_COVERAGE_RATIO
-    }
-    stale_dates = sorted(d for d in price_counts if d not in done_dates and feature_counts.get(d, 0) > 0)
-    if stale_dates:
+    def _rows_ok(d: date, pc: int) -> bool:
+        return feature_counts.get(d, 0) >= pc * FEATURE_BACKFILL_MIN_COVERAGE_RATIO
+
+    def _warm_ok(d: date) -> bool:
+        # 暖身豁免區間內不判欄位（否則最早那批每次都重算）
+        if warmup_exempt_before is not None and d <= warmup_exempt_before:
+            return True
+        return warm_ratios.get(d, 0.0) >= FEATURE_BACKFILL_MIN_WARM_RATIO
+
+    done_dates = {d for d, pc in price_counts.items() if _rows_ok(d, pc) and _warm_ok(d)}
+
+    stale_rows = sorted(d for d, pc in price_counts.items() if feature_counts.get(d, 0) > 0 and not _rows_ok(d, pc))
+    stale_warm = sorted(
+        d for d, pc in price_counts.items() if feature_counts.get(d, 0) > 0 and _rows_ok(d, pc) and not _warm_ok(d)
+    )
+    if stale_rows:
         logger.warning(
-            "[DailyFeature 回補] %d 日的特徵覆蓋不足將重算（價量補齊後未重算的舊缺口）：%s%s",
-            len(stale_dates),
-            ", ".join(str(d) for d in stale_dates[:5]),
-            " ..." if len(stale_dates) > 5 else "",
+            "[DailyFeature 回補] %d 日的特徵**列數**不足將重算（價量補齊後未重算的舊缺口）：%s%s",
+            len(stale_rows),
+            ", ".join(str(d) for d in stale_rows[:5]),
+            " ..." if len(stale_rows) > 5 else "",
+        )
+    if stale_warm:
+        logger.warning(
+            "[DailyFeature 回補] %d 日的特徵**欄位未暖身**將重算（列數滿額但 ma60/turnover_ma20 多為 NULL，§6.6 #28）：%s%s",
+            len(stale_warm),
+            ", ".join(f"{d}({warm_ratios.get(d, 0.0):.3f})" for d in stale_warm[:5]),
+            " ..." if len(stale_warm) > 5 else "",
         )
 
     pending = sorted(set(price_counts) - done_dates)

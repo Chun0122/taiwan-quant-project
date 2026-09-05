@@ -66,7 +66,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `data/calendar.py` | TWSE 交易日行事曆（2025-2026）+ 臨時休市日 `_UNSCHEDULED_CLOSURES`（颱風假等；morning-routine 哨兵偵測「行事曆交易日但全市場無資料」後手動登錄） |
 | `data/io.py` | CSV/Parquet 匯出匯入（欄位驗證 + upsert） |
 | `data/pipeline.py` 之 `compute_feature_columns` | **DailyFeature 算式 SSOT**（B1②）：每日增量與歷史回補共用同一實作，兩邊漂移會使歷史特徵與今日特徵不同質、PIT 重放的 universe 失真 |
-| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead。**續跑判定看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」**——不可改回「該日有無特徵列」：TPEX 逾時使該日只有上市價量時算過特徵，日期會被永久標記已補，事後補齊上櫃也不重算（2026-08-09 實測 11 天中招，含 3 個 live 日；後果是缺特徵列的股票被 `_stage2_liquidity_filter` **整批排除於 universe 之外**——`avg5_map` 只由既有列建立，非「門檻放寬」亦非 fallback） |
+| `data/pipeline.py` 之 `backfill_daily_features` | B1② DailyFeature 歷史化：分批計算並**多讀 130 天暖身**確保 chunk 邊界 MA60 正確；rolling 皆後視窗故天然無 look-ahead。**續跑判定看「特徵列數 ≥ 價量列數 × `FEATURE_BACKFILL_MIN_COVERAGE_RATIO`(0.95)」**且**欄位暖身率（`ma60`／`turnover_ma20` 非空率取較小值，限 4 碼普通股）≥ `FEATURE_BACKFILL_MIN_WARM_RATIO`(0.5)**（§6.6 #28：列數滿額不代表欄位可用，實測 30 日中招含 1 個 live 日；欄位判定須豁免全表最早 `FEATURE_WARMUP_EXEMPT_TRADING_DAYS`(60) 個交易日，否則那批天生填不滿的日子會每次重算）——不可改回「該日有無特徵列」：TPEX 逾時使該日只有上市價量時算過特徵，日期會被永久標記已補，事後補齊上櫃也不重算（2026-08-09 實測 11 天中招，含 3 個 live 日；後果是缺特徵列的股票被 `_stage2_liquidity_filter` **整批排除於 universe 之外**——`avg5_map` 只由既有列建立，非「門檻放寬」亦非 fallback） |
 | `data/pipeline.py` 之 `backfill_market_history` | B1① 歷史回補：以 TWSE/TPEX 每日全市場端點逐交易日補齊；**續跑判定看「當日普通股（4 碼）檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`」**——既不能看「有無資料」（2020~2024 每日皆有 6 檔 watchlist，會靜默跳過 5 年）也不能看總筆數（崩盤日權證無報價會偽陽性、權證多的半套日會偽陰性） |
 | `data/pipeline.py` 之 `backfill_valuation_history` | §6.5 #20 估值回補：**上市走 TWSE `BWIBBU_d` 每日端點、上櫃走 FinMind 逐股**——TPEX 估值端點（`peratio_book/pera_result.php`）已下架（所有日期含當日皆 302 導向 `/errors`），新版 openapi 只回當日無歷史，故上櫃無官方來源。續跑判定：上市看當日檔數 ≥ `BACKFILL_MIN_VALUATION_STOCKS`（800，母體僅約 1,000 遠小於價量）、上櫃看該檔估值日數 ≥ 價量日數 × `VALUATION_COVERAGE_RATIO`（0.8）。**上市段只走 DB 認定的交易日**（§6.6 #27，該日 4 碼普通股價量檔數 ≥ `BACKFILL_MIN_COMMON_STOCKS`）——不可改用 `calendar.is_trading_day`：假日表只有 2025~2027，其餘年份退化成只判週末，2020–2023 的 69 個假日會每次重打 |
 | `data/pipeline.py` 之 `backfill_revenue_history` | §6.6 #24 月營收回補：**走 MOPS 全市場靜態頁不走 FinMind 逐股**（`t21sc03_{民國年}_{月}_0.html` 回溯到 2020-01 仍健在，一個月兩個請求拿全市場 ~1,700 檔且自帶官方 YoY；79 個月僅 158 個免費請求，FinMind 則要 ~2,000 次呼叫並吃配額）。續跑判定看「該月 `source='mops'` 的相異股票數 ≥ `BACKFILL_MIN_REVENUE_STOCKS`（1400）」——**只數 mops 列**，候選池逐股補抓每月累積上千列，算進來會把閘門灌滿使該月永不重抓（與 §6.5 #22 同型）。開頭自動跑 `normalize_revenue_date_semantics()` |
@@ -186,7 +186,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2888 測試 / 107 檔）
+- **執行**：`pytest -v`（2892 測試 / 107 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

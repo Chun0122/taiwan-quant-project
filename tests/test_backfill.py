@@ -1678,3 +1678,113 @@ class TestSecondsUntilNextHour:
         assert _seconds_until_next_hour(datetime(2026, 8, 15, 10, 30, 0)) == pytest.approx(1860.0)
         # 整點前一秒也必須是正值（不能算成 0 而連續重試）
         assert _seconds_until_next_hour(datetime(2026, 8, 15, 10, 59, 59)) == pytest.approx(61.0)
+
+
+class TestFeatureWarmupResume:
+    """§6.6 #28：續跑判定必須同時看列數與**欄位暖身率**。"""
+
+    def _seed_prices(self, session, dates: list[date], n_stocks: int = 4, prefix: int = 1000):
+        for d in dates:
+            for i in range(n_stocks):
+                px = 100.0 + i
+                session.add(
+                    DailyPrice(
+                        stock_id=f"{prefix + i}",
+                        date=d,
+                        open=px,
+                        high=px + 1,
+                        low=px - 1,
+                        close=px,
+                        volume=1000,
+                        turnover=10000,
+                    )
+                )
+        session.flush()
+
+    def _seed_features(self, session, dates: list[date], *, n_stocks: int = 4, warm: bool):
+        """種特徵列；`warm=False` 模擬「列數滿額但 ma60/turnover_ma20 全 NULL」。"""
+        from src.data.schema import DailyFeature
+
+        for d in dates:
+            for i in range(n_stocks):
+                session.add(
+                    DailyFeature(
+                        stock_id=f"{1000 + i}",
+                        date=d,
+                        close=100.0,
+                        volume=1000,
+                        turnover=10000,
+                        ma20=100.0 if warm else None,
+                        ma60=100.0 if warm else None,
+                        turnover_ma20=10000.0 if warm else None,
+                    )
+                )
+        session.flush()
+
+    def _trading_days(self, n: int, start=date(2020, 1, 1)) -> list[date]:
+        out, d = [], start
+        while len(out) < n:
+            if d.weekday() < 5:
+                out.append(d)
+            d += timedelta(days=1)
+        return out
+
+    def test_unwarmed_columns_are_recomputed(self, db, monkeypatch):
+        """**核心回歸**：列數滿額但 `ma60` 全 NULL 的日期必須重算。
+
+        實測 2024-01-02 ~ 2024-02-20 共 29 個交易日中招——B1① 第一批回補範圍是
+        2024-01 起、特徵從該日起算故暖身不足；補完 2020–2023 價量後，舊的列數
+        判定看不出欄位是 NULL，於是永不重算（§6.5 #21d 的教訓在回補層重演）。
+        """
+        from src.data.pipeline import backfill_daily_features
+
+        days = self._trading_days(80)
+        self._seed_prices(db, days)
+        broken = days[70:75]  # 遠離暖身豁免區
+        self._seed_features(db, [d for d in days if d not in broken], warm=True)
+        self._seed_features(db, broken, warm=False)
+
+        res = backfill_daily_features(days[0], days[-1], min_stocks_per_day=1, dry_run=True)
+        assert res["skipped_dates"] == len(days) - len(broken)
+
+    def test_warm_days_are_skipped(self, db, monkeypatch):
+        from src.data.pipeline import backfill_daily_features
+
+        days = self._trading_days(80)
+        self._seed_prices(db, days)
+        self._seed_features(db, days, warm=True)
+
+        res = backfill_daily_features(days[0], days[-1], min_stocks_per_day=1, dry_run=True)
+        assert res["skipped_dates"] == len(days), "欄位齊全的日期不得重算"
+
+    def test_earliest_window_is_exempt(self, db, monkeypatch):
+        """**反向核心回歸**：全表最早那批 `ma60` 天生填不滿，不得每次都重算。
+
+        沒有更早的資料可暖身，套用門檻會讓它們變成永遠的待補項——與本項要修的
+        「永遠重抓」是同一種病，方向相反。
+        """
+        from src.constants import FEATURE_WARMUP_EXEMPT_TRADING_DAYS
+        from src.data.pipeline import backfill_daily_features
+
+        days = self._trading_days(FEATURE_WARMUP_EXEMPT_TRADING_DAYS + 20)
+        self._seed_prices(db, days)
+        # 最早 60 天欄位為 NULL（真實暖身），其餘齊全
+        exempt = days[:FEATURE_WARMUP_EXEMPT_TRADING_DAYS]
+        self._seed_features(db, exempt, warm=False)
+        self._seed_features(db, days[FEATURE_WARMUP_EXEMPT_TRADING_DAYS:], warm=True)
+
+        res = backfill_daily_features(days[0], days[-1], min_stocks_per_day=1, dry_run=True)
+        assert res["skipped_dates"] == len(days), "暖身豁免區間內不得因欄位 NULL 而重算"
+
+    def test_row_shortfall_still_detected(self, db, monkeypatch):
+        """列數判定不得因新增欄位判定而失效（既有 §10 缺陷的守門）。"""
+        from src.data.pipeline import backfill_daily_features
+
+        days = self._trading_days(80)
+        self._seed_prices(db, days, n_stocks=10)
+        self._seed_features(db, days, n_stocks=10, warm=True)
+        # 事後補進另一批股票的價量，使那 5 天的既有特徵覆蓋率掉到 10/20
+        self._seed_prices(db, days[70:75], n_stocks=10, prefix=6000)
+
+        res = backfill_daily_features(days[0], days[-1], min_stocks_per_day=1, dry_run=True)
+        assert res["skipped_dates"] == len(days) - 5
