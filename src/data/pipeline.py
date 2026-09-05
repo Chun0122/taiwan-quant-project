@@ -1265,34 +1265,71 @@ def sync_watchlist(
 
 
 def _classify_security_type(stock_id: str, stock_name: str = "") -> str:
-    """從股票代號與名稱推斷有價證券類型（純函數）。
+    r"""從股票代號推斷有價證券類型（純函數，§6.6 #29）。
 
-    分類規則（優先順序）：
-    1. 6 位數字開頭 00：ETF（如 0050、00878）
-    2. 名稱含 ETF 字樣：ETF
-    3. 6 位數字：權證（warrant）
-    4. 名稱含「特」：特別股（preferred）
-    5. 其餘（4 位數字等）：普通股（stock）
+    `security_type == "stock"` 是 UniverseFilter Stage 1 的硬過濾條件之一
+    （`universe.py:_stage1_sql_filter`，**且該處不限 4 碼**），故本函數的每一個
+    誤判都會直接反映成「選股池混進不該有的標的」或「真股票被踢出去」。
+
+    ## 兩個實測到的舊缺陷（2026-09-05）
+
+    **① 帶字母尾碼的證券全部漏網成 `stock`**：舊規則要求 `len==6 and sid.isdigit()`
+    才判權證，於是 REIT（`01001T` 土銀富邦R1，8 檔）、ETN（`02001L` 富邦蘋果正二N，
+    6 檔）、認售權證（`73107P`，2 檔）、以及**類股指數與 `TAIEX` 加權指數**全部
+    被標成普通股。實測 `TAIEX` 確實通過 Stage 1（收盤 107,486、242 個交易日），
+    只因 `turnover=0` 才被 Stage 2 擋下；`02001L` 的 8 月均成交 19.3M 距門檻 30M
+    僅 1.5 倍——**擋住它們的是流動性門檻而非分類，是偶然不是設計**。
+
+    **② 名稱含「特」→ preferred 造成反向誤殺**：實測 **30 檔真普通股**中招
+    （`6907 雅特力-KY` 8 月均成交 413M、`6706 惠特` 216M、`4772 台特化` 147M、
+    `3289 宜特` 94M、`7740 熙特爾-創` 33M 等 5 檔流動性足以進 universe），
+    **它們每天都被排除在選股池之外**；同時真特別股 `2833A 台壽甲` 因名稱無「特」
+    而漏網判成 stock。改以**代號形態**判定後兩個方向一起解決——實查全表 40 檔
+    符合 `\d{4}[A-Za-z]\d?` 者確實全為特別股，無一例外。
+
+    ## 分類規則（順序有意義）
+
+    1. 非數字開頭 → `index`（`TAIEX`／`Semiconductor` 等類股指數）
+    2. `00` 開頭或名稱含 ETF → `etf`（含 `00713L` 槓桿、`00632R` 反向）
+    3. 4 碼數字 + 字母(+數字) → `preferred`（`2891A`／`2887Z1`）
+       **必須排在權證之前**——`2887Z1` 是 6 碼，會被權證規則吃掉
+    4. 6 碼且 `01` 開頭 → `reit`
+    5. 6 碼且 `02` 開頭 → `etn`
+    6. 6 碼且 `91`／`92` 開頭 → `dr`（存託憑證，如 `911868` 同方友友-DR）
+    7. 其餘 6 碼 → `warrant`
+    8. 其餘（4 碼數字等）→ `stock`
+
+    ⚠ 4 碼的存託憑證（`9103` 美德醫療-DR 等）**維持 `stock`**：改判會縮小 universe，
+    屬策略決定而非分類修正，另議。
 
     Args:
         stock_id: 股票代號
-        stock_name: 股票名稱（可選）
+        stock_name: 股票名稱（可選；只用於 ETF 的輔助判定）
 
     Returns:
-        "stock" / "etf" / "warrant" / "preferred"
+        "stock" / "etf" / "warrant" / "preferred" / "reit" / "etn" / "dr" / "index"
     """
     import re
 
     sid = str(stock_id).strip()
     name = str(stock_name or "").upper()
 
+    if not sid[:1].isdigit():
+        return "index"
     # 台股 ETF 代號皆以 "00" 開頭：0050、00878、00882、00991A、00715L 等
-    if re.match(r"^00", sid) or "ETF" in name:
+    if sid.startswith("00") or "ETF" in name:
         return "etf"
-    if len(sid) == 6 and sid.isdigit():
-        return "warrant"
-    if "特" in (stock_name or ""):
+    # 特別股：4 碼數字 + 字母(+數字)。勿改回「名稱含特」——那會誤殺「宜特/惠特」等真股票
+    if re.fullmatch(r"\d{4}[A-Za-z]\d?", sid):
         return "preferred"
+    if len(sid) == 6:
+        if sid.startswith("01"):
+            return "reit"
+        if sid.startswith("02"):
+            return "etn"
+        if sid[:2] in ("91", "92"):
+            return "dr"
+        return "warrant"
     return "stock"
 
 
@@ -2039,9 +2076,11 @@ def sync_delisting_info(fetcher: FinMindFetcher | None = None) -> int:
                         stock_id=sid,
                         stock_name=str(row.get("stock_name") or "") or None,
                         industry_category=None,
-                        # 讓 UniverseFilter 的 SQL 過濾不會直接排除它；
-                        # 實際可交易性由 delisted_date + 當日有無報價決定
-                        security_type="stock",
+                        # 讓 UniverseFilter 的 SQL 過濾不會直接排除普通股；
+                        # 實際可交易性由 delisted_date + 當日有無報價決定。
+                        # §6.6 #29：改走分類函數——下市清單裡也有權證/ETN/DR，
+                        # 一律寫死 "stock" 會把它們送進 Stage 1 母體。
+                        security_type=_classify_security_type(sid, str(row.get("stock_name") or "")),
                         delisted_date=dl_date,
                     )
                 )
@@ -2111,8 +2150,40 @@ def sync_stock_info(force_refresh: bool = False) -> int:
             session.execute(stmt)
         session.commit()
 
-    logger.info("[StockInfo] 已同步 %d 筆股票基本資料（含 security_type）", len(records))
+    n_fixed = reclassify_security_types()
+    logger.info("[StockInfo] 已同步 %d 筆股票基本資料（含 security_type，重分類修正 %d 筆）", len(records), n_fixed)
     return len(records)
+
+
+def reclassify_security_types() -> int:
+    """依現行規則重算全表 `security_type`（§6.6 #29，冪等）。
+
+    ## 為什麼不能只靠 `sync_stock_info` 的 upsert
+
+    upsert 只涵蓋 FinMind `TaiwanStockInfo` 回傳的清單，而 `stock_info` 還有
+    **另一個寫入來源**：`sync_delisting_info` 為「已從現行清單消失的下市股」新增列。
+    那條路徑的舊版寫死 `security_type="stock"`，且既有列不再更新——實測
+    `911613 特藝石油能源有限公司`（存託憑證）因此一直掛著 `stock`，`sync-info --force`
+    也修不掉它。
+
+    分類規則是純函數，重算成本是全表一次掃描（數千列），故每次 `sync_stock_info`
+    結尾都跑一次，讓分類永遠與規則同步——不必記得「改了規則要另外跑什麼」。
+
+    Returns:
+        實際被改寫的列數。
+    """
+    fixed = 0
+    with get_session() as session:
+        for info in session.execute(select(StockInfo)).scalars().all():
+            correct = _classify_security_type(info.stock_id, info.stock_name or "")
+            if info.security_type != correct:
+                info.security_type = correct
+                fixed += 1
+        if fixed:
+            session.commit()
+    if fixed:
+        logger.info("[StockInfo] security_type 重分類：修正 %d 筆", fixed)
+    return fixed
 
 
 def sync_taiex_index(

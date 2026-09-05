@@ -11,7 +11,7 @@
 - TestCandidateMemory (5):           _load_candidate_memory() DB 整合（含 days_ago）
 - TestMemoryDecay (4):               Candidate Memory 漸進衰減門檻
 - TestComputeAndStoreDailyFeatures (4): pipeline ETL 整合
-- TestClassifySecurityType (8):      _classify_security_type() 純函數
+- TestClassifySecurityType (20):     _classify_security_type() 純函數（含 §6.6 #29 誤分類回歸）
 - TestFilterLiquidityDualWindow (5): 雙窗口流動性確認（turnover_ma20 欄位）
 """
 
@@ -974,6 +974,65 @@ class TestClassifySecurityType:
     # --- 權證 ---
     def test_warrant_6digit(self):
         assert self._classify("123456") == "warrant"
+
+    def test_warrant_with_letter_suffix(self):
+        """§6.6 #29 核心回歸：認售權證帶字母尾碼，舊規則要求 isdigit() 故漏網成 stock。"""
+        assert self._classify("73107P", "原相國票9B售02") == "warrant"
+
+    # --- §6.6 #29：帶字母尾碼的證券不得漏網成 stock ---
+    def test_index_taiex(self):
+        """**最嚴重的漏網**：TAIEX 實測通過 Stage 1（收盤 107,486、242 個交易日），
+        只因 turnover=0 才被 Stage 2 擋下——擋住它的是流動性不是分類。"""
+        assert self._classify("TAIEX", "加權指數") == "index"
+
+    def test_index_sector(self):
+        assert self._classify("Semiconductor", "半導體類指數") == "index"
+        assert self._classify("Rubber", "橡膠類指數") == "index"
+
+    def test_reit(self):
+        assert self._classify("01001T", "土銀富邦R1") == "reit"
+
+    def test_etn(self):
+        """02001L 富邦蘋果正二N：8 月均成交 19.3M，距 Stage 2 門檻 30M 僅 1.5 倍。"""
+        assert self._classify("02001L", "富邦蘋果正二N") == "etn"
+
+    def test_dr_6digit(self):
+        assert self._classify("911868", "同方友友-DR") == "dr"
+
+    # --- §6.6 #29：特別股改用代號形態，不再看名稱含「特」---
+    def test_preferred_by_code_pattern(self):
+        assert self._classify("2891A", "中信特") == "preferred"
+        assert self._classify("8916A", "光隆甲特") == "preferred"
+
+    def test_preferred_6char_pattern_not_warrant(self):
+        """2887Z1 是 6 碼，特別股規則**必須**排在權證之前否則被吃掉。"""
+        assert self._classify("2887Z1", "台新新光己特") == "preferred"
+
+    def test_preferred_without_special_char_in_name(self):
+        """2833A 台壽甲：名稱無「特」字，舊規則漏網判成 stock。"""
+        assert self._classify("2833A", "台壽甲") == "preferred"
+
+    def test_real_stock_with_special_char_in_name_not_preferred(self):
+        """**核心回歸**：名稱含「特」的真普通股不得被判為特別股。
+
+        實測 30 檔中招，其中 5 檔流動性足以進 universe（雅特力-KY 8 月均成交
+        413M、惠特 216M、台特化 147M、宜特 94M、熙特爾-創 33M）——**它們每天
+        都被排除在選股池之外**，這是反向誤殺、且實際在發生。
+        """
+        for sid, name in [
+            ("6907", "雅特力-KY"),
+            ("6706", "惠特"),
+            ("4772", "台特化"),
+            ("3289", "宜特"),
+            ("7740", "熙特爾-創"),
+            ("6616", "特昇-KY"),
+            ("2908", "特力"),
+        ]:
+            assert self._classify(sid, name) == "stock", f"{sid} {name} 應為普通股"
+
+    def test_4digit_dr_stays_stock(self):
+        """4 碼 DR 維持 stock——改判會縮小 universe，屬策略決定非分類修正。"""
+        assert self._classify("9103", "美德醫療-DR") == "stock"
 
 
 # ────────────────────────────────────────────────────────────────────────────
