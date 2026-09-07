@@ -917,7 +917,26 @@ def compute_rotation_actions(
             shares = sell_action.get("shares", 0)
             available_cash += exit_p * shares * (1 - COMMISSION_RATE - TAX_RATE - SLIPPAGE_RATE)
 
-        per_position_capital = available_cash / max_positions if max_positions > 0 else 0
+        # ── 部位大小：目標等權 N 檔，現金不足時才退讓 ──
+        #
+        # ⚠ 分母是**空缺數**不是 `max_positions`。舊版寫 `available_cash / max_positions`，
+        # 只有「一次補滿全部部位」（起跑、crisis 清倉後）才正確；實務上最常見的
+        # 「換掉一檔、補一檔」只會投入可用現金的 1/N，其餘留在現金——而下次補空缺時
+        # 又只投 1/N，形成**自我強化的收縮螺旋**，曝險單調衰減且與策略好壞無關。
+        #
+        # 實測四個 live 組合都留下同一個指紋（首月→最近的平均曝險）：
+        #   mom3_20d 100%→20%／mom5_10d 78%→31%／mg5_20d 100%→50%／swing5_3d 76%→47%
+        # mom5_10d 在 2026-09-07 持股 5 檔（滿額）卻只有 22.4% 曝險、現金 826k 閒置，
+        # 同期 0050 漲 8pp 完全跟不上，alpha 因此掉到 −7.46%。
+        #
+        # `min(目標, 現金/空缺)` 的兩種情形：
+        #   • 現金充足 → 取目標部位（維持等權 N 檔的設計意圖）
+        #   • 現金不足 → 取可用現金平均分配到空缺（不透支）
+        target_capital = (
+            total_capital / max_positions if total_capital and total_capital > 0 and max_positions > 0 else 0.0
+        )
+        cash_per_slot = available_cash / free_slots if free_slots > 0 else 0.0
+        per_position_capital = min(target_capital, cash_per_slot) if target_capital > 0 else cash_per_slot
         per_position_capital *= drawdown_scale  # Drawdown Guard 縮減
 
         # ── Portfolio Heat：計算當前組合風險 ──

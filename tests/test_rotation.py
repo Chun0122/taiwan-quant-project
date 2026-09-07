@@ -2401,3 +2401,150 @@ class TestCostBreakdownMetrics:
             "cost_per_turnover_bps",
         }
         assert required.issubset(m.keys())
+
+
+# ===========================================================================
+# 部位大小：等權 N 檔（§7 sizing 修復）
+# ===========================================================================
+
+
+class TestPositionSizing:
+    """補空缺時的部位大小必須是「目標等權部位」，不是「可用現金 / max_positions」。
+
+    ## 這段邏輯原本零測試守門，實測造成 live 曝險單調衰減
+
+    舊版 `per_position_capital = available_cash / max_positions` 只有在「一次補滿
+    全部部位」（起跑、crisis 清倉後）時才正確。實務上最常見的「換掉一檔、補一檔」
+    只會投入可用現金的 1/N，其餘留在現金——下次補空缺又只投 1/N，形成**自我強化的
+    收縮螺旋**，且與策略好壞完全無關。
+
+    2026-09-07 實測四個 live 組合的平均曝險（首月 → 最近）留下同一指紋：
+    mom3_20d 100%→20%／mom5_10d 78%→31%／mg5_20d 100%→50%／swing5_3d 76%→47%。
+    mom5_10d 當日持股 5 檔（滿額）卻只有 22.4% 曝險、826k 現金閒置，同期 0050
+    漲 8pp 完全跟不上，alpha 掉到 −7.46%。
+
+    ⚠ 修好**不會創造 alpha**（§6.6 #26 已證明五模式毛超額為零），只是讓系統做它
+    設計要做的事——等權 N 檔；同時也會等比放大虧損。
+    """
+
+    def _fill_one_slot(self, cash: float, n_held: int = 4, max_positions: int = 5, held_capital: float = 100_000.0):
+        """n_held 檔續抱 + 補滿空缺；回傳 (actions, total_capital)。"""
+        held = [
+            _make_position(f"{1000 + i}", date(2025, 1, 2), allocated_capital=held_capital, entry_rank=i + 1)
+            for i in range(n_held)
+        ]
+        # 續抱者仍在榜（不被替換），其後接候選新股
+        rankings = _make_rankings([(f"{1000 + i}", 100.0) for i in range(n_held)])
+        rankings += _make_rankings(
+            [(f"{9000 + j}", 50.0) for j in range(max_positions - n_held)], start_rank=n_held + 1
+        )
+        total_capital = cash + n_held * held_capital
+        actions = compute_rotation_actions(
+            current_positions=held,
+            new_rankings=rankings,
+            max_positions=max_positions,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=cash,
+            today_prices={r["stock_id"]: r["close"] for r in rankings},
+            total_capital=total_capital,
+        )
+        return actions, total_capital
+
+    def test_single_slot_gets_full_target_position(self):
+        """**核心回歸**：只缺 1 檔時投入「目標部位」而非「可用現金 / max_positions」。
+
+        舊版在此情境只投入 500,000/5 = 100,000（現金的 20%），400,000 閒置。
+        """
+        actions, total_capital = self._fill_one_slot(cash=500_000)
+        assert len(actions.to_buy) == 1
+        target = total_capital / 5  # 900,000 / 5 = 180,000
+        assert actions.to_buy[0]["allocated_capital"] == pytest.approx(target, rel=0.01)
+        assert actions.to_buy[0]["allocated_capital"] > 500_000 / 5 * 1.5, "不得退回 available_cash/max_positions"
+
+    def test_two_slots_each_get_target(self):
+        actions, total_capital = self._fill_one_slot(cash=500_000, n_held=3)
+        assert len(actions.to_buy) == 2
+        target = total_capital / 5  # 800,000 / 5 = 160,000
+        for b in actions.to_buy:
+            assert b["allocated_capital"] == pytest.approx(target, rel=0.01)
+
+    def test_cold_start_unchanged(self):
+        """全空補滿是舊版唯一正確的情境，行為必須不變（等權 1/N）。"""
+        actions, total_capital = self._fill_one_slot(cash=1_000_000, n_held=0)
+        assert len(actions.to_buy) == 5
+        for b in actions.to_buy:
+            assert b["allocated_capital"] == pytest.approx(1_000_000 / 5, rel=0.01)
+
+    def test_insufficient_cash_falls_back_to_cash_per_slot(self):
+        """現金不足目標部位時退回「可用現金 / 空缺數」，不得透支。"""
+        # 4 檔各 500k → total 2.05M，目標 410k，但現金只有 50k
+        actions, _ = self._fill_one_slot(cash=50_000, held_capital=500_000)
+        assert len(actions.to_buy) == 1
+        assert actions.to_buy[0]["allocated_capital"] <= 50_000 * 1.01, "不得超過可用現金"
+
+    def test_drawdown_scale_still_applies(self):
+        """Drawdown Guard 的縮減必須疊在目標部位之上（不得被本修復抵銷）。"""
+        held = [_make_position(f"{1000 + i}", date(2025, 1, 2), entry_rank=i + 1) for i in range(4)]
+        rankings = _make_rankings([(f"{1000 + i}", 100.0) for i in range(4)])
+        rankings += _make_rankings([("9000", 50.0)], start_rank=5)
+        kw = dict(
+            current_positions=held,
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000,
+            today_prices={r["stock_id"]: r["close"] for r in rankings},
+            total_capital=900_000,
+        )
+        full = compute_rotation_actions(**kw)
+        halved = compute_rotation_actions(**kw, drawdown_pct=7.5, drawdown_stop_threshold=15.0)
+        assert full.to_buy and halved.to_buy
+        assert halved.to_buy[0]["allocated_capital"] < full.to_buy[0]["allocated_capital"] * 0.6
+
+    def test_exposure_does_not_decay_over_rotations(self):
+        """**行為級守門**：反覆換股不得讓曝險單調衰減。
+
+        舊版每輪只投入現金的 1/N，模擬 6 輪後曝險會從 100% 一路掉到 50% 以下。
+        """
+        max_pos, target_each = 5, 200_000.0
+        holdings = [
+            _make_position(f"{1000 + i}", date(2025, 1, 2), allocated_capital=target_each, entry_rank=i + 1)
+            for i in range(max_pos)
+        ]
+        cash = 0.0
+        for rnd in range(6):
+            # 每輪賣掉最後一檔（平價出場，資金全數回收）並補一檔新的
+            sold = holdings.pop()
+            cash += sold["allocated_capital"]
+            total_capital = cash + sum(h["allocated_capital"] for h in holdings)
+            rankings = _make_rankings([(h["stock_id"], 100.0) for h in holdings])
+            rankings += _make_rankings([(f"{9000 + rnd}", 100.0)], start_rank=max_pos)
+            actions = compute_rotation_actions(
+                current_positions=holdings,
+                new_rankings=rankings,
+                max_positions=max_pos,
+                holding_days=10,
+                allow_renewal=True,
+                today=date(2025, 1, 6),
+                trading_calendar=TRADING_CAL,
+                current_cash=cash,
+                today_prices={r["stock_id"]: r["close"] for r in rankings},
+                total_capital=total_capital,
+            )
+            assert actions.to_buy, f"第 {rnd + 1} 輪應補進 1 檔"
+            bought = actions.to_buy[0]["allocated_capital"]
+            cash -= bought
+            holdings.append(
+                _make_position(f"{9000 + rnd}", date(2025, 1, 6), allocated_capital=bought, entry_rank=max_pos)
+            )
+
+        exposure = sum(h["allocated_capital"] for h in holdings) / (
+            cash + sum(h["allocated_capital"] for h in holdings)
+        )
+        assert exposure > 0.95, f"6 輪換股後曝險掉到 {exposure:.1%}（舊版會單調衰減）"
