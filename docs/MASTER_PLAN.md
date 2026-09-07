@@ -264,6 +264,7 @@ R1 歷史裁決重審 ✅2026-07-08（無翻案；報告 `logs/r1_20260708/REPOR
 ### 確認的 bug / 死碼（已驗證）
 | 項目 | 位置 | 狀態 |
 |------|------|------|
+| ★★ **輪動部位大小用「可用現金 ÷ max_positions」而非「目標等權部位」**：只有「一次補滿全部部位」時正確；「換掉一檔補一檔」只投入可用現金的 1/N，其餘閒置，下次又只投 1/N ⇒ **自我強化的收縮螺旋**。四個 live 組合留下同一指紋（首月→最近平均曝險）：mom3_20d 100%→20%／mom5_10d 78%→31%／mg5_20d 100%→50%／swing5_3d 76%→47%。mom5_10d 於 2026-09-07 持股 5 檔（滿額）卻只有 **22.4% 曝險**、826k 現金閒置，同期 0050 漲 8pp 完全跟不上，alpha 掉到 **−7.46%**。**live 與 backtest 共用同一路徑**（`manager.decide` / `manager.backtest`），故歷史回測的曝險亦被系統性低估 | `rotation.py:compute_rotation_actions` | ✅ 2026-09-07 已修（改 `min(總資本/max_positions, 可用現金/空缺數)`；**原本零測試守門**，故新增 `tests/test_rotation.py::TestPositionSizing`(6) 含行為級的「反覆換股不得使曝險衰減」）。⚠ 修好**不創造 alpha**（§6.6 #26 已證明五模式毛超額為零），只是讓系統做設計要做的事，同時等比放大虧損；**所有 rotation 回測結論需重跑對照**（含 swing5_3d 暫停、mg5_20d 降級的依據） |
 | ★ **`security_type` 誤分類雙向污染 universe**：帶字母尾碼的 REIT/ETN/認售權證/類股指數/`TAIEX` 漏網成 `stock`；名稱含「特」使 **30 檔真普通股**被判 preferred 而**每天排除在選股池外**（5 檔流動性足以進 universe） | `pipeline.py:_classify_security_type` | ✅ 2026-09-05 已修（§6.6 #29，改依代號形態 + `reclassify_security_types()` 全表重算） |
 | `Announcement.title` 欄位不存在 | `pipeline.py:1802` | ✅ 2026-07-05 已修復（`subject` + smoke test） |
 | `backup_db()` 零呼叫者 | `database.py` | ✅ 2026-07-05 已接上 morning-routine Step 18 |
