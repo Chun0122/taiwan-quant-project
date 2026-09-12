@@ -150,6 +150,18 @@ python main.py rotation preview --name swing5_3d                # 預覽單一�
 python main.py rotation preview --all                            # 預覽所有 active 組合
 python main.py rotation preview --name swing5_3d --date 2026-05-20  # 指定決策日
 
+# 一次性補倉（rotation topup）：把既有持倉補到目標等權部位（total_capital / max_positions）
+# 用途：2026-09-07 修好 sizing 後（見 constants.ACTION_TYPE_TOPUP），修復只作用在新買入，
+#      既有的萎縮部位要等自然換手才會重建。此指令把殘留缺口一次補平。
+# T+1：以決策日收盤估算規劃股數，寫 pending 買單，次一交易日 fill_pending 以開盤成交並重算股數。
+# ⚠ 不是常態 rebalance，不掛進 morning-routine；只在已知的一次性事件後手動執行。
+python main.py rotation topup --all --dry-run          # 先看計畫（不寫 DB）
+python main.py rotation topup --all                    # 建立補倉單
+python main.py rotation topup --name mom5_10d --date 2026-09-11
+# 冪等：重跑會撤掉尚未成交的舊補倉單再重寫；補完後再跑因缺口消失而回 0 筆。
+# 缺口 < 目標 × TOPUP_MIN_GAP_RATIO(5%) 不補（避免零碎單）；現金不足時按缺口等比縮減。
+# 成交後 ActionLog 類型為 `topup`（非 `open`）——加碼既有部位，持有時鐘與停損不變。
+
 # 查詢
 python main.py rotation status --name mom5_3d
 python main.py rotation status --all

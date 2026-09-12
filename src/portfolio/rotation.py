@@ -33,6 +33,7 @@ from src.constants import (
     SLIPPAGE_RATE,
     SLIPPAGE_SPREAD_WEIGHT,
     TAX_RATE,
+    TOPUP_MIN_GAP_RATIO,
 )
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1083,95 @@ def compute_rotation_actions(
 
     actions.holding_expired_sells = weekly_swaps_this_call
     return actions
+
+
+# ---------------------------------------------------------------------------
+# 補倉（target-weight top-up）
+# ---------------------------------------------------------------------------
+
+
+def compute_topup_orders(
+    positions: list[dict],
+    prices: dict[str, float],
+    total_capital: float,
+    max_positions: int,
+    available_cash: float,
+    *,
+    min_gap_ratio: float = TOPUP_MIN_GAP_RATIO,
+) -> list[dict]:
+    """把既有持倉補到目標等權部位所需的買單（純函數）。
+
+    目標部位與 `compute_rotation_actions` 的 sizing 同式：`total_capital / max_positions`。
+    缺口 = 目標 − 目前市值；現金不足時**按缺口比例等比縮減**（而非先來後到），
+    使補完後各部位仍維持等權關係。
+
+    ⚠ 這是一次性維護路徑，不是常態 rebalance——2026-09-07 的 sizing 修復之後，
+    每筆新買入都已是目標部位，不存在持續漂移來源。詳 `constants.ACTION_TYPE_TOPUP`。
+
+    Parameters
+    ----------
+    positions : list[dict]
+        目前 open 持倉，每筆至少含 {stock_id, shares}。
+    prices : dict[str, float]
+        決策日收盤價 {stock_id: close}。無報價的持倉直接略過（無法定價）。
+    total_capital : float
+        組合總資本（current_capital）。
+    max_positions : int
+        最大持股數，決定目標等權部位。
+    available_cash : float
+        可動用現金。所有 allocated_capital 合計不超過此值（`compute_shares` 另從
+        allocated_capital 內扣手續費與滑價，故不會透支）。
+    min_gap_ratio : float
+        缺口 < 目標部位 × 此比例即不補，避免價格波動造成的零碎單。
+
+    Returns
+    -------
+    list[dict]
+        每筆 {stock_id, shares, ref_price, allocated_capital, target_capital,
+        current_value, gap}；`shares` 為以 ref_price 估算的規劃股數，實際成交股數
+        由 fill 端以成交日 open 重算。無缺口時回傳空 list。
+    """
+    if total_capital <= 0 or max_positions <= 0 or available_cash <= 0 or not positions:
+        return []
+
+    target = total_capital / max_positions
+    gaps: list[dict] = []
+    for pos in positions:
+        sid = pos["stock_id"]
+        price = prices.get(sid, 0.0)
+        shares_held = pos.get("shares", 0)
+        if price <= 0 or shares_held <= 0:
+            continue
+        current_value = shares_held * price
+        gap = target - current_value
+        if gap < target * min_gap_ratio:
+            continue
+        gaps.append(
+            {
+                "stock_id": sid,
+                "stock_name": pos.get("stock_name", ""),
+                "ref_price": price,
+                "current_value": current_value,
+                "target_capital": target,
+                "gap": gap,
+            }
+        )
+
+    total_gap = sum(g["gap"] for g in gaps)
+    if total_gap <= 0:
+        return []
+
+    # 現金不足時等比縮減，使補完後各部位維持等權關係（非先來後到）
+    scale = min(1.0, available_cash / total_gap)
+
+    orders: list[dict] = []
+    for g in gaps:
+        alloc = g["gap"] * scale
+        shares = compute_shares(alloc, g["ref_price"])
+        if shares <= 0:
+            continue
+        orders.append({**g, "allocated_capital": alloc, "shares": shares})
+    return orders
 
 
 # ---------------------------------------------------------------------------

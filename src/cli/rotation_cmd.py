@@ -60,7 +60,9 @@ def cmd_rotation(args: argparse.Namespace) -> None:
     init_db()
     action = getattr(args, "action", None)
     if not action:
-        print("使用方式: python main.py rotation {create|update|status|history|backtest|list|pause|resume|delete}")
+        print(
+            "使用方式: python main.py rotation {create|update|status|history|backtest|list|preview|topup|pause|resume|delete}"
+        )
         return
 
     from src.portfolio.manager import RotationManager
@@ -229,6 +231,30 @@ def cmd_rotation(args: argparse.Namespace) -> None:
             _print_rotation_preview(name, actions, target_date=target_date)
         else:
             print("請指定 --name 或 --all")
+
+    elif action == "topup":
+        from datetime import date as date_type
+
+        date_arg = getattr(args, "date", None)
+        decision_date = date_type.fromisoformat(date_arg) if date_arg else None
+        dry_run = getattr(args, "dry_run", False)
+        all_active = getattr(args, "all", False)
+        name = getattr(args, "name", None)
+
+        if all_active:
+            targets = [p["name"] for p in RotationManager.list_portfolios() if p["status"] == "active"]
+            if not targets:
+                print("無 active 的輪動組合")
+                return
+        elif name:
+            targets = [name]
+        else:
+            print("請指定 --name 或 --all")
+            return
+
+        for target in targets:
+            summary = RotationManager(target).plan_topup(decision_date=decision_date, dry_run=dry_run)
+            _print_rotation_topup(target, summary, dry_run=dry_run)
 
     elif action == "cost-attribution":
         from datetime import date as date_type
@@ -512,3 +538,28 @@ def _print_rotation_preview(name: str, actions, target_date) -> None:
 
     print()
     print("  ※ DRY RUN：未實際寫入 DB；要執行請改 `rotation update --name {}`。".format(name))
+
+
+def _print_rotation_topup(name: str, summary: dict | None, *, dry_run: bool) -> None:
+    """列印補倉計畫（rotation topup）。"""
+    if summary is None:
+        print(f"\n[{name}] 找不到組合或非 active（非 active 掛單永遠不會成交，故不建立）")
+        return
+    orders = summary["orders"]
+    tag = "（DRY RUN，未寫入）" if dry_run else ""
+    print(f"\n[{name}] 補倉計畫 {summary['decision_date']}{tag}")
+    print(f"  目標部位 {summary['target_capital']:,.0f} × N | 可用現金 {summary['cash_before']:,.0f}")
+    if not orders:
+        print("  無缺口（或現金不足以構成任何一筆），不建立補倉單")
+        return
+    print(f"  {'股票':<8}{'現值':>12}{'目標':>12}{'缺口':>12}{'規劃股數':>10}{'投入':>12}")
+    for o in orders:
+        print(
+            f"  {o['stock_id']:<8}{o['current_value']:>12,.0f}{o['target_capital']:>12,.0f}"
+            f"{o['gap']:>12,.0f}{o['shares']:>10,}{o['allocated_capital']:>12,.0f}"
+        )
+    print(
+        f"  合計投入 {summary['notional']:,.0f}｜曝險 {summary['exposure_before'] * 100:.1f}% → {summary['exposure_after'] * 100:.1f}%"
+    )
+    if not dry_run:
+        print("  已寫入 pending 買單，次一交易日 fill_pending 以開盤價成交（股數屆時重算）")

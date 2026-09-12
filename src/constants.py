@@ -456,3 +456,19 @@ DECIDE_STAGE_ACTION_TYPES: tuple[str, ...] = (ACTION_TYPE_PENDING_BUY, ACTION_TY
 # A3 股利會計：持倉除息入帳的 ActionLog 類型（同時作為同日冪等入帳標記，
 # 與現金更新同一 transaction —— decide/fill 的冪等刪除範圍皆不含此型）
 ACTION_TYPE_DIVIDEND: str = "dividend"
+
+# ── 補倉（target-weight top-up）：一次性修復 sizing bug 殘留的曝險缺口 ──
+#
+# 背景：`compute_rotation_actions` 舊版部位大小以 `available_cash / max_positions`
+# 計算（分母是 max_positions 而非空缺數），形成自我強化的收縮螺旋（2026-09-07
+# 修復，見 rotation.py 該處註解）。修復只作用在**新買入**，既有的萎縮部位得等
+# 到自然換手才會重建，期間組合以遠低於設計的曝險運行（實測 mom3_20d 7.1%、
+# mom5_10d 22.3%）。補倉是把既有持倉一次補到目標等權的維護路徑。
+#
+# ⚠ 這**不是**常態 rebalance：修復後每筆新買入都已是目標部位，不存在持續漂移
+# 來源，故補倉只在「已知的一次性事件後」手動執行，不掛進 morning-routine。
+ACTION_TYPE_TOPUP: str = "topup"  # 補倉成交（加碼既有持倉，非新開倉）
+ACTION_TYPE_PENDING_TOPUP: str = "pending_topup"  # 補倉待成交意圖（decide 冪等刪除範圍之外）
+PENDING_REASON_TOPUP: str = "topup"  # RotationPendingOrder.reason 的補倉標記（買單唯一會帶 reason 的情形）
+# 缺口 < 目標部位 × 此比例即不補（避免價格波動造成的零碎單）
+TOPUP_MIN_GAP_RATIO: float = 0.05
