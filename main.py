@@ -958,6 +958,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp_rpv.add_argument("--all", action="store_true", help="預覽所有 active 組合")
     sp_rpv.add_argument("--date", default=None, help="目標日期 (YYYY-MM-DD)，預設今日")
 
+    # rotation topup（一次性補倉：既有持倉補到目標等權，修 sizing bug 的曝險殘留）
+    sp_rtu = rot_sub.add_parser(
+        "topup",
+        help="一次性補倉至目標等權（寫 pending 買單，次一交易日開盤成交）",
+    )
+    sp_rtu.add_argument("--name", default=None, help="指定組合名稱")
+    sp_rtu.add_argument("--all", action="store_true", help="對所有 active 組合建立補倉單")
+    sp_rtu.add_argument("--date", default=None, help="決策日 (YYYY-MM-DD)，預設 DB 最後一個交易日")
+    sp_rtu.add_argument("--dry-run", action="store_true", help="只計算不寫入")
+
     # rotation cost-attribution（實盤 RotationPosition 成本歸因 — 5/29 audit alpha 拖累驗證）
     sp_rca = rot_sub.add_parser(
         "cost-attribution", help="實盤成本歸因（手續費/交易稅/滑價 + 累計周轉 + bps per turnover）"

@@ -129,7 +129,7 @@ def _build_discover(target_date: _dt.date, top_n: int) -> dict[str, list[dict]]:
 def _serialize_action_log_row(row: RotationActionLog) -> dict:
     """RotationActionLog → dashboard today_actions 單筆。"""
     return {
-        "action_type": row.action_type,  # open / close / renew / hold
+        "action_type": row.action_type,  # open / close / topup / renew / hold / pending_*
         "reason": row.reason,
         "is_risk_exit": bool(row.is_risk_exit),
         "switch_group": row.switch_group,
@@ -146,11 +146,20 @@ def _serialize_action_log_row(row: RotationActionLog) -> dict:
 def _build_today_actions(target_date: _dt.date) -> dict[str, list[dict]]:
     """撈 target_date 當日各 portfolio 的操作明細，回傳 {portfolio_name: [action, ...]}。
 
-    排序：成交（open → close）→ 明日預定（pending_sell → pending_buy）→
-    renew → hold，同類型內依 stock_id，讓 UI 呈現穩定。
+    排序：成交（open → close → topup）→ 明日預定（pending_sell → pending_buy →
+    pending_topup）→ renew → hold，同類型內依 stock_id，讓 UI 呈現穩定。
     A2 T+1 後同一天可能同時有「今晨成交」與「明日預定」兩組；未知類型排最後不炸。
     """
-    order = {"open": 0, "close": 1, "pending_sell": 2, "pending_buy": 3, "renew": 4, "hold": 5}
+    order = {
+        "open": 0,
+        "close": 1,
+        "topup": 2,
+        "pending_sell": 3,
+        "pending_buy": 4,
+        "pending_topup": 5,
+        "renew": 6,
+        "hold": 7,
+    }
     out: dict[str, list[dict]] = {}
     with get_session() as session:
         rows = (

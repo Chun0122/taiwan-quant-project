@@ -1617,6 +1617,31 @@ python main.py rotation update --name mom5_3d --force  # 強制重跑（繞過�
 > （避免排名/價格變動導致二次交易）。人工修復或回補情境請加 `--force`。
 > `morning-routine` 亦有檔案鎖：偵測到另一個執行中的 routine 會直接退出。
 
+**一次性補倉（`rotation topup`）：**
+
+把既有持倉補到目標等權部位（`總資本 / max_positions`）。
+
+```bash
+python main.py rotation topup --all --dry-run   # 先看計畫（不寫 DB）
+python main.py rotation topup --all             # 建立補倉單
+python main.py rotation topup --name mom5_10d --date 2026-09-11
+```
+
+> **什麼時候用**：2026-09-07 修好部位大小的收縮螺旋後，修復只作用在**新買入**，
+> 既有的萎縮部位要等自然換手（平均 3~4 週）才會重建。此指令把殘留缺口一次補平。
+>
+> **這不是常態 rebalance**：修好之後每筆新買入都已是目標部位，不存在持續漂移來源，
+> 所以它不掛進 morning-routine，只在已知的一次性事件後手動執行。
+>
+> 走與 `update` 相同的 T+1 路徑：以決策日收盤估算規劃股數 → 寫 pending 買單 →
+> 次一交易日 `fill_pending` 以**開盤價**成交並重算股數。成交後是**加碼既有部位**
+> （股數相加、進場價取加權平均），`entry_date`／`planned_exit_date`／`stop_loss`
+> 一律不動——持有時鐘與停損屬於原始進場，補倉不該重設它們。
+>
+> 缺口 < 目標 × 5% 不補（避免零碎單）；現金不足時按缺口等比縮減；重跑會取代
+> 尚未成交的舊補倉單。ActionLog 類型為 `topup`（不是 `open`），故交易統計與
+> 換股標記都不會把它算成新開倉。
+
 **查看狀態 / 歷史：**
 
 ```bash

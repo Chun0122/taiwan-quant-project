@@ -18,12 +18,16 @@ from src.constants import (
     ACTION_TYPE_DIVIDEND,
     ACTION_TYPE_PENDING_BUY,
     ACTION_TYPE_PENDING_SELL,
+    ACTION_TYPE_PENDING_TOPUP,
+    ACTION_TYPE_TOPUP,
     COMMISSION_RATE,
     COMPOSITE_MODES,
     DECIDE_STAGE_ACTION_TYPES,
     LIQUIDITY_PARTICIPATION_LIMIT,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
     PENDING_BUY_TTL_TRADING_DAYS,
+    PENDING_REASON_TOPUP,
+    PENDING_SIDE_BUY,
     PENDING_STATUS_CANCELLED,
     PENDING_STATUS_FILLED,
     PENDING_STATUS_PENDING,
@@ -77,6 +81,7 @@ from src.portfolio.rotation import (
     compute_position_pnl,
     compute_rotation_actions,
     compute_shares,
+    compute_topup_orders,
     compute_vol_inverse_weights,
     detect_limit_price,
 )
@@ -879,6 +884,10 @@ class RotationManager:
             held_sids = {p["stock_id"] for p in self._load_open_positions(session, portfolio.id)}
             bought_today: set[str] = set()
             for order in buys:
+                # 補倉單（reason=topup）的持倉條件**與一般買單相反**：它加碼既有部位，
+                # 故「已持倉」是前提而非重複。反之若該持倉已不在（例如今晨的停損賣單
+                # 先成交了），補倉單即失效——絕不可退化成開新倉，那會是計畫外的進場。
+                is_topup = order.reason == PENDING_REASON_TOPUP
                 # TTL：逾期買單一律取消（決策已過期），不論當日是否有報價
                 elapsed_tds = sum(1 for d in trading_cal if order.decision_date < d <= exec_day)
                 if elapsed_tds > PENDING_BUY_TTL_TRADING_DAYS:
@@ -892,7 +901,17 @@ class RotationManager:
                         PENDING_BUY_TTL_TRADING_DAYS,
                     )
                     continue
-                if order.stock_id in held_sids or order.stock_id in bought_today:
+                if is_topup and order.stock_id not in held_sids:
+                    if not dry_run:
+                        order.status = PENDING_STATUS_CANCELLED
+                    cancelled += 1
+                    logger.warning(
+                        "[%s] 補倉單 %s 的持倉已不存在（今晨已出場），取消",
+                        self.portfolio_name,
+                        order.stock_id,
+                    )
+                    continue
+                if (order.stock_id in held_sids and not is_topup) or order.stock_id in bought_today:
                     if not dry_run:
                         order.status = PENDING_STATUS_CANCELLED
                     cancelled += 1
@@ -967,6 +986,7 @@ class RotationManager:
                     cash,
                     slippage=buy_slip,
                     daily_volume=ohlcv.get("volume"),
+                    topup=is_topup,
                 )
                 if cash_after == cash:
                     # _execute_buy 內 reshrink 後 shares<=0 → 未成交（現金不足）
@@ -981,8 +1001,8 @@ class RotationManager:
                 filled += 1
                 fill_rows.append(
                     {
-                        "action_type": "open",
-                        "reason": None,
+                        "action_type": ACTION_TYPE_TOPUP if is_topup else "open",
+                        "reason": order.reason,
                         "stock_id": order.stock_id,
                         "stock_name": order.stock_name,
                         "shares": shares,
@@ -1029,6 +1049,161 @@ class RotationManager:
                 portfolio.current_capital,
             )
             return {"filled": filled, "cancelled": cancelled, "deferred": deferred, "dividends": n_dividends}
+
+    def plan_topup(
+        self,
+        decision_date: date | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict | None:
+        """一次性補倉：把既有持倉補到目標等權，寫成 D+1 開盤成交的 pending 買單。
+
+        **用途**：2026-09-07 修好 `compute_rotation_actions` 的部位大小後（見
+        `constants.ACTION_TYPE_TOPUP`），修復只作用在新買入，既有的萎縮部位得等自然
+        換手才會重建。此方法把殘留缺口一次補平，不必等 3~4 週的輪替。
+
+        **不是常態 rebalance**：修復後每筆新買入都已是目標部位，不存在持續漂移來源，
+        故本方法只在已知的一次性事件後手動執行，不掛進 morning-routine。
+
+        **T+1 一致**：與 `decide()` 同規格——以 decision_date 的收盤價估算規劃股數，
+        寫入 `RotationPendingOrder`，由次一交易日的 `fill_pending()` 以 open 成交並
+        重算股數。不走任何「以收盤價當場成交」的捷徑（A2 紀律）。
+
+        **冪等**：重跑會先撤掉本組合尚未成交的舊補倉單再重寫，故同一天多次執行只會
+        留下一份計畫；補完後再跑則因缺口已消失而回傳 0 筆。
+
+        Parameters
+        ----------
+        decision_date : date | None
+            決策日（取該日收盤價）。None = DB 中最後一個交易日。
+        dry_run : bool
+            只計算不寫入。
+
+        Returns
+        -------
+        dict | None
+            {"orders": [...], "planned": n, "notional": float, "cash_before": float,
+             "exposure_before": float, "exposure_after": float, "decision_date": date}
+            ——組合不存在或非 active 時回傳 None。
+        """
+        with get_session() as session:
+            portfolio = self._load_portfolio(session)
+            if portfolio is None:
+                logger.warning("找不到組合: %s", self.portfolio_name)
+                return None
+            if portfolio.status != "active":
+                # fill_pending 對非 active 組合直接跳過，掛了單也永遠不會成交
+                logger.warning("組合 %s 非 active，不建立補倉單", self.portfolio_name)
+                return None
+
+            if decision_date is None:
+                from datetime import timedelta
+
+                cal = _get_trading_calendar(session, date.today() - timedelta(days=30), date.today())
+                if not cal:
+                    logger.warning("[%s] 查無交易日曆，無法決定補倉決策日", self.portfolio_name)
+                    return None
+                decision_date = cal[-1]
+
+            positions = self._load_open_positions(session, portfolio.id)
+            prices = _get_prices_on_date(session, [p["stock_id"] for p in positions], decision_date)
+            market_value = sum(prices.get(p["stock_id"], p["entry_price"]) * p["shares"] for p in positions)
+            capital = portfolio.current_capital or 0.0
+
+            orders = compute_topup_orders(
+                positions,
+                prices,
+                capital,
+                portfolio.max_positions,
+                portfolio.current_cash,
+            )
+            notional = sum(o["allocated_capital"] for o in orders)
+            summary = {
+                "orders": orders,
+                "planned": len(orders),
+                "notional": notional,
+                "cash_before": portfolio.current_cash,
+                "exposure_before": market_value / capital if capital > 0 else 0.0,
+                "exposure_after": (market_value + notional) / capital if capital > 0 else 0.0,
+                "decision_date": decision_date,
+                "target_capital": capital / portfolio.max_positions if portfolio.max_positions > 0 else 0.0,
+            }
+            if dry_run or not orders:
+                logger.info(
+                    "[%s] %s補倉計畫（%s）：%d 筆 / %.0f 元，曝險 %.1f%% → %.1f%%",
+                    self.portfolio_name,
+                    "DRY RUN " if dry_run else "",
+                    decision_date,
+                    len(orders),
+                    notional,
+                    summary["exposure_before"] * 100,
+                    summary["exposure_after"] * 100,
+                )
+                return summary
+
+            # 冪等：撤掉本組合尚未成交的舊補倉單，再重寫（同日重跑只留一份計畫）
+            session.execute(
+                delete(RotationPendingOrder).where(
+                    RotationPendingOrder.portfolio_name == self.portfolio_name,
+                    RotationPendingOrder.status == PENDING_STATUS_PENDING,
+                    RotationPendingOrder.reason == PENDING_REASON_TOPUP,
+                )
+            )
+            session.execute(
+                delete(RotationActionLog).where(
+                    RotationActionLog.portfolio_name == self.portfolio_name,
+                    RotationActionLog.action_date == decision_date,
+                    RotationActionLog.action_type == ACTION_TYPE_PENDING_TOPUP,
+                )
+            )
+
+            pos_by_id = {p["stock_id"]: p for p in positions}
+            for o in orders:
+                pos = pos_by_id[o["stock_id"]]
+                session.add(
+                    RotationPendingOrder(
+                        portfolio_name=self.portfolio_name,
+                        decision_date=decision_date,
+                        side=PENDING_SIDE_BUY,
+                        stock_id=o["stock_id"],
+                        stock_name=pos.get("stock_name"),
+                        shares=o["shares"],
+                        ref_price=o["ref_price"],
+                        allocated_capital=o["allocated_capital"],
+                        reason=PENDING_REASON_TOPUP,
+                        entry_rank=pos.get("entry_rank"),
+                        entry_score=pos.get("entry_score"),
+                        stop_loss=pos.get("stop_loss"),
+                        status=PENDING_STATUS_PENDING,
+                    )
+                )
+                session.add(
+                    RotationActionLog(
+                        portfolio_name=self.portfolio_name,
+                        action_date=decision_date,
+                        action_type=ACTION_TYPE_PENDING_TOPUP,
+                        reason=PENDING_REASON_TOPUP,
+                        is_risk_exit=False,
+                        switch_group=None,
+                        stock_id=o["stock_id"],
+                        stock_name=pos.get("stock_name"),
+                        shares=o["shares"],
+                        price=o["ref_price"],
+                        entry_rank=pos.get("entry_rank"),
+                    )
+                )
+            session.commit()
+
+            logger.info(
+                "[%s] 補倉計畫（%s）：%d 筆 / %.0f 元，曝險 %.1f%% → %.1f%%（次一交易日開盤成交）",
+                self.portfolio_name,
+                decision_date,
+                len(orders),
+                notional,
+                summary["exposure_before"] * 100,
+                summary["exposure_after"] * 100,
+            )
+            return summary
 
     def _process_dividends(self, session, portfolio, exec_day: date, *, dry_run: bool) -> int:
         """持倉除息處理（A3）：現金入帳 + 停損價除息調整，回傳處理事件數。
@@ -1146,9 +1321,10 @@ class RotationManager:
         return processed
 
     def _write_fill_action_log(self, session, exec_day: date, fill_rows: list[dict]) -> None:
-        """fill 階段 ActionLog：寫實際成交的 open/close 列（冪等：只刪同日 open/close）。
+        """fill 階段 ActionLog：寫實際成交的 open/close/topup 列（冪等：只刪同日這三型）。
 
         不動同日 decide 階段的 pending_buy/pending_sell/renew/hold 列。
+        topup（補倉成交）不計入換股標記——它加碼既有部位，沒有對應的賣出。
         """
         if not fill_rows:
             return
@@ -1156,7 +1332,7 @@ class RotationManager:
             delete(RotationActionLog).where(
                 RotationActionLog.portfolio_name == self.portfolio_name,
                 RotationActionLog.action_date == exec_day,
-                RotationActionLog.action_type.in_(("open", "close")),
+                RotationActionLog.action_type.in_(("open", "close", ACTION_TYPE_TOPUP)),
             )
         )
         non_risk_sells = [
@@ -2867,12 +3043,20 @@ class RotationManager:
         cash: float,
         slippage: float = SLIPPAGE_RATE,
         daily_volume: float | None = None,
+        topup: bool = False,
     ) -> float:
         """執行買入：建立 RotationPosition 並扣減現金。
 
         P1-4：slippage 由 caller 以 compute_dynamic_slippage 計算；daily_volume 提供時
         以 apply_liquidity_limit 限制單筆量（≤ 當日量 × LIQUIDITY_PARTICIPATION_LIMIT），
         並寫入 pos.buy_slippage（與 backtest 對齊）。
+
+        topup=True 時**不建立新部位**，而是加碼既有 open 部位：股數相加、entry_price
+        與 buy_slippage 取股數加權平均、allocated_capital 與 trade_cost 累加。
+        entry_date / planned_exit_date / holding_days_count / stop_loss / entry_rank /
+        entry_score 一律不動——持有時鐘與進場理由屬於原始進場，補倉不該重設它們
+        （尤其 stop_loss：移動停損是另一個決策，不可當成補倉的副作用）。
+        呼叫端（fill_pending）保證此時持倉存在；查無持倉一律不成交，絕不退化成開新倉。
         """
         from src.portfolio.rotation import apply_liquidity_limit
 
@@ -2891,6 +3075,35 @@ class RotationManager:
             if shares <= 0:
                 return cash
             fill = simulate_buy(price, shares, slippage)
+
+        if topup:
+            existing = (
+                session.execute(
+                    select(RotationPosition).where(
+                        RotationPosition.portfolio_id == portfolio_id,
+                        RotationPosition.stock_id == buy["stock_id"],
+                        RotationPosition.status == "open",
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing is None:
+                logger.warning("[%s] 補倉 %s 查無 open 持倉，不成交", self.portfolio_name, buy["stock_id"])
+                return cash
+            merged_shares = existing.shares + shares
+            # 加權平均進場價：出場時的 pnl/return_pct 才會反映兩次買進的真實成本
+            existing.entry_price = (existing.entry_price * existing.shares + price * shares) / merged_shares
+            existing.buy_slippage = (
+                (existing.buy_slippage if existing.buy_slippage is not None else slippage) * existing.shares
+                + slippage * shares
+            ) / merged_shares
+            existing.shares = merged_shares
+            existing.allocated_capital = (existing.allocated_capital or 0.0) + buy.get(
+                "allocated_capital", fill.buy_cost
+            )
+            existing.trade_cost = round((existing.trade_cost or 0.0) + fill.costs.total, 2)
+            return cash - fill.buy_cost
 
         from src.portfolio.rotation import compute_planned_exit_date
 

@@ -77,6 +77,18 @@ class TestParserSmoke:
         args = build_parser().parse_args([])
         assert args.command is None
 
+    def test_rotation_topup_parses(self):
+        """rotation topup：一次性補倉的旗標與預設值。"""
+        parser = build_parser()
+        args = parser.parse_args(["rotation", "topup", "--all", "--dry-run"])
+        assert args.action == "topup"
+        assert args.all is True
+        assert args.dry_run is True
+        assert args.date is None
+        args = parser.parse_args(["rotation", "topup", "--name", "mom5_10d", "--date", "2026-09-11"])
+        assert args.name == "mom5_10d"
+        assert args.dry_run is False
+
     def test_backtest_a4_flags(self):
         """A4 交易現實化旗標：預設開、--no-* 可關。"""
         parser = build_parser()
