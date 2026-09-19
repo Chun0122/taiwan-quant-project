@@ -17,6 +17,7 @@ from src.constants import (
     COMMISSION_RATE,
     CORRELATION_PENALTY,
     CORRELATION_THRESHOLD,
+    DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
     LIMIT_DETECT_THRESHOLD,
     LIQUIDITY_PARTICIPATION_LIMIT,
     LOT_SIZE,
@@ -1513,6 +1514,71 @@ def compute_drawdown_with_snapshots(
         return 0.0
     dd = (peak - current) / peak * 100
     return round(max(dd, 0.0), 2)
+
+
+def compute_guard_drawdown(
+    equity_points: list[tuple[date, float]],
+    current_equity: float,
+    as_of: date,
+    trading_calendar: list[date],
+    window_trading_days: int = DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
+) -> float:
+    """Drawdown Guard 專用回撤：peak **只看近 N 個交易日**（純函數）。
+
+    與 `compute_drawdown_with_snapshots`（Kill Switch 用，peak 自成立起算）**刻意不同**。
+    兩者問的問題不一樣：
+
+      • Kill Switch：「累計虧掉高水位的幾成？」→ 自成立 peak，不可逆也合理（清倉是終局）
+      • Drawdown Guard：「**現在**是不是在流血？」→ 近期 peak
+
+    自成立 peak 拿來當節流閥會退化成單向棘輪：peak 永不下修，組合若在 dd > 12%
+    （scale < 0.2，低於最小可行部位）時走到全現金，現金無報酬 → 權益不動 →
+    dd 不動 → 永遠開不了新倉。詳 `constants.DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS`。
+
+    **窗口按日期不按列數**：`equity_points` 會缺日（熔斷日不寫 snapshot、update
+    失敗日、組合暫停期間），取「最後 N 列」會讓窗口悄悄拉長到遠超 N 個交易日——
+    那正是本函數要消除的陳舊 peak。故以 `trading_calendar` 反推 cutoff 日期。
+
+    Parameters
+    ----------
+    equity_points : list[tuple[date, float]]
+        歷史每日 MtM 權益序列 [(日期, 權益)]，順序不拘（內部自行過濾）。
+    current_equity : float
+        當前權益（含當日盤中 MtM）。恆納入 peak 與 current 的計算。
+    as_of : date
+        今日。窗口為 `[as_of 往前數 N 個交易日, as_of]`。
+    trading_calendar : list[date]
+        已排序的交易日清單。**長度不足 N 或為空時退回「全序列」**（＝現行的自成立
+        行為，偏保守），不會比修改前更寬鬆。
+    window_trading_days : int
+        窗口長度（交易日）。≤0 時停用窗口（全序列），供回測 A/B 對照。
+
+    Returns
+    -------
+    float
+        當前回撤百分比（0.0~100.0），0.0 = 在窗口高點。
+    """
+    if current_equity is None:
+        return 0.0
+
+    values = [current_equity]
+    if equity_points:
+        cutoff: date | None = None
+        if window_trading_days > 0 and trading_calendar:
+            past = [d for d in trading_calendar if d <= as_of]
+            if len(past) >= window_trading_days:
+                cutoff = sorted(past)[-window_trading_days]
+        for d, v in equity_points:
+            if v is None or d > as_of:
+                continue
+            if cutoff is not None and d < cutoff:
+                continue
+            values.append(v)
+
+    peak = max(values)
+    if peak <= 0:
+        return 0.0
+    return round(max((peak - current_equity) / peak * 100, 0.0), 2)
 
 
 def build_equity_history(

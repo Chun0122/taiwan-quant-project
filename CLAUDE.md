@@ -157,7 +157,8 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | **E2b/E2c 凍結中（P0 #17）** | IC 自動調權（E2b）與分數翻轉/中性化（E2c）**預設不生效**，開關在 `quant.ic_governance`（兩者 false）。凍結只在唯一套用點 `_score_candidates`——底層純函數與 `_apply_ic_weight_adjustment` 行為不變，**仍照常計算並記錄** would-be 動作（log 標【凍結中，未生效】）。`_ic_actions` 凍結時留空，避免 CLI 的 (N)/(F)/(D) 誤示為已套用。**解凍前提**：B2 落地 + `valuation`/`dividend` 維度納入落庫 + 改用標準誤顯著性判定，詳 `config.py:ICGovernanceConfig` |
 | **Scanner 評分** | 四維度（技術+籌碼+基本面+消息面）；技術面 3 Cluster 等權 v2（報酬動能/量能/突破，各 1/3）；零方差因子自動排除（`exclude_zero_variance_factors`）；子因子 IC 自動權重調整；Rolling IC + Per-Regime IC 監控 |
 | **單一漏斗（N2）** | **`run()` 只有 `MarketScanner` 一份實作，子類禁止覆寫**（`tests/test_scanner_pipeline_parity.py` 有契約測試守門）。模式差異只能透過：①`_STAGES = StageConfig(...)` 宣告不跑哪些階段；②4 個 hook（`_prepare_before_load` / `_after_market_data_loaded` / `_sync_candidate_valuation` / `_reload_candidate_valuation`）；③`_coarse_filter` / `_compute_*_scores` / `_compute_extra_scores`。<br>⚠ value/dividend/growth 的 `_STAGES` 多數 False 是**現況存檔非設計主張**（源自舊複製貼上），改動任一旗標都會改變選股——先看 MASTER_PLAN §7 #3b 的實測影響表。**已開啟**：4.2 回撤縮表（2026-08-01，五模式一致）。改旗標時務必同步更新 `tests/test_scanner_pipeline_parity.py` 的 `_EXPECTED` 基準**並在該處寫明原因** |
-| **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Drawdown Guard（`scale = 1 − dd/15`，**縮放後低於最小可行部位即不進場、slot 留空**）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解）。⚠ dd > 12% 時 `scale < 0.2` 使**任何新倉都被擋下**；peak 不衰減，故組合若在 dd > 12% 時走到全現金就再也回不來（現金無報酬 → dd 不動 → 續擋），此為已知待議項 |
+| **輪動風控** | Drawdown Kill Switch（≥25% 清倉）、Drawdown Guard（`scale = 1 − dd/15`，**縮放後低於最小可行部位即不進場、slot 留空**）、Portfolio Heat、Correlation Budget（60 日 rolling）、Crisis 硬阻擋、Ex-Ante VaR（Component VaR 分解） |
+| **回撤雙軌（2026-09-19）** | **熔斷與 Guard 用不同的 peak，勿合併回一個數字**。熔斷問「累計虧掉高水位的幾成」→ `compute_drawdown_with_snapshots`（自成立 peak，不可逆也正確，清倉本來就是終局）；Guard 問「**現在**是不是在流血」→ `compute_guard_drawdown`（peak 只看近 `DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS`(60) 個交易日）。自成立 peak 當節流閥會退化成**單向棘輪**——peak 永不下修，組合在 dd > 12%（scale < 0.2，低於最小可行部位）時走到全現金後，現金無報酬 → dd 不動 → 永遠開不了新倉（2026-09-19 實測 mom3_20d 被 06-03 的 peak 擋死 09-08~09-18，該期間近 60 日回撤其實僅 4.7~10.1%）。**窗口按日期不按列數**（缺日會讓窗口悄悄拉長）；日曆不足 60 日時退回全序列（保守）。慢跌由熔斷接手：每日 −0.2% 時滾動 dd 停在 11.3% 高原而自成立 dd 第 150 日觸發 25%。**live 與 backtest 必須同一實作**（`tests/test_rotation_drawdown.py::TestGuardBacktestParity` 契約守門）|
 | **T+1 延遲** | BacktestEngine + Walk-Forward + Discover + **Rotation 回測與 live** 一致執行訊號延遲，消除 look-ahead bias。Rotation backtest：D 日 close 決策 → 暫存 pending_exec → D+1 開盤成交。**Live（A2，2026-07-06）**：`update()` = `fill_pending(today)`（先以 open 成交昨日 `RotationPendingOrder`）→ `decide(today)`（close 決策寫明日 pending）；renew 與熔斷即時（熔斷為與 backtest 的刻意差異）。買單 TTL 2 交易日（逾期不論有無報價一律取消）、同股僅允許一張在途買單（decide 去重 + fill 端 UNIQUE 防護）、風控賣單停牌以 ref_price 成交不凍結；`update --all` per-portfolio 隔離 |
 | **動態滑價** | 三因子模型 + A4 participation impact（`compute_dynamic_slippage`，傳 `order_shares` 時加 c×√(下單量/當日量)）；流動性約束（`apply_liquidity_limit`）；漲跌停偵測（`detect_limit_price`） |
 | **A4 交易現實化** | 混合單成本模型（2026-07-08）：委託拆整張單+盤中零股單，各計最低手續費 20/1 元、零股 notional 加 0.1% 滑價 premium；**股數計算不整張化**（sizing 不變，僅成本真實化）。成本 SSOT=`rotation.trade_cost_amounts`（未捨入），rotation live+backtest 恆開；BacktestEngine 走 `BacktestConfig.min_commission`/`participation_impact` 旗標（引擎預設關、`backtest` CLI 預設開，`--no-*` 可關） |
@@ -187,7 +188,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2941 測試 / 108 檔）
+- **執行**：`pytest -v`（2951 測試 / 108 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 
