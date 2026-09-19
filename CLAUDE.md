@@ -113,7 +113,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | 模組 | 職責 |
 |------|------|
 | `entry_exit.py` | 共用純函數：ATR 止損止利、進場觸發、時機評估（Discover/Suggest/Watch 三系統共用） |
-| `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR）。**部位大小＝`min(總資本/max_positions, 可用現金/空缺數)`**——分母是**空缺數**不是 `max_positions`：舊版 `available_cash/max_positions` 只在「一次補滿」時正確，「換一檔補一檔」只投入現金的 1/N 而形成自我強化的收縮螺旋（2026-09-07 實測四個 live 組合曝險單調衰減，mom5_10d 滿倉 5 檔卻只有 22.4% 曝險）。live 與 backtest 共用此路徑。`compute_topup_orders`：補倉純函數（把既有持倉補到同一目標部位，現金不足時按缺口**等比**縮減而非先來後到），供一次性維護用。**最小可行部位**：所有縮放（drawdown/vol weight/correlation/heat）疊完後 `shares × price < 目標部位 × `MIN_POSITION_TARGET_RATIO`(0.2)` 即整筆跳過**且不遞減 `free_slots`**——舊行為會開 dust 部位佔死配額（2026-09-15 實測 4 股 2,232 元吃掉 mom3_20d 1/3 配額到 10-13），滿倉→不再買→現金空轉→出不了回撤→guard 續夾，與 sizing 收縮螺旋同型的第二個陷阱；跳過的候選落 `RotationActions.skipped_undersized` 供 caller 告警 |
+| `portfolio/rotation.py` | 輪動核心：換股 + 風控（Drawdown Guard/Portfolio Heat/Correlation/VaR）。**部位大小＝`min(總資本/max_positions, 可用現金/空缺數)`**——分母是**空缺數**不是 `max_positions`：舊版 `available_cash/max_positions` 只在「一次補滿」時正確，「換一檔補一檔」只投入現金的 1/N 而形成自我強化的收縮螺旋（2026-09-07 實測四個 live 組合曝險單調衰減，mom5_10d 滿倉 5 檔卻只有 22.4% 曝險）。live 與 backtest 共用此路徑。`compute_topup_orders`：補倉純函數（把既有持倉補到同一目標部位，現金不足時按缺口**等比**縮減而非先來後到），供一次性維護用。**最小可行部位**：所有縮放（drawdown/vol weight/correlation/heat）疊完後 `shares × price < 目標部位 × `MIN_POSITION_TARGET_RATIO`(0.2)` 即整筆跳過**且不遞減 `free_slots`**——舊行為會開 dust 部位佔死配額（2026-09-15 實測 4 股 2,232 元吃掉 mom3_20d 1/3 配額到 10-13），滿倉→不再買→現金空轉→出不了回撤→guard 續夾，與 sizing 收縮螺旋同型的第二個陷阱；跳過的候選落 `RotationActions.skipped_undersized` 供 caller 告警。**同一把尺也用在續持**：到期時市值低於門檻者一律出場（`undersized_exit`），**豁免閘門 B/C 且不計入週換手預算**——否則 dust 靠「仍在榜上」無限續持鎖死配額（實測 3034 連 14 個掃描日有 13 天在 top-N，兩組合又都 `allow_renewal=1`）。止損仍優先於此判定 |
 | `portfolio/manager.py` | RotationManager：每日更新（A2 T+1 兩段式：`decide`/`fill_pending`/`update` wrapper + `_build_decision_context` 共用組裝）/ Kill Switch / 歷史回測（`backtest()` 含研究旋鈕 `disable_stop_loss`/`stop_loss_widen`/`t1_execution`/`save_result`，僅回測用、live 不受影響）。A3 股利會計：live `fill_pending` 開頭與 backtest 迴圈頂端同構呼叫除息處理（現金入帳 + 停損調整，ActionLog `dividend` 型為冪等標記）。`plan_topup()`：一次性補倉（走 T+1 pending，`reason='topup'`），**非常態 rebalance 且不掛 morning-routine** |
 | `portfolio/dividends.py` | 股利會計純函數（A3）：`load_dividend_events` / `dividend_adjustment_factor`（與 Strategy Layer 1 同式）/ `adjust_stop_loss_for_dividend` / `dividend_cash_for_position`；入帳時點=`Dividend.date`（除息日）；配股第一版僅調停損不調股數 |
 | `portfolio/execution_core.py` | 成交模擬核心純函數（`simulate_buy`/`simulate_sell` + `BuyFill`/`SellFill`）：live 與 backtest 共用同一份金額算式（pnl/成本/淨回收/總支出），消除兩路徑 drift；A4 起金額由 `rotation.trade_cost_amounts`（混合單成本 SSOT）導出；股數定價/滑價/流動性/漲跌停留各 caller |
@@ -188,7 +188,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2951 測試 / 108 檔）
+- **執行**：`pytest -v`（2958 測試 / 108 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

@@ -754,10 +754,12 @@ def compute_rotation_actions(
         crisis 時是否強制平倉所有既有持倉（預設 False）。
         啟用時 regime='crisis' 會觸發全持倉賣出。
     min_position_ratio : float
-        最小可行部位＝目標部位 × 此比例。所有縮放（Drawdown Guard／波動率反比
-        權重／Correlation Budget／Portfolio Heat）疊完後若仍低於此值，**整筆跳過
-        並把 slot 留空**，而不是開一個佔著配額的 dust 部位。詳
-        `constants.MIN_POSITION_TARGET_RATIO`。設 0 可停用。
+        最小可行部位＝目標部位 × 此比例。兩個作用點：
+        ①**新開倉**——所有縮放（Drawdown Guard／波動率反比權重／Correlation
+        Budget／Portfolio Heat）疊完後若仍低於此值，整筆跳過並把 slot 留空；
+        ②**到期續持**——低於此值的持倉一律出場（`undersized_exit`），豁免閘門
+        B/C 且不計入週換手預算，否則 dust 會靠「仍在榜上」無限續持鎖死配額。
+        詳 `constants.MIN_POSITION_TARGET_RATIO`。設 0 可停用。
 
     Returns
     -------
@@ -799,6 +801,13 @@ def compute_rotation_actions(
             if best_new_score is None or s > best_new_score:
                 best_new_score = s
 
+    # 續持的最小可行部位門檻：與新開倉同一把尺（不值得開的部位也不值得續抱）。
+    # 這裡的參照是目標等權部位本身（非 min(目標, 現金/空缺)）——續持不涉及現金。
+    _target_capital = (
+        total_capital / max_positions if total_capital and total_capital > 0 and max_positions > 0 else 0.0
+    )
+    min_hold_capital = _target_capital * max(0.0, min_position_ratio)
+
     for pos in current_positions:
         sid = pos["stock_id"]
         days_held = count_trading_days_held(pos["entry_date"], today, trading_calendar)
@@ -823,6 +832,30 @@ def compute_rotation_actions(
         expired = days_held >= effective_holding_days
 
         if expired:
+            # ── 到期時低於最小可行部位 → 一律出場，**豁免閘門 B/C 與續持** ──
+            #
+            # 最小可行部位原本只擋新開倉，卻照樣讓 dust **續持**——同一個不對稱。
+            # 2026-09-15 的 3034（mom5_10d 53 股／mom3_20d 4 股）就是這樣卡住配額的：
+            # 它連續 14 個掃描日有 13 天在 momentum top-N，到期只會被 renew 而永遠
+            # 不出場，slot 被一個佔資本 0.2~2.8% 的部位鎖死。
+            #
+            # 豁免閘門是刻意的：閘門 B（score_gap）擋的是「為了邊際優勢而換股」、
+            # 閘門 C 擋的是策略換手過頻，但清掉一個**本來就不該存在的畸形部位**
+            # 兩者都不適用。同理不計入週換手預算。
+            position_value = (current_price or pos.get("entry_price", 0.0)) * pos.get("shares", 0)
+            if min_hold_capital > 0 and position_value < min_hold_capital:
+                actions.to_sell.append(
+                    {
+                        "stock_id": sid,
+                        "reason": "undersized_exit",
+                        "exit_price": current_price if current_price is not None else pos["entry_price"],
+                        "days_held": days_held,
+                        **pos,
+                    }
+                )
+                sold_today.add(sid)
+                continue
+
             # ── 成本閘門 B：若新最佳候選分數與現持分差距不足，阻擋賣出 ──
             entry_score = pos.get("entry_score") or pos.get("composite_score")
             gate_b_block = (

@@ -2550,6 +2550,130 @@ class TestMinPositionSize:
         assert len(new.skipped_undersized) == 1
 
 
+class TestUndersizedExit:
+    """到期時低於最小可行部位 → 一律出場，不得靠「仍在榜上」無限續持。
+
+    ## 事故延伸（2026-09-19）
+
+    最小可行部位原本只擋新開倉，卻照樣讓 dust **續持**——同一個不對稱。
+    2026-09-15 留下的 3034（mom5_10d 53 股／mom3_20d 4 股）連續 14 個掃描日有
+    13 天在 momentum top-N，兩個組合又都 `allow_renewal=1`，到期只會被 renew，
+    slot 被一個佔資本 0.2~2.8% 的部位永久鎖死。
+    """
+
+    def _expired(self, shares, *, score_gap_threshold=0.0, entry_score=None, weekly_swap_cap=0, weekly_swaps_used=0):
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100.0, shares=shares)
+        if entry_score is not None:
+            pos["entry_score"] = entry_score
+        rankings = _make_rankings([("2330", 100.0), ("2317", 150.0)])
+        return compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=3,
+            allow_renewal=True,
+            today=date(2025, 1, 9),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000.0,
+            today_prices={"2330": 100.0, "2317": 150.0},
+            total_capital=900_000.0,  # 目標部位 180,000 → 門檻 36,000
+            score_gap_threshold=score_gap_threshold,
+            weekly_swap_cap=weekly_swap_cap,
+            weekly_swaps_used=weekly_swaps_used,
+        )
+
+    def test_dust_position_exits_instead_of_renewing(self):
+        """仍在 Top-N 但只值 5,000（門檻 36,000）→ 出場而非續持。"""
+        actions = self._expired(shares=50)
+
+        assert actions.renewed == []
+        assert len(actions.to_sell) == 1
+        assert actions.to_sell[0]["stock_id"] == "2330"
+        assert actions.to_sell[0]["reason"] == "undersized_exit"
+
+    def test_full_size_position_still_renews(self):
+        """正常大小的部位照常續持——門檻不得誤殺。"""
+        actions = self._expired(shares=1800)  # 180,000 = 目標部位
+
+        assert len(actions.renewed) == 1
+        assert actions.to_sell == []
+
+    def test_gate_b_does_not_block_undersized_exit(self):
+        """閘門 B 擋的是「為了邊際優勢而換股」，不適用於清掉畸形部位。"""
+        # entry_score 高到 best_new_score - entry_score < threshold，正常會被 gate B 擋成 hold
+        actions = self._expired(shares=50, score_gap_threshold=0.5, entry_score=0.95)
+
+        assert actions.to_hold == [], "不得被 gate B 擋成 hold"
+        assert len(actions.to_sell) == 1
+        assert actions.to_sell[0]["reason"] == "undersized_exit"
+
+    def test_gate_c_does_not_block_and_budget_not_consumed(self):
+        """週換手預算用盡時仍須出場，且清 dust 不計入預算。"""
+        actions = self._expired(shares=50, weekly_swap_cap=1, weekly_swaps_used=1)
+
+        assert len(actions.to_sell) == 1
+        assert actions.to_sell[0]["reason"] == "undersized_exit"
+        assert actions.holding_expired_sells == 0, "清 dust 不是策略換手，不佔週預算"
+
+    def test_not_triggered_before_expiry(self):
+        """未到期的小部位不動——這只改變到期時的去留，不是新的出場觸發。"""
+        pos = _make_position("2330", entry_date=date(2025, 1, 8), entry_price=100.0, shares=50)
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=_make_rankings([("2330", 100.0)]),
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 9),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000.0,
+            today_prices={"2330": 100.0},
+            total_capital=900_000.0,
+        )
+
+        assert actions.to_sell == []
+        assert len(actions.to_hold) == 1
+
+    def test_stop_loss_still_takes_priority(self):
+        """止損優先於一切——不得被 undersized_exit 搶走語意（風控歸因會失真）。"""
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100.0, shares=50)
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=_make_rankings([("2330", 80.0)]),
+            max_positions=5,
+            holding_days=3,
+            allow_renewal=True,
+            today=date(2025, 1, 9),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000.0,
+            stop_losses={"2330": 90.0},
+            today_prices={"2330": 80.0},
+            total_capital=900_000.0,
+        )
+
+        assert actions.to_sell[0]["reason"] == "stop_loss"
+
+    def test_ratio_zero_restores_renewal(self):
+        """min_position_ratio=0 回到舊行為（回測 A/B 對照用）。"""
+        pos = _make_position("2330", entry_date=date(2025, 1, 6), entry_price=100.0, shares=50)
+        actions = compute_rotation_actions(
+            current_positions=[pos],
+            new_rankings=_make_rankings([("2330", 100.0)]),
+            max_positions=5,
+            holding_days=3,
+            allow_renewal=True,
+            today=date(2025, 1, 9),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000.0,
+            today_prices={"2330": 100.0},
+            total_capital=900_000.0,
+            min_position_ratio=0.0,
+        )
+
+        assert len(actions.renewed) == 1
+        assert actions.to_sell == []
+
+
 class TestPositionSizing:
     """補空缺時的部位大小必須是「目標等權部位」，不是「可用現金 / max_positions」。
 
