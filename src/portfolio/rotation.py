@@ -24,6 +24,7 @@ from src.constants import (
     MAX_PORTFOLIO_HEAT,
     MIN_COMMISSION_LOT,
     MIN_COMMISSION_ODD,
+    MIN_POSITION_TARGET_RATIO,
     ODD_LOT_SLIPPAGE_PREMIUM,
     PARTICIPATION_IMPACT_COEFF,
     PER_POSITION_RISK_CAP,
@@ -51,6 +52,9 @@ class RotationActions:
     renewed: list[dict] = field(default_factory=list)
     # 本次呼叫產生的非止損換手次數（供 backtest 累積週預算使用）
     holding_expired_sells: int = 0
+    # 縮放後低於最小可行部位而**刻意留空 slot** 的候選（供 caller 告警；
+    # 否則「沒買、現金空轉」是靜默狀態，2026-09 實測一週才被發現）
+    skipped_undersized: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +690,8 @@ def compute_rotation_actions(
     score_gap_threshold: float = 0.0,
     weekly_swap_cap: int = 0,
     weekly_swaps_used: int = 0,
+    # 最小可行部位（縮放後低於此比例即不買，slot 留空）
+    min_position_ratio: float = MIN_POSITION_TARGET_RATIO,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -746,6 +752,11 @@ def compute_rotation_actions(
     crisis_force_close : bool
         crisis 時是否強制平倉所有既有持倉（預設 False）。
         啟用時 regime='crisis' 會觸發全持倉賣出。
+    min_position_ratio : float
+        最小可行部位＝目標部位 × 此比例。所有縮放（Drawdown Guard／波動率反比
+        權重／Correlation Budget／Portfolio Heat）疊完後若仍低於此值，**整筆跳過
+        並把 slot 留空**，而不是開一個佔著配額的 dust 部位。詳
+        `constants.MIN_POSITION_TARGET_RATIO`。設 0 可停用。
 
     Returns
     -------
@@ -937,8 +948,10 @@ def compute_rotation_actions(
             total_capital / max_positions if total_capital and total_capital > 0 and max_positions > 0 else 0.0
         )
         cash_per_slot = available_cash / free_slots if free_slots > 0 else 0.0
-        per_position_capital = min(target_capital, cash_per_slot) if target_capital > 0 else cash_per_slot
-        per_position_capital *= drawdown_scale  # Drawdown Guard 縮減
+        # 縮放前的每檔基準；最小可行部位以它為參照（故 drawdown_scale 本身也受門檻檢驗）
+        base_position_capital = min(target_capital, cash_per_slot) if target_capital > 0 else cash_per_slot
+        min_position_capital = base_position_capital * max(0.0, min_position_ratio)
+        per_position_capital = base_position_capital * drawdown_scale  # Drawdown Guard 縮減
 
         # ── Portfolio Heat：計算當前組合風險 ──
         current_heat = 0.0
@@ -1044,6 +1057,32 @@ def compute_rotation_actions(
 
             shares = tentative_shares if heat_enabled else compute_shares(adj_capital, price)
             if shares <= 0:
+                continue
+
+            # ── 最小可行部位：縮放後太小就不買，**slot 留空** ──
+            #
+            # 檢查點放在所有縮放（drawdown / vol weight / correlation / heat）之後，
+            # 且以**實際下單金額**（shares × price）判定，故不論哪條路徑把部位壓小
+            # 都擋得住。與 heat 預算用完時的 `continue` 同義：表達「現在不進場」。
+            #
+            # ⚠ 關鍵是**不遞減 free_slots**。舊行為會開一個 dust 部位把配額佔死：
+            # 2026-09-15 mom3_20d 以 4 股（2,232 元、資本 0.2%）吃掉 1/3 配額到
+            # 10-13，滿倉使 free_slots=0 → 不再買 → 現金空轉 → 出不了回撤 →
+            # drawdown_scale 繼續夾緊，與 sizing 收縮螺旋同型的第二個自我強化陷阱。
+            if min_position_capital > 0 and shares * price < min_position_capital:
+                actions.skipped_undersized.append(
+                    {
+                        "stock_id": sid,
+                        "stock_name": r.get("stock_name", ""),
+                        "rank": r["rank"],
+                        "price": price,
+                        "shares": shares,
+                        "notional": shares * price,
+                        "min_position_capital": min_position_capital,
+                        "base_position_capital": base_position_capital,
+                        "drawdown_scale": drawdown_scale,
+                    }
+                )
                 continue
 
             # 更新累積 heat

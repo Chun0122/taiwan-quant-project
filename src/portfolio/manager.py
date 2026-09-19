@@ -584,6 +584,20 @@ class RotationManager:
                         ", ".join(dupes),
                     )
 
+            # 縮放後低於最小可行部位而留空 slot：這是**刻意不進場**，但若無告警
+            # 就是「沒買、現金空轉」的靜默狀態（2026-09 實測一週才被發現）
+            if actions.skipped_undersized:
+                first = actions.skipped_undersized[0]
+                logger.warning(
+                    "[%s] %d 檔候選因縮放後低於最小可行部位而跳過（slot 留空，非滿倉）："
+                    "%s｜最小 %.0f 元、drawdown_scale=%.3f",
+                    self.portfolio_name,
+                    len(actions.skipped_undersized),
+                    ", ".join(f"{s['stock_id']}({s['notional']:,.0f})" for s in actions.skipped_undersized[:5]),
+                    first["min_position_capital"],
+                    first["drawdown_scale"],
+                )
+
             if dry_run:
                 logger.info(
                     "[%s] DRY RUN 決策預覽: 明日預定賣出=%d, 續持=%d, 明日預定買入=%d, 保持=%d",

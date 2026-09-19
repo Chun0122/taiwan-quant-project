@@ -10,7 +10,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 
 ## 測試統計
 
-- **2935 個測試**，108 個測試檔
+- **2941 個測試**，108 個測試檔
 - Fixtures：`tests/conftest.py`（`in_memory_engine` / `db_session` / `sample_ohlcv`）
 - 共用建構函數：`tests/scanner_helpers.py`
 
@@ -72,7 +72,7 @@ pytest --cov=src --cov-report=term-missing   # 覆蓋率報告
 | `test_attribution.py` | `FactorAttribution` 五因子 | 純函數 |
 | `test_universe.py` | `discovery/universe.py` + DailyFeature ETL | 純函數+SQLite |
 | `test_concepts.py` | `classify_concepts()` + ConceptGroup ORM | 純函數+SQLite |
-| `test_rotation.py` | `portfolio/rotation.py` 全模組 + 部位大小等權守門（含「反覆換股不得使曝險衰減」的行為級測試） | 純函數+SQLite |
+| `test_rotation.py` | `portfolio/rotation.py` 全模組 + 部位大小等權守門（含「反覆換股不得使曝險衰減」的行為級測試）+ 最小可行部位守門（`TestMinPositionSize`，含 2026-09-15 dust 部位事故的參數級複現） | 純函數+SQLite |
 | `test_rotation_topup.py` | 補倉：`compute_topup_orders` 純函數 + `plan_topup` 建單 + `fill_pending` 加碼既有部位（加權平均進場價、持有時鐘/停損不變、持倉已出場一律取消不開新倉） | 純函數+SQLite |
 | `test_calendar.py` | `data/calendar.py` TWSE 交易日行事曆 | 純函數 |
 | `test_morning_atomicity.py` | `cli/morning_cmd.py` 原子性 | mock |

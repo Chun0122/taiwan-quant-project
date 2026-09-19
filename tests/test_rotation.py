@@ -2408,6 +2408,148 @@ class TestCostBreakdownMetrics:
 # ===========================================================================
 
 
+class TestMinPositionSize:
+    """縮放後低於最小可行部位 → 整筆跳過並**留空 slot**，不開 dust 部位。
+
+    ## 事故（2026-09-15，補倉驗收時發現）
+
+    `drawdown_scale` 沒有下限。mom3_20d 回撤 14.76%（門檻 15%）使 scale=0.0158，
+    替代標的 3034 只買到 **4 股（2,232 元、佔資本 0.2%）卻照樣佔掉 1/3 持股配額**
+    到 10-13；mom5_10d 同日 53 股佔 1/5 配額。滿倉使 `free_slots=0` → 不再買 →
+    現金空轉（335,459／170,815）→ 賺不到錢就出不了回撤 → scale 繼續夾緊。
+    這是與 sizing 收縮螺旋同型的第二個自我強化陷阱。
+
+    對照 Portfolio Heat 的處理即知舊行為不對稱：heat 預算用完時是 `continue`
+    （放棄這筆、**留著 slot**），drawdown 縮放卻一路縮到 dust 還是照佔位。
+    """
+
+    def _one_slot(self, *, drawdown_pct=None, cash=500_000.0, total_capital=900_000.0, min_position_ratio=0.20):
+        """4 檔續抱 + 1 個空缺；回傳 actions。"""
+        held = [
+            _make_position(f"{1000 + i}", date(2025, 1, 2), allocated_capital=100_000.0, entry_rank=i + 1)
+            for i in range(4)
+        ]
+        rankings = _make_rankings([(f"{1000 + i}", 100.0) for i in range(4)])
+        rankings += _make_rankings([("9001", 100.0)], start_rank=5)
+        return compute_rotation_actions(
+            current_positions=held,
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=cash,
+            today_prices={r["stock_id"]: r["close"] for r in rankings},
+            total_capital=total_capital,
+            drawdown_pct=drawdown_pct,
+            min_position_ratio=min_position_ratio,
+        )
+
+    def test_deep_drawdown_skips_instead_of_dust(self):
+        """回撤逼近門檻 → 不買，而不是買一口 dust 佔死 slot。"""
+        # dd=14.76% → scale=0.016 → 目標 180,000 的 1.6% ≈ 2,880 元，遠低於門檻 36,000
+        actions = self._one_slot(drawdown_pct=14.76)
+
+        assert actions.to_buy == []
+        assert len(actions.skipped_undersized) == 1
+        skipped = actions.skipped_undersized[0]
+        assert skipped["stock_id"] == "9001"
+        assert skipped["notional"] < skipped["min_position_capital"]
+        assert skipped["drawdown_scale"] == pytest.approx(1 - 14.76 / 15.0)
+
+    def test_no_drawdown_buys_full_target(self):
+        """無回撤時照買目標部位，門檻不得誤殺。"""
+        actions = self._one_slot(drawdown_pct=None)
+
+        assert len(actions.to_buy) == 1
+        assert actions.skipped_undersized == []
+        assert actions.to_buy[0]["allocated_capital"] == pytest.approx(180_000.0)
+
+    def test_moderate_drawdown_still_buys(self):
+        """回撤淺時縮減後仍在門檻之上 → 照買（縮小的部位本身是合理的風控行為）。"""
+        # dd=3% → scale=0.8 → 144,000，遠高於門檻 36,000
+        actions = self._one_slot(drawdown_pct=3.0)
+
+        assert len(actions.to_buy) == 1
+        assert actions.skipped_undersized == []
+        assert actions.to_buy[0]["allocated_capital"] == pytest.approx(144_000.0)
+
+    def test_skipped_slot_stays_free_for_next_candidate(self):
+        """跳過的候選不得遞減 free_slots——後面的候選仍有機會補上。"""
+        held = [
+            _make_position(f"{1000 + i}", date(2025, 1, 2), allocated_capital=100_000.0, entry_rank=i + 1)
+            for i in range(4)
+        ]
+        rankings = _make_rankings([(f"{1000 + i}", 100.0) for i in range(4)])
+        # 兩個候選：9001 波動高（權重低 → 被門檻擋），9002 權重高（可買）
+        rankings += _make_rankings([("9001", 100.0), ("9002", 100.0)], start_rank=5)
+        actions = compute_rotation_actions(
+            current_positions=held,
+            new_rankings=rankings,
+            max_positions=5,
+            holding_days=10,
+            allow_renewal=True,
+            today=date(2025, 1, 6),
+            trading_calendar=TRADING_CAL,
+            current_cash=500_000.0,
+            today_prices={r["stock_id"]: r["close"] for r in rankings},
+            total_capital=900_000.0,
+            vol_weights={"9001": 0.01, "9002": 0.30},
+        )
+
+        assert [b["stock_id"] for b in actions.to_buy] == ["9002"]
+        assert [s["stock_id"] for s in actions.skipped_undersized] == ["9001"]
+
+    def test_ratio_zero_disables_the_gate(self):
+        """min_position_ratio=0 回到舊行為（保留給回測 A/B 對照）。"""
+        actions = self._one_slot(drawdown_pct=14.76, min_position_ratio=0.0)
+
+        assert len(actions.to_buy) == 1
+        assert actions.skipped_undersized == []
+        assert actions.to_buy[0]["shares"] > 0
+
+    def test_reproduces_20260915_incident(self):
+        """以 2026-09-15 mom3_20d 的實際參數複現：舊行為買 4 股，新行為不買。
+
+        實際數字：peak 1,244,551（06-03）→ 09-14 資本 1,060,813 = 回撤 14.76%，
+        可用現金 339,155（含 3006 停損回收），vol_weight(3034)=0.172588，
+        3034 收盤 556.0。實測 pending_buy = 5 股 / 2,780 元。
+        """
+        held = [
+            _make_position("2880", date(2026, 9, 4), entry_price=45.85, shares=7705, allocated_capital=357_361.0),
+            _make_position("2890", date(2026, 9, 4), entry_price=43.64, shares=8108, allocated_capital=357_886.0),
+        ]
+        rankings = [
+            {"stock_id": "3034", "stock_name": "聯詠", "rank": 1, "score": 0.8, "close": 556.0, "stop_loss": 530.07},
+        ]
+        cal = [date(2026, 9, d) for d in (8, 9, 10, 11, 14, 15, 16, 17, 18)]
+        kwargs = dict(
+            current_positions=held,
+            new_rankings=rankings,
+            max_positions=3,
+            holding_days=20,
+            allow_renewal=True,
+            today=date(2026, 9, 14),
+            trading_calendar=cal,
+            current_cash=339_155.0,
+            today_prices={"2880": 46.30, "2890": 44.80, "3034": 556.0},
+            total_capital=1_060_813.0,
+            drawdown_pct=14.76,
+            vol_weights={"3034": 0.172588},
+        )
+
+        # 舊行為（門檻停用）：買進一口 dust，佔死 1/3 配額
+        old = compute_rotation_actions(**kwargs, min_position_ratio=0.0)
+        assert len(old.to_buy) == 1
+        assert old.to_buy[0]["shares"] * 556.0 < 0.01 * 1_060_813.0, "應為 <1% 資本的 dust 部位"
+
+        # 新行為：不買，slot 留空
+        new = compute_rotation_actions(**kwargs)
+        assert new.to_buy == []
+        assert len(new.skipped_undersized) == 1
+
+
 class TestPositionSizing:
     """補空缺時的部位大小必須是「目標等權部位」，不是「可用現金 / max_positions」。
 

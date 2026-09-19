@@ -472,3 +472,19 @@ ACTION_TYPE_PENDING_TOPUP: str = "pending_topup"  # 補倉待成交意圖（deci
 PENDING_REASON_TOPUP: str = "topup"  # RotationPendingOrder.reason 的補倉標記（買單唯一會帶 reason 的情形）
 # 缺口 < 目標部位 × 此比例即不補（避免價格波動造成的零碎單）
 TOPUP_MIN_GAP_RATIO: float = 0.05
+
+# ── 最小可行部位：縮放後低於此比例即整筆跳過，**slot 留空** ──
+#
+# 2026-09-19 發現（補倉驗收時）：Drawdown Guard 的 `drawdown_scale` 沒有下限，
+# 回撤逼近門檻時把新部位縮到接近零**卻照買照佔位**——mom3_20d 09-15 以 4 股
+# （2,232 元、佔資本 0.2%）吃掉 1/3 的持股配額到 10-13，mom5_10d 53 股佔 1/5
+# 配額到 09-29。滿倉 → `free_slots=0` → 不再買 → 現金空轉 → 賺不到錢就出不了
+# 回撤 → guard 繼續夾緊，形成與 sizing 收縮螺旋同型的第二個自我強化陷阱。
+#
+# 對照 Portfolio Heat 的處理即知不對稱：heat 預算用完時是 `continue`（放棄這筆、
+# **留著 slot**），drawdown 縮放卻一路縮到 dust 還是照佔位。本門檻讓所有縮放路徑
+# （drawdown / vol weight / correlation / heat）統一表達「現在不值得進場」。
+#
+# 0.20＝目標等權部位的兩成。校準：vol_weight 0.6 × corr penalty 0.5 ≈ 0.30 的
+# 合法部位仍放行；實際造成事故的 0.008 與 0.144 都會被擋下。
+MIN_POSITION_TARGET_RATIO: float = 0.20
