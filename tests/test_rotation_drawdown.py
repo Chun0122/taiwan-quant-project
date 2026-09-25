@@ -26,6 +26,7 @@ from src.portfolio.manager import RotationManager
 from src.portfolio.rotation import (
     check_drawdown_kill_switch,
     compute_drawdown_with_snapshots,
+    compute_guard_drawdown,
     compute_portfolio_drawdown,
 )
 
@@ -396,3 +397,145 @@ class TestLoadSnapshotCapitals:
         assert dd >= 25.0
         # 修復前行為對照：不看 snapshot → 5% 不熔斷
         assert check_drawdown_kill_switch(equity, threshold_pct=25.0) is False
+
+
+# ===========================================================================
+# Drawdown Guard 專用回撤：peak 只看近 N 個交易日（2026-09-19 拆分）
+# ===========================================================================
+
+_CAL = [
+    date(2026, 1, 5) + timedelta(days=i) for i in range(400) if (date(2026, 1, 5) + timedelta(days=i)).weekday() < 5
+]
+
+
+class TestComputeGuardDrawdown:
+    """Guard 的 peak 與 Kill Switch **刻意不同源**。
+
+    ## 為什麼要拆
+
+    `dd_pct` 原本一個數字餵兩個機制，但兩者問的問題相反：
+      • Kill Switch：「累計虧掉高水位的幾成？」→ 自成立 peak 正確，不可逆也正確
+      • Drawdown Guard：「**現在**是不是在流血？」→ 自成立 peak 會退化成單向棘輪
+
+    後果（2026-09-19 實測 mom3_20d）：以 2026-06-03 的 peak 把 09-08~09-18 全部
+    擋死（scale 0.074 < 最小可行部位 0.2），而該期間近 60 日回撤其實只有
+    4.7~10.1%。若組合在此狀態走到全現金，現金無報酬 → dd 不動 → 永遠開不了新倉。
+    """
+
+    def test_stale_peak_scrolls_out_of_window(self):
+        """三個月前的高點滾出窗口後不再壓制 dd——這正是修復的重點。"""
+        idx = _CAL.index(date(2026, 6, 3))
+        points = [(date(2026, 6, 3), 1_244_551.0)]  # 舊高點
+        points += [(d, 1_075_000.0) for d in _CAL[idx + 1 : idx + 75]]  # 之後一路持平
+        as_of = _CAL[idx + 74]
+
+        rolling = compute_guard_drawdown(points, 1_071_722.0, as_of, _CAL, window_trading_days=60)
+        inception = compute_guard_drawdown(points, 1_071_722.0, as_of, _CAL, window_trading_days=0)
+
+        assert inception > 13.0, "自成立 peak 下仍是深度回撤"
+        assert rolling < 1.0, "舊高點已滾出 60 日窗口"
+
+    def test_fresh_drawdown_still_bites(self):
+        """回撤新鮮時，滾動窗口與自成立**行為一致**——不得偷放水。"""
+        idx = _CAL.index(date(2026, 6, 3))
+        points = [(date(2026, 6, 3), 1_244_551.0)]
+        points += [(d, 1_080_000.0) for d in _CAL[idx + 1 : idx + 5]]
+        as_of = _CAL[idx + 4]
+
+        rolling = compute_guard_drawdown(points, 1_070_501.0, as_of, _CAL, window_trading_days=60)
+        inception = compute_guard_drawdown(points, 1_070_501.0, as_of, _CAL, window_trading_days=0)
+
+        assert rolling == pytest.approx(inception)
+
+    def test_window_cut_by_date_not_row_count(self):
+        """缺日（熔斷日不寫 snapshot／暫停期間）不得讓窗口悄悄拉長。"""
+        idx = _CAL.index(date(2026, 6, 3))
+        # 只有 3 列：舊高點 + 兩個近日 → 按列數取「最後 60 列」會把舊高點算進來
+        points = [
+            (date(2026, 6, 3), 1_244_551.0),
+            (_CAL[idx + 70], 1_075_000.0),
+            (_CAL[idx + 71], 1_074_000.0),
+        ]
+        as_of = _CAL[idx + 71]
+
+        dd = compute_guard_drawdown(points, 1_071_722.0, as_of, _CAL, window_trading_days=60)
+
+        assert dd < 1.0, "舊高點在 60 個交易日之外，不得因為列數少就被算進 peak"
+
+    def test_short_calendar_falls_back_to_full_series(self):
+        """交易日曆不足 N 天（新組合）→ 退回全序列＝現行保守行為，不得更寬鬆。"""
+        short_cal = _CAL[:10]
+        points = [(short_cal[0], 1_200_000.0), (short_cal[5], 1_000_000.0)]
+
+        dd = compute_guard_drawdown(points, 1_000_000.0, short_cal[-1], short_cal, window_trading_days=60)
+
+        assert dd == pytest.approx(100 * (1_200_000 - 1_000_000) / 1_200_000, abs=0.01)
+
+    def test_future_points_excluded(self):
+        """as_of 之後的點不得進入 peak（PIT 紀律）。"""
+        idx = _CAL.index(date(2026, 6, 3))
+        points = [(_CAL[idx], 1_000_000.0), (_CAL[idx + 5], 5_000_000.0)]
+
+        dd = compute_guard_drawdown(points, 1_000_000.0, _CAL[idx], _CAL, window_trading_days=60)
+
+        assert dd == 0.0
+
+    def test_current_equity_always_counted(self):
+        """無歷史點時以當前權益為 peak → dd=0，不得炸。"""
+        assert compute_guard_drawdown([], 1_000_000.0, date(2026, 6, 3), _CAL) == 0.0
+
+    def test_slow_grind_plateaus_while_killswitch_keeps_climbing(self):
+        """慢跌：Guard 的 dd 停在高原持續節流，累計損害交由 Kill Switch 接手。"""
+        equity = 1_000_000.0
+        points = []
+        for d in _CAL[:150]:
+            equity *= 0.998
+            points.append((d, equity))
+        as_of = _CAL[149]
+
+        guard = compute_guard_drawdown(points, equity, as_of, _CAL, window_trading_days=60)
+        killswitch = compute_drawdown_with_snapshots([v for _, v in points], [1_000_000.0])
+
+        assert 10.0 < guard < 13.0, "滾動 dd 停在約 11.3% 的高原（scale ~0.25，仍在節流）"
+        assert killswitch >= 25.0, "自成立 dd 持續累積，熔斷仍會觸發"
+
+
+class TestGuardBacktestParity:
+    """live 與 backtest 必須用**同一個** Guard 回撤實作。
+
+    這兩條路徑的 overlay 是兩份組裝（MASTER_PLAN §10 結構債 B7），parity 漂移
+    歷史上已炸過 3 次 P0，故此處以契約測試守門。
+    """
+
+    def test_backtest_uses_compute_guard_drawdown(self):
+        """backtest 迴圈必須呼叫 compute_guard_drawdown，不得退回自成立 peak。"""
+        import inspect
+
+        from src.portfolio.manager import RotationManager
+
+        code = inspect.getsource(RotationManager.backtest)
+        assert "compute_guard_drawdown(" in code, "backtest 未同步改用滾動 peak → 與 live 漂移"
+        assert "compute_portfolio_drawdown(" not in code, "backtest 仍在用自成立 peak 餵 Guard"
+
+    def test_live_and_backtest_pass_same_window(self):
+        """兩條路徑的窗口長度必須取自同一個常數。"""
+        import inspect
+
+        from src.constants import DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS
+        from src.portfolio.manager import RotationManager
+
+        assert DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS == 60
+        for fn in (RotationManager._build_decision_context, RotationManager.backtest):
+            code = inspect.getsource(fn)
+            assert "DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS" in code, f"{fn.__name__} 未使用共用常數"
+
+    def test_killswitch_still_uses_inception_peak(self):
+        """熔斷不得跟著改——它要的就是自成立 peak。"""
+        import inspect
+
+        from src.portfolio.manager import RotationManager
+
+        code = inspect.getsource(RotationManager._build_decision_context)
+        assert "dd_pct = compute_drawdown_with_snapshots(" in code
+        code_decide = inspect.getsource(RotationManager.decide)
+        assert "ctx.dd_pct >= MAX_DRAWDOWN_LIQUIDATE_PCT" in code_decide, "熔斷必須續用自成立 peak 的 dd_pct"

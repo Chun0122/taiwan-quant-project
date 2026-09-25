@@ -472,3 +472,42 @@ ACTION_TYPE_PENDING_TOPUP: str = "pending_topup"  # 補倉待成交意圖（deci
 PENDING_REASON_TOPUP: str = "topup"  # RotationPendingOrder.reason 的補倉標記（買單唯一會帶 reason 的情形）
 # 缺口 < 目標部位 × 此比例即不補（避免價格波動造成的零碎單）
 TOPUP_MIN_GAP_RATIO: float = 0.05
+
+# ── 最小可行部位：縮放後低於此比例即整筆跳過，**slot 留空** ──
+#
+# 2026-09-19 發現（補倉驗收時）：Drawdown Guard 的 `drawdown_scale` 沒有下限，
+# 回撤逼近門檻時把新部位縮到接近零**卻照買照佔位**——mom3_20d 09-15 以 4 股
+# （2,232 元、佔資本 0.2%）吃掉 1/3 的持股配額到 10-13，mom5_10d 53 股佔 1/5
+# 配額到 09-29。滿倉 → `free_slots=0` → 不再買 → 現金空轉 → 賺不到錢就出不了
+# 回撤 → guard 繼續夾緊，形成與 sizing 收縮螺旋同型的第二個自我強化陷阱。
+#
+# 對照 Portfolio Heat 的處理即知不對稱：heat 預算用完時是 `continue`（放棄這筆、
+# **留著 slot**），drawdown 縮放卻一路縮到 dust 還是照佔位。本門檻讓所有縮放路徑
+# （drawdown / vol weight / correlation / heat）統一表達「現在不值得進場」。
+#
+# 0.20＝目標等權部位的兩成。校準：vol_weight 0.6 × corr penalty 0.5 ≈ 0.30 的
+# 合法部位仍放行；實際造成事故的 0.008 與 0.144 都會被擋下。
+MIN_POSITION_TARGET_RATIO: float = 0.20
+
+# ── Drawdown Guard 的 peak 窗口（交易日）──
+#
+# 2026-09-19 發現：`dd_pct` 這一個數字同時餵給 Kill Switch（≥25% 清倉）與
+# Drawdown Guard（`scale = 1 − dd/15`），但兩者要的語意相反：
+#   • Kill Switch 問「累計虧掉高水位的幾成」→ 自成立 peak **正確**，不可逆也正確
+#     （清倉本來就是終局）。
+#   • Drawdown Guard 問「**現在**是不是在流血」→ 自成立 peak **錯誤**：它把
+#     「三個月前虧過、還沒賺回來」和「此刻正在虧」當成同一件事。
+#
+# 後果是節流閥變成單向棘輪：peak 永不下修，組合若在 dd > 12%（scale < 0.2，
+# 低於最小可行部位）時走到全現金，現金無報酬 → 權益不動 → dd 不動 → 永遠開不了
+# 新倉。實測 mom3_20d 以 2026-06-03 的 peak 把 09-08~09-18 全部擋死，而該期間
+# 近 60 日回撤其實只有 4.7~10.1%。
+#
+# 60 交易日 ≈ 3 個月 ≈ 3~20 個完整輪動週期（持有期 3~20 交易日）——不會被單筆
+# 爛交易洗掉記憶，也不會被季度前的高點綁架。實測回放 mom3_20d 90 天：擋單由
+# 18 天降為 9 天，**且消失的正好是 peak 已過期的那 9 天**（回撤新鮮時
+# `dd(60日) == dd(自成立)`，行為與現行完全一致）。
+#
+# ⚠ 安全網由 Kill Switch 接手：每日 −0.2% 的慢跌情境下，滾動 dd 停在 11.3%
+# 高原（scale 0.25，仍在節流）而自成立 dd 持續累積，第 150 日觸發 25% 熔斷。
+DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS: int = 60

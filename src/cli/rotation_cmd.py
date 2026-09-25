@@ -504,7 +504,7 @@ def _print_rotation_preview(name: str, actions, target_date) -> None:
 
     _print_pending_queue(name)
 
-    if not (actions.to_sell or actions.renewed or actions.to_buy or actions.to_hold):
+    if not (actions.to_sell or actions.renewed or actions.to_buy or actions.to_hold or actions.skipped_undersized):
         print("  （無新決策動作）")
         return
 
@@ -535,6 +535,17 @@ def _print_rotation_preview(name: str, actions, target_date) -> None:
 
     if actions.to_hold:
         print(f"\n  將保持 ({len(actions.to_hold)} 檔持倉不變)")
+
+    if actions.skipped_undersized:
+        first = actions.skipped_undersized[0]
+        print(f"\n  ⚪ 跳過 ({len(actions.skipped_undersized)} 檔，縮放後低於最小可行部位 → slot 留空)：")
+        for s in actions.skipped_undersized:
+            print(
+                f"    ⚪ {s['stock_id']:<8s} rank#{s.get('rank', '?'):<3} 縮放後僅 {s['notional']:>10,.0f} 元"
+                f"  < 門檻 {s['min_position_capital']:,.0f}"
+            )
+        print(f"     （目標部位 {first['base_position_capital']:,.0f}｜drawdown_scale={first['drawdown_scale']:.3f}）")
+        print("     ※ 這是刻意不進場：留空 slot 好過開一個佔死配額的 dust 部位")
 
     print()
     print("  ※ DRY RUN：未實際寫入 DB；要執行請改 `rotation update --name {}`。".format(name))

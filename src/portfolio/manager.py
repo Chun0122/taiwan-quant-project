@@ -23,6 +23,7 @@ from src.constants import (
     COMMISSION_RATE,
     COMPOSITE_MODES,
     DECIDE_STAGE_ACTION_TYPES,
+    DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
     LIQUIDITY_PARTICIPATION_LIMIT,
     MAX_DRAWDOWN_LIQUIDATE_PCT,
     PENDING_BUY_TTL_TRADING_DAYS,
@@ -75,8 +76,11 @@ from src.portfolio.rotation import (
     compute_covariance_matrix,
     compute_drawdown_with_snapshots,
     compute_dynamic_slippage,
+    compute_guard_drawdown,
     compute_planned_exit_date,
-    compute_portfolio_drawdown,
+    compute_portfolio_drawdown,  # noqa: F401  re-export（2026-09-19 起 manager 內未直接使用；
+    # Guard 改走 compute_guard_drawdown、熔斷走 compute_drawdown_with_snapshots。
+    # 保留模組屬性供既有測試的相容分支 monkeypatch）
     compute_portfolio_var,
     compute_position_pnl,
     compute_rotation_actions,
@@ -138,7 +142,8 @@ class _DecisionContext:
     corr_matrix: pd.DataFrame | None
     price_rows: list | None
     vol_weights: dict[str, float] | None
-    dd_pct: float
+    dd_pct: float  # Kill Switch 用：peak 自成立起算
+    guard_dd_pct: float  # Drawdown Guard 用：peak 只看近 N 個交易日（滾動）
     gate_min_hold: int
     gate_score_gap: float
     gate_weekly_cap: int
@@ -383,7 +388,10 @@ class RotationManager:
                 vol_weights = compute_vol_inverse_weights(vol_dict)
                 logger.info("波動率反比權重：%s", vol_weights)
 
-        # ── 回撤（kill-switch 判斷 + Drawdown Guard 共用同一 dd_pct）──
+        # ── 回撤：Kill Switch 與 Drawdown Guard **各用各的**（2026-09-19 拆分）──
+        # 兩者問的問題相反：熔斷問「累計虧掉高水位的幾成」（自成立 peak 正確，
+        # 不可逆也正確）；Guard 問「現在是不是在流血」（自成立 peak 會退化成
+        # 單向棘輪——全現金時 dd 永遠不動，節流閥再也不放開）。
         # C1 修復（2026-05-09）：傳入 open_positions + today_prices，
         # 讓 equity_history 反映當日盤中浮動損益（含 gap-down），
         # 否則用過時 portfolio.current_capital 會在真實回撤時不觸發熔斷。
@@ -397,6 +405,23 @@ class RotationManager:
         # 修復 realized-only 序列低估「浮盈回吐型」回撤、熔斷不觸發的漏洞。
         snapshot_capitals = self._load_snapshot_capitals(session)
         dd_pct = compute_drawdown_with_snapshots(equity_history, snapshot_capitals)
+        # Guard 用滾動窗口 peak；current 沿用 equity_history 尾端（含當日 MtM），
+        # 與熔斷的 current 同源，兩者只差在 peak 的取樣範圍。
+        guard_dd_pct = compute_guard_drawdown(
+            self._load_snapshot_points(session),
+            equity_history[-1] if equity_history else (portfolio.current_capital or 0.0),
+            today,
+            trading_cal,
+            window_trading_days=DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
+        )
+        if guard_dd_pct != dd_pct:
+            logger.info(
+                "[%s] 回撤：熔斷用 %.2f%%（自成立 peak）／Guard 用 %.2f%%（近 %d 交易日 peak）",
+                self.portfolio_name,
+                dd_pct,
+                guard_dd_pct,
+                DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
+            )
 
         # ── Rotation 成本閘門（A/B/C）參數（per-mode：閘門對 momentum/swing 效果相反）──
         cost_cfg = settings.quant.rotation_cost.for_mode(portfolio.mode)
@@ -431,6 +456,7 @@ class RotationManager:
             price_rows=price_rows,
             vol_weights=vol_weights,
             dd_pct=dd_pct,
+            guard_dd_pct=guard_dd_pct,
             gate_min_hold=gate_min_hold,
             gate_score_gap=gate_score_gap,
             gate_weekly_cap=gate_weekly_cap,
@@ -553,7 +579,7 @@ class RotationManager:
                 corr_matrix=ctx.corr_matrix,
                 vol_weights=ctx.vol_weights,
                 regime=ctx.regime,
-                drawdown_pct=ctx.dd_pct,
+                drawdown_pct=ctx.guard_dd_pct,  # Guard 用滾動 peak（熔斷仍用 ctx.dd_pct）
                 min_hold_days=ctx.gate_min_hold,
                 score_gap_threshold=ctx.gate_score_gap,
                 weekly_swap_cap=ctx.gate_weekly_cap,
@@ -583,6 +609,20 @@ class RotationManager:
                         len(dupes),
                         ", ".join(dupes),
                     )
+
+            # 縮放後低於最小可行部位而留空 slot：這是**刻意不進場**，但若無告警
+            # 就是「沒買、現金空轉」的靜默狀態（2026-09 實測一週才被發現）
+            if actions.skipped_undersized:
+                first = actions.skipped_undersized[0]
+                logger.warning(
+                    "[%s] %d 檔候選因縮放後低於最小可行部位而跳過（slot 留空，非滿倉）："
+                    "%s｜最小 %.0f 元、drawdown_scale=%.3f",
+                    self.portfolio_name,
+                    len(actions.skipped_undersized),
+                    ", ".join(f"{s['stock_id']}({s['notional']:,.0f})" for s in actions.skipped_undersized[:5]),
+                    first["min_position_capital"],
+                    first["drawdown_scale"],
+                )
 
             if dry_run:
                 logger.info(
@@ -2381,8 +2421,20 @@ class RotationManager:
                     gate_score_gap = 0.0
                     gate_weekly_cap = 0
 
-                # P1-2：當前回撤（已實現權益序列 + 今日 pre-action 權益）供 Drawdown Guard 連續減倉
-                _dd_pct = compute_portfolio_drawdown([e["equity"] for e in equity_curve] + [pre_equity])
+                # P1-2：當前回撤供 Drawdown Guard 連續減倉。
+                # 2026-09-19：peak 改為近 N 個交易日的滾動窗口，**與 live
+                # `_build_decision_context` 的 guard_dd_pct 同一實作**——這條路徑
+                # 的 overlay 與 live 是兩份組裝（§10 結構債 B7），parity 漂移歷史上
+                # 已炸過 3 次 P0，故此處與 live 必須逐字同步。
+                # 註：backtest 無 Kill Switch（熔斷只在 live decide()），故此處不需
+                # 另算自成立 peak 的 dd。
+                _dd_pct = compute_guard_drawdown(
+                    [(e["date"], e["equity"]) for e in equity_curve],
+                    pre_equity,
+                    day,
+                    trading_cal,
+                    window_trading_days=DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
+                )
 
                 # 計算 rotation
                 actions = compute_rotation_actions(
@@ -2858,6 +2910,20 @@ class RotationManager:
             .order_by(RotationDailySnapshot.snapshot_date)
         )
         return [v for v in session.execute(stmt).scalars().all() if v is not None]
+
+    def _load_snapshot_points(self, session) -> list[tuple[date, float]]:
+        """載入該組合每日 snapshot 的 (日期, MtM 權益)，供 Drawdown Guard 的滾動 peak。
+
+        與 `_load_snapshot_capitals` 的差別只在**帶日期**：Guard 的窗口必須按日期
+        而非列數裁切，否則缺日（熔斷日不寫、update 失敗日、暫停期間）會讓窗口
+        悄悄拉長到遠超 N 個交易日，正好是本機制要消除的陳舊 peak。
+        """
+        stmt = (
+            select(RotationDailySnapshot.snapshot_date, RotationDailySnapshot.total_capital)
+            .where(RotationDailySnapshot.portfolio_name == self.portfolio_name)
+            .order_by(RotationDailySnapshot.snapshot_date)
+        )
+        return [(d, v) for d, v in session.execute(stmt).all() if v is not None]
 
     def _load_open_positions(self, session, portfolio_id: int) -> list[dict]:
         stmt = select(RotationPosition).where(

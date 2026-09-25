@@ -17,6 +17,7 @@ from src.constants import (
     COMMISSION_RATE,
     CORRELATION_PENALTY,
     CORRELATION_THRESHOLD,
+    DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
     LIMIT_DETECT_THRESHOLD,
     LIQUIDITY_PARTICIPATION_LIMIT,
     LOT_SIZE,
@@ -24,6 +25,7 @@ from src.constants import (
     MAX_PORTFOLIO_HEAT,
     MIN_COMMISSION_LOT,
     MIN_COMMISSION_ODD,
+    MIN_POSITION_TARGET_RATIO,
     ODD_LOT_SLIPPAGE_PREMIUM,
     PARTICIPATION_IMPACT_COEFF,
     PER_POSITION_RISK_CAP,
@@ -51,6 +53,9 @@ class RotationActions:
     renewed: list[dict] = field(default_factory=list)
     # 本次呼叫產生的非止損換手次數（供 backtest 累積週預算使用）
     holding_expired_sells: int = 0
+    # 縮放後低於最小可行部位而**刻意留空 slot** 的候選（供 caller 告警；
+    # 否則「沒買、現金空轉」是靜默狀態，2026-09 實測一週才被發現）
+    skipped_undersized: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +691,8 @@ def compute_rotation_actions(
     score_gap_threshold: float = 0.0,
     weekly_swap_cap: int = 0,
     weekly_swaps_used: int = 0,
+    # 最小可行部位（縮放後低於此比例即不買，slot 留空）
+    min_position_ratio: float = MIN_POSITION_TARGET_RATIO,
 ) -> RotationActions:
     """根據目前持倉與今日 discover 排名，計算買賣動作。
 
@@ -746,6 +753,13 @@ def compute_rotation_actions(
     crisis_force_close : bool
         crisis 時是否強制平倉所有既有持倉（預設 False）。
         啟用時 regime='crisis' 會觸發全持倉賣出。
+    min_position_ratio : float
+        最小可行部位＝目標部位 × 此比例。兩個作用點：
+        ①**新開倉**——所有縮放（Drawdown Guard／波動率反比權重／Correlation
+        Budget／Portfolio Heat）疊完後若仍低於此值，整筆跳過並把 slot 留空；
+        ②**到期續持**——低於此值的持倉一律出場（`undersized_exit`），豁免閘門
+        B/C 且不計入週換手預算，否則 dust 會靠「仍在榜上」無限續持鎖死配額。
+        詳 `constants.MIN_POSITION_TARGET_RATIO`。設 0 可停用。
 
     Returns
     -------
@@ -787,6 +801,13 @@ def compute_rotation_actions(
             if best_new_score is None or s > best_new_score:
                 best_new_score = s
 
+    # 續持的最小可行部位門檻：與新開倉同一把尺（不值得開的部位也不值得續抱）。
+    # 這裡的參照是目標等權部位本身（非 min(目標, 現金/空缺)）——續持不涉及現金。
+    _target_capital = (
+        total_capital / max_positions if total_capital and total_capital > 0 and max_positions > 0 else 0.0
+    )
+    min_hold_capital = _target_capital * max(0.0, min_position_ratio)
+
     for pos in current_positions:
         sid = pos["stock_id"]
         days_held = count_trading_days_held(pos["entry_date"], today, trading_calendar)
@@ -811,6 +832,30 @@ def compute_rotation_actions(
         expired = days_held >= effective_holding_days
 
         if expired:
+            # ── 到期時低於最小可行部位 → 一律出場，**豁免閘門 B/C 與續持** ──
+            #
+            # 最小可行部位原本只擋新開倉，卻照樣讓 dust **續持**——同一個不對稱。
+            # 2026-09-15 的 3034（mom5_10d 53 股／mom3_20d 4 股）就是這樣卡住配額的：
+            # 它連續 14 個掃描日有 13 天在 momentum top-N，到期只會被 renew 而永遠
+            # 不出場，slot 被一個佔資本 0.2~2.8% 的部位鎖死。
+            #
+            # 豁免閘門是刻意的：閘門 B（score_gap）擋的是「為了邊際優勢而換股」、
+            # 閘門 C 擋的是策略換手過頻，但清掉一個**本來就不該存在的畸形部位**
+            # 兩者都不適用。同理不計入週換手預算。
+            position_value = (current_price or pos.get("entry_price", 0.0)) * pos.get("shares", 0)
+            if min_hold_capital > 0 and position_value < min_hold_capital:
+                actions.to_sell.append(
+                    {
+                        "stock_id": sid,
+                        "reason": "undersized_exit",
+                        "exit_price": current_price if current_price is not None else pos["entry_price"],
+                        "days_held": days_held,
+                        **pos,
+                    }
+                )
+                sold_today.add(sid)
+                continue
+
             # ── 成本閘門 B：若新最佳候選分數與現持分差距不足，阻擋賣出 ──
             entry_score = pos.get("entry_score") or pos.get("composite_score")
             gate_b_block = (
@@ -937,8 +982,10 @@ def compute_rotation_actions(
             total_capital / max_positions if total_capital and total_capital > 0 and max_positions > 0 else 0.0
         )
         cash_per_slot = available_cash / free_slots if free_slots > 0 else 0.0
-        per_position_capital = min(target_capital, cash_per_slot) if target_capital > 0 else cash_per_slot
-        per_position_capital *= drawdown_scale  # Drawdown Guard 縮減
+        # 縮放前的每檔基準；最小可行部位以它為參照（故 drawdown_scale 本身也受門檻檢驗）
+        base_position_capital = min(target_capital, cash_per_slot) if target_capital > 0 else cash_per_slot
+        min_position_capital = base_position_capital * max(0.0, min_position_ratio)
+        per_position_capital = base_position_capital * drawdown_scale  # Drawdown Guard 縮減
 
         # ── Portfolio Heat：計算當前組合風險 ──
         current_heat = 0.0
@@ -1044,6 +1091,32 @@ def compute_rotation_actions(
 
             shares = tentative_shares if heat_enabled else compute_shares(adj_capital, price)
             if shares <= 0:
+                continue
+
+            # ── 最小可行部位：縮放後太小就不買，**slot 留空** ──
+            #
+            # 檢查點放在所有縮放（drawdown / vol weight / correlation / heat）之後，
+            # 且以**實際下單金額**（shares × price）判定，故不論哪條路徑把部位壓小
+            # 都擋得住。與 heat 預算用完時的 `continue` 同義：表達「現在不進場」。
+            #
+            # ⚠ 關鍵是**不遞減 free_slots**。舊行為會開一個 dust 部位把配額佔死：
+            # 2026-09-15 mom3_20d 以 4 股（2,232 元、資本 0.2%）吃掉 1/3 配額到
+            # 10-13，滿倉使 free_slots=0 → 不再買 → 現金空轉 → 出不了回撤 →
+            # drawdown_scale 繼續夾緊，與 sizing 收縮螺旋同型的第二個自我強化陷阱。
+            if min_position_capital > 0 and shares * price < min_position_capital:
+                actions.skipped_undersized.append(
+                    {
+                        "stock_id": sid,
+                        "stock_name": r.get("stock_name", ""),
+                        "rank": r["rank"],
+                        "price": price,
+                        "shares": shares,
+                        "notional": shares * price,
+                        "min_position_capital": min_position_capital,
+                        "base_position_capital": base_position_capital,
+                        "drawdown_scale": drawdown_scale,
+                    }
+                )
                 continue
 
             # 更新累積 heat
@@ -1474,6 +1547,71 @@ def compute_drawdown_with_snapshots(
         return 0.0
     dd = (peak - current) / peak * 100
     return round(max(dd, 0.0), 2)
+
+
+def compute_guard_drawdown(
+    equity_points: list[tuple[date, float]],
+    current_equity: float,
+    as_of: date,
+    trading_calendar: list[date],
+    window_trading_days: int = DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS,
+) -> float:
+    """Drawdown Guard 專用回撤：peak **只看近 N 個交易日**（純函數）。
+
+    與 `compute_drawdown_with_snapshots`（Kill Switch 用，peak 自成立起算）**刻意不同**。
+    兩者問的問題不一樣：
+
+      • Kill Switch：「累計虧掉高水位的幾成？」→ 自成立 peak，不可逆也合理（清倉是終局）
+      • Drawdown Guard：「**現在**是不是在流血？」→ 近期 peak
+
+    自成立 peak 拿來當節流閥會退化成單向棘輪：peak 永不下修，組合若在 dd > 12%
+    （scale < 0.2，低於最小可行部位）時走到全現金，現金無報酬 → 權益不動 →
+    dd 不動 → 永遠開不了新倉。詳 `constants.DRAWDOWN_GUARD_PEAK_WINDOW_TRADING_DAYS`。
+
+    **窗口按日期不按列數**：`equity_points` 會缺日（熔斷日不寫 snapshot、update
+    失敗日、組合暫停期間），取「最後 N 列」會讓窗口悄悄拉長到遠超 N 個交易日——
+    那正是本函數要消除的陳舊 peak。故以 `trading_calendar` 反推 cutoff 日期。
+
+    Parameters
+    ----------
+    equity_points : list[tuple[date, float]]
+        歷史每日 MtM 權益序列 [(日期, 權益)]，順序不拘（內部自行過濾）。
+    current_equity : float
+        當前權益（含當日盤中 MtM）。恆納入 peak 與 current 的計算。
+    as_of : date
+        今日。窗口為 `[as_of 往前數 N 個交易日, as_of]`。
+    trading_calendar : list[date]
+        已排序的交易日清單。**長度不足 N 或為空時退回「全序列」**（＝現行的自成立
+        行為，偏保守），不會比修改前更寬鬆。
+    window_trading_days : int
+        窗口長度（交易日）。≤0 時停用窗口（全序列），供回測 A/B 對照。
+
+    Returns
+    -------
+    float
+        當前回撤百分比（0.0~100.0），0.0 = 在窗口高點。
+    """
+    if current_equity is None:
+        return 0.0
+
+    values = [current_equity]
+    if equity_points:
+        cutoff: date | None = None
+        if window_trading_days > 0 and trading_calendar:
+            past = [d for d in trading_calendar if d <= as_of]
+            if len(past) >= window_trading_days:
+                cutoff = sorted(past)[-window_trading_days]
+        for d, v in equity_points:
+            if v is None or d > as_of:
+                continue
+            if cutoff is not None and d < cutoff:
+                continue
+            values.append(v)
+
+    peak = max(values)
+    if peak <= 0:
+        return 0.0
+    return round(max((peak - current_equity) / peak * 100, 0.0), 2)
 
 
 def build_equity_history(
