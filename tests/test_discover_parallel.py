@@ -82,7 +82,7 @@ class TestDiscoverParallel:
         timestamps: dict[str, float] = {}
         lock = threading.Lock()
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             with lock:
                 timestamps[self.mode_name] = time.time()
             time.sleep(0.1)
@@ -117,7 +117,7 @@ class TestDiscoverParallel:
         completed_modes: list[str] = []
         lock = threading.Lock()
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             if self.mode_name == "swing":
                 raise RuntimeError("swing simulation crash")
             with lock:
@@ -152,7 +152,7 @@ class TestDiscoverParallel:
 
         monkeypatch.setattr(dc, "_prewarm_stage_25", fake_prewarm)
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             with lock:
                 events.append(("scanner", threading.current_thread().name, time.time()))
             return DiscoveryResult(
@@ -199,7 +199,7 @@ class TestDiscoverParallel:
 
         monkeypatch.setattr(dc, "_save_discovery_records", fake_save)
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             # 三個 mode 有結果、兩個沒有
             if self.mode_name in ("momentum", "value", "growth"):
                 return DiscoveryResult(
@@ -232,7 +232,7 @@ class TestDiscoverParallel:
         called: list[str] = []
         lock = threading.Lock()
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             with lock:
                 called.append(self.mode_name)
             return DiscoveryResult(
@@ -372,7 +372,7 @@ class TestRunScannerWorker:
         """scanner.run() 例外 → 回傳 (mode, None, summary, error)。"""
         from src.discovery.scanner import MomentumScanner
 
-        def raising(self, shared=None, precomputed_ic=None):
+        def raising(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             raise ValueError("test")
 
         monkeypatch.setattr("src.discovery.scanner._base.MarketScanner.run", raising)
@@ -391,7 +391,7 @@ class TestRunScannerWorker:
 
         monkeypatch.setattr(
             "src.discovery.scanner._base.MarketScanner.run",
-            lambda self, shared=None, precomputed_ic=None: DiscoveryResult(
+            lambda self, shared=None, precomputed_ic=None, as_of=None, replay=None: DiscoveryResult(
                 rankings=pd.DataFrame([{"stock_id": "2330", "rank": 1}]),
                 total_stocks=10,
                 after_coarse=5,

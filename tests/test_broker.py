@@ -872,7 +872,7 @@ class TestStage25AutoFetch:
             regime_module.MarketRegimeDetector,
             "detect",
             # 需接受 as_of：Stage 0 自 B1 起以 detect(as_of=...) 呼叫
-            lambda self, as_of=None: {"regime": "bull", "taiex_close": 20000.0},
+            lambda self, as_of=None, replay=None: {"regime": "bull", "taiex_close": 20000.0},
         )
 
         scanner.run()

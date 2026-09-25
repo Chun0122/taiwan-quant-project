@@ -386,7 +386,15 @@ def _run_scanner_worker(
             weekly_confirm=getattr(args, "weekly_confirm", False),
             use_ic_adjustment=getattr(args, "use_ic_adjustment", False),
         )
-        result = scanner.run(shared=shared, precomputed_ic=precomputed_ic)
+        # morning-routine 傳入釘住的決策日時，以 live 身分掃描（replay=False）：
+        # 否則午夜後決策日早於牆上時鐘，會被誤判為 PIT 重放（見 MarketScanner.run）
+        as_of = getattr(args, "as_of", None)
+        result = scanner.run(
+            shared=shared,
+            precomputed_ic=precomputed_ic,
+            as_of=as_of,
+            replay=False if as_of is not None else None,
+        )
     except Exception as exc:
         logger.exception("Scanner [%s] 執行失敗", mode_key)
         return mode_key, None, f"  {label:<4} 失敗：{exc}", exc
@@ -443,7 +451,11 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     # 項目 B：一次性載入全市場資料（80 天價量 + 180 天營收），由 5 個 scanner 共用，
     # 取代原本每個 scanner 各自 SELECT DailyPrice/Inst/Margin/Revenue 造成的 4 次重複 I/O。
     print("載入全市場共用資料（80 天價量 + 180 天營收）...", end="", flush=True)
-    shared = load_shared_market_data(price_lookback_days=80, revenue_days=180)
+    # 決策日（morning-routine 釘住的 today；手動執行時為 None＝今日）。shared 與
+    # scanner 必須套同一個上界，否則會觸發「Shared price_cutoff 晚於 scanner cutoff」
+    # 而退回逐 scanner 查 DB（CLAUDE.md PIT 規則：兩路徑須套相同上界）
+    decision_date = getattr(args, "as_of", None)
+    shared = load_shared_market_data(price_lookback_days=80, revenue_days=180, as_of=decision_date)
     print(
         f" 日K {len(shared.df_price):,} | 法人 {len(shared.df_inst):,} | "
         f"融資融券 {len(shared.df_margin):,} | 營收 {len(shared.df_revenue):,}"
@@ -522,7 +534,7 @@ def _cmd_discover_all(args: argparse.Namespace) -> None:
     if min_app > 1 and not df.empty:
         df = df[df["appearances"] >= min_app].reset_index(drop=True)
 
-    today = datetime.date.today().strftime("%Y-%m-%d")
+    today = (decision_date or datetime.date.today()).strftime("%Y-%m-%d")
     n_modes = sum(1 for r in results.values() if r is not None and not r.rankings.empty)
 
     print(f"\n{'═' * 100}")

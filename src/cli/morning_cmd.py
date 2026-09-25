@@ -1142,8 +1142,13 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
 
     # C3 修復（2026-05-09 audit）：建立單一 today 物件貫穿全流程，避免跨午夜執行時
     # 各 step 各自呼叫 date.today() 拿到不同日期（observed: 23:13 啟動跑到 02:17 隔日）。
-    # 此 today 會被傳遞給 Step 8c IC 預檢與 Step 16 export-dashboard，
-    # 確保 scan_date / target_date 與此處 today_str 完全對齊。
+    # 此 today 會被傳遞給 Step 8c IC 預檢、**Step 9 discover**、**Step 12 rotation**、
+    # Step 15 衰減監控與 Step 16 export-dashboard，確保 scan_date / 決策日 / target_date
+    # 與此處 today_str 完全對齊。
+    # ⚠ 2026-09-25 補完：原本漏傳 Step 9 與 Step 12——平常 Step 12 在 23:08~23:29
+    # 跑完不會出事，但 routine 一拖過午夜就把前一交易日的決策標成隔日（09-21 的 run
+    # 標成 09-22、09-24 的 run 標成休市日 09-25）。`tests/test_morning_e2e.py::TestDatePinning`
+    # 守門：各 step 不得自行呼叫 date.today()。
     today = datetime.date.today()
     today_str = today.strftime("%Y-%m-%d")
     TOTAL = 18
@@ -1338,6 +1343,9 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
                 # 參數保留是為了 `discover all --disable-mode` 之類的人工介入場景。
                 disabled_modes=[],
                 precomputed_ic_by_mode=ic_df_by_mode,  # 項目 E
+                # C3 補完（2026-09-25）：scan_date 必須是釘住的 today，否則拖過午夜會
+                # 標成隔日；scanner 以 replay=False 處理，不會被誤判為 PIT 重放
+                as_of=today,
             )
         )
 
@@ -1346,7 +1354,8 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
         if freshness.get("phantom"):
             print("  !! 疑似臨時休市（行事曆交易日但全市場無今日資料）——跳過輪動更新，避免以陳舊 close 決策")
             return
-        _rotation_update_all(regime=regime_state["regime"])
+        # C3 補完（2026-09-25）：傳入釘住的 today，否則 mgr.update() 自取 date.today()
+        _rotation_update_all(regime=regime_state["regime"], today=today)
 
     # ── Step 1~7: 依序執行 ──────────────────────────────────────────
     _steps = [

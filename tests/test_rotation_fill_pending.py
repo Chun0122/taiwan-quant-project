@@ -418,7 +418,7 @@ class TestRotationUpdateAllIsolation:
             def __init__(self, name):
                 self.name = name
 
-            def update(self, regime=None, force=False):
+            def update(self, today=None, regime=None, force=False):
                 calls.append(self.name)
                 if self.name == "bad":
                     raise RuntimeError("boom")
