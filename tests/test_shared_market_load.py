@@ -336,7 +336,7 @@ class TestDiscoverAllSharedLoadCallCount:
 
         call_count = {"n": 0}
 
-        def fake_load(price_lookback_days=80, revenue_days=180):
+        def fake_load(price_lookback_days=80, revenue_days=180, as_of=None):
             call_count["n"] += 1
             return SharedMarketData(
                 df_price=pd.DataFrame(

@@ -8,7 +8,7 @@ from src.cli.helpers import init_db
 from src.cli.helpers import safe_print as print
 
 
-def _rotation_update_all(regime: str | None = None, force: bool = False) -> None:
+def _rotation_update_all(regime: str | None = None, force: bool = False, today=None) -> None:
     """更新所有 active 的輪動組合（供 morning-routine 與 CLI update --all 呼叫）。
 
     單一組合失敗不阻擋其餘組合（per-portfolio 隔離；2026-07-13 事故教訓：
@@ -21,6 +21,10 @@ def _rotation_update_all(regime: str | None = None, force: bool = False) -> None
         目前市場狀態，傳遞給 RotationManager.update() 用於 Crisis 硬阻擋。
     force : bool
         繞過同日冪等保護，強制重跑今日 update。
+    today : date | None
+        決策日。morning-routine 必須傳入釘住的日期——否則 routine 拖過午夜時
+        `mgr.update()` 會自行取 `date.today()` 得到隔日，把前一交易日的決策
+        標成隔日（2026-09-22、09-25 實測，09-25 還是休市日）。None＝今日（手動執行）。
     """
     import logging
 
@@ -37,7 +41,7 @@ def _rotation_update_all(regime: str | None = None, force: bool = False) -> None
         print(f"\n  ── 更新 [{p['name']}] ({p['mode']}, N={p['max_positions']}, {p['holding_days']}d) ──")
         try:
             mgr = RotationManager(p["name"])
-            actions = mgr.update(regime=regime, force=force)
+            actions = mgr.update(today=today, regime=regime, force=force)
         except Exception:
             logger.exception("[%s] 輪動更新失敗，跳過此組合繼續", p["name"])
             print(f"    !! [{p['name']}] 更新失敗，跳過此組合繼續")

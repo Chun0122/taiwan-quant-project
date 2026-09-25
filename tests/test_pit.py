@@ -105,6 +105,26 @@ class TestAsOfInjection:
         s.run(as_of=date(2026, 1, 5))
         assert s._is_offline() is True
 
+    def test_replay_false_keeps_live_with_past_as_of(self, monkeypatch):
+        """morning-routine 拖過午夜：釘住的決策日早於牆上時鐘，仍須是 live 掃描。
+
+        2026-09-25：未顯式宣告時會被誤判為 PIT 重放——停掉外部補抓、
+        不寫 universe_stat_log、regime 改用不套遲滯的 raw 值。
+        """
+        yesterday = date.today() - timedelta(days=1)
+        s = MomentumScanner(min_volume=1, use_ic_adjustment=False)
+        _stub_run_deps(s, monkeypatch)
+        s.run(as_of=yesterday, replay=False)
+        assert s.scan_date == yesterday, "scan_date 必須是釘住的決策日（落庫標籤）"
+        assert s._is_offline() is False, "顯式 live 不得進入 offline"
+
+    def test_replay_default_unchanged_for_existing_callers(self, monkeypatch):
+        """replay 未指定時沿用舊推斷——pit-replay 等既有呼叫端行為不得改變。"""
+        s = MomentumScanner(min_volume=1, use_ic_adjustment=False)
+        _stub_run_deps(s, monkeypatch)
+        s.run(as_of=date.today() - timedelta(days=1))
+        assert s._is_offline() is True
+
     def test_as_of_helper_falls_back_before_run(self):
         """run() 尚未執行時 helper 仍可用（單元測試直接呼叫子函數的情境）。"""
         assert MomentumScanner(min_volume=1)._as_of() == date.today()
@@ -287,8 +307,10 @@ class TestNoBareTodayInEngine:
         explicit_allow = {
             # 記錄「何時寫入」的掛鐘時間，非資料日；狀態機的冪等鍵是 data_date
             "today_str = datetime.date.today().isoformat()",
-            # PIT 判定本身：必須跟真實今日比較才知道這是不是歷史重放
-            "if as_of is not None and as_of < datetime.date.today():",
+            # PIT 判定本身：必須跟真實今日比較才知道這是不是歷史重放。
+            # 2026-09-25 改寫為「未顯式宣告 replay 時才推斷」——同一條判定、同一個理由；
+            # live 呼叫端（morning-routine 拖過午夜）改以 replay=False 顯式宣告，不再依賴此推斷
+            "is_replay = (as_of is not None and as_of < datetime.date.today()) if replay is None else replay",
         }
 
         offenders: list[str] = []
@@ -361,7 +383,7 @@ def _stub_run_deps(scanner, monkeypatch):
     import src.regime.detector as det_mod
 
     class _FakeDetector:
-        def detect(self, as_of=None):
+        def detect(self, as_of=None, replay=None):
             # 需接受 as_of：Stage 0 自 B1 起以 detect(as_of=self.scan_date) 呼叫，
             # 簽名不符會拋例外並被 Stage 0 吞掉 → regime 退回 sideways → 模式被封鎖
             return {"regime": "bull", "taiex_close": 20000.0}
@@ -437,6 +459,27 @@ class TestRegimePIT:
         assert after == before, "PIT 重放不得寫入 RegimeStateLog"
         assert r["state_advanced"] is False
         assert r["transition_info"]["reason"] == "pit_replay_readonly"
+
+    def test_replay_false_uses_live_state_machine(self, db_session, monkeypatch):
+        """顯式 live（replay=False）即使 as_of 早於今日也須走遲滯狀態機，不得回 raw。"""
+        import src.data.database as db_mod
+        from src.regime.detector import MarketRegimeDetector
+
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(db_mod, "get_session", lambda: _Ctx())
+        self._seed_taiex(db_session, [15000 + i * 30 for i in range(130)], date(2026, 3, 1))
+
+        r = MarketRegimeDetector().detect(as_of=date(2026, 3, 1), replay=False)
+
+        assert r["transition_info"].get("reason") != "pit_replay_readonly", (
+            "live 掃描被誤判為 PIT 重放 → regime 改用不套遲滯的 raw 值"
+        )
 
     def test_breadth_respects_as_of(self, db_session, monkeypatch):
         """市場寬度取 <= as_of 的最新 DailyFeature，非今日。"""

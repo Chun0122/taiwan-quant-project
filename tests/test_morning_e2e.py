@@ -435,3 +435,91 @@ class TestStepInventory:
 
         src = inspect.getsource(_run_morning_routine)
         assert "TOTAL = 18" in src, "TOTAL 應為 18（若 step 數變動請更新此測試）"
+
+
+# ====================================================================== #
+# C3 補完（2026-09-25）：決策日釘住——Step 9 / Step 12 不得自取 date.today()
+# ====================================================================== #
+
+
+class TestDatePinning:
+    """routine 拖過午夜時，Step 9 / Step 12 仍須使用啟動時釘住的 today。
+
+    ## 事故
+
+    C3 修復（2026-05-09）在 `_run_morning_routine` 開頭釘住 `today`，但只傳給
+    Step 8c 與 Step 16。Step 9（`_cmd_discover_all`）與 Step 12
+    （`_rotation_update_all` → `mgr.update()`）內部各自 `date.today()`。平常
+    Step 12 在 23:08~23:29 跑完不會出事，但一拖過午夜就把前一交易日的決策
+    標成隔日：09-21 的 run 在 09-22 03:15 跑 Step 12 → 標成 09-22；09-24 的 run
+    在 09-25 04:32 跑 → 標成 09-25，而那天是**休市日**。
+    """
+
+    def test_step9_and_step12_receive_pinned_today(self, fresh_db, monkeypatch, tmp_path):
+        import src.cli.morning_cmd as mc
+
+        today = _dt.date.today()
+        with fresh_db() as session:
+            _seed_taiex(session, today, n_days=60)
+            _seed_0050(session, today, n_days=30)
+            _seed_watchlist(session, today, n_days=30)
+            _seed_rotation_portfolio(session)
+
+        _patch_external_io(monkeypatch)
+        monkeypatch.setattr("src.data.calendar.is_trading_day", lambda d: True)
+        monkeypatch.setattr("src.cli.export_dashboard_cmd._DEFAULT_OUT_DIR", tmp_path / "dashboard_out")
+
+        captured: dict = {}
+
+        def _fake_discover(args):
+            captured["discover_as_of"] = getattr(args, "as_of", "MISSING")
+
+        def _fake_rotation(regime=None, force=False, today="MISSING"):
+            captured["rotation_today"] = today
+
+        monkeypatch.setattr(mc, "_cmd_discover_all", _fake_discover)
+        monkeypatch.setattr(mc, "_rotation_update_all", _fake_rotation)
+
+        cmd_morning_routine(argparse.Namespace(dry_run=False, skip_sync=True, top=5, notify=False))
+
+        assert captured.get("discover_as_of") == today, "Step 9 未收到釘住的 today → 拖過午夜會標成隔日"
+        assert captured.get("rotation_today") == today, "Step 12 未收到釘住的 today → mgr.update() 自取隔日"
+
+    def test_routine_reads_wall_clock_exactly_once(self):
+        """靜態守門：`_run_morning_routine` 本體只准在開頭讀一次牆上時鐘。
+
+        任何 step 另外呼叫 `date.today()`，拖過午夜時就會拿到與其他 step 不同的
+        日期。step 需要日期時一律用閉包裡釘住的 `today`。
+        """
+        import inspect
+        import re
+
+        import src.cli.morning_cmd as mc
+
+        src_lines = inspect.getsource(mc._run_morning_routine).splitlines()
+        code = "\n".join(line.split("#", 1)[0] for line in src_lines)
+        calls = re.findall(r"date\.today\(\)", code)
+        assert len(calls) == 1, f"_run_morning_routine 讀了 {len(calls)} 次 date.today()（應只在開頭釘住一次）"
+
+    def test_rotation_update_all_forwards_today(self, monkeypatch):
+        """`_rotation_update_all(today=D)` 必須把 D 原樣交給每個組合的 update()。"""
+        from src.cli.rotation_cmd import _rotation_update_all
+        from src.portfolio.manager import RotationManager
+
+        pinned = _dt.date(2026, 9, 24)
+        seen: list = []
+        monkeypatch.setattr(
+            RotationManager,
+            "list_portfolios",
+            staticmethod(
+                lambda: [
+                    {"name": "a", "status": "active", "mode": "momentum", "max_positions": 5, "holding_days": 10},
+                    {"name": "b", "status": "active", "mode": "momentum", "max_positions": 3, "holding_days": 20},
+                ]
+            ),
+        )
+        monkeypatch.setattr(RotationManager, "update", lambda self, today=None, **kw: seen.append(today))
+
+        _rotation_update_all(regime="bull", today=pinned)
+
+        assert seen == [pinned, pinned]

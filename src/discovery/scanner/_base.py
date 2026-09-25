@@ -198,6 +198,8 @@ class MarketScanner:
         shared: SharedMarketData | None = None,
         precomputed_ic: pd.DataFrame | None = None,
         as_of: date | None = None,
+        *,
+        replay: bool | None = None,
     ) -> DiscoveryResult:
         """執行四階段漏斗掃描。
 
@@ -221,12 +223,19 @@ class MarketScanner:
 
                 注意：`date.today()` 只出現在此處與 CLI 入口（MASTER_PLAN §3
                 原則 4）；引擎內部一律使用 `self.scan_date`。
+            replay: 是否為 PIT 重放的**顯式宣告**，決定 offline mode 與 Stage 0
+                regime 是否走唯讀路徑。None（預設）＝沿用舊推斷（as_of 早於 `date.today()` 即視為重放），
+                pit-replay 等既有呼叫端行為不變；False＝即使 as_of 早於牆上時鐘也是
+                live 掃描。
+                ⚠ 用途（2026-09-25）：morning-routine 拖過午夜時，釘住的決策日早於
+                牆上時鐘。舊推斷會把 live 掃描誤判為重放——停掉所有外部補抓、
+                不寫 universe_stat_log、regime 改用不套遲滯的 raw 值。
         """
         self._shared = shared
         self._precomputed_ic = precomputed_ic
         self.scan_date = as_of or date.today()
         # PIT 重放時禁止外部 API——否則會把「今天」的資料寫進歷史情境
-        self._offline = is_pit_replay(as_of)
+        self._offline = is_pit_replay(as_of) if replay is None else replay
         if self._offline:
             logger.info("PIT 重放模式：as_of=%s，已停用所有外部資料補抓", self.scan_date)
         stages = self._STAGES
@@ -241,7 +250,7 @@ class MarketScanner:
         try:
             from src.regime.detector import MarketRegimeDetector
 
-            regime_info = MarketRegimeDetector().detect(as_of=self.scan_date)
+            regime_info = MarketRegimeDetector().detect(as_of=self.scan_date, replay=self._offline)
             self.regime = regime_info["regime"]
             logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
         except Exception:

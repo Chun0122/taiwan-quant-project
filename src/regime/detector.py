@@ -1047,7 +1047,7 @@ class MarketRegimeDetector:
                 return_window=return_window,
             )
 
-    def detect(self, as_of: datetime.date | None = None) -> dict:
+    def detect(self, as_of: datetime.date | None = None, *, replay: bool | None = None) -> dict:
         """偵測市場狀態。
 
         Args:
@@ -1055,6 +1055,12 @@ class MarketRegimeDetector:
                 `<= as_of` 上界，且**不寫入狀態機**（read-only）——歷史重放
                 若推進 live 的 hysteresis 狀態，等於用過去的資料污染今天的判定。
                 None（預設）＝今日偵測，行為與注入前完全相同。
+            replay: 是否為 PIT 重放的**顯式宣告**。None（預設）＝沿用舊推斷
+                as_of 早於 `date.today()` 即視為重放；False＝即使 as_of 早於牆上時鐘也走 live 路徑。
+                ⚠ 用途（2026-09-25）：morning-routine 拖過午夜時，釘住的決策日
+                會早於牆上時鐘，舊推斷會把 **live 掃描誤判為歷史重放**，改走
+                不套遲滯的 raw regime（實測常見 raw=sideways、final=bull），
+                評分權重與門檻整組換掉。live 呼叫端須傳 `replay=False`。
 
                 regime 驅動評分權重、分數門檻、ATR 倍數、universe 乘數與
                 `REGIME_MODE_BLOCK`；PIT 重放若沿用今日 regime，重放結果便毫無意義。
@@ -1131,7 +1137,8 @@ class MarketRegimeDetector:
             # B1 PIT：歷史重放**不得**推進 live 狀態機——用過去的資料去推進今天的
             # hysteresis，等於把重放的副作用寫回生產狀態。改走 read-only 路徑：
             # 照常算 raw regime 與所有訊號，但不套遲滯、不寫 RegimeStateLog。
-            if as_of is not None and as_of < datetime.date.today():
+            is_replay = (as_of is not None and as_of < datetime.date.today()) if replay is None else replay
+            if is_replay:
                 result = detect_from_series(
                     closes,
                     volumes=volumes,

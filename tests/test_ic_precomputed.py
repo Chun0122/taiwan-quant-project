@@ -174,7 +174,7 @@ class TestEndToEndIcDfFlow:
 
         captured = {}
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             captured["precomputed_ic"] = precomputed_ic
             captured["shared"] = shared
             return DiscoveryResult(
@@ -210,7 +210,7 @@ class TestEndToEndIcDfFlow:
 
         captured = {}
 
-        def fake_run(self, shared=None, precomputed_ic=None):
+        def fake_run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):
             captured["precomputed_ic"] = precomputed_ic
             return DiscoveryResult(
                 rankings=pd.DataFrame(),

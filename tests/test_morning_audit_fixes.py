@@ -205,7 +205,7 @@ class TestDiscoverAllDisabledModes:
             def __init__(self, mode_key, **kwargs):
                 self._mode_key = mode_key
 
-            def run(self, shared=None, precomputed_ic=None):  # 項目 B + E
+            def run(self, shared=None, precomputed_ic=None, as_of=None, replay=None):  # 項目 B + E
                 called_modes.append(self._mode_key)
                 return _FakeResult()
 
