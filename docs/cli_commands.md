@@ -352,6 +352,8 @@ python main.py validate-baseline --tolerance 0.5          # 嚴格半量閾值
 python main.py validate-baseline --tolerance 2.0 --quiet  # 寬鬆 + 只用 exit code（CI 用）
 # baseline_metrics.json 結構：每個 portfolio 凍結 sharpe / max_drawdown_pct / win_rate_pct / alpha_cum_pct
 # 預設 deltas：sharpe -0.20 / mdd +2pp / win_rate -5pp / alpha -3pp 觸發 regression
+# 只比 **active** 組合（2026-09-25）：baseline 內已暫停/刪除的組合會被略過並列出——其指標凍結，
+# 對上凍結的 baseline 只會產生恆定告警。CLI 與 morning Step 17 共用 split_baseline_portfolios()
 
 # 匯出
 python main.py export --list

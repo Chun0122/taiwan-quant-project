@@ -118,6 +118,34 @@ class TestAsOfInjection:
         assert s.scan_date == yesterday, "scan_date 必須是釘住的決策日（落庫標籤）"
         assert s._is_offline() is False, "顯式 live 不得進入 offline"
 
+    def test_stage0_failure_falls_back_loudly(self, monkeypatch, caplog):
+        """detect() 失敗仍退回 sideways（掃描要能跑完），但必須留下帶 traceback 的 ERROR。
+
+        2026-09-25：舊版只有一行無細節的 warning——測試替身的簽名錯誤就這樣被吞成
+        sideways，選股序列默默改變。正式環境同理，所以失敗必須看得到原因。
+        """
+        import logging
+
+        import src.regime.detector as det_mod
+
+        s = MomentumScanner(min_volume=1, use_ic_adjustment=False)
+        _stub_run_deps(s, monkeypatch)
+
+        class _Broken:
+            def detect(self, as_of=None):  # 刻意不收 replay → TypeError
+                return {"regime": "bull", "taiex_close": 20000.0}
+
+        monkeypatch.setattr(det_mod, "MarketRegimeDetector", _Broken)
+
+        with caplog.at_level(logging.ERROR, logger="src.discovery.scanner._base"):
+            s.run()
+
+        assert s.regime == "sideways", "失敗時仍須退回 sideways 讓掃描跑完"
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR and "Stage 0" in r.getMessage()]
+        assert errors, "Stage 0 失敗必須以 ERROR 記錄"
+        assert errors[0].exc_info is not None, "必須附 traceback，否則看不出是簽名錯誤還是資料問題"
+        assert errors[0].exc_info[0] is TypeError
+
     def test_replay_default_unchanged_for_existing_callers(self, monkeypatch):
         """replay 未指定時沿用舊推斷——pit-replay 等既有呼叫端行為不得改變。"""
         s = MomentumScanner(min_volume=1, use_ic_adjustment=False)

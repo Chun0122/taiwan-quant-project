@@ -62,6 +62,11 @@ class TestLaunchdTask:
 
         sh_text = sh_path.read_text(encoding="utf-8")
         assert "morning-routine --notify" in sh_text
+        # 2026-09-25：輸出不緩衝（卡住時看得到停在哪個 step）＋ 執行期間阻止休眠
+        assert "export PYTHONUNBUFFERED=1" in sh_text
+        assert "/usr/bin/caffeinate -ims" in sh_text
+        run_line = next(line for line in sh_text.splitlines() if "morning-routine --notify" in line)
+        assert run_line.startswith("/usr/bin/caffeinate"), "caffeinate 必須包住 routine 本身，而非另起一行"
         assert "#!/bin/bash" in sh_text
         assert "venv/bin/activate" in sh_text
 

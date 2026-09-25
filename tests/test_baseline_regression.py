@@ -334,6 +334,8 @@ class TestValidateBaselineExitCodes:
         cm = _cm(name="x")
         monkeypatch.setattr(baseline_cmd, "load_baseline", lambda *a, **kw: {"x": bm})
         monkeypatch.setattr(baseline_cmd, "collect_current_metrics", lambda *a, **kw: {"x": cm})
+        # 必須打樁：否則會查真的 dev DB（無 "x"）→ x 被當 paused 略過 → 什麼都沒比就回 0
+        monkeypatch.setattr(baseline_cmd, "_active_portfolio_names", lambda: ["x"])
 
         exit_code = baseline_cmd.cmd_validate_baseline(argparse.Namespace(tolerance=1.0, lookback_days=90, quiet=True))
         assert exit_code == 0
@@ -349,6 +351,8 @@ class TestValidateBaselineExitCodes:
         cm = _cm(name="x", sharpe=0.3)  # -0.7 退化 > 0.20
         monkeypatch.setattr(baseline_cmd, "load_baseline", lambda *a, **kw: {"x": bm})
         monkeypatch.setattr(baseline_cmd, "collect_current_metrics", lambda *a, **kw: {"x": cm})
+        # 必須打樁：否則會查真的 dev DB（無 "x"）→ x 被當 paused 略過 → 什麼都沒比就回 0
+        monkeypatch.setattr(baseline_cmd, "_active_portfolio_names", lambda: ["x"])
 
         exit_code = baseline_cmd.cmd_validate_baseline(argparse.Namespace(tolerance=1.0, lookback_days=90, quiet=True))
         assert exit_code == 1
@@ -364,3 +368,97 @@ class TestValidateBaselineExitCodes:
             argparse.Namespace(confirm=False, portfolios=None, lookback_days=90)
         )
         assert exit_code == 2
+
+
+# ====================================================================== #
+# 只比 active 組合（2026-09-25）
+# ====================================================================== #
+
+
+class TestActiveOnlyComparison:
+    """paused 組合指標凍結，對上凍結的 baseline 是恆定差值——每天照響、資訊量為零。
+
+    2026-09 實測 swing5_3d／mg5_20d 兩個 paused 組合佔 Step 17 十二項告警中的三項，
+    連續多日告警值逐位相同。舊版的「找不到當前 portfolio — skip」分支永遠不會觸發：
+    `collect_current_metrics` 對每個要求的名字都會回一筆。
+    """
+
+    def test_split_pure(self):
+        from src.cli.baseline_cmd import split_baseline_portfolios
+
+        compare, skipped = split_baseline_portfolios(
+            ["mom5_10d", "swing5_3d", "mom3_20d", "mg5_20d"], ["mom5_10d", "mom3_20d", "other"]
+        )
+        assert compare == ["mom3_20d", "mom5_10d"]
+        assert skipped == ["mg5_20d", "swing5_3d"]
+
+    def test_split_active_not_in_baseline_is_ignored(self):
+        """active 但不在 baseline 的組合不比（沒有基準可比）。"""
+        from src.cli.baseline_cmd import split_baseline_portfolios
+
+        compare, skipped = split_baseline_portfolios(["a"], ["a", "b"])
+        assert compare == ["a"]
+        assert skipped == []
+
+    def test_validate_skips_paused_regression(self, monkeypatch, capsys):
+        """paused 組合嚴重退化也不得觸發告警，且不得去撈它的指標。"""
+        import argparse
+
+        import src.cli.helpers as helpers
+        from src.cli import baseline_cmd
+
+        monkeypatch.setattr(helpers, "init_db", lambda: None)
+        baseline = {"live": _bm(name="live", sharpe=1.0), "paused": _bm(name="paused", sharpe=1.0)}
+        requested: list = []
+
+        def _collect(portfolio_names=None, **kw):
+            requested.extend(portfolio_names or [])
+            return {"live": _cm(name="live", sharpe=1.0), "paused": _cm(name="paused", sharpe=-3.0)}
+
+        monkeypatch.setattr(baseline_cmd, "load_baseline", lambda *a, **kw: baseline)
+        monkeypatch.setattr(baseline_cmd, "collect_current_metrics", _collect)
+        monkeypatch.setattr(baseline_cmd, "_active_portfolio_names", lambda: ["live"])
+
+        exit_code = baseline_cmd.cmd_validate_baseline(argparse.Namespace(tolerance=1.0, lookback_days=90, quiet=False))
+
+        assert exit_code == 0, "paused 組合的退化不得使守門失敗"
+        assert requested == ["live"], "不得去撈 paused 組合的指標"
+        assert "略過非 active 組合" in capsys.readouterr().out, "略過必須說出來（降級但不靜默）"
+
+    def test_validate_still_catches_active_regression(self, monkeypatch):
+        """過濾不得連 active 組合的退化也一起放掉。"""
+        import argparse
+
+        import src.cli.helpers as helpers
+        from src.cli import baseline_cmd
+
+        monkeypatch.setattr(helpers, "init_db", lambda: None)
+        baseline = {"live": _bm(name="live", sharpe=1.0), "paused": _bm(name="paused", sharpe=1.0)}
+        monkeypatch.setattr(baseline_cmd, "load_baseline", lambda *a, **kw: baseline)
+        monkeypatch.setattr(
+            baseline_cmd, "collect_current_metrics", lambda *a, **kw: {"live": _cm(name="live", sharpe=0.3)}
+        )
+        monkeypatch.setattr(baseline_cmd, "_active_portfolio_names", lambda: ["live"])
+
+        exit_code = baseline_cmd.cmd_validate_baseline(argparse.Namespace(tolerance=1.0, lookback_days=90, quiet=True))
+        assert exit_code == 1
+
+    def test_morning_step17_skips_paused(self, monkeypatch):
+        """morning Step 17 與 CLI 共用同一判定——每天真正在響的是這一條。"""
+        from src.cli import baseline_cmd
+        from src.cli.morning_cmd import _baseline_regression_check
+
+        baseline = {"live": _bm(name="live", sharpe=1.0), "paused": _bm(name="paused", sharpe=1.0)}
+        monkeypatch.setattr(baseline_cmd, "load_baseline", lambda *a, **kw: baseline)
+        monkeypatch.setattr(
+            baseline_cmd,
+            "collect_current_metrics",
+            lambda portfolio_names=None, **kw: {n: _cm(name=n, sharpe=-3.0) for n in (portfolio_names or [])},
+        )
+        monkeypatch.setattr(baseline_cmd, "_active_portfolio_names", lambda: ["live"])
+
+        state: dict = {}
+        _baseline_regression_check(state=state)
+
+        names = {r.portfolio_name for r in state["regressions"]}
+        assert names == {"live"}, f"paused 組合不得出現在告警中：{names}"

@@ -254,8 +254,15 @@ class MarketScanner:
             self.regime = regime_info["regime"]
             logger.info("Stage 0: 市場狀態 = %s (TAIEX=%.0f)", self.regime, regime_info["taiex_close"])
         except Exception:
+            # 降級但不靜默（§3 原則 8）：退回 sideways 讓掃描能跑完，但必須看得到原因。
+            # 2026-09-25 教訓：舊版只印一行無細節的 warning，detect() 的簽名錯誤
+            # （TypeError）就這樣被吞成 sideways，選股權重與門檻默默換掉而無人察覺。
             self.regime = "sideways"
-            logger.warning("Stage 0: 市場狀態偵測失敗，預設 sideways")
+            logger.error(
+                "Stage 0: 市場狀態偵測失敗，退回 sideways——本次掃描的評分權重、門檻、"
+                "universe 乘數皆非當日真實 regime 的設定",
+                exc_info=True,
+            )
 
         # Stage 0.1: Regime gate — 特定模式在指定 regime 不執行
         if self._is_regime_blocked():
