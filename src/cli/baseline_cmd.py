@@ -294,6 +294,37 @@ def _try_git_head() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 哪些 baseline 組合要比對
+# ---------------------------------------------------------------------------
+
+
+def split_baseline_portfolios(
+    baseline_names: list[str] | set[str],
+    active_names: list[str] | set[str],
+) -> tuple[list[str], list[str]]:
+    """把 baseline 內的組合拆成（要比對的, 非 active 而略過的），皆依名稱排序（純函數）。
+
+    **只比 active 組合**：paused 組合不再產生 snapshot，指標凍結在暫停當下，對上
+    凍結的 baseline 就是恆定差值——每天照響、資訊量為零（2026-09 實測 swing5_3d／
+    mg5_20d 兩個 paused 組合佔 12 項告警中的 3 項，連續多日告警值逐位相同）。
+    用「仍在跑的標準」守門一個已停止的組合沒有意義。
+
+    舊版以 `collect_current_metrics(portfolio_names=list(baseline.keys()))` 強制取
+    所有 baseline 組合的指標，而該函式對每個要求的名字都會回一筆，故原本的
+    「找不到當前 portfolio — skip」分支是永遠不會觸發的死碼。
+    """
+    active = set(active_names)
+    names = sorted(set(baseline_names))
+    return [n for n in names if n in active], [n for n in names if n not in active]
+
+
+def _active_portfolio_names() -> list[str]:
+    from src.portfolio.manager import RotationManager
+
+    return [p["name"] for p in RotationManager.list_portfolios() if p["status"] == "active"]
+
+
+# ---------------------------------------------------------------------------
 # DB 撈當前指標
 # ---------------------------------------------------------------------------
 
@@ -353,24 +384,21 @@ def cmd_validate_baseline(args: argparse.Namespace) -> int:
         print("  請先執行：python main.py update-baseline --confirm")
         return 2
 
-    current = collect_current_metrics(
-        portfolio_names=list(baseline.keys()),
-        lookback_days=lookback_days,
-    )
+    compare_names, skipped = split_baseline_portfolios(baseline.keys(), _active_portfolio_names())
+    if skipped and not quiet:
+        print(f"[baseline] 略過非 active 組合（已暫停/刪除，指標凍結無比對意義）：{', '.join(skipped)}")
+
+    current = collect_current_metrics(portfolio_names=compare_names, lookback_days=lookback_days)
 
     all_findings: list[RegressionFinding] = []
-    for name, bm in baseline.items():
-        cm = current.get(name)
-        if cm is None:
-            print(f"[{name}] 找不到當前 portfolio（可能已 paused/delete）— skip")
-            continue
-        findings = compare_metrics(bm, cm, tolerance=tolerance)
-        all_findings.extend(findings)
+    for name in compare_names:
+        all_findings.extend(compare_metrics(baseline[name], current[name], tolerance=tolerance))
 
     regressions = [f for f in all_findings if f.is_regression]
 
     if not quiet:
-        _print_baseline_report(baseline, current, all_findings, tolerance=tolerance)
+        compared = {n: baseline[n] for n in compare_names}
+        _print_baseline_report(compared, current, all_findings, tolerance=tolerance)
 
     return 1 if regressions else 0
 

@@ -131,7 +131,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 | `report/` | 每日報告 + Discord 格式化（2000 字元限制）+ AI 摘要（`claude-sonnet-4-6`） |
 | `notification/line_notify.py` | Discord Webhook（檔名歷史遺留） |
 | `visualization/` | Streamlit 儀表板（12 分頁）+ Plotly 圖表 |
-| `scheduler/` | 排程（前景 / Windows Task Scheduler / macOS LaunchAgent） |
+| `scheduler/` | 排程（前景 / Windows Task Scheduler / macOS LaunchAgent）。**macOS 腳本由 `launchd_task.py` 產生，`scripts/` 是 gitignored——改排程行為要改產生器再重新產生，不要只改 `scripts/daily_sync.sh`**。daily 腳本以 `caffeinate -ims` 包住 routine（執行期間不睡眠；闔蓋仍會強制休眠）並設 `PYTHONUNBUFFERED=1`（否則 stdout 導檔時 `[Step N/18]` 標題卡在緩衝區，process 被 kill 就查不出停在哪一步） |
 | `features/indicators.py` | SMA/RSI/MACD/BB/ADX EAV + 週線聚合 |
 | `features/ta_compat.py` | `ta` 套件版本相容層（0.5.x `n=` vs ≥0.7 `window=` 自動偵測，`make_sma/rsi/macd/bollinger/adx` 工廠） |
 | `features/ml_features.py` | ML 特徵矩陣 + SHAP 篩選 |
@@ -189,7 +189,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 
 - **策略**：純函數優先（零 mock）；DB 整合用 in-memory SQLite + transaction rollback；HTTP mock `requests.Session.get` + `time.sleep`
 - **要求**：新增計算邏輯**必須**補測試
-- **執行**：`pytest -v`（2964 測試 / 108 檔）
+- **執行**：`pytest -v`（2970 測試 / 108 檔）
 - **Fixtures**：`tests/conftest.py`（`in_memory_engine`/`db_session`/`sample_ohlcv`）；共用建構函數 `tests/scanner_helpers.py`
 - 詳細測試檔對照表見 [`docs/testing_guide.md`](docs/testing_guide.md)
 

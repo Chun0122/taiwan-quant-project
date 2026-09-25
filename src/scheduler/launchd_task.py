@@ -68,7 +68,13 @@ elif [ -f "venv/bin/activate" ]; then
 fi
 
 # 執行完整早晨例行流程
-"{python_exe}" "{main_script}" morning-routine --notify >> "{log_dir}/morning_routine.log" 2>&1
+# ・PYTHONUNBUFFERED：stdout 導向檔案時 Python 預設區塊緩衝，[Step N/18] 標題會卡在
+#   緩衝區、process 被 kill 時一併遺失——2026-09-25 因此查不出卡住的 run 停在哪個 step
+# ・caffeinate -ims：執行期間阻止閒置睡眠（-i）、磁碟睡眠（-m）、接電時系統睡眠（-s）。
+#   2026-09-21 的 run 因休眠拖了 51 小時；routine 結束即自動解除，不影響平時省電。
+#   ⚠ 闔上筆電蓋仍會強制休眠，caffeinate 擋不住（根治見 MASTER_PLAN B5）
+export PYTHONUNBUFFERED=1
+/usr/bin/caffeinate -ims "{python_exe}" "{main_script}" morning-routine --notify >> "{log_dir}/morning_routine.log" 2>&1
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Morning routine completed."
 """

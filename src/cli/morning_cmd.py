@@ -423,9 +423,11 @@ def _baseline_regression_check(state: dict | None = None) -> None:
       - 不抛例外（不影響後續步驟，與 Step 15 風格一致）
     """
     from src.cli.baseline_cmd import (
+        _active_portfolio_names,
         collect_current_metrics,
         compare_metrics,
         load_baseline,
+        split_baseline_portfolios,
     )
 
     baseline = load_baseline()
@@ -435,13 +437,14 @@ def _baseline_regression_check(state: dict | None = None) -> None:
             state["missing"] = True
         return
 
-    current = collect_current_metrics(portfolio_names=list(baseline.keys()))
+    # 只比 active 組合（與 validate-baseline CLI 共用同一個判定，勿各寫一份）
+    compare_names, skipped = split_baseline_portfolios(baseline.keys(), _active_portfolio_names())
+    if skipped:
+        print(f"  [baseline] 略過非 active 組合：{', '.join(skipped)}")
+    current = collect_current_metrics(portfolio_names=compare_names)
     all_findings = []
-    for name, bm in baseline.items():
-        cm = current.get(name)
-        if cm is None:
-            continue
-        all_findings.extend(compare_metrics(bm, cm, tolerance=1.0))
+    for name in compare_names:
+        all_findings.extend(compare_metrics(baseline[name], current[name], tolerance=1.0))
 
     regressions = [f for f in all_findings if f.is_regression]
     if state is not None:
