@@ -276,12 +276,17 @@ def _watch_close(args: argparse.Namespace) -> None:
     print(f"\n已平倉 #{entry_id_arg} {entry_obj.stock_id}（{close_date_today}）{pnl_str}\n")
 
 
-def _watch_update_status() -> None:
+def _watch_update_status(today: date | None = None) -> None:
     """watch update-status：批次更新止損/止利/過期狀態（含移動止損）。
 
     對 trailing_stop_enabled=True 的持倉，先依最新收盤價更新
     highest_price_since_entry 與 stop_loss（只升不降），
     再統一檢查止損/止利/過期狀態。
+
+    Args:
+        today: 過期判定的基準日；None 時取 date.today()。morning-routine 必須傳入
+            釘住的決策日——routine 拖過午夜時，牆上時鐘會把 valid_until 當天的
+            持倉提前一天判為過期（C3，2026-09-25）。
     """
     import datetime
 
@@ -292,7 +297,8 @@ def _watch_update_status() -> None:
     from src.data.schema import DailyPrice, WatchEntry
     from src.discovery.scanner import _calc_atr14
 
-    today = datetime.date.today()
+    if today is None:
+        today = datetime.date.today()
 
     with get_session() as session:
         active_entries = session.execute(select(WatchEntry).where(WatchEntry.status == "active")).scalars().all()

@@ -1449,7 +1449,7 @@ def _run_morning_routine(args: argparse.Namespace) -> None:
             {"dry_run"},
             lambda: cmd_alert_check(argparse.Namespace(days=3, types=None, stocks=None, notify=False)),
         ),
-        (11, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status()),
+        (11, "更新持倉狀態（watch update-status）", {"dry_run"}, lambda: _watch_update_status(today=today)),
         (
             "11b",
             "補抓 rotation 標的股利資料（除息入帳前提，A3）",

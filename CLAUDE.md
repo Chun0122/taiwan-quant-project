@@ -179,7 +179,7 @@ Strategy.load_data() ← 寬表（OHLCV + 指標合併）
 - 入口：`python main.py <子命令>`（52 子命令；parser 建構在 `main.py build_parser()`，dispatch 在 `main()`）
 - 每日例行：`morning-routine`（Step 0~18 + 子步驟 8b/8c/8d/8e/9b/11b，含全市場同步 + discover + 風控 + 通知）
   - Step 8e「同步後 regime 重解」：Step 0 宏觀預檢在同步**之前**執行，其 regime 只到前一交易日；Step 12 輪動須用同步後的判定（`resolve_regime_after_sync()`，dry_run/skip_sync 跳過）
-  - **決策日釘住**（C3，2026-09-25 補完）：`_run_morning_routine` 開頭只讀一次 `date.today()`，並傳給 Step 8c/**9**/**12**/15/16。**step 內不得再自取日期**——routine 拖過午夜時會把前一交易日的決策標成隔日（2026-09-22、09-25 實測，後者是休市日）。守門：`test_morning_e2e.py::TestDatePinning`
+  - **決策日釘住**（C3，2026-09-25 補完）：`_run_morning_routine` 開頭只讀一次 `date.today()`，並傳給 Step 8c/**9**/**11**/**12**/15/16。**step 內不得再自取日期**——routine 拖過午夜時會把前一交易日的決策標成隔日（2026-09-22、09-25 實測，後者是休市日）。守門：`test_morning_e2e.py::TestDatePinning`
 - 新增子命令須更新 `main.py` dispatch table + `docs/cli_commands.md`，**並附 CLI smoke test**（`tests/test_cli_smoke.py`；glue code 是測試盲區，`Announcement.title` 事故教訓）
 - 完整指令參考見 [`docs/cli_commands.md`](docs/cli_commands.md)
 

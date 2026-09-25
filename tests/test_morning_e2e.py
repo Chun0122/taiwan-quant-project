@@ -479,11 +479,15 @@ class TestDatePinning:
 
         monkeypatch.setattr(mc, "_cmd_discover_all", _fake_discover)
         monkeypatch.setattr(mc, "_rotation_update_all", _fake_rotation)
+        monkeypatch.setattr(
+            mc, "_watch_update_status", lambda today="MISSING": captured.__setitem__("watch_today", today)
+        )
 
         cmd_morning_routine(argparse.Namespace(dry_run=False, skip_sync=True, top=5, notify=False))
 
         assert captured.get("discover_as_of") == today, "Step 9 未收到釘住的 today → 拖過午夜會標成隔日"
         assert captured.get("rotation_today") == today, "Step 12 未收到釘住的 today → mgr.update() 自取隔日"
+        assert captured.get("watch_today") == today, "Step 11 未收到釘住的 today → 拖過午夜會提前一天判過期"
 
     def test_routine_reads_wall_clock_exactly_once(self):
         """靜態守門：`_run_morning_routine` 本體只准在開頭讀一次牆上時鐘。
